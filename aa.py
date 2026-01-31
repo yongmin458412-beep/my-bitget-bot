@@ -221,7 +221,6 @@ st.title(f"🤖 {symbol}")
 tab1, tab2, tab3 = None, None, None
 if is_mobile:
     tab1, tab2, tab3 = st.tabs(["📊 차트/현황", "⚡ 주문/설정", "📝 봇 상태"])
-
 # =========================================================
 # 1. 상단 메트릭 (공통)
 # =========================================================
@@ -229,15 +228,45 @@ def show_metrics():
     # 모바일이면 2열, 데스크탑이면 4열
     cols = st.columns(2) if is_mobile else st.columns(4)
     cols[0].metric("현재가", f"${curr_price:,.2f}")
-    cols[0].metric("RSI", f"{last['RSI']:.1f}") if is_mobile else cols[1].metric("RSI", f"{last['RSI']:.1f}")
     
+    # RSI 표시 (모바일/데스크탑 위치 다름)
     if is_mobile:
+        cols[0].metric("RSI", f"{last['RSI']:.1f}")
         cols[1].metric("잔고", f"${usdt_free:,.0f}")
         cols[1].metric("볼륨", f"{last['vol']:.0f}")
     else:
+        cols[1].metric("RSI", f"{last['RSI']:.1f}")
         cols[2].metric("잔고", f"${usdt_free:,.2f}")
         cols[3].metric("거래량", f"{last['vol']:.0f}")
 
+# ... (중간 생략) ...
+
+# =========================================================
+# 🚀 화면 그리기 (모바일 vs 데스크탑)
+# =========================================================
+
+if is_mobile:
+    # 📱 모바일 뷰
+    show_metrics() # 👈 여기가 st.help() 없이 깨끗해야 합니다!
+    
+    with tab1: # 차트 & 포지션
+        pos = show_chart_and_position()
+        
+    with tab2: # 주문
+        show_order_controls(pos)
+        
+    with tab3: # 봇 상태
+        show_bot_logic(pos)
+        
+else:
+    # 🖥️ 데스크탑 뷰
+    show_metrics() # 👈 여기도 확인!
+    st.divider()
+    pos = show_chart_and_position()
+    st.divider()
+    c_left, c_right = st.columns([1, 1])
+    with c_left: show_order_controls(pos)
+    with c_right: show_bot_logic(pos)
 # =========================================================
 # 2. 차트 및 포지션 (Tab 1 or Main)
 # =========================================================
