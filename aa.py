@@ -19,7 +19,7 @@ IS_SANDBOX = True # 모의투자
 SETTINGS_FILE = "bot_settings.json"
 LOG_FILE = "trade_log.csv"
 
-st.set_page_config(layout="wide", page_title="비트겟 봇 (Graduation)")
+st.set_page_config(layout="wide", page_title="비트겟 봇 (Full Option)")
 
 # ---------------------------------------------------------
 # 💾 설정 파일 관리
@@ -28,10 +28,14 @@ def load_settings():
     default = {
         "leverage": 20, "target_vote": 2, "tp": 15.0, "sl": 10.0,
         "auto_trade": False, "order_usdt": 100.0,
-        "use_rsi": True, "use_bb": True, "use_ma": False, 
-        "use_macd": False, "use_stoch": False, "use_cci": True, "use_vol": True,
-        "use_switching": True, 
-        "use_dca": False, "dca_trigger": -20.0, "dca_max_count": 1 # 추천값 적용됨
+        # 지표 10개
+        "use_rsi": True, "use_bb": True, "use_ma": False, "use_macd": False, 
+        "use_stoch": False, "use_cci": True, "use_mfi": False, 
+        "use_willr": False, "use_vol": True, "use_adx": False,
+        # 방어 & 추매
+        "use_switching": True, "use_dca": False, "dca_trigger": -20.0, "dca_max_count": 1,
+        # 자동매매 금액 설정 (추가됨)
+        "auto_size_type": "percent", "auto_size_val": 20.0
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -208,13 +212,13 @@ except: pass
 
 st.sidebar.divider()
 st.sidebar.subheader("🛡️ 방어 및 추매 설정")
-use_switching = st.sidebar.checkbox("스위칭 허용", value=config['use_switching'])
+use_switching = st.sidebar.checkbox("스위칭 허용 (반대 신호 시)", value=config['use_switching'])
 use_dca = st.sidebar.checkbox("추매(물타기) 허용", value=config['use_dca'])
 dca_trigger = st.sidebar.number_input("추매 발동 (ROI %)", -50.0, -1.0, config['dca_trigger'], step=0.5)
 dca_max_count = st.sidebar.number_input("최대 추매 횟수", 1, 5, config['dca_max_count'])
 
 st.sidebar.divider()
-st.sidebar.subheader("📊 지표 설정")
+st.sidebar.subheader("📊 지표 설정 (10개)")
 
 P = {} 
 with st.sidebar.expander("1. RSI", expanded=True):
@@ -228,15 +232,35 @@ with st.sidebar.expander("2. 볼린저밴드", expanded=True):
     P['bb_period'] = st.number_input("BB 기간", 10, 50, 20)
     P['bb_std'] = st.number_input("승수", 1.0, 3.0, 2.0)
 
+with st.sidebar.expander("3. 이동평균선", expanded=False):
+    use_ma = st.checkbox("이평선 사용", value=config['use_ma'])
+    P['ma_fast'] = st.number_input("단기", 1, 100, 5)
+    P['ma_slow'] = st.number_input("장기", 10, 200, 60)
+
+with st.sidebar.expander("4. MACD", expanded=False):
+    use_macd = st.checkbox("MACD 사용", value=config['use_macd'])
+
+with st.sidebar.expander("5. 스토캐스틱", expanded=False):
+    use_stoch = st.checkbox("스토캐스틱 사용", value=config['use_stoch'])
+    P['stoch_k'] = st.number_input("K 기간", 5, 30, 14)
+
 with st.sidebar.expander("6. CCI", expanded=True):
     use_cci = st.checkbox("CCI 사용", value=config['use_cci'])
+
+with st.sidebar.expander("7. MFI", expanded=False):
+    use_mfi = st.checkbox("MFI 사용", value=config['use_mfi'])
+
+with st.sidebar.expander("8. Williams %R", expanded=False):
+    use_willr = st.checkbox("WillR 사용", value=config['use_willr'])
 
 with st.sidebar.expander("9. 거래량", expanded=True):
     use_vol = st.checkbox("거래량 감지", value=config['use_vol'])
     P['vol_mul'] = st.number_input("거래량 배수", 1.5, 5.0, 2.0)
 
-use_ma = config['use_ma']; use_macd = config['use_macd']; use_stoch = config['use_stoch']
-active_indicators = sum([use_rsi, use_bb, use_ma, use_macd, use_stoch, use_cci, use_vol])
+with st.sidebar.expander("10. ADX", expanded=False):
+    use_adx = st.checkbox("ADX 사용", value=config['use_adx'])
+
+active_indicators = sum([use_rsi, use_bb, use_ma, use_macd, use_stoch, use_cci, use_mfi, use_willr, use_vol, use_adx])
 
 st.sidebar.divider()
 target_vote = st.sidebar.slider("🎯 진입 조건 (신호 개수)", 1, max(1, active_indicators), config['target_vote'])
@@ -262,24 +286,63 @@ def safe_toast(msg):
 
 def calculate_indicators(df, params):
     close = df['close']
+    high = df['high']
+    low = df['low']
+    vol = df['vol']
+    
+    # 1. RSI
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(params['rsi_period']).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(params['rsi_period']).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # 2. BB
     df['BB_MA'] = close.rolling(params['bb_period']).mean()
     df['BB_STD'] = close.rolling(params['bb_period']).std()
     df['BB_UP'] = df['BB_MA'] + (df['BB_STD'] * params['bb_std'])
     df['BB_LO'] = df['BB_MA'] - (df['BB_STD'] * params['bb_std'])
-    tp = (df['high'] + df['low'] + close) / 3
-    sma = tp.rolling(20).mean()
-    mad = tp.rolling(20).apply(lambda x: np.mean(np.abs(x - np.mean(x))))
-    df['CCI'] = (tp - sma) / (0.015 * mad)
-    df['VOL_MA'] = df['vol'].rolling(20).mean()
+    
+    # 3. MA
+    df['MA_FAST'] = close.rolling(params['ma_fast']).mean()
+    df['MA_SLOW'] = close.rolling(params['ma_slow']).mean()
+
+    # 4. MACD
     exp12 = close.ewm(span=12, adjust=False).mean()
     exp26 = close.ewm(span=26, adjust=False).mean()
     df['MACD'] = exp12 - exp26
     df['MACD_SIG'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    # 5. Stoch
+    k_period = params['stoch_k']
+    lowest_low = low.rolling(k_period).min()
+    highest_high = high.rolling(k_period).max()
+    df['STOCH_K'] = 100 * ((close - lowest_low) / (highest_high - lowest_low))
+
+    # 6. CCI
+    tp = (high + low + close) / 3
+    sma = tp.rolling(20).mean()
+    mad = tp.rolling(20).apply(lambda x: np.mean(np.abs(x - np.mean(x))))
+    df['CCI'] = (tp - sma) / (0.015 * mad)
+
+    # 7. MFI
+    typical_price = (high + low + close) / 3
+    money_flow = typical_price * vol
+    pos_flow = money_flow.where(typical_price > typical_price.shift(1), 0).rolling(14).sum()
+    neg_flow = money_flow.where(typical_price < typical_price.shift(1), 0).rolling(14).sum()
+    mfi_ratio = pos_flow / neg_flow
+    df['MFI'] = 100 - (100 / (1 + mfi_ratio))
+
+    # 8. WillR
+    df['WILLR'] = -100 * ((highest_high - close) / (highest_high - lowest_low))
+
+    # 9. Volume
+    df['VOL_MA'] = vol.rolling(20).mean()
+
+    # 10. ADX
+    tr = np.maximum((high - low), np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
+    df['ADX'] = (tr.rolling(14).mean() / close) * 1000
+
     return df
 
 # ---------------------------------------------------------
@@ -296,7 +359,7 @@ except Exception as e:
     st.error(f"데이터 에러: {e}"); st.stop()
 
 # ---------------------------------------------------------
-# ⚡ 주문 실행 함수 (자동: 20% / 수동: 입력값)
+# ⚡ 주문 실행 함수 (자동/수동 분기 처리)
 # ---------------------------------------------------------
 def execute_trade(side, is_close=False, reason="", qty=0.0, manual_amt=0.0):
     try:
@@ -313,13 +376,11 @@ def execute_trade(side, is_close=False, reason="", qty=0.0, manual_amt=0.0):
             emoji = "💰"; log_pnl = float(pos['unrealizedPnl']); log_roi = float(pos['percentage'])
         else:
             if qty == 0.0:
-                # 👇 [핵심] 수동/자동 금액 분기 처리
+                # 👇 자동/수동 금액 분기
                 if manual_amt > 0:
-                    # 자동매매에서 넘어온 금액 (20%)
-                    input_val = manual_amt
+                    input_val = manual_amt # 자동매매 계산값
                 else:
-                    # 수동 탭에서 입력한 금액
-                    input_val = st.session_state['order_usdt']
+                    input_val = st.session_state['order_usdt'] # 수동 입력값
                 
                 raw_qty = (input_val * p_leverage) / curr_price
                 qty = exchange.amount_to_precision(symbol, raw_qty)
@@ -355,7 +416,6 @@ def execute_trade(side, is_close=False, reason="", qty=0.0, manual_amt=0.0):
 st.title(f"🔥 {symbol}")
 
 coin, free, total = get_balance_details(exchange)
-# 미실현 손익 합산 (정확한 Equity 표시용)
 temp_unrealized = 0.0
 try:
     positions = exchange.fetch_positions([symbol])
@@ -367,7 +427,8 @@ current_equity = total + temp_unrealized
 _, d_pnl, t_pnl, _ = get_analytics()
 pnl_color = "#4CAF50" if d_pnl >= 0 else "#FF5252"
 
-st.markdown(f"""<div style="background-color: #1e1e1e; padding: 15px; border-radius: 10px; margin-bottom: 10px; display: flex; justify-content: space-around;"><div style="text-align: center;"><span style="color: #888;">사용 가능 잔고</span><br><span style="font-size: 1.5em; color: white;">${free:,.2f}</span></div><div style="text-align: center;"><span style="color: #888;">총 추정 자산</span><br><span style="font-size: 1.5em; color: white;">${current_equity:,.2f}</span></div><div style="text-align: center;"><span style="color: #888;">금일 수익</span><br><span style="font-size: 1.5em; color: {pnl_color};">${d_pnl:,.2f}</span></div></div>""", unsafe_allow_html=True)
+# 상단 대시보드 (총 누적 수익 부활)
+st.markdown(f"""<div style="background-color: #1e1e1e; padding: 15px; border-radius: 10px; margin-bottom: 10px; display: flex; justify-content: space-around;"><div style="text-align: center;"><span style="color: #888;">사용 가능 잔고</span><br><span style="font-size: 1.5em; color: white;">${free:,.2f}</span></div><div style="text-align: center;"><span style="color: #888;">총 추정 자산</span><br><span style="font-size: 1.5em; color: white;">${current_equity:,.2f}</span></div><div style="text-align: center;"><span style="color: #888;">금일 수익</span><br><span style="font-size: 1.5em; color: {pnl_color};">${d_pnl:,.2f}</span></div><div style="text-align: center;"><span style="color: #888;">총 누적 수익</span><br><span style="font-size: 1.5em; color: {'#4CAF50' if t_pnl>=0 else '#FF5252'};">${t_pnl:,.2f}</span></div></div>""", unsafe_allow_html=True)
 
 def show_main_ui():
     tv_studies = ["RSI@tv-basicstudies", "BB@tv-basicstudies"]
@@ -391,6 +452,7 @@ def show_main_ui():
 
 active_pos = show_main_ui()
 
+# 신호 계산 (10개 지표)
 long_score = 0; short_score = 0; reasons_L = []; reasons_S = []
 if use_rsi:
     if last['RSI'] <= P['rsi_buy']: long_score+=1; reasons_L.append("RSI과매도")
@@ -398,11 +460,28 @@ if use_rsi:
 if use_bb:
     if last['close'] <= last['BB_LO']: long_score+=1; reasons_L.append("BB하단")
     elif last['close'] >= last['BB_UP']: short_score+=1; reasons_S.append("BB상단")
+if use_ma:
+    if last['close'] > last['MA_SLOW']: long_score+=1; reasons_L.append("MA상승")
+    else: short_score+=1; reasons_S.append("MA하락")
+if use_macd:
+    if last['MACD'] > last['MACD_SIG']: long_score+=1; reasons_L.append("MACD골든")
+    else: short_score+=1; reasons_S.append("MACD데드")
+if use_stoch:
+    if last['STOCH_K'] < 20: long_score+=1; reasons_L.append("스토캐과매도")
+    elif last['STOCH_K'] > 80: short_score+=1; reasons_S.append("스토캐과매수")
 if use_cci:
     if last['CCI'] < -100: long_score+=1; reasons_L.append("CCI저점")
     elif last['CCI'] > 100: short_score+=1; reasons_S.append("CCI고점")
+if use_mfi:
+    if last['MFI'] < 20: long_score+=1; reasons_L.append("MFI저점")
+    elif last['MFI'] > 80: short_score+=1; reasons_S.append("MFI고점")
+if use_willr:
+    if last['WILLR'] < -80: long_score+=1; reasons_L.append("WillR저점")
+    elif last['WILLR'] > -20: short_score+=1; reasons_S.append("WillR고점")
 if use_vol:
     if last['vol'] > last['VOL_MA'] * P['vol_mul']: long_score+=1; short_score+=1; reasons_L.append("거래량↑"); reasons_S.append("거래량↑")
+if use_adx:
+    if last['ADX'] > 25: long_score+=1; short_score+=1
 
 c1, c2 = st.columns(2)
 c1.metric("📈 롱 점수", f"{long_score}/{target_vote}")
@@ -411,26 +490,44 @@ c2.metric("📉 숏 점수", f"{short_score}/{target_vote}")
 final_long = long_score >= target_vote
 final_short = short_score >= target_vote
 
-current_settings = {
-    "leverage": p_leverage, "target_vote": target_vote, "tp": tp_pct, "sl": sl_pct,
-    "auto_trade": st.session_state.get('auto_trade', False),
-    "use_rsi": use_rsi, "use_bb": use_bb, "use_ma": use_ma, "use_macd": use_macd,
-    "use_stoch": use_stoch, "use_cci": use_cci, "use_vol": use_vol,
-    "use_switching": use_switching, "use_dca": use_dca, "dca_trigger": dca_trigger, "dca_max_count": dca_max_count,
-    "order_usdt": st.session_state.get('order_usdt', 100.0)
-}
-if current_settings != config: save_settings(current_settings)
-
+# 자동매매 설정 UI (수정됨)
 t1, t2 = st.tabs(["🤖 자동매매", "⚡ 수동주문"])
 with t1:
-    auto_on = st.checkbox("자동매매 활성화", value=config['auto_trade'], key="auto_trade")
+    c_auto_1, c_auto_2 = st.columns(2)
+    with c_auto_1:
+        auto_on = st.checkbox("자동매매 활성화", value=config['auto_trade'], key="auto_trade")
+        auto_size_type = st.radio("진입 금액 방식", ["자산 비율 (%)", "고정 금액 (USDT)"], index=0 if config.get('auto_size_type', 'percent') == 'percent' else 1)
+    with c_auto_2:
+        if auto_size_type == "자산 비율 (%)":
+            auto_size_val = st.number_input("비율 설정 (%)", 1.0, 100.0, float(config.get('auto_size_val', 20.0)), step=5.0)
+            st.caption(f"현재 자산(${current_equity:,.2f})의 {auto_size_val}% = 약 ${current_equity * (auto_size_val/100):,.2f} 진입")
+        else:
+            auto_size_val = st.number_input("금액 설정 (USDT)", 10.0, 10000.0, float(config.get('auto_size_val', 100.0)), step=10.0)
+            st.caption(f"매번 ${auto_size_val} 고정 진입")
+
+    # 설정 저장
+    current_settings = {
+        "leverage": p_leverage, "target_vote": target_vote, "tp": tp_pct, "sl": sl_pct,
+        "auto_trade": auto_on, 
+        "auto_size_type": "percent" if auto_size_type == "자산 비율 (%)" else "fixed",
+        "auto_size_val": auto_size_val,
+        "use_rsi": use_rsi, "use_bb": use_bb, "use_ma": use_ma, "use_macd": use_macd,
+        "use_stoch": use_stoch, "use_cci": use_cci, "use_vol": use_vol, "use_mfi": use_mfi,
+        "use_willr": use_willr, "use_adx": use_adx,
+        "use_switching": use_switching, "use_dca": use_dca, "dca_trigger": dca_trigger, "dca_max_count": dca_max_count,
+        "order_usdt": st.session_state.get('order_usdt', 100.0)
+    }
+    if current_settings != config: save_settings(current_settings)
+
     if auto_on:
         if not active_pos:
-            # 👇 [핵심] 20% 복리 계산
-            # 현재 총 추정 자산(Equity)의 20%
-            entry_amount = current_equity * 0.2
-            # 만약 사용가능 잔고보다 크면 잔고만큼만
-            if entry_amount > free: entry_amount = free
+            # 진입 금액 계산
+            if auto_size_type == "자산 비율 (%)":
+                entry_amount = current_equity * (auto_size_val / 100.0)
+            else:
+                entry_amount = auto_size_val
+            
+            if entry_amount > free: entry_amount = free # 잔고 초과 방지
 
             if final_long: execute_trade('long', reason=",".join(reasons_L), manual_amt=entry_amount)
             elif final_short: execute_trade('short', reason=",".join(reasons_S), manual_amt=entry_amount)
@@ -446,9 +543,8 @@ with t1:
                     size = float(active_pos['contracts'])
                     curr_margin = (entry * size) / p_leverage
                 
-                # 1배수 추매
-                base_margin = curr_margin / (1 + dca_max_count) # 대략적인 1회분 계산
-                if curr_margin < (base_margin * (1 + dca_max_count)) * 1.1: # 여유있게 비교
+                base_margin = curr_margin / (1 + dca_max_count)
+                if curr_margin < (base_margin * (1 + dca_max_count)) * 1.1:
                     add_qty = float(active_pos['contracts'])
                     execute_trade(cur_side, False, f"💧 추매 (ROI {roi:.2f}%)", qty=add_qty)
                     time.sleep(2)
@@ -458,8 +554,10 @@ with t1:
                    (cur_side == 'short' and long_score >= target_vote)):
                     execute_trade(cur_side, True, "🚨 손절 후 스위칭")
                     time.sleep(1)
-                    # 스위칭 진입 시에도 20% 룰 적용
-                    entry_amount = current_equity * 0.2 # 손절 후 줄어든 자산 기준
+                    # 스위칭 시에도 설정된 금액 비율로 재진입
+                    if auto_size_type == "자산 비율 (%)": entry_amount = current_equity * (auto_size_val / 100.0)
+                    else: entry_amount = auto_size_val
+                    
                     target_side = 'short' if cur_side == 'long' else 'long'
                     execute_trade(target_side, reason="스위칭 진입", manual_amt=entry_amount)
                 else:
