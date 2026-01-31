@@ -14,19 +14,25 @@ import io
 # =========================================================
 IS_SANDBOX = True # 실전시 False
 
-st.set_page_config(layout="wide", page_title="비트겟 프로 봇 (Custom)")
+st.set_page_config(layout="wide", page_title="비트겟 프로 봇 (Fixed)")
 
 if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = 100.0
 
 # ---------------------------------------------------------
-# 🔐 API 키 (Secrets)
+# 🔐 API 키 & 텔레그램 키 로딩 (Secrets)
 # ---------------------------------------------------------
 try:
+    # 비트겟 키
     api_key = st.secrets["API_KEY"]
     api_secret = st.secrets["API_SECRET"]
     api_password = st.secrets["API_PASSWORD"]
+    
+    # 👇 [추가됨] 텔레그램 키 자동 로딩 (없으면 빈칸)
+    default_tg_token = st.secrets.get("TG_TOKEN", "")
+    default_tg_id = st.secrets.get("TG_CHAT_ID", "")
+    
 except:
-    st.error("🚨 API 키가 설정되지 않았습니다. Streamlit Secrets를 확인해주세요.")
+    st.error("🚨 Secrets 설정이 필요합니다.")
     st.stop()
 
 # ---------------------------------------------------------
@@ -41,8 +47,8 @@ def safe_toast(msg):
     if hasattr(st, 'toast'): st.toast(msg)
     else: st.success(msg)
 
-# 텔레그램 (텍스트 + 차트 이미지)
-def send_telegram(token, chat_id, message, chart_df=None, indicators=None):
+# 텔레그램 전송
+def send_telegram(token, chat_id, message, chart_df=None):
     try:
         if not token or not chat_id: return
         
@@ -52,11 +58,7 @@ def send_telegram(token, chat_id, message, chart_df=None, indicators=None):
         # 2. 차트 이미지
         if chart_df is not None:
             plt.figure(figsize=(10, 6))
-            
-            # 메인 차트
             plt.plot(chart_df['time'], chart_df['close'], label='Price', color='yellow')
-            
-            # 보조지표 시각화 (설정된 것만)
             if 'MA_SLOW' in chart_df.columns:
                 plt.plot(chart_df['time'], chart_df['MA_SLOW'], label='MA(Slow)', color='cyan', alpha=0.5)
             if 'BB_UP' in chart_df.columns:
@@ -67,7 +69,6 @@ def send_telegram(token, chat_id, message, chart_df=None, indicators=None):
             plt.legend()
             plt.grid(True, alpha=0.2)
             
-            # 다크 모드 스타일
             ax = plt.gca()
             ax.set_facecolor('black')
             plt.gcf().patch.set_facecolor('black')
@@ -84,7 +85,7 @@ def send_telegram(token, chat_id, message, chart_df=None, indicators=None):
         print(f"텔레그램 전송 실패: {e}")
 
 # ---------------------------------------------------------
-# 🧮 10대 보조지표 계산 (파라미터 유동적)
+# 🧮 10대 보조지표 계산
 # ---------------------------------------------------------
 def calculate_indicators(df, params):
     close = df['close']
@@ -105,7 +106,7 @@ def calculate_indicators(df, params):
     df['BB_UP'] = df['BB_MA'] + (df['BB_STD'] * params['bb_std'])
     df['BB_LO'] = df['BB_MA'] - (df['BB_STD'] * params['bb_std'])
 
-    # 3. 이동평균선 (사용자가 정한 기간)
+    # 3. 이동평균선
     df['MA_FAST'] = close.rolling(params['ma_fast']).mean()
     df['MA_SLOW'] = close.rolling(params['ma_slow']).mean()
 
@@ -128,10 +129,9 @@ def calculate_indicators(df, params):
     mad = tp.rolling(20).apply(get_mad)
     df['CCI'] = (tp - sma) / (0.015 * mad)
 
-    # 7. MFI (Money Flow Index - 거래량 RSI)
+    # 7. MFI
     typical_price = (high + low + close) / 3
     money_flow = typical_price * vol
-    
     positive_flow = money_flow.where(typical_price > typical_price.shift(1), 0).rolling(14).sum()
     negative_flow = money_flow.where(typical_price < typical_price.shift(1), 0).rolling(14).sum()
     mfi_ratio = positive_flow / negative_flow
@@ -140,9 +140,9 @@ def calculate_indicators(df, params):
     # 8. Williams %R
     df['WILLR'] = -100 * ((highest_high - close) / (highest_high - lowest_low))
 
-    # 9. ADX (단순화된 계산)
+    # 9. ADX
     tr = np.maximum((high - low), np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
-    df['ADX'] = (tr.rolling(14).mean() / close) * 1000 # 스케일 조정됨
+    df['ADX'] = (tr.rolling(14).mean() / close) * 1000
 
     # 10. Volume MA
     df['VOL_MA'] = vol.rolling(20).mean()
@@ -165,7 +165,7 @@ exchange = init_exchange()
 if not exchange: st.stop()
 
 # ---------------------------------------------------------
-# 🎨 사이드바: 정밀 설정 UI
+# 🎨 사이드바
 # ---------------------------------------------------------
 st.sidebar.title("🛠️ 봇 정밀 설정")
 is_mobile = st.sidebar.checkbox("📱 모바일 모드", value=True)
@@ -175,85 +175,73 @@ futures_symbols = [s for s in markets if markets[s].get('linear') and markets[s]
 symbol = st.sidebar.selectbox("코인 선택", futures_symbols, index=0)
 
 # =========================================================
-# 🎛️ 보조지표 10종 상세 설정 (Expanders)
+# 🎛️ 보조지표 설정
 # =========================================================
 st.sidebar.divider()
-st.sidebar.subheader("📊 지표 세부 설정 & 사용 여부")
-st.sidebar.info("체크박스를 켠 지표만 '다수결 투표'에 포함됩니다.")
+st.sidebar.subheader("📊 지표 세부 설정")
 
-# 파라미터 저장용 딕셔너리
 P = {} 
 
-with st.sidebar.expander("1. RSI (상대강도지수)", expanded=False):
+with st.sidebar.expander("1. RSI (상대강도지수)", expanded=True):
     use_rsi = st.checkbox("RSI 사용", value=True)
-    P['rsi_period'] = st.number_input("RSI 기간 (기본 14)", 5, 100, 14)
-    P['rsi_buy'] = st.slider("롱 진입 (이하)", 10, 50, 30, help="이 수치보다 낮으면 과매도(매수) 신호")
-    P['rsi_sell'] = st.slider("숏 진입 (이상)", 50, 90, 70, help="이 수치보다 높으면 과매수(매도) 신호")
+    P['rsi_period'] = st.number_input("RSI 기간", 5, 100, 14)
+    P['rsi_buy'] = st.slider("롱 진입 (이하)", 10, 50, 30)
+    P['rsi_sell'] = st.slider("숏 진입 (이상)", 50, 90, 70)
 
-with st.sidebar.expander("2. 볼린저밴드 (변동성)", expanded=False):
+with st.sidebar.expander("2. 볼린저밴드", expanded=True):
     use_bb = st.checkbox("볼린저밴드 사용", value=True)
     P['bb_period'] = st.number_input("BB 기간", 10, 50, 20)
     P['bb_std'] = st.number_input("승수 (표준편차)", 1.0, 3.0, 2.0, step=0.1)
-    st.caption("하단 밴드 이탈 시 롱, 상단 이탈 시 숏")
 
-with st.sidebar.expander("3. 이동평균선 (MA)", expanded=False):
-    use_ma = st.checkbox("이평선 사용", value=True)
-    P['ma_fast'] = st.number_input("단기 이평선 (예: 5)", 1, 100, 5)
-    P['ma_slow'] = st.number_input("장기 이평선 (예: 60)", 10, 200, 60)
-    st.caption("가격이 장기 이평선 위에 있으면 '상승추세'로 판단 (롱 유리)")
+with st.sidebar.expander("3. 이동평균선", expanded=False):
+    use_ma = st.checkbox("이평선 사용", value=False)
+    P['ma_fast'] = st.number_input("단기 이평선", 1, 100, 5)
+    P['ma_slow'] = st.number_input("장기 이평선", 10, 200, 60)
 
-with st.sidebar.expander("4. MACD (추세)", expanded=False):
+with st.sidebar.expander("4. MACD", expanded=False):
     use_macd = st.checkbox("MACD 사용", value=False)
-    st.caption("MACD 선이 시그널 선을 돌파(골든크로스)하면 롱")
 
-with st.sidebar.expander("5. 스토캐스틱 (Stochastic)", expanded=False):
+with st.sidebar.expander("5. 스토캐스틱", expanded=False):
     use_stoch = st.checkbox("스토캐스틱 사용", value=False)
     P['stoch_k'] = st.number_input("K 기간", 5, 30, 14)
-    st.caption("K값이 20 이하면 롱, 80 이상이면 숏")
 
-with st.sidebar.expander("6. CCI (상품채널지수)", expanded=False):
+with st.sidebar.expander("6. CCI", expanded=False):
     use_cci = st.checkbox("CCI 사용", value=False)
-    st.caption("-100 이하면 과매도(롱), +100 이상이면 과매수(숏)")
 
-with st.sidebar.expander("7. MFI (자금흐름지수)", expanded=False):
+with st.sidebar.expander("7. MFI", expanded=False):
     use_mfi = st.checkbox("MFI 사용", value=False)
-    st.caption("거래량이 실린 RSI. 20 이하면 롱, 80 이상이면 숏")
 
 with st.sidebar.expander("8. Williams %R", expanded=False):
     use_willr = st.checkbox("Williams %R 사용", value=False)
-    st.caption("-80 이하면 과매도(롱), -20 이상이면 과매수(숏)")
 
-with st.sidebar.expander("9. 거래량 (Volume)", expanded=False):
-    use_vol = st.checkbox("거래량 폭발 감지", value=False)
+with st.sidebar.expander("9. 거래량", expanded=True):
+    use_vol = st.checkbox("거래량 폭발 감지", value=True)
     P['vol_mul'] = st.number_input("평소 대비 배수", 1.5, 5.0, 2.0)
-    st.caption(f"거래량이 20일 평균의 {P['vol_mul']}배 터지면 신호 발생")
 
-with st.sidebar.expander("10. ADX (추세강도)", expanded=False):
-    use_adx = st.checkbox("ADX (추세확인) 사용", value=False)
-    st.caption("ADX 수치가 높을 때만(추세가 강할 때만) 진입 허용")
+with st.sidebar.expander("10. ADX", expanded=False):
+    use_adx = st.checkbox("ADX 사용", value=False)
 
 # ---------------------------------------------------------
-# 🎛️ 전략 및 리스크 관리
+# 🎛️ 전략 및 리스크
 # ---------------------------------------------------------
 st.sidebar.divider()
 st.sidebar.subheader("⚖️ 전략 및 리스크")
 
-# 투표 시스템
 active_indicators = sum([use_rsi, use_bb, use_ma, use_macd, use_stoch, use_cci, use_mfi, use_willr, use_vol, use_adx])
 target_vote = st.sidebar.slider(
     f"🎯 진입 조건 (총 {active_indicators}개 중)", 
-    1, max(1, active_indicators), min(3, active_indicators),
-    help="선택한 지표들 중 몇 개가 동시에 신호를 보내야 진입할지 설정합니다."
+    1, max(1, active_indicators), min(3, active_indicators)
 )
 
-p_leverage = st.sidebar.slider("레버리지", 1, 125, 20)
-tp_pct = st.sidebar.number_input("💰 익절 목표 (%)", 1.0, 500.0, 10.0)
-sl_pct = st.sidebar.number_input("💸 손절 제한 (%)", 1.0, 100.0, 5.0)
+p_leverage = st.sidebar.slider("레버리지", 1, 50, 20)
+tp_pct = st.sidebar.number_input("💰 익절 목표 (%)", 1.0, 500.0, 15.0)
+sl_pct = st.sidebar.number_input("💸 손절 제한 (%)", 1.0, 100.0, 10.0)
 
 st.sidebar.divider()
 st.sidebar.subheader("🔔 텔레그램")
-tg_token = st.sidebar.text_input("봇 토큰", type="password")
-tg_id = st.sidebar.text_input("챗 ID")
+# 👇 [수정됨] Secrets에서 가져온 값을 기본값(value)으로 설정
+tg_token = st.sidebar.text_input("봇 토큰", value=default_tg_token, type="password")
+tg_id = st.sidebar.text_input("챗 ID", value=default_tg_id)
 
 # ---------------------------------------------------------
 # 📊 데이터 로딩 및 계산
@@ -261,11 +249,9 @@ tg_id = st.sidebar.text_input("챗 ID")
 try:
     ticker = exchange.fetch_ticker(symbol)
     curr_price = ticker['last']
-    ohlcv = exchange.fetch_ohlcv(symbol, '1m', limit=200) # 계산 정확도를 위해 200개
+    ohlcv = exchange.fetch_ohlcv(symbol, '1m', limit=200)
     df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
     df['time'] = pd.to_datetime(df['time'], unit='ms')
-    
-    # 지표 계산
     df = calculate_indicators(df, P)
     last = df.iloc[-1]
     
@@ -309,7 +295,7 @@ def execute_trade(side, is_close=False, reason=""):
         price = ticker['ask']*1.01 if order_side == 'buy' else ticker['bid']*0.99
         exchange.create_order(symbol, 'limit', order_side, qty, price, params=params)
         
-        # 메시지 및 알림
+        # 메시지
         action = "청산" if is_close else "진입"
         krw_val = curr_price * 1450
         msg = f"{trade_emoji} {side.upper()} {action} 체결!\n"
@@ -322,6 +308,7 @@ def execute_trade(side, is_close=False, reason=""):
         st.success(msg)
         safe_toast(msg)
         
+        # 텔레그램 전송
         if tg_token and tg_id:
             chart_data = df.tail(60) if not is_close else None
             send_telegram(tg_token, tg_id, msg, chart_data)
@@ -335,17 +322,20 @@ def execute_trade(side, is_close=False, reason=""):
 # 📱 UI 디스플레이
 # =========================================================
 def show_metrics():
-    cols = st.columns(2) if is_mobile else st.columns(4)
+    # 잔고 강조
+    st.markdown(f"""
+    <div style="background-color: #1e1e1e; padding: 15px; border-radius: 10px; margin-bottom: 10px; text-align: center;">
+        <span style="font-size: 1.2em; color: #888;">내 잔고 (USDT)</span><br>
+        <span style="font-size: 2.5em; color: #4CAF50; font-weight: bold;">${usdt_free:,.2f}</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    cols = st.columns(3)
     cols[0].metric("현재가", f"${curr_price:,.2f}")
-    if is_mobile:
-        cols[0].metric("RSI", f"{last['RSI']:.1f}")
-    else:
-        cols[1].metric("RSI", f"{last['RSI']:.1f}")
-        cols[2].metric("잔고", f"${usdt_free:,.2f}")
-        cols[3].metric("변동성", f"{last['BB_STD']:.2f}")
+    cols[1].metric("RSI", f"{last['RSI']:.1f}")
+    cols[2].metric("변동성(BB)", f"{last['BB_STD']:.2f}")
 
 def show_chart_and_pos():
-    # 차트
     tv_studies = ["RSI@tv-basicstudies", "BB@tv-basicstudies"]
     studies_json = str(tv_studies).replace("'", '"')
     tv_symbol = "BITGET:" + symbol.split(':')[0].replace('/', '') + ".P"
@@ -359,7 +349,6 @@ def show_chart_and_pos():
       </script>
     </div>""", height=h)
 
-    # 포지션
     st.subheader("💼 포지션 상태")
     active_pos = None
     try:
@@ -382,11 +371,10 @@ def show_chart_and_pos():
                 <p>진입: ${entry:,.2f} | 수익: ${pnl:.2f} ({roi:.2f}%)</p>
             </div>""", unsafe_allow_html=True)
             
-            # 리스크 관리
             if roi >= tp_pct: execute_trade(side, True, "익절")
             elif roi <= -sl_pct: execute_trade(side, True, "손절")
         else:
-            st.info("보유 포지션 없음 (대기 중)")
+            st.info("보유 포지션 없음")
             
     except: pass
     return active_pos
@@ -394,9 +382,6 @@ def show_chart_and_pos():
 def show_strategy(active_pos):
     st.subheader("🧠 전략 분석 (다수결)")
     
-    # ---------------------------
-    # 신호 계산 (Logic)
-    # ---------------------------
     long_score = 0
     short_score = 0
     reasons_L = []
@@ -404,58 +389,44 @@ def show_strategy(active_pos):
     
     # 1. RSI
     if use_rsi:
-        if last['RSI'] <= P['rsi_buy']: long_score+=1; reasons_L.append(f"RSI과매도({last['RSI']:.0f})")
-        elif last['RSI'] >= P['rsi_sell']: short_score+=1; reasons_S.append(f"RSI과매수({last['RSI']:.0f})")
-    
+        if last['RSI'] <= P['rsi_buy']: long_score+=1; reasons_L.append(f"RSI과매도")
+        elif last['RSI'] >= P['rsi_sell']: short_score+=1; reasons_S.append(f"RSI과매수")
     # 2. BB
     if use_bb:
         if last['close'] <= last['BB_LO']: long_score+=1; reasons_L.append("BB하단")
         elif last['close'] >= last['BB_UP']: short_score+=1; reasons_S.append("BB상단")
-        
     # 3. MA
     if use_ma:
-        # 가격이 장기 이평 위에 있으면 롱 유리
-        if last['close'] > last['MA_SLOW']: long_score+=1; reasons_L.append("이평상승추세")
-        else: short_score+=1; reasons_S.append("이평하락추세")
-        
+        if last['close'] > last['MA_SLOW']: long_score+=1; reasons_L.append("이평상승")
+        else: short_score+=1; reasons_S.append("이평하락")
     # 4. MACD
     if use_macd:
         if last['MACD'] > last['MACD_SIG']: long_score+=1; reasons_L.append("MACD골든")
         else: short_score+=1; reasons_S.append("MACD데드")
-        
     # 5. Stoch
     if use_stoch:
         if last['STOCH_K'] < 20: long_score+=1; reasons_L.append("스토캐과매도")
         elif last['STOCH_K'] > 80: short_score+=1; reasons_S.append("스토캐과매수")
-        
     # 6. CCI
     if use_cci:
         if last['CCI'] < -100: long_score+=1; reasons_L.append("CCI저점")
         elif last['CCI'] > 100: short_score+=1; reasons_S.append("CCI고점")
-        
     # 7. MFI
     if use_mfi:
         if last['MFI'] < 20: long_score+=1; reasons_L.append("MFI저점")
         elif last['MFI'] > 80: short_score+=1; reasons_S.append("MFI고점")
-        
     # 8. WillR
     if use_willr:
         if last['WILLR'] < -80: long_score+=1; reasons_L.append("WillR저점")
         elif last['WILLR'] > -20: short_score+=1; reasons_S.append("WillR고점")
-        
     # 9. Volume
     if use_vol:
         if last['vol'] > last['VOL_MA'] * P['vol_mul']:
             long_score+=1; short_score+=1; reasons_L.append("거래량급증"); reasons_S.append("거래량급증")
-            
-    # 10. ADX (필터 역할)
+    # 10. ADX
     if use_adx:
-        # ADX가 낮으면(횡보) 점수 깎거나 진입 금지? 여기선 단순 가점으로 처리
-        if last['ADX'] > 25: long_score+=1; short_score+=1; # 추세가 있다
+        if last['ADX'] > 25: long_score+=1; short_score+=1;
 
-    # ---------------------------
-    # 결과 표시
-    # ---------------------------
     c1, c2 = st.columns(2)
     c1.metric("📈 롱 점수", f"{long_score} / {target_vote}", delta=f"{long_score-target_vote}")
     c2.metric("📉 숏 점수", f"{short_score} / {target_vote}", delta=f"{short_score-target_vote}")
@@ -466,14 +437,12 @@ def show_strategy(active_pos):
     if final_long: st.success(f"🔥 롱 진입 조건 만족! ({', '.join(reasons_L)})")
     if final_short: st.error(f"🔥 숏 진입 조건 만족! ({', '.join(reasons_S)})")
 
-    # 자동매매
     st.divider()
-    if st.checkbox("🤖 자동매매 활성화 (조건 만족 시 진입)"):
+    if st.checkbox("🤖 자동매매 활성화"):
         if not active_pos:
             if final_long: execute_trade('long', reason=",".join(reasons_L))
             elif final_short: execute_trade('short', reason=",".join(reasons_S))
         else:
-            # 포지션 있을 때 강력한 반대 신호(목표치+1)면 스위칭
             cur = active_pos['side']
             if cur == 'long' and short_score >= target_vote + 1: execute_trade('long', True, "스위칭")
             elif cur == 'short' and long_score >= target_vote + 1: execute_trade('short', True, "스위칭")
@@ -484,9 +453,9 @@ def show_order(active_pos):
     st.subheader("⚡ 수동 주문")
     c1, c2, c3, c4 = st.columns(4)
     def set_amt(pct): st.session_state['order_usdt'] = float(f"{usdt_free * pct:.2f}")
-    if c1.button("25%"): set_amt(0.25)
+    if c1.button("20%"): set_amt(0.2)
     if c2.button("50%"): set_amt(0.5)
-    if c3.button("75%"): set_amt(0.75)
+    if c3.button("80%"): set_amt(0.8)
     if c4.button("Full"): set_amt(1.0)
     
     st.number_input("금액 (USDT)", 0.0, usdt_free, key='order_usdt')
