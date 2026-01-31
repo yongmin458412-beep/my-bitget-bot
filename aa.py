@@ -10,11 +10,12 @@ import matplotlib.pyplot as plt
 import io
 
 # =========================================================
-# ⚙️ [설정] 기본 환경
+# ⚙️ [설정] 환경 설정 (강제 모의투자 모드)
 # =========================================================
-IS_SANDBOX = True # ⚠️ 모의투자면 True, 실전이면 False
+# 👇 여기가 핵심입니다. True로 설정되어 있어야 500불이 보입니다.
+IS_SANDBOX = True 
 
-st.set_page_config(layout="wide", page_title="비트겟 프로 봇 (Final)")
+st.set_page_config(layout="wide", page_title="비트겟 봇 (Demo 500)")
 
 if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = 100.0
 
@@ -22,17 +23,15 @@ if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = 100.0
 # 🔐 API 키 & 텔레그램 키 로딩 (Secrets)
 # ---------------------------------------------------------
 try:
-    # 비트겟 키
     api_key = st.secrets["API_KEY"]
     api_secret = st.secrets["API_SECRET"]
     api_password = st.secrets["API_PASSWORD"]
     
-    # 텔레그램 키 (없으면 빈칸 처리)
     default_tg_token = st.secrets.get("TG_TOKEN", "")
     default_tg_id = st.secrets.get("TG_CHAT_ID", "")
     
 except:
-    st.error("🚨 Secrets 설정이 필요합니다. (API_KEY, API_SECRET, API_PASSWORD)")
+    st.error("🚨 Secrets 설정이 필요합니다.")
     st.stop()
 
 # ---------------------------------------------------------
@@ -47,26 +46,21 @@ def safe_toast(msg):
     if hasattr(st, 'toast'): st.toast(msg)
     else: st.success(msg)
 
-# 텔레그램 전송 (텍스트 + 차트)
 def send_telegram(token, chat_id, message, chart_df=None):
     try:
         if not token or not chat_id: return
-        
-        # 1. 텍스트 전송
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={'chat_id': chat_id, 'text': message})
         
-        # 2. 차트 이미지 전송
         if chart_df is not None:
             plt.figure(figsize=(10, 6))
             plt.plot(chart_df['time'], chart_df['close'], label='Price', color='yellow')
-            
             if 'MA_SLOW' in chart_df.columns:
                 plt.plot(chart_df['time'], chart_df['MA_SLOW'], label='MA(Slow)', color='cyan', alpha=0.5)
             if 'BB_UP' in chart_df.columns:
                 plt.plot(chart_df['time'], chart_df['BB_UP'], color='white', alpha=0.1)
                 plt.plot(chart_df['time'], chart_df['BB_LO'], color='white', alpha=0.1)
 
-            plt.title(f"Entry Snapshot")
+            plt.title(f"Trading Signal")
             plt.legend()
             plt.grid(True, alpha=0.2)
             
@@ -81,12 +75,11 @@ def send_telegram(token, chat_id, message, chart_df=None):
             
             requests.post(f"https://api.telegram.org/bot{token}/sendPhoto", data={'chat_id': chat_id}, files={'photo': buf})
             plt.close()
-
     except Exception as e:
         print(f"텔레그램 전송 실패: {e}")
 
 # ---------------------------------------------------------
-# 🧮 10대 보조지표 계산
+# 🧮 보조지표 계산
 # ---------------------------------------------------------
 def calculate_indicators(df, params):
     close = df['close']
@@ -157,6 +150,7 @@ def calculate_indicators(df, params):
 def init_exchange():
     try:
         ex = ccxt.bitget({'apiKey': api_key, 'secret': api_secret, 'password': api_password, 'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
+        # 👇 강제 샌드박스 모드
         ex.set_sandbox_mode(IS_SANDBOX)
         ex.load_markets()
         return ex
@@ -166,7 +160,7 @@ exchange = init_exchange()
 if not exchange: st.stop()
 
 # ---------------------------------------------------------
-# 🎨 사이드바: 설정 UI
+# 🎨 사이드바: 정밀 설정 UI
 # ---------------------------------------------------------
 st.sidebar.title("🛠️ 봇 정밀 설정")
 is_mobile = st.sidebar.checkbox("📱 모바일 모드", value=True)
@@ -182,7 +176,6 @@ st.sidebar.divider()
 st.sidebar.subheader("📊 지표 세부 설정")
 
 P = {} 
-
 with st.sidebar.expander("1. RSI (상대강도지수)", expanded=True):
     use_rsi = st.checkbox("RSI 사용", value=True)
     P['rsi_period'] = st.number_input("RSI 기간", 5, 100, 14)
@@ -222,9 +215,9 @@ with st.sidebar.expander("9. 거래량", expanded=True):
 with st.sidebar.expander("10. ADX", expanded=False):
     use_adx = st.checkbox("ADX 사용", value=False)
 
-# ---------------------------------------------------------
+# =========================================================
 # 🎛️ 전략 및 리스크
-# ---------------------------------------------------------
+# =========================================================
 st.sidebar.divider()
 st.sidebar.subheader("⚖️ 전략 및 리스크")
 
@@ -243,12 +236,11 @@ st.sidebar.subheader("🔔 텔레그램")
 tg_token = st.sidebar.text_input("봇 토큰", value=default_tg_token, type="password")
 tg_id = st.sidebar.text_input("챗 ID", value=default_tg_id)
 
-# 연결 확인 버튼
 if st.sidebar.button("📡 연결 상태 확인"):
     with st.sidebar.status("확인 중...", expanded=True) as status:
         try:
             exchange.fetch_ticker(symbol)
-            st.write("✅ 비트겟 연결 성공!")
+            st.write("✅ 거래소 연결 성공!")
             if tg_token and tg_id:
                 requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': "✅ 연결 확인!"})
                 st.write("✅ 텔레그램 발송 성공!")
@@ -257,7 +249,7 @@ if st.sidebar.button("📡 연결 상태 확인"):
             st.error(f"실패: {e}")
 
 # ---------------------------------------------------------
-# 📊 데이터 로딩 & 잔고 자동 감지 (핵심 수정됨)
+# 📊 데이터 로딩 & 잔고 로직 (문제 해결된 부분)
 # ---------------------------------------------------------
 usdt_free = 0.0
 margin_coin_display = "USDT"
@@ -271,29 +263,26 @@ try:
     df = calculate_indicators(df, P)
     last = df.iloc[-1]
     
-    # 👇 잔고 스마트 감지 로직
+    # 👇 [수정됨] 잔고를 가져올 때 모든 가능성을 열어두고 0보다 큰 것을 찾습니다.
     balance = exchange.fetch_balance({'type': 'swap'})
     
-    # 디버그용: 지갑에 돈 있는 코인 다 찾기
-    found_assets = {}
-    for coin, info in balance.items():
-        if isinstance(info, dict) and 'free' in info and info['free'] > 0:
-            found_assets[coin] = info['free']
-
-    # 우선순위: SUSDT(모의) -> USDT(실전) -> SBTC(모의)
-    if 'SUSDT' in found_assets:
-        usdt_free = float(found_assets['SUSDT'])
-        margin_coin_display = "SUSDT (모의)"
-    elif 'USDT' in found_assets:
-        usdt_free = float(found_assets['USDT'])
-        margin_coin_display = "USDT (실전)"
-    elif 'SBTC' in found_assets:
-        usdt_free = float(found_assets['SBTC'])
-        margin_coin_display = "SBTC (모의)"
+    # 테스터기 결과가 'USDT: 500.0' 이었으므로 USDT를 가장 먼저 체크
+    if 'USDT' in balance and float(balance['USDT']['free']) > 0:
+        usdt_free = float(balance['USDT']['free'])
+        margin_coin_display = "USDT (Demo)"
+    elif 'SUSDT' in balance and float(balance['SUSDT']['free']) > 0:
+        usdt_free = float(balance['SUSDT']['free'])
+        margin_coin_display = "SUSDT (Demo)"
+    elif 'SBTC' in balance and float(balance['SBTC']['free']) > 0:
+        usdt_free = float(balance['SBTC']['free'])
+        margin_coin_display = "SBTC (Demo)"
     else:
-        # 돈이 하나도 없으면
-        usdt_free = 0.0
-        margin_coin_display = "USDT (잔고없음)"
+        # 혹시 'total' 딕셔너리에만 있는 경우를 대비해 한번 더 검색
+        for coin, amt in balance.get('total', {}).items():
+            if float(amt) > 0:
+                usdt_free = float(balance[coin]['free'])
+                margin_coin_display = f"{coin} (Demo)"
+                break
 
 except Exception as e:
     st.error(f"데이터 로딩 오류: {e}")
@@ -362,7 +351,7 @@ def show_metrics():
     st.markdown(f"""
     <div style="background-color: #1e1e1e; padding: 15px; border-radius: 10px; margin-bottom: 10px; text-align: center;">
         <span style="font-size: 1.2em; color: #888;">내 잔고 ({margin_coin_display})</span><br>
-        <span style="font-size: 2.5em; color: #4CAF50; font-weight: bold;">{usdt_free:,.2f}</span>
+        <span style="font-size: 2.5em; color: #4CAF50; font-weight: bold;">${usdt_free:,.2f}</span>
     </div>
     """, unsafe_allow_html=True)
 
