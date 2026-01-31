@@ -19,7 +19,7 @@ IS_SANDBOX = True # 모의투자
 SETTINGS_FILE = "bot_settings.json"
 LOG_FILE = "trade_log.csv"
 
-st.set_page_config(layout="wide", page_title="비트겟 봇 (Master)")
+st.set_page_config(layout="wide", page_title="비트겟 봇 (Fixed)")
 
 # ---------------------------------------------------------
 # 💾 설정 파일 관리
@@ -30,7 +30,6 @@ def load_settings():
         "auto_trade": False, "order_usdt": 100.0,
         "use_rsi": True, "use_bb": True, "use_ma": False, 
         "use_macd": False, "use_stoch": False, "use_cci": True, "use_vol": True,
-        # 스마트 방어 & 추매 설정
         "use_switching": True, 
         "use_dca": False, "dca_trigger": -5.0, "dca_max_count": 1
     }
@@ -85,38 +84,30 @@ def get_analytics():
         df = pd.read_csv(LOG_FILE)
         if df.empty: return 0.0, 0.0, 0.0, 0
         
-        # 청산된 건만 계산
         closed_trades = df[df['Action'].str.contains('청산')]
         total_pnl = closed_trades['PnL'].sum()
         
-        # 오늘 누적
         today = datetime.now().strftime("%Y-%m-%d")
         today_df = closed_trades[closed_trades['Date'] == today]
         daily_pnl = today_df['PnL'].sum()
         
-        # 최근 ROI (마지막 거래)
         last_roi = closed_trades.iloc[-1]['ROI'] if not closed_trades.empty else 0.0
         
         return last_roi, daily_pnl, total_pnl, len(today_df)
     except: return 0.0, 0.0, 0.0, 0
 
 # ---------------------------------------------------------
-# 📡 텔레그램 (잔고 표시 완벽 수정)
+# 📡 텔레그램
 # ---------------------------------------------------------
 def get_balance_details(exchange_obj):
-    """
-    사용자가 원하는 잔고 표시 방식:
-    1. 현재 잔고 (Free): 포지션 잡고 남은 쓸 수 있는 돈 (예: 400)
-    2. 총 추정 자산 (Total + PnL): 내 원금 + 현재 수익금 (예: 500 + 10 = 510)
-    """
     try:
         bal = exchange_obj.fetch_balance({'type': 'swap'})
         if 'SUSDT' in bal: coin = 'SUSDT'
         elif 'USDT' in bal: coin = 'USDT'
         else: coin = 'SBTC'
         
-        free = float(bal[coin]['free'])   # 사용 가능 잔고 (400)
-        total = float(bal[coin]['total']) # 지갑 총액 (500, 증거금 포함)
+        free = float(bal[coin]['free'])
+        total = float(bal[coin]['total'])
         return coin, free, total
     except:
         return "USDT", 0.0, 0.0
@@ -153,12 +144,8 @@ def telegram_listener(exchange_obj, symbol_name):
                     if 'callback_query' in update:
                         cb = update['callback_query']; cb_id = cb['id']; chat_id = cb['message']['chat']['id']
                         if cb['data'] == 'check_status':
-                            # 1. 잔고 조회
                             coin, free, total = get_balance_details(exchange_obj)
-                            
-                            # 2. 포지션 조회
-                            msg = ""; unrealized_pnl = 0.0
-                            has_pos = False
+                            msg = ""; unrealized_pnl = 0.0; has_pos = False
                             try:
                                 positions = exchange_obj.fetch_positions([symbol_name])
                                 for p in positions:
@@ -171,10 +158,7 @@ def telegram_listener(exchange_obj, symbol_name):
                                 if not has_pos: msg = f"📉 <b>포지션 없음</b> (대기 중)\n------------------\n"
                             except: msg = "❌ 데이터 조회 실패\n"
 
-                            # 3. 총 자산 계산 (지갑총액 + 미실현손익)
                             equity = total + unrealized_pnl
-                            
-                            # 4. 수익 현황
                             last_roi, d_pnl, t_pnl, _ = get_analytics()
 
                             msg += f"💰 <b>현재 잔고 (Free):</b> ${free:,.2f}\n"
@@ -213,7 +197,6 @@ markets = exchange.markets
 futures_symbols = [s for s in markets if markets[s].get('linear') and markets[s].get('swap')]
 symbol = st.sidebar.selectbox("코인 선택", futures_symbols, index=0)
 
-# 리스너 시작
 thread_exists = False
 for t in threading.enumerate():
     if t.name == "TelegramListener": thread_exists = True; break
@@ -221,7 +204,6 @@ if not thread_exists:
     t = threading.Thread(target=telegram_listener, args=(exchange, symbol), daemon=True, name="TelegramListener")
     t.start()
 
-# 원웨이 모드 강제
 try:
     exchange.set_leverage(config['leverage'], symbol)
     try: exchange.set_position_mode(hedged=False, symbol=symbol)
@@ -230,11 +212,10 @@ except: pass
 
 st.sidebar.divider()
 st.sidebar.subheader("🛡️ 방어 및 추매 설정")
-# 👇 [추가됨] 추매 및 스위칭 UI
 use_switching = st.sidebar.checkbox("스위칭 허용 (반대 신호 시)", value=config['use_switching'])
 use_dca = st.sidebar.checkbox("추매(물타기) 허용", value=config['use_dca'])
-dca_trigger = st.sidebar.number_input("추매 발동 (ROI %)", -50.0, -1.0, config['dca_trigger'], step=0.5, help="-5.0이면 -5% 손실 시 물탑니다.")
-dca_max_count = st.sidebar.number_input("최대 추매 횟수", 1, 5, config['dca_max_count'], help="안전을 위해 1~2회를 추천합니다.")
+dca_trigger = st.sidebar.number_input("추매 발동 (ROI %)", -50.0, -1.0, config['dca_trigger'], step=0.5)
+dca_max_count = st.sidebar.number_input("최대 추매 횟수", 1, 5, config['dca_max_count'])
 
 st.sidebar.divider()
 st.sidebar.subheader("📊 지표 설정")
@@ -258,7 +239,6 @@ with st.sidebar.expander("9. 거래량", expanded=True):
     use_vol = st.checkbox("거래량 감지", value=config['use_vol'])
     P['vol_mul'] = st.number_input("거래량 배수", 1.5, 5.0, 2.0)
 
-# 나머지 지표
 use_ma = config['use_ma']; use_macd = config['use_macd']; use_stoch = config['use_stoch']
 active_indicators = sum([use_rsi, use_bb, use_ma, use_macd, use_stoch, use_cci, use_vol])
 
@@ -268,7 +248,6 @@ p_leverage = st.sidebar.slider("레버리지", 1, 50, config['leverage'])
 tp_pct = st.sidebar.number_input("💰 익절 목표 (%)", 1.0, 500.0, config['tp'])
 sl_pct = st.sidebar.number_input("💸 손절 제한 (%)", 1.0, 100.0, config['sl'])
 
-# 👇 [복구됨] 테스트 버튼
 if st.sidebar.button("📡 텔레그램 연결 테스트"):
     send_telegram("✅ <b>연결 테스트 성공!</b>\n아래 버튼을 눌러보세요.")
     st.toast("테스트 발송 완료")
@@ -325,7 +304,7 @@ except Exception as e:
     st.error(f"데이터 에러: {e}"); st.stop()
 
 # ---------------------------------------------------------
-# ⚡ 주문 실행 함수 (추매 포함)
+# ⚡ 주문 실행 함수 (에러 수정됨)
 # ---------------------------------------------------------
 def execute_trade(side, is_close=False, reason="", qty=0.0):
     try:
@@ -341,8 +320,7 @@ def execute_trade(side, is_close=False, reason="", qty=0.0):
             order_side = 'sell' if pos['side'] == 'long' else 'buy'
             emoji = "💰"; log_pnl = float(pos['unrealizedPnl']); log_roi = float(pos['percentage'])
         else:
-            # 진입 또는 추매
-            if qty == 0.0: # 첫 진입 시
+            if qty == 0.0:
                 input_val = st.session_state['order_usdt']
                 raw_qty = (input_val * p_leverage) / curr_price
                 qty = exchange.amount_to_precision(symbol, raw_qty)
@@ -352,14 +330,12 @@ def execute_trade(side, is_close=False, reason="", qty=0.0):
         price = ticker['ask']*1.01 if order_side == 'buy' else ticker['bid']*0.99
         exchange.create_order(symbol, 'limit', order_side, qty, price, params=params)
         
-        # 로그 및 알림
         action_name = "청산" if is_close else "진입/추매"
         if is_close: log_trade(action_name, symbol, side, curr_price, qty, p_leverage, log_pnl, log_roi)
         
         last_roi, d_pnl, t_pnl, _ = get_analytics()
         coin, free, total = get_balance_details(exchange)
-        # 포지션 있을 때 총 자산은 (총액 + 미실현손익)
-        unrealized = log_pnl if is_close else 0.0 # 지금은 약식
+        unrealized = log_pnl if is_close else 0.0
         equity = total + unrealized
         
         msg = f"{emoji} <b>{side.upper()} {action_name} 완료</b>\n--------------------------------\n📍 <b>이유:</b> {reason}\n💲 <b>가격:</b> ${curr_price:,.2f}"
@@ -380,7 +356,6 @@ def execute_trade(side, is_close=False, reason="", qty=0.0):
 # =========================================================
 st.title(f"🔥 {symbol}")
 
-# 상단 대시보드
 coin, free, total = get_balance_details(exchange)
 _, d_pnl, t_pnl, _ = get_analytics()
 pnl_color = "#4CAF50" if d_pnl >= 0 else "#FF5252"
@@ -409,7 +384,6 @@ def show_main_ui():
 
 active_pos = show_main_ui()
 
-# 신호 계산
 long_score = 0; short_score = 0; reasons_L = []; reasons_S = []
 if use_rsi:
     if last['RSI'] <= P['rsi_buy']: long_score+=1; reasons_L.append("RSI과매도")
@@ -430,7 +404,6 @@ c2.metric("📉 숏 점수", f"{short_score}/{target_vote}")
 final_long = long_score >= target_vote
 final_short = short_score >= target_vote
 
-# 설정 저장
 current_settings = {
     "leverage": p_leverage, "target_vote": target_vote, "tp": tp_pct, "sl": sl_pct,
     "auto_trade": st.session_state.get('auto_trade', False),
@@ -441,7 +414,6 @@ current_settings = {
 }
 if current_settings != config: save_settings(current_settings)
 
-# 👇 [지능형 자동매매 로직]
 t1, t2 = st.tabs(["🤖 자동매매", "⚡ 수동주문"])
 with t1:
     auto_on = st.checkbox("자동매매 활성화", value=config['auto_trade'], key="auto_trade")
@@ -452,23 +424,29 @@ with t1:
         else:
             cur_side = active_pos['side']
             roi = float(active_pos['percentage'])
-            initial_margin = float(active_pos['initialMargin'])
-            current_margin = float(active_pos['margin']) # 현재 잡힌 증거금
             
             # 1. 익절
             if roi >= tp_pct: execute_trade(cur_side, True, "목표 달성")
             
-            # 2. 추매 (물타기) 로직
-            # 조건: 사용자가 켰고, ROI가 트리거(예:-5%) 도달했고, 현재 마진이 초기마진 * (1 + 최대횟수) 보다 작을 때
-            elif use_dca and roi <= dca_trigger and current_margin < (initial_margin * (1 + dca_max_count)):
-                # 추매 수량: 최초 진입금액만큼 (100% 비율)
-                # 현재 비트겟 API에서 정확한 수량 계산을 위해 단순화:
-                # 현재 보유 수량만큼 더 삼 (1배수 물타기)
-                add_qty = float(active_pos['contracts'])
-                execute_trade(cur_side, False, f"💧 추매 (ROI {roi:.2f}%)", qty=add_qty)
-                time.sleep(2) # 중복 방지
+            # 2. 추매 (안전 로직: KeyError 수정됨)
+            elif use_dca and roi <= dca_trigger:
+                # 현재 증거금 계산 (안전하게)
+                curr_margin = float(active_pos.get('initialMargin', 0) or 0.0)
+                if curr_margin == 0.0:
+                    # initialMargin 키가 없으면 (진입가*수량)/레버리지 로 역산
+                    entry = float(active_pos['entryPrice'])
+                    size = float(active_pos['contracts'])
+                    curr_margin = (entry * size) / p_leverage
 
-            # 3. 손절 & 스위칭 로직
+                base_order = st.session_state['order_usdt']
+                limit_margin = base_order * (1 + dca_max_count) * 0.95 # 약간의 오차 허용
+                
+                if curr_margin < limit_margin:
+                    add_qty = float(active_pos['contracts']) # 1배수 물타기
+                    execute_trade(cur_side, False, f"💧 추매 (ROI {roi:.2f}%)", qty=add_qty)
+                    time.sleep(2)
+
+            # 3. 손절 & 스위칭
             elif roi <= -sl_pct:
                 if use_switching and ((cur_side == 'long' and short_score >= target_vote) or \
                    (cur_side == 'short' and long_score >= target_vote)):
