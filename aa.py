@@ -10,17 +10,16 @@ import matplotlib.pyplot as plt
 import io
 
 # =========================================================
-# ⚙️ [설정] 환경 설정 (강제 모의투자 모드)
+# ⚙️ [설정] 기본 환경 (모의투자 500불 전용)
 # =========================================================
-# 👇 여기가 핵심입니다. True로 설정되어 있어야 500불이 보입니다.
 IS_SANDBOX = True 
 
-st.set_page_config(layout="wide", page_title="비트겟 봇 (Demo 500)")
+st.set_page_config(layout="wide", page_title="비트겟 봇 (Final Fixed)")
 
 if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = 100.0
 
 # ---------------------------------------------------------
-# 🔐 API 키 & 텔레그램 키 로딩 (Secrets)
+# 🔐 API 키 & 텔레그램 키 로딩
 # ---------------------------------------------------------
 try:
     api_key = st.secrets["API_KEY"]
@@ -29,10 +28,102 @@ try:
     
     default_tg_token = st.secrets.get("TG_TOKEN", "")
     default_tg_id = st.secrets.get("TG_CHAT_ID", "")
-    
 except:
     st.error("🚨 Secrets 설정이 필요합니다.")
     st.stop()
+
+# ---------------------------------------------------------
+# 📡 거래소 연결 (객체 생성만 먼저 함)
+# ---------------------------------------------------------
+@st.cache_resource
+def init_exchange():
+    try:
+        ex = ccxt.bitget({
+            'apiKey': api_key, 
+            'secret': api_secret, 
+            'password': api_password, 
+            'enableRateLimit': True, 
+            'options': {'defaultType': 'swap'}
+        })
+        ex.set_sandbox_mode(IS_SANDBOX)
+        ex.load_markets()
+        return ex
+    except: return None
+
+exchange = init_exchange()
+if not exchange: st.stop()
+
+# ---------------------------------------------------------
+# 🎨 사이드바 (여기서 변수들을 먼저 정의해야 에러가 안 남!)
+# ---------------------------------------------------------
+st.sidebar.title("🛠️ 봇 정밀 설정")
+is_mobile = st.sidebar.checkbox("📱 모바일 모드", value=True)
+
+markets = exchange.markets
+futures_symbols = [s for s in markets if markets[s].get('linear') and markets[s].get('swap')]
+symbol = st.sidebar.selectbox("코인 선택", futures_symbols, index=0)
+
+# 👇 [에러 해결 핵심] 레버리지 변수를 여기서 먼저 정의합니다.
+st.sidebar.divider()
+st.sidebar.subheader("⚖️ 전략 및 리스크")
+
+p_leverage = st.sidebar.slider("레버리지", 1, 50, 20) # 변수 정의 완료!
+
+# 나머지 설정들...
+tp_pct = st.sidebar.number_input("💰 익절 목표 (%)", 1.0, 500.0, 15.0)
+sl_pct = st.sidebar.number_input("💸 손절 제한 (%)", 1.0, 100.0, 10.0)
+
+st.sidebar.subheader("📊 지표 세부 설정")
+P = {} 
+with st.sidebar.expander("1. RSI", expanded=True):
+    use_rsi = st.checkbox("RSI 사용", value=True)
+    P['rsi_period'] = st.number_input("RSI 기간", 5, 100, 14)
+    P['rsi_buy'] = st.slider("롱 진입 (이하)", 10, 50, 30)
+    P['rsi_sell'] = st.slider("숏 진입 (이상)", 50, 90, 70)
+
+with st.sidebar.expander("2. 볼린저밴드", expanded=True):
+    use_bb = st.checkbox("볼린저밴드 사용", value=True)
+    P['bb_period'] = st.number_input("BB 기간", 10, 50, 20)
+    P['bb_std'] = st.number_input("승수", 1.0, 3.0, 2.0, step=0.1)
+
+with st.sidebar.expander("3. 이동평균선", expanded=False):
+    use_ma = st.checkbox("이평선 사용", value=False)
+    P['ma_fast'] = st.number_input("단기 이평선", 1, 100, 5)
+    P['ma_slow'] = st.number_input("장기 이평선", 10, 200, 60)
+
+with st.sidebar.expander("4. MACD", expanded=False):
+    use_macd = st.checkbox("MACD 사용", value=False)
+
+with st.sidebar.expander("5. 스토캐스틱", expanded=False):
+    use_stoch = st.checkbox("스토캐스틱 사용", value=False)
+    P['stoch_k'] = st.number_input("K 기간", 5, 30, 14)
+
+with st.sidebar.expander("6. CCI", expanded=False):
+    use_cci = st.checkbox("CCI 사용", value=False)
+
+with st.sidebar.expander("7. MFI", expanded=False):
+    use_mfi = st.checkbox("MFI 사용", value=False)
+
+with st.sidebar.expander("8. Williams %R", expanded=False):
+    use_willr = st.checkbox("Williams %R 사용", value=False)
+
+with st.sidebar.expander("9. 거래량", expanded=True):
+    use_vol = st.checkbox("거래량 폭발 감지", value=True)
+    P['vol_mul'] = st.number_input("평소 대비 배수", 1.5, 5.0, 2.0)
+
+with st.sidebar.expander("10. ADX", expanded=False):
+    use_adx = st.checkbox("ADX 사용", value=False)
+
+active_indicators = sum([use_rsi, use_bb, use_ma, use_macd, use_stoch, use_cci, use_mfi, use_willr, use_vol, use_adx])
+target_vote = st.sidebar.slider(
+    f"🎯 진입 조건 (총 {active_indicators}개 중)", 
+    1, max(1, active_indicators), min(3, active_indicators)
+)
+
+st.sidebar.divider()
+st.sidebar.subheader("🔔 텔레그램")
+tg_token = st.sidebar.text_input("봇 토큰", value=default_tg_token, type="password")
+tg_id = st.sidebar.text_input("챗 ID", value=default_tg_id)
 
 # ---------------------------------------------------------
 # 🛠️ 유틸리티 함수
@@ -142,140 +233,9 @@ def calculate_indicators(df, params):
     df['VOL_MA'] = vol.rolling(20).mean()
 
     return df
-# ---------------------------------------------------------
-# 📡 거래소 연결 (모드 강제 변경 기능 추가됨)
-# ---------------------------------------------------------
-@st.cache_resource
-def init_exchange():
-    try:
-        ex = ccxt.bitget({
-            'apiKey': api_key, 
-            'secret': api_secret, 
-            'password': api_password, 
-            'enableRateLimit': True, 
-            'options': {'defaultType': 'swap'}
-        })
-        ex.set_sandbox_mode(IS_SANDBOX)
-        ex.load_markets()
-        
-        # 👇 [여기가 추가된 핵심!] 포지션 모드 강제 설정
-        # symbol이 정의되기 전이라, 로딩 후 메인 로직에서 처리해야 하지만
-        # 여기서 객체만 반환하고 아래에서 처리하겠습니다.
-        return ex
-    except: return None
-
-exchange = init_exchange()
-if not exchange: st.stop()
-
-# 👇 [이 부분이 핵심] 코인 선택 직후에 모드 변경 실행
-try:
-    # 1. 레버리지 설정 (기존 코드)
-    exchange.set_leverage(p_leverage, symbol)
-    
-    # 2. 포지션 모드 강제 변경 (One-Way Mode)
-    # hedged=False (원웨이), hedged=True (헷지)
-    try:
-        exchange.set_position_mode(hedged=False, symbol=symbol)
-    except Exception as e:
-        # 이미 원웨이 모드이거나, 포지션이 있어서 못 바꾸는 경우 등
-        # 에러가 나도 봇이 멈추지 않게 pass 처리 (대부분 이미 설정돼서 에러남)
-        pass 
-        
-except Exception as e:
-    # 여기서 에러가 나면 보통 "이미 포지션이 있어서 설정을 못 바꿈"인 경우가 많음
-    st.toast(f"⚠️ 설정 변경 주의: {e}")
 
 # ---------------------------------------------------------
-# 🎨 사이드바: 정밀 설정 UI
-# ---------------------------------------------------------
-st.sidebar.title("🛠️ 봇 정밀 설정")
-is_mobile = st.sidebar.checkbox("📱 모바일 모드", value=True)
-
-markets = exchange.markets
-futures_symbols = [s for s in markets if markets[s].get('linear') and markets[s].get('swap')]
-symbol = st.sidebar.selectbox("코인 선택", futures_symbols, index=0)
-
-# =========================================================
-# 🎛️ 보조지표 설정
-# =========================================================
-st.sidebar.divider()
-st.sidebar.subheader("📊 지표 세부 설정")
-
-P = {} 
-with st.sidebar.expander("1. RSI (상대강도지수)", expanded=True):
-    use_rsi = st.checkbox("RSI 사용", value=True)
-    P['rsi_period'] = st.number_input("RSI 기간", 5, 100, 14)
-    P['rsi_buy'] = st.slider("롱 진입 (이하)", 10, 50, 30)
-    P['rsi_sell'] = st.slider("숏 진입 (이상)", 50, 90, 70)
-
-with st.sidebar.expander("2. 볼린저밴드", expanded=True):
-    use_bb = st.checkbox("볼린저밴드 사용", value=True)
-    P['bb_period'] = st.number_input("BB 기간", 10, 50, 20)
-    P['bb_std'] = st.number_input("승수", 1.0, 3.0, 2.0, step=0.1)
-
-with st.sidebar.expander("3. 이동평균선", expanded=False):
-    use_ma = st.checkbox("이평선 사용", value=False)
-    P['ma_fast'] = st.number_input("단기 이평선", 1, 100, 5)
-    P['ma_slow'] = st.number_input("장기 이평선", 10, 200, 60)
-
-with st.sidebar.expander("4. MACD", expanded=False):
-    use_macd = st.checkbox("MACD 사용", value=False)
-
-with st.sidebar.expander("5. 스토캐스틱", expanded=False):
-    use_stoch = st.checkbox("스토캐스틱 사용", value=False)
-    P['stoch_k'] = st.number_input("K 기간", 5, 30, 14)
-
-with st.sidebar.expander("6. CCI", expanded=False):
-    use_cci = st.checkbox("CCI 사용", value=False)
-
-with st.sidebar.expander("7. MFI", expanded=False):
-    use_mfi = st.checkbox("MFI 사용", value=False)
-
-with st.sidebar.expander("8. Williams %R", expanded=False):
-    use_willr = st.checkbox("Williams %R 사용", value=False)
-
-with st.sidebar.expander("9. 거래량", expanded=True):
-    use_vol = st.checkbox("거래량 폭발 감지", value=True)
-    P['vol_mul'] = st.number_input("평소 대비 배수", 1.5, 5.0, 2.0)
-
-with st.sidebar.expander("10. ADX", expanded=False):
-    use_adx = st.checkbox("ADX 사용", value=False)
-
-# =========================================================
-# 🎛️ 전략 및 리스크
-# =========================================================
-st.sidebar.divider()
-st.sidebar.subheader("⚖️ 전략 및 리스크")
-
-active_indicators = sum([use_rsi, use_bb, use_ma, use_macd, use_stoch, use_cci, use_mfi, use_willr, use_vol, use_adx])
-target_vote = st.sidebar.slider(
-    f"🎯 진입 조건 (총 {active_indicators}개 중)", 
-    1, max(1, active_indicators), min(3, active_indicators)
-)
-
-p_leverage = st.sidebar.slider("레버리지", 1, 50, 20)
-tp_pct = st.sidebar.number_input("💰 익절 목표 (%)", 1.0, 500.0, 15.0)
-sl_pct = st.sidebar.number_input("💸 손절 제한 (%)", 1.0, 100.0, 10.0)
-
-st.sidebar.divider()
-st.sidebar.subheader("🔔 텔레그램")
-tg_token = st.sidebar.text_input("봇 토큰", value=default_tg_token, type="password")
-tg_id = st.sidebar.text_input("챗 ID", value=default_tg_id)
-
-if st.sidebar.button("📡 연결 상태 확인"):
-    with st.sidebar.status("확인 중...", expanded=True) as status:
-        try:
-            exchange.fetch_ticker(symbol)
-            st.write("✅ 거래소 연결 성공!")
-            if tg_token and tg_id:
-                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': "✅ 연결 확인!"})
-                st.write("✅ 텔레그램 발송 성공!")
-            status.update(label="완료!", state="complete")
-        except Exception as e:
-            st.error(f"실패: {e}")
-
-# ---------------------------------------------------------
-# 📊 데이터 로딩 & 잔고 로직 (문제 해결된 부분)
+# 📊 데이터 로딩 & 잔고 로직
 # ---------------------------------------------------------
 usdt_free = 0.0
 margin_coin_display = "USDT"
@@ -289,21 +249,24 @@ try:
     df = calculate_indicators(df, P)
     last = df.iloc[-1]
     
-    # 👇 [수정됨] 잔고를 가져올 때 모든 가능성을 열어두고 0보다 큰 것을 찾습니다.
     balance = exchange.fetch_balance({'type': 'swap'})
     
-    # 테스터기 결과가 'USDT: 500.0' 이었으므로 USDT를 가장 먼저 체크
-    if 'USDT' in balance and float(balance['USDT']['free']) > 0:
-        usdt_free = float(balance['USDT']['free'])
+    # 잔고 우선순위 검색
+    found_assets = {}
+    for coin, info in balance.items():
+        if isinstance(info, dict) and 'free' in info and info['free'] > 0:
+            found_assets[coin] = info['free']
+
+    if 'USDT' in found_assets:
+        usdt_free = float(found_assets['USDT'])
         margin_coin_display = "USDT (Demo)"
-    elif 'SUSDT' in balance and float(balance['SUSDT']['free']) > 0:
-        usdt_free = float(balance['SUSDT']['free'])
+    elif 'SUSDT' in found_assets:
+        usdt_free = float(found_assets['SUSDT'])
         margin_coin_display = "SUSDT (Demo)"
-    elif 'SBTC' in balance and float(balance['SBTC']['free']) > 0:
-        usdt_free = float(balance['SBTC']['free'])
+    elif 'SBTC' in found_assets:
+        usdt_free = float(found_assets['SBTC'])
         margin_coin_display = "SBTC (Demo)"
     else:
-        # 혹시 'total' 딕셔너리에만 있는 경우를 대비해 한번 더 검색
         for coin, amt in balance.get('total', {}).items():
             if float(amt) > 0:
                 usdt_free = float(balance[coin]['free'])
@@ -315,11 +278,12 @@ except Exception as e:
     st.stop()
 
 # ---------------------------------------------------------
-# ⚡ 주문 함수
+# ⚡ 주문 함수 (레버리지 설정 안전하게 적용)
 # ---------------------------------------------------------
 def execute_trade(side, is_close=False, reason=""):
     try:
         if not is_close:
+            # ⭐ 여기서 레버리지를 설정합니다. (변수가 이미 정의된 상태)
             exchange.set_leverage(p_leverage, symbol)
             
         qty = 0.0
@@ -438,33 +402,43 @@ def show_strategy(active_pos):
     reasons_L = []
     reasons_S = []
     
+    # 1. RSI
     if use_rsi:
         if last['RSI'] <= P['rsi_buy']: long_score+=1; reasons_L.append(f"RSI과매도")
         elif last['RSI'] >= P['rsi_sell']: short_score+=1; reasons_S.append(f"RSI과매수")
+    # 2. BB
     if use_bb:
         if last['close'] <= last['BB_LO']: long_score+=1; reasons_L.append("BB하단")
         elif last['close'] >= last['BB_UP']: short_score+=1; reasons_S.append("BB상단")
+    # 3. MA
     if use_ma:
         if last['close'] > last['MA_SLOW']: long_score+=1; reasons_L.append("이평상승")
         else: short_score+=1; reasons_S.append("이평하락")
+    # 4. MACD
     if use_macd:
         if last['MACD'] > last['MACD_SIG']: long_score+=1; reasons_L.append("MACD골든")
         else: short_score+=1; reasons_S.append("MACD데드")
+    # 5. Stoch
     if use_stoch:
         if last['STOCH_K'] < 20: long_score+=1; reasons_L.append("스토캐과매도")
         elif last['STOCH_K'] > 80: short_score+=1; reasons_S.append("스토캐과매수")
+    # 6. CCI
     if use_cci:
         if last['CCI'] < -100: long_score+=1; reasons_L.append("CCI저점")
         elif last['CCI'] > 100: short_score+=1; reasons_S.append("CCI고점")
+    # 7. MFI
     if use_mfi:
         if last['MFI'] < 20: long_score+=1; reasons_L.append("MFI저점")
         elif last['MFI'] > 80: short_score+=1; reasons_S.append("MFI고점")
+    # 8. WillR
     if use_willr:
         if last['WILLR'] < -80: long_score+=1; reasons_L.append("WillR저점")
         elif last['WILLR'] > -20: short_score+=1; reasons_S.append("WillR고점")
+    # 9. Volume
     if use_vol:
         if last['vol'] > last['VOL_MA'] * P['vol_mul']:
             long_score+=1; short_score+=1; reasons_L.append("거래량급증"); reasons_S.append("거래량급증")
+    # 10. ADX
     if use_adx:
         if last['ADX'] > 25: long_score+=1; short_score+=1;
 
