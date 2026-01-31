@@ -12,23 +12,26 @@ from datetime import datetime
 # =========================================================
 IS_SANDBOX = True 
 
-st.set_page_config(layout="wide", page_title="비트겟 봇 (Mobile Ver)")
+st.set_page_config(layout="wide", page_title="비트겟 봇 (Mobile)")
 
+# 세션 상태 초기화
 if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = 10.0
 
 # ---------------------------------------------------------
-# 🔐 API 키 설정 (Secrets 사용)
+# 🔐 API 키 설정 (Secrets)
 # ---------------------------------------------------------
 try:
     api_key = st.secrets["API_KEY"]
     api_secret = st.secrets["API_SECRET"]
     api_password = st.secrets["API_PASSWORD"]
 except:
+    # 로컬 테스트용 (Secrets가 없을 때 에러 방지용 예비 코드)
+    # 배포 시에는 Secrets가 작동하므로 이 부분은 무시됨
     st.error("🚨 API 키가 설정되지 않았습니다. Streamlit Secrets를 설정해주세요.")
     st.stop()
 
 # ---------------------------------------------------------
-# 🛠️ 유틸리티 함수
+# 🛠️ 유틸리티 함수 정의
 # ---------------------------------------------------------
 def safe_rerun():
     time.sleep(0.5)
@@ -50,7 +53,7 @@ def send_telegram(token, chat_id, message):
         print(f"텔레그램 전송 실패: {e}")
 
 # ---------------------------------------------------------
-# 🧮 보조지표 계산
+# 🧮 보조지표 계산 함수
 # ---------------------------------------------------------
 def calculate_indicators(df):
     close = df['close']
@@ -70,41 +73,34 @@ def calculate_indicators(df):
     df['BB_UP'] = df['MA20'] + (df['STD'] * 2)
     df['BB_LO'] = df['MA20'] - (df['STD'] * 2)
 
-    # MA50
+    # MA50, MACD, Stoch, CCI, WillR, VolMA, ADX
     df['MA50'] = close.rolling(50).mean()
-
-    # MACD
+    
     exp12 = close.ewm(span=12, adjust=False).mean()
     exp26 = close.ewm(span=26, adjust=False).mean()
     df['MACD'] = exp12 - exp26
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
 
-    # 스토캐스틱
     lowest_low = low.rolling(14).min()
     highest_high = high.rolling(14).max()
     df['STOCH_K'] = 100 * ((close - lowest_low) / (highest_high - lowest_low))
     
-    # CCI
     tp = (high + low + close) / 3
     sma = tp.rolling(20).mean()
     def get_mad(x): return np.mean(np.abs(x - np.mean(x)))
     mad = tp.rolling(20).apply(get_mad)
     df['CCI'] = (tp - sma) / (0.015 * mad)
 
-    # Williams %R
     df['WILLR'] = -100 * ((highest_high - close) / (highest_high - lowest_low))
-
-    # Volume MA
     df['VOL_MA'] = df['vol'].rolling(20).mean()
 
-    # ADX
     df['TR'] = np.maximum((high - low), np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
     df['ADX'] = (df['TR'] / close).rolling(14).mean() * 100 
 
     return df
 
 # ---------------------------------------------------------
-# 거래소 연결
+# 📡 거래소 연결 및 데이터 로딩
 # ---------------------------------------------------------
 @st.cache_resource
 def init_exchange():
@@ -116,14 +112,14 @@ def init_exchange():
     except: return None
 
 exchange = init_exchange()
-if not exchange: st.stop()
+if not exchange: 
+    st.error("거래소 연결 실패")
+    st.stop()
 
 # ---------------------------------------------------------
-# 사이드바 설정
+# 🎨 사이드바 UI 설정
 # ---------------------------------------------------------
 st.sidebar.title("🛠️ 봇 설정")
-
-# 👇 [핵심] 모바일 모드 스위치
 is_mobile = st.sidebar.checkbox("📱 모바일 모드 (탭 보기)", value=True)
 
 markets = exchange.markets
@@ -149,7 +145,7 @@ tg_token = st.sidebar.text_input("봇 토큰 (Token)", type="password")
 tg_id = st.sidebar.text_input("챗 ID (Chat ID)")
 
 # ---------------------------------------------------------
-# 데이터 로딩
+# 📊 데이터 Fetching
 # ---------------------------------------------------------
 try:
     ticker = exchange.fetch_ticker(symbol)
@@ -161,13 +157,12 @@ try:
     
     balance = exchange.fetch_balance({'type': 'swap'})
     usdt_free = float(balance[MARGIN_COIN]['free']) if MARGIN_COIN in balance else 0.0
-
 except Exception as e:
-    st.error(f"데이터 로딩 실패: {e}")
+    st.error(f"데이터 로딩 중 에러: {e}")
     st.stop()
 
 # ---------------------------------------------------------
-# 주문 함수
+# ⚡ 주문 실행 함수 (전역 정의)
 # ---------------------------------------------------------
 def execute_trade(side, is_close=False, reason=""):
     try:
@@ -212,24 +207,15 @@ def execute_trade(side, is_close=False, reason=""):
     except Exception as e:
         st.error(f"주문 에러: {e}")
 
-# ---------------------------------------------------------
-# 📱 모바일 vs 데스크탑 레이아웃 분기
-# ---------------------------------------------------------
-st.title(f"🤖 {symbol}")
+# =========================================================
+# 📱 UI 구성 함수들 (반드시 실행 로직보다 위에 있어야 함)
+# =========================================================
 
-# 모바일 모드일 때는 탭을 생성하고, 아니면 그냥 변수(None) 처리
-tab1, tab2, tab3 = None, None, None
-if is_mobile:
-    tab1, tab2, tab3 = st.tabs(["📊 차트/현황", "⚡ 주문/설정", "📝 봇 상태"])
-# =========================================================
-# 1. 상단 메트릭 (공통)
-# =========================================================
 def show_metrics():
-    # 모바일이면 2열, 데스크탑이면 4열
+    # 상단 정보 표시 함수
     cols = st.columns(2) if is_mobile else st.columns(4)
     cols[0].metric("현재가", f"${curr_price:,.2f}")
     
-    # RSI 표시 (모바일/데스크탑 위치 다름)
     if is_mobile:
         cols[0].metric("RSI", f"{last['RSI']:.1f}")
         cols[1].metric("잔고", f"${usdt_free:,.0f}")
@@ -239,51 +225,11 @@ def show_metrics():
         cols[2].metric("잔고", f"${usdt_free:,.2f}")
         cols[3].metric("거래량", f"{last['vol']:.0f}")
 
-# ... (중간 생략) ...
-
-# =========================================================
-# 🚀 화면 그리기 (모바일 vs 데스크탑)
-# =========================================================
-
-if is_mobile:
-    # 📱 모바일 뷰
-    show_metrics() # 👈 여기가 st.help() 없이 깨끗해야 합니다!
-    
-    with tab1: # 차트 & 포지션
-        pos = show_chart_and_position()
-        
-    with tab2: # 주문
-        show_order_controls(pos)
-        
-    with tab3: # 봇 상태
-        show_bot_logic(pos)
-        
-else:
-    # 🖥️ 데스크탑 뷰
-    show_metrics() # 👈 여기도 확인!
-    st.divider()
-    pos = show_chart_and_position()
-    st.divider()
-    c_left, c_right = st.columns([1, 1])
-    with c_left: show_order_controls(pos)
-    with c_right: show_bot_logic(pos)
-# =========================================================
-# 2. 차트 및 포지션 (Tab 1 or Main)
-# =========================================================
 def show_chart_and_position():
-    # 차트
-    tv_studies = []
-    if is_mobile: 
-        # 모바일에선 지표 너무 많으면 지저분하니 핵심만
-        tv_studies = ["RSI@tv-basicstudies", "BB@tv-basicstudies"]
-    else:
-        # 데스크탑은 다 보여줌
-        tv_studies = ["RSI@tv-basicstudies", "BB@tv-basicstudies", "MACD@tv-basicstudies"]
-        
+    # 차트와 포지션 현황 표시 함수
+    tv_studies = ["RSI@tv-basicstudies", "BB@tv-basicstudies"]
     studies_json = str(tv_studies).replace("'", '"')
     tv_symbol = "BITGET:" + symbol.split(':')[0].replace('/', '') + ".P"
-    
-    # 모바일은 차트 높이 줄임 (450 -> 350)
     chart_h = 350 if is_mobile else 450
     
     components.html(f"""
@@ -300,7 +246,6 @@ def show_chart_and_position():
     </div>
     """, height=chart_h)
 
-    # 포지션 현황
     st.subheader("💼 포지션")
     active_position = None
     try:
@@ -327,7 +272,7 @@ def show_chart_and_position():
             </div>
             """, unsafe_allow_html=True)
             
-            # 리스크 관리 로직 실행
+            # 리스크 관리
             if use_sl_tp:
                 if roi >= tp_pct: execute_trade(side, is_close=True, reason="익절")
                 elif roi <= -sl_pct: execute_trade(side, is_close=True, reason="손절")
@@ -338,16 +283,15 @@ def show_chart_and_position():
                     st.progress(progress)
         else:
             st.info("포지션 없음 (대기중)")
-    except: pass
+            
+    except Exception as e:
+        st.error(f"포지션 조회 중 에러: {e}")
+        
     return active_position
 
-# =========================================================
-# 3. 주문 및 설정 (Tab 2 or Main)
-# =========================================================
 def show_order_controls(active_pos):
+    # 주문 컨트롤 표시 함수
     st.subheader("⚡ 주문")
-    
-    # 퍼센트 버튼
     c1, c2, c3, c4 = st.columns(4)
     def set_amt(pct): st.session_state['order_usdt'] = float(f"{usdt_free * pct:.2f}")
     if c1.button("10%"): set_amt(0.1)
@@ -364,22 +308,15 @@ def show_order_controls(active_pos):
     if st.button("🚫 포지션 청산", use_container_width=True): 
         if active_pos: execute_trade(active_pos['side'], is_close=True, reason="수동")
 
-# =========================================================
-# 4. 봇 상태 및 로직 (Tab 3 or Main)
-# =========================================================
 def show_bot_logic(active_pos):
+    # 봇 로직 및 상태 표시 함수
     st.subheader("🧠 봇 상태")
     
-    # 지표 체크박스 (모바일에선 여기서 설정)
     if is_mobile:
-        st.caption("✅ 적용할 지표 선택")
         use_rsi = st.checkbox("RSI", value=True)
         use_bb = st.checkbox("볼린저밴드", value=True)
-        use_ma = st.checkbox("MA50 추세")
-        use_macd = st.checkbox("MACD")
     else:
-        # 데스크탑은 아래에 별도 섹션
-        use_rsi = True; use_bb = True; use_ma = False; use_macd = False 
+        use_rsi = True; use_bb = True
         
     signals_long = []
     signals_short = []
@@ -393,8 +330,6 @@ def show_bot_logic(active_pos):
         if last['close'] <= last['BB_LO']: signals_long.append(True)
         elif last['close'] >= last['BB_UP']: signals_short.append(True)
         else: signals_long.append(False); signals_short.append(False)
-        
-    # (나머지 지표 생략 - 모바일 최적화를 위해 핵심만)
     
     final_long = all(signals_long) and (len(signals_long)>0)
     final_short = all(signals_short) and (len(signals_short)>0)
@@ -406,40 +341,41 @@ def show_bot_logic(active_pos):
     if final_short: c2.error("🔥 숏 조건 만족")
     else: c2.warning("숏 대기")
 
-    # 자동매매 실행
     auto_on = st.checkbox("🤖 자동매매 활성화")
     if auto_on:
         if not active_pos:
             if final_long: execute_trade('long', reason="자동")
             elif final_short: execute_trade('short', reason="자동")
         else:
-            # 스위칭 로직
             cur = active_pos['side']
             if cur == 'long' and final_short: execute_trade('long', is_close=True, reason="스위칭")
             elif cur == 'short' and final_long: execute_trade('short', is_close=True, reason="스위칭")
-        
         time.sleep(3)
         safe_rerun()
 
 # =========================================================
-# 🚀 화면 그리기 (모바일 vs 데스크탑)
+# 🚀 메인 실행 로직 (반드시 모든 함수 정의 후에 위치)
 # =========================================================
 
+st.title(f"🤖 {symbol}")
+
 if is_mobile:
-    # 📱 모바일 뷰
-    show_metrics() # 상단 공통
+    # 📱 모바일 뷰 (탭 방식)
+    show_metrics()
     
-    with tab1: # 차트 & 포지션
+    tab1, tab2, tab3 = st.tabs(["📊 차트/현황", "⚡ 주문/설정", "📝 봇 상태"])
+    
+    with tab1:
         pos = show_chart_and_position()
         
-    with tab2: # 주문
+    with tab2:
         show_order_controls(pos)
         
-    with tab3: # 봇 상태
+    with tab3:
         show_bot_logic(pos)
         
 else:
-    # 🖥️ 데스크탑 뷰 (기존 방식대로 길게 나열)
+    # 🖥️ 데스크탑 뷰 (기존 방식)
     show_metrics()
     st.divider()
     pos = show_chart_and_position()
