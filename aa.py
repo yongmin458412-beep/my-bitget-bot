@@ -12,9 +12,9 @@ import io
 # =========================================================
 # ⚙️ [설정] 기본 환경
 # =========================================================
-IS_SANDBOX = True # ⚠️ 실전 매매시 False로 변경 필수!
+IS_SANDBOX = True # ⚠️ 모의투자면 True, 실전이면 False
 
-st.set_page_config(layout="wide", page_title="비트겟 프로 봇 (Check)")
+st.set_page_config(layout="wide", page_title="비트겟 프로 봇 (Final)")
 
 if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = 100.0
 
@@ -22,15 +22,17 @@ if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = 100.0
 # 🔐 API 키 & 텔레그램 키 로딩 (Secrets)
 # ---------------------------------------------------------
 try:
+    # 비트겟 키
     api_key = st.secrets["API_KEY"]
     api_secret = st.secrets["API_SECRET"]
     api_password = st.secrets["API_PASSWORD"]
     
+    # 텔레그램 키 (없으면 빈칸 처리)
     default_tg_token = st.secrets.get("TG_TOKEN", "")
     default_tg_id = st.secrets.get("TG_CHAT_ID", "")
     
 except:
-    st.error("🚨 Secrets 설정이 필요합니다.")
+    st.error("🚨 Secrets 설정이 필요합니다. (API_KEY, API_SECRET, API_PASSWORD)")
     st.stop()
 
 # ---------------------------------------------------------
@@ -45,25 +47,26 @@ def safe_toast(msg):
     if hasattr(st, 'toast'): st.toast(msg)
     else: st.success(msg)
 
-# 텔레그램 전송
+# 텔레그램 전송 (텍스트 + 차트)
 def send_telegram(token, chat_id, message, chart_df=None):
     try:
         if not token or not chat_id: return
         
-        # 1. 텍스트
+        # 1. 텍스트 전송
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={'chat_id': chat_id, 'text': message})
         
-        # 2. 차트 이미지
+        # 2. 차트 이미지 전송
         if chart_df is not None:
             plt.figure(figsize=(10, 6))
             plt.plot(chart_df['time'], chart_df['close'], label='Price', color='yellow')
+            
             if 'MA_SLOW' in chart_df.columns:
                 plt.plot(chart_df['time'], chart_df['MA_SLOW'], label='MA(Slow)', color='cyan', alpha=0.5)
             if 'BB_UP' in chart_df.columns:
                 plt.plot(chart_df['time'], chart_df['BB_UP'], color='white', alpha=0.1)
                 plt.plot(chart_df['time'], chart_df['BB_LO'], color='white', alpha=0.1)
 
-            plt.title(f"Signal Snapshot")
+            plt.title(f"Entry Snapshot")
             plt.legend()
             plt.grid(True, alpha=0.2)
             
@@ -163,7 +166,7 @@ exchange = init_exchange()
 if not exchange: st.stop()
 
 # ---------------------------------------------------------
-# 🎨 사이드바
+# 🎨 사이드바: 설정 UI
 # ---------------------------------------------------------
 st.sidebar.title("🛠️ 봇 정밀 설정")
 is_mobile = st.sidebar.checkbox("📱 모바일 모드", value=True)
@@ -189,7 +192,7 @@ with st.sidebar.expander("1. RSI (상대강도지수)", expanded=True):
 with st.sidebar.expander("2. 볼린저밴드", expanded=True):
     use_bb = st.checkbox("볼린저밴드 사용", value=True)
     P['bb_period'] = st.number_input("BB 기간", 10, 50, 20)
-    P['bb_std'] = st.number_input("승수 (표준편차)", 1.0, 3.0, 2.0, step=0.1)
+    P['bb_std'] = st.number_input("승수", 1.0, 3.0, 2.0, step=0.1)
 
 with st.sidebar.expander("3. 이동평균선", expanded=False):
     use_ma = st.checkbox("이평선 사용", value=False)
@@ -240,31 +243,25 @@ st.sidebar.subheader("🔔 텔레그램")
 tg_token = st.sidebar.text_input("봇 토큰", value=default_tg_token, type="password")
 tg_id = st.sidebar.text_input("챗 ID", value=default_tg_id)
 
-# 👇 [신규 기능] 연결 상태 확인 버튼
-if st.sidebar.button("📡 연결 상태 확인 (Click)", use_container_width=True):
-    with st.sidebar.status("연결 확인 중...", expanded=True) as status:
-        # 1. 거래소 확인
+# 연결 확인 버튼
+if st.sidebar.button("📡 연결 상태 확인"):
+    with st.sidebar.status("확인 중...", expanded=True) as status:
         try:
             exchange.fetch_ticker(symbol)
             st.write("✅ 비트겟 연결 성공!")
-        except Exception as e:
-            st.error(f"❌ 비트겟 연결 실패: {e}")
-            
-        # 2. 텔레그램 확인
-        if tg_token and tg_id:
-            try:
-                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': "✅ [테스트] 봇 연결 확인 완료!"})
+            if tg_token and tg_id:
+                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': "✅ 연결 확인!"})
                 st.write("✅ 텔레그램 발송 성공!")
-            except Exception as e:
-                st.error(f"❌ 텔레그램 실패: {e}")
-        else:
-            st.warning("⚠️ 텔레그램 설정이 없습니다.")
-            
-        status.update(label="확인 완료!", state="complete", expanded=True)
+            status.update(label="완료!", state="complete")
+        except Exception as e:
+            st.error(f"실패: {e}")
 
 # ---------------------------------------------------------
-# 📊 데이터 로딩 및 계산
+# 📊 데이터 로딩 & 잔고 자동 감지 (핵심 수정됨)
 # ---------------------------------------------------------
+usdt_free = 0.0
+margin_coin_display = "USDT"
+
 try:
     ticker = exchange.fetch_ticker(symbol)
     curr_price = ticker['last']
@@ -274,11 +271,32 @@ try:
     df = calculate_indicators(df, P)
     last = df.iloc[-1]
     
+    # 👇 잔고 스마트 감지 로직
     balance = exchange.fetch_balance({'type': 'swap'})
-    margin_coin = 'SUSDT' if 'SBTC' in symbol else 'USDT'
-    usdt_free = float(balance[margin_coin]['free']) if margin_coin in balance else 0.0
+    
+    # 디버그용: 지갑에 돈 있는 코인 다 찾기
+    found_assets = {}
+    for coin, info in balance.items():
+        if isinstance(info, dict) and 'free' in info and info['free'] > 0:
+            found_assets[coin] = info['free']
+
+    # 우선순위: SUSDT(모의) -> USDT(실전) -> SBTC(모의)
+    if 'SUSDT' in found_assets:
+        usdt_free = float(found_assets['SUSDT'])
+        margin_coin_display = "SUSDT (모의)"
+    elif 'USDT' in found_assets:
+        usdt_free = float(found_assets['USDT'])
+        margin_coin_display = "USDT (실전)"
+    elif 'SBTC' in found_assets:
+        usdt_free = float(found_assets['SBTC'])
+        margin_coin_display = "SBTC (모의)"
+    else:
+        # 돈이 하나도 없으면
+        usdt_free = 0.0
+        margin_coin_display = "USDT (잔고없음)"
+
 except Exception as e:
-    st.error(f"데이터 처리 중 오류: {e}")
+    st.error(f"데이터 로딩 오류: {e}")
     st.stop()
 
 # ---------------------------------------------------------
@@ -327,7 +345,6 @@ def execute_trade(side, is_close=False, reason=""):
         st.success(msg)
         safe_toast(msg)
         
-        # 텔레그램 전송
         if tg_token and tg_id:
             chart_data = df.tail(60) if not is_close else None
             send_telegram(tg_token, tg_id, msg, chart_data)
@@ -344,8 +361,8 @@ def show_metrics():
     # 잔고 강조
     st.markdown(f"""
     <div style="background-color: #1e1e1e; padding: 15px; border-radius: 10px; margin-bottom: 10px; text-align: center;">
-        <span style="font-size: 1.2em; color: #888;">내 잔고 (USDT)</span><br>
-        <span style="font-size: 2.5em; color: #4CAF50; font-weight: bold;">${usdt_free:,.2f}</span>
+        <span style="font-size: 1.2em; color: #888;">내 잔고 ({margin_coin_display})</span><br>
+        <span style="font-size: 2.5em; color: #4CAF50; font-weight: bold;">{usdt_free:,.2f}</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -409,39 +426,30 @@ def show_strategy(active_pos):
     if use_rsi:
         if last['RSI'] <= P['rsi_buy']: long_score+=1; reasons_L.append(f"RSI과매도")
         elif last['RSI'] >= P['rsi_sell']: short_score+=1; reasons_S.append(f"RSI과매수")
-    # 2. BB
     if use_bb:
         if last['close'] <= last['BB_LO']: long_score+=1; reasons_L.append("BB하단")
         elif last['close'] >= last['BB_UP']: short_score+=1; reasons_S.append("BB상단")
-    # 3. MA
     if use_ma:
         if last['close'] > last['MA_SLOW']: long_score+=1; reasons_L.append("이평상승")
         else: short_score+=1; reasons_S.append("이평하락")
-    # 4. MACD
     if use_macd:
         if last['MACD'] > last['MACD_SIG']: long_score+=1; reasons_L.append("MACD골든")
         else: short_score+=1; reasons_S.append("MACD데드")
-    # 5. Stoch
     if use_stoch:
         if last['STOCH_K'] < 20: long_score+=1; reasons_L.append("스토캐과매도")
         elif last['STOCH_K'] > 80: short_score+=1; reasons_S.append("스토캐과매수")
-    # 6. CCI
     if use_cci:
         if last['CCI'] < -100: long_score+=1; reasons_L.append("CCI저점")
         elif last['CCI'] > 100: short_score+=1; reasons_S.append("CCI고점")
-    # 7. MFI
     if use_mfi:
         if last['MFI'] < 20: long_score+=1; reasons_L.append("MFI저점")
         elif last['MFI'] > 80: short_score+=1; reasons_S.append("MFI고점")
-    # 8. WillR
     if use_willr:
         if last['WILLR'] < -80: long_score+=1; reasons_L.append("WillR저점")
         elif last['WILLR'] > -20: short_score+=1; reasons_S.append("WillR고점")
-    # 9. Volume
     if use_vol:
         if last['vol'] > last['VOL_MA'] * P['vol_mul']:
             long_score+=1; short_score+=1; reasons_L.append("거래량급증"); reasons_S.append("거래량급증")
-    # 10. ADX
     if use_adx:
         if last['ADX'] > 25: long_score+=1; short_score+=1;
 
