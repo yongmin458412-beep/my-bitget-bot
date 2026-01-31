@@ -5,56 +5,200 @@ import pandas as pd
 import numpy as np
 import time
 import requests
+import threading
+import os
+import json
 from datetime import datetime
 import matplotlib.pyplot as plt
 import io
 
 # =========================================================
-# ⚙️ [설정] 기본 환경 (모의투자 500불 전용)
+# ⚙️ [설정] 기본 환경
 # =========================================================
-IS_SANDBOX = True 
+IS_SANDBOX = True # 모의투자=True, 실전=False
 
-st.set_page_config(layout="wide", page_title="비트겟 봇 (Final Fixed)")
+st.set_page_config(layout="wide", page_title="비트겟 봇 (Ultimate)")
 
 if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = 100.0
 
 # ---------------------------------------------------------
-# 🔐 API 키 & 텔레그램 키 로딩
+# 🔐 API 키 & 텔레그램 로딩
 # ---------------------------------------------------------
 try:
     api_key = st.secrets["API_KEY"]
     api_secret = st.secrets["API_SECRET"]
     api_password = st.secrets["API_PASSWORD"]
-    
-    default_tg_token = st.secrets.get("TG_TOKEN", "")
-    default_tg_id = st.secrets.get("TG_CHAT_ID", "")
+    tg_token = st.secrets.get("TG_TOKEN", "")
+    tg_id = st.secrets.get("TG_CHAT_ID", "")
 except:
     st.error("🚨 Secrets 설정이 필요합니다.")
     st.stop()
 
 # ---------------------------------------------------------
-# 📡 거래소 연결 (객체 생성만 먼저 함)
+# 📊 매매일지(Log) 관리 함수
+# ---------------------------------------------------------
+LOG_FILE = "trade_log.csv"
+
+def log_trade(action, symbol, side, price, qty, leverage, pnl=0, roi=0):
+    """매매 기록을 CSV에 저장"""
+    now = datetime.now()
+    margin = (price * qty) / leverage # 실제 투입 금액
+    
+    new_data = {
+        "Time": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "Date": now.strftime("%Y-%m-%d"), # 하루단위 계산용
+        "Symbol": symbol,
+        "Action": action,
+        "Side": side,
+        "Price": price,
+        "Qty": qty,
+        "Margin": margin,
+        "PnL": pnl,
+        "ROI": roi
+    }
+    
+    df_new = pd.DataFrame([new_data])
+    
+    if not os.path.exists(LOG_FILE):
+        df_new.to_csv(LOG_FILE, index=False)
+    else:
+        df_new.to_csv(LOG_FILE, mode='a', header=False, index=False)
+
+def get_daily_summary():
+    """오늘 누적 수익금 계산"""
+    if not os.path.exists(LOG_FILE): return 0.0, 0
+    
+    try:
+        df = pd.read_csv(LOG_FILE)
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_df = df[df['Date'] == today]
+        
+        daily_pnl = today_df['PnL'].sum()
+        trade_count = len(today_df[today_df['Action'].str.contains('청산')])
+        
+        return daily_pnl, trade_count
+    except:
+        return 0.0, 0
+
+# ---------------------------------------------------------
+# 📡 텔레그램 봇 (메시지 전송 & 버튼 리스너)
+# ---------------------------------------------------------
+def send_telegram(message, chart_df=None, show_button=False):
+    if not tg_token or not tg_id: return
+    
+    try:
+        # 1. 텍스트 전송 (버튼 포함 여부 결정)
+        url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+        payload = {'chat_id': tg_id, 'text': message, 'parse_mode': 'HTML'}
+        
+        if show_button:
+            # 인라인 키보드 (버튼) 추가
+            keyboard = {
+                "inline_keyboard": [[
+                    {"text": "🔍 실시간 현황 확인", "callback_data": "check_status"}
+                ]]
+            }
+            payload['reply_markup'] = json.dumps(keyboard)
+            
+        requests.post(url, data=payload)
+        
+        # 2. 차트 전송
+        if chart_df is not None:
+            plt.figure(figsize=(10, 5))
+            plt.plot(chart_df['time'], chart_df['close'], color='yellow', label='Price')
+            if 'MA_SLOW' in chart_df.columns:
+                plt.plot(chart_df['time'], chart_df['MA_SLOW'], color='cyan', alpha=0.5, label='MA')
+            if 'BB_UP' in chart_df.columns:
+                plt.plot(chart_df['time'], chart_df['BB_UP'], color='white', alpha=0.1)
+                plt.plot(chart_df['time'], chart_df['BB_LO'], color='white', alpha=0.1)
+            
+            # 스타일
+            plt.title("Trade Snapshot")
+            plt.grid(True, alpha=0.2)
+            ax = plt.gca()
+            ax.set_facecolor('black')
+            plt.gcf().patch.set_facecolor('black')
+            ax.tick_params(colors='white')
+            
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', facecolor='black')
+            buf.seek(0)
+            requests.post(f"https://api.telegram.org/bot{tg_token}/sendPhoto", data={'chat_id': tg_id}, files={'photo': buf})
+            plt.close()
+            
+    except Exception as e:
+        print(f"텔레그램 전송 실패: {e}")
+
+# 👇 [핵심] 백그라운드에서 텔레그램 버튼 클릭을 감시하는 리스너
+def telegram_listener(exchange_obj, symbol_name):
+    last_update_id = 0
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{tg_token}/getUpdates?offset={last_update_id+1}&timeout=30"
+            res = requests.get(url).json()
+            
+            if res.get('ok') and res.get('result'):
+                for update in res['result']:
+                    last_update_id = update['update_id']
+                    
+                    # 버튼 클릭(Callback Query) 감지
+                    if 'callback_query' in update:
+                        cb = update['callback_query']
+                        cb_data = cb['data']
+                        cb_id = cb['id']
+                        chat_id = cb['message']['chat']['id']
+                        
+                        if cb_data == 'check_status':
+                            # 포지션 조회
+                            msg = "📉 <b>포지션 없음</b>\n봇이 대기 중입니다."
+                            try:
+                                positions = exchange_obj.fetch_positions([symbol_name])
+                                for p in positions:
+                                    if float(p['contracts']) > 0:
+                                        roi = float(p['percentage'])
+                                        pnl = float(p['unrealizedPnl'])
+                                        side = p['side'].upper()
+                                        msg = f"📊 <b>실시간 포지션 현황</b>\n"
+                                        msg += f"• 종목: {symbol_name}\n"
+                                        msg += f"• 포지션: <b>{side}</b>\n"
+                                        msg += f"• 수익률: <b>{roi:.2f}%</b>\n"
+                                        msg += f"• 수익금: ${pnl:.2f}"
+                                        break
+                            except:
+                                msg = "❌ 거래소 연결 상태를 확인해주세요."
+                                
+                            # 답장 보내기
+                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
+                                          data={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'})
+                            
+                            # 로딩바 없애기 (Answer Callback)
+                            requests.post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", 
+                                          data={'callback_query_id': cb_id})
+                                          
+            time.sleep(1)
+        except:
+            time.sleep(5)
+
+# ---------------------------------------------------------
+# 📡 거래소 연결 및 리스너 시작
 # ---------------------------------------------------------
 @st.cache_resource
-def init_exchange():
+def init_exchange_and_listener():
     try:
         ex = ccxt.bitget({
-            'apiKey': api_key, 
-            'secret': api_secret, 
-            'password': api_password, 
-            'enableRateLimit': True, 
-            'options': {'defaultType': 'swap'}
+            'apiKey': api_key, 'secret': api_secret, 'password': api_password, 
+            'enableRateLimit': True, 'options': {'defaultType': 'swap'}
         })
         ex.set_sandbox_mode(IS_SANDBOX)
         ex.load_markets()
         return ex
     except: return None
 
-exchange = init_exchange()
+exchange = init_exchange_and_listener()
 if not exchange: st.stop()
 
 # ---------------------------------------------------------
-# 🎨 사이드바 (여기서 변수들을 먼저 정의해야 에러가 안 남!)
+# 🎨 사이드바 및 UI
 # ---------------------------------------------------------
 st.sidebar.title("🛠️ 봇 정밀 설정")
 is_mobile = st.sidebar.checkbox("📱 모바일 모드", value=True)
@@ -63,17 +207,18 @@ markets = exchange.markets
 futures_symbols = [s for s in markets if markets[s].get('linear') and markets[s].get('swap')]
 symbol = st.sidebar.selectbox("코인 선택", futures_symbols, index=0)
 
-# 👇 [에러 해결 핵심] 레버리지 변수를 여기서 먼저 정의합니다.
+# 리스너 쓰레드 시작 (한 번만 실행)
+if 'listener_started' not in st.session_state:
+    t = threading.Thread(target=telegram_listener, args=(exchange, symbol), daemon=True)
+    t.start()
+    st.session_state['listener_started'] = True
+
+# ---------------------------------------------------------
+# 🎛️ 지표 및 전략 설정
+# ---------------------------------------------------------
 st.sidebar.divider()
-st.sidebar.subheader("⚖️ 전략 및 리스크")
+st.sidebar.subheader("📊 지표 및 전략")
 
-p_leverage = st.sidebar.slider("레버리지", 1, 50, 20) # 변수 정의 완료!
-
-# 나머지 설정들...
-tp_pct = st.sidebar.number_input("💰 익절 목표 (%)", 1.0, 500.0, 15.0)
-sl_pct = st.sidebar.number_input("💸 손절 제한 (%)", 1.0, 100.0, 10.0)
-
-st.sidebar.subheader("📊 지표 세부 설정")
 P = {} 
 with st.sidebar.expander("1. RSI", expanded=True):
     use_rsi = st.checkbox("RSI 사용", value=True)
@@ -84,12 +229,12 @@ with st.sidebar.expander("1. RSI", expanded=True):
 with st.sidebar.expander("2. 볼린저밴드", expanded=True):
     use_bb = st.checkbox("볼린저밴드 사용", value=True)
     P['bb_period'] = st.number_input("BB 기간", 10, 50, 20)
-    P['bb_std'] = st.number_input("승수", 1.0, 3.0, 2.0, step=0.1)
+    P['bb_std'] = st.number_input("승수", 1.0, 3.0, 2.0)
 
 with st.sidebar.expander("3. 이동평균선", expanded=False):
     use_ma = st.checkbox("이평선 사용", value=False)
-    P['ma_fast'] = st.number_input("단기 이평선", 1, 100, 5)
-    P['ma_slow'] = st.number_input("장기 이평선", 10, 200, 60)
+    P['ma_fast'] = st.number_input("단기", 1, 100, 5)
+    P['ma_slow'] = st.number_input("장기", 10, 200, 60)
 
 with st.sidebar.expander("4. MACD", expanded=False):
     use_macd = st.checkbox("MACD 사용", value=False)
@@ -98,35 +243,30 @@ with st.sidebar.expander("5. 스토캐스틱", expanded=False):
     use_stoch = st.checkbox("스토캐스틱 사용", value=False)
     P['stoch_k'] = st.number_input("K 기간", 5, 30, 14)
 
-with st.sidebar.expander("6. CCI", expanded=False):
-    use_cci = st.checkbox("CCI 사용", value=False)
-
-with st.sidebar.expander("7. MFI", expanded=False):
-    use_mfi = st.checkbox("MFI 사용", value=False)
-
-with st.sidebar.expander("8. Williams %R", expanded=False):
-    use_willr = st.checkbox("Williams %R 사용", value=False)
+with st.sidebar.expander("6. CCI", expanded=True):
+    use_cci = st.checkbox("CCI 사용", value=True)
 
 with st.sidebar.expander("9. 거래량", expanded=True):
-    use_vol = st.checkbox("거래량 폭발 감지", value=True)
-    P['vol_mul'] = st.number_input("평소 대비 배수", 1.5, 5.0, 2.0)
+    use_vol = st.checkbox("거래량 감지", value=True)
+    P['vol_mul'] = st.number_input("거래량 배수", 1.5, 5.0, 2.0)
 
-with st.sidebar.expander("10. ADX", expanded=False):
-    use_adx = st.checkbox("ADX 사용", value=False)
+# (나머지 지표 생략 가능, 필요시 추가)
 
-active_indicators = sum([use_rsi, use_bb, use_ma, use_macd, use_stoch, use_cci, use_mfi, use_willr, use_vol, use_adx])
-target_vote = st.sidebar.slider(
-    f"🎯 진입 조건 (총 {active_indicators}개 중)", 
-    1, max(1, active_indicators), min(3, active_indicators)
-)
+active_indicators = sum([use_rsi, use_bb, use_ma, use_macd, use_stoch, use_cci, use_vol])
+target_vote = st.sidebar.slider(f"🎯 진입 조건 (총 {active_indicators}개 중)", 1, max(1, active_indicators), min(2, active_indicators))
 
 st.sidebar.divider()
-st.sidebar.subheader("🔔 텔레그램")
-tg_token = st.sidebar.text_input("봇 토큰", value=default_tg_token, type="password")
-tg_id = st.sidebar.text_input("챗 ID", value=default_tg_id)
+p_leverage = st.sidebar.slider("레버리지", 1, 50, 20)
+tp_pct = st.sidebar.number_input("💰 익절 목표 (%)", 1.0, 500.0, 15.0)
+sl_pct = st.sidebar.number_input("💸 손절 제한 (%)", 1.0, 100.0, 10.0)
+
+# 텔레그램 연결 확인 버튼
+if st.sidebar.button("📡 연결 테스트 (버튼 확인)"):
+    send_telegram("✅ <b>연결 테스트 성공!</b>\n아래 버튼을 눌러보세요.", show_button=True)
+    st.toast("테스트 메시지 발송 완료!")
 
 # ---------------------------------------------------------
-# 🛠️ 유틸리티 함수
+# 🛠️ 유틸리티 (Safe Rerun 등)
 # ---------------------------------------------------------
 def safe_rerun():
     time.sleep(0.5)
@@ -137,105 +277,43 @@ def safe_toast(msg):
     if hasattr(st, 'toast'): st.toast(msg)
     else: st.success(msg)
 
-def send_telegram(token, chat_id, message, chart_df=None):
-    try:
-        if not token or not chat_id: return
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={'chat_id': chat_id, 'text': message})
-        
-        if chart_df is not None:
-            plt.figure(figsize=(10, 6))
-            plt.plot(chart_df['time'], chart_df['close'], label='Price', color='yellow')
-            if 'MA_SLOW' in chart_df.columns:
-                plt.plot(chart_df['time'], chart_df['MA_SLOW'], label='MA(Slow)', color='cyan', alpha=0.5)
-            if 'BB_UP' in chart_df.columns:
-                plt.plot(chart_df['time'], chart_df['BB_UP'], color='white', alpha=0.1)
-                plt.plot(chart_df['time'], chart_df['BB_LO'], color='white', alpha=0.1)
-
-            plt.title(f"Trading Signal")
-            plt.legend()
-            plt.grid(True, alpha=0.2)
-            
-            ax = plt.gca()
-            ax.set_facecolor('black')
-            plt.gcf().patch.set_facecolor('black')
-            ax.tick_params(colors='white')
-            
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png', facecolor='black')
-            buf.seek(0)
-            
-            requests.post(f"https://api.telegram.org/bot{token}/sendPhoto", data={'chat_id': chat_id}, files={'photo': buf})
-            plt.close()
-    except Exception as e:
-        print(f"텔레그램 전송 실패: {e}")
-
 # ---------------------------------------------------------
-# 🧮 보조지표 계산
+# 🧮 지표 계산 로직
 # ---------------------------------------------------------
 def calculate_indicators(df, params):
     close = df['close']
-    high = df['high']
-    low = df['low']
-    vol = df['vol']
-    
-    # 1. RSI
+    # RSI
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(params['rsi_period']).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(params['rsi_period']).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
-
-    # 2. 볼린저밴드
+    
+    # BB
     df['BB_MA'] = close.rolling(params['bb_period']).mean()
     df['BB_STD'] = close.rolling(params['bb_period']).std()
     df['BB_UP'] = df['BB_MA'] + (df['BB_STD'] * params['bb_std'])
     df['BB_LO'] = df['BB_MA'] - (df['BB_STD'] * params['bb_std'])
-
-    # 3. 이동평균선
-    df['MA_FAST'] = close.rolling(params['ma_fast']).mean()
-    df['MA_SLOW'] = close.rolling(params['ma_slow']).mean()
-
-    # 4. MACD
+    
+    # CCI
+    tp = (df['high'] + df['low'] + close) / 3
+    sma = tp.rolling(20).mean()
+    mad = tp.rolling(20).apply(lambda x: np.mean(np.abs(x - np.mean(x))))
+    df['CCI'] = (tp - sma) / (0.015 * mad)
+    
+    # Vol
+    df['VOL_MA'] = df['vol'].rolling(20).mean()
+    
+    # MACD (기본값)
     exp12 = close.ewm(span=12, adjust=False).mean()
     exp26 = close.ewm(span=26, adjust=False).mean()
     df['MACD'] = exp12 - exp26
     df['MACD_SIG'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-    # 5. 스토캐스틱
-    k_period = params['stoch_k']
-    lowest_low = low.rolling(k_period).min()
-    highest_high = high.rolling(k_period).max()
-    df['STOCH_K'] = 100 * ((close - lowest_low) / (highest_high - lowest_low))
     
-    # 6. CCI
-    tp = (high + low + close) / 3
-    sma = tp.rolling(20).mean()
-    def get_mad(x): return np.mean(np.abs(x - np.mean(x)))
-    mad = tp.rolling(20).apply(get_mad)
-    df['CCI'] = (tp - sma) / (0.015 * mad)
-
-    # 7. MFI
-    typical_price = (high + low + close) / 3
-    money_flow = typical_price * vol
-    positive_flow = money_flow.where(typical_price > typical_price.shift(1), 0).rolling(14).sum()
-    negative_flow = money_flow.where(typical_price < typical_price.shift(1), 0).rolling(14).sum()
-    mfi_ratio = positive_flow / negative_flow
-    df['MFI'] = 100 - (100 / (1 + mfi_ratio))
-
-    # 8. Williams %R
-    df['WILLR'] = -100 * ((highest_high - close) / (highest_high - lowest_low))
-
-    # 9. ADX
-    tr = np.maximum((high - low), np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
-    df['ADX'] = (tr.rolling(14).mean() / close) * 1000
-
-    # 10. Volume MA
-    df['VOL_MA'] = vol.rolling(20).mean()
-
     return df
 
 # ---------------------------------------------------------
-# 📊 데이터 로딩 & 잔고 로직
+# 📊 데이터 및 잔고
 # ---------------------------------------------------------
 usdt_free = 0.0
 margin_coin_display = "USDT"
@@ -249,41 +327,25 @@ try:
     df = calculate_indicators(df, P)
     last = df.iloc[-1]
     
+    # 잔고 조회
     balance = exchange.fetch_balance({'type': 'swap'})
-    
-    # 잔고 우선순위 검색
-    found_assets = {}
-    for coin, info in balance.items():
-        if isinstance(info, dict) and 'free' in info and info['free'] > 0:
-            found_assets[coin] = info['free']
-
-    if 'USDT' in found_assets:
-        usdt_free = float(found_assets['USDT'])
-        margin_coin_display = "USDT (Demo)"
-    elif 'SUSDT' in found_assets:
-        usdt_free = float(found_assets['SUSDT'])
-        margin_coin_display = "SUSDT (Demo)"
-    elif 'SBTC' in found_assets:
-        usdt_free = float(found_assets['SBTC'])
-        margin_coin_display = "SBTC (Demo)"
-    else:
-        for coin, amt in balance.get('total', {}).items():
-            if float(amt) > 0:
-                usdt_free = float(balance[coin]['free'])
-                margin_coin_display = f"{coin} (Demo)"
-                break
-
+    if 'USDT' in balance and float(balance['USDT']['free']) > 0:
+        usdt_free = float(balance['USDT']['free'])
+        margin_coin_display = "USDT"
+    elif 'SUSDT' in balance and float(balance['SUSDT']['free']) > 0:
+        usdt_free = float(balance['SUSDT']['free'])
+        margin_coin_display = "SUSDT"
+        
 except Exception as e:
-    st.error(f"데이터 로딩 오류: {e}")
+    st.error(f"데이터 에러: {e}")
     st.stop()
 
 # ---------------------------------------------------------
-# ⚡ 주문 함수 (레버리지 설정 안전하게 적용)
+# ⚡ 주문 실행
 # ---------------------------------------------------------
 def execute_trade(side, is_close=False, reason=""):
     try:
         if not is_close:
-            # ⭐ 여기서 레버리지를 설정합니다. (변수가 이미 정의된 상태)
             exchange.set_leverage(p_leverage, symbol)
             
         qty = 0.0
@@ -298,7 +360,7 @@ def execute_trade(side, is_close=False, reason=""):
             qty = float(pos['contracts'])
             params = {'reduceOnly': True}
             order_side = 'sell' if pos['side'] == 'long' else 'buy'
-            trade_emoji = "💰"
+            emoji = "💰"
             log_pnl = float(pos['unrealizedPnl'])
             log_roi = float(pos['percentage'])
         else:
@@ -306,51 +368,72 @@ def execute_trade(side, is_close=False, reason=""):
             raw_qty = (input_val * p_leverage) / curr_price
             qty = exchange.amount_to_precision(symbol, raw_qty)
             order_side = 'buy' if side == 'long' else 'sell'
-            trade_emoji = "🚀"
+            emoji = "🚀"
             
         price = ticker['ask']*1.01 if order_side == 'buy' else ticker['bid']*0.99
         exchange.create_order(symbol, 'limit', order_side, qty, price, params=params)
         
-        # 메시지
-        action = "청산" if is_close else "진입"
-        krw_val = curr_price * 1450
-        msg = f"{trade_emoji} {side.upper()} {action} 체결!\n"
-        msg += f"📍 이유: {reason}\n"
-        msg += f"💲 가격: ${curr_price:,.2f} (약 {krw_val:,.0f}원)\n"
-        msg += f"📊 레버리지: {p_leverage}배"
-        if is_close:
-            msg += f"\n📈 실현손익: ${log_pnl:.2f} ({log_roi:.2f}%)"
-            
-        st.success(msg)
-        safe_toast(msg)
+        # 1. 로그 저장
+        action_name = "청산" if is_close else "진입"
+        log_trade(action_name, symbol, side, curr_price, qty, p_leverage, log_pnl, log_roi)
         
-        if tg_token and tg_id:
-            chart_data = df.tail(60) if not is_close else None
-            send_telegram(tg_token, tg_id, msg, chart_data)
+        # 2. 일일 요약 계산
+        daily_pnl, daily_cnt = get_daily_summary()
+        
+        # 3. 메시지 작성
+        krw_val = curr_price * 1450
+        invest_amount = (float(qty) * curr_price) / p_leverage # 증거금 계산
+        
+        msg = f"{emoji} <b>{side.upper()} {action_name} 완료</b>\n"
+        msg += f"--------------------------------\n"
+        msg += f"📍 <b>이유:</b> {reason}\n"
+        msg += f"💲 <b>가격:</b> ${curr_price:,.2f}\n"
+        
+        if not is_close:
+            msg += f"💸 <b>투자금(증거금):</b> ${invest_amount:,.2f}\n"
+            msg += f"📊 <b>레버리지:</b> {p_leverage}배\n"
+        else:
+            msg += f"📈 <b>실현 수익:</b> ${log_pnl:.2f} ({log_roi:.2f}%)\n"
+            msg += f"--------------------------------\n"
+            msg += f"📅 <b>오늘 누적 수익:</b> ${daily_pnl:.2f} ({daily_cnt}회 매매)"
             
+        st.success(msg.replace("<b>", "").replace("</b>", "")) # 화면엔 태그 제거
+        safe_toast(msg.replace("<b>", "").replace("</b>", ""))
+        
+        # 4. 전송 (버튼 포함)
+        chart_data = df.tail(60) if not is_close else None
+        send_telegram(msg, chart_data, show_button=True)
+        
         safe_rerun()
         
     except Exception as e:
         st.error(f"주문 실패: {e}")
 
 # =========================================================
-# 📱 UI 디스플레이
+# 🚀 메인 UI
 # =========================================================
-def show_metrics():
-    # 잔고 강조
-    st.markdown(f"""
-    <div style="background-color: #1e1e1e; padding: 15px; border-radius: 10px; margin-bottom: 10px; text-align: center;">
-        <span style="font-size: 1.2em; color: #888;">내 잔고 ({margin_coin_display})</span><br>
-        <span style="font-size: 2.5em; color: #4CAF50; font-weight: bold;">${usdt_free:,.2f}</span>
+st.title(f"🔥 {symbol}")
+
+# 잔고 표시
+daily_pnl_show, _ = get_daily_summary()
+pnl_color = "#4CAF50" if daily_pnl_show >= 0 else "#FF5252"
+
+st.markdown(f"""
+<div style="background-color: #1e1e1e; padding: 15px; border-radius: 10px; margin-bottom: 10px; display: flex; justify-content: space-around; align-items: center;">
+    <div style="text-align: center;">
+        <span style="color: #888;">내 잔고 ({margin_coin_display})</span><br>
+        <span style="font-size: 1.8em; color: white; font-weight: bold;">${usdt_free:,.2f}</span>
     </div>
-    """, unsafe_allow_html=True)
+    <div style="text-align: center;">
+        <span style="color: #888;">오늘 수익</span><br>
+        <span style="font-size: 1.8em; color: {pnl_color}; font-weight: bold;">${daily_pnl_show:,.2f}</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-    cols = st.columns(3)
-    cols[0].metric("현재가", f"${curr_price:,.2f}")
-    cols[1].metric("RSI", f"{last['RSI']:.1f}")
-    cols[2].metric("변동성(BB)", f"{last['BB_STD']:.2f}")
-
-def show_chart_and_pos():
+# 차트 및 포지션
+def show_main_ui():
+    # 1. 차트
     tv_studies = ["RSI@tv-basicstudies", "BB@tv-basicstudies"]
     studies_json = str(tv_studies).replace("'", '"')
     tv_symbol = "BITGET:" + symbol.split(':')[0].replace('/', '') + ".P"
@@ -364,7 +447,8 @@ def show_chart_and_pos():
       </script>
     </div>""", height=h)
 
-    st.subheader("💼 포지션 상태")
+    # 2. 포지션 상태
+    st.subheader("💼 포지션")
     active_pos = None
     try:
         positions = exchange.fetch_positions([symbol])
@@ -390,70 +474,46 @@ def show_chart_and_pos():
             elif roi <= -sl_pct: execute_trade(side, True, "손절")
         else:
             st.info("보유 포지션 없음")
-            
     except: pass
+    
     return active_pos
 
-def show_strategy(active_pos):
-    st.subheader("🧠 전략 분석 (다수결)")
-    
-    long_score = 0
-    short_score = 0
-    reasons_L = []
-    reasons_S = []
-    
-    # 1. RSI
-    if use_rsi:
-        if last['RSI'] <= P['rsi_buy']: long_score+=1; reasons_L.append(f"RSI과매도")
-        elif last['RSI'] >= P['rsi_sell']: short_score+=1; reasons_S.append(f"RSI과매수")
-    # 2. BB
-    if use_bb:
-        if last['close'] <= last['BB_LO']: long_score+=1; reasons_L.append("BB하단")
-        elif last['close'] >= last['BB_UP']: short_score+=1; reasons_S.append("BB상단")
-    # 3. MA
-    if use_ma:
-        if last['close'] > last['MA_SLOW']: long_score+=1; reasons_L.append("이평상승")
-        else: short_score+=1; reasons_S.append("이평하락")
-    # 4. MACD
-    if use_macd:
-        if last['MACD'] > last['MACD_SIG']: long_score+=1; reasons_L.append("MACD골든")
-        else: short_score+=1; reasons_S.append("MACD데드")
-    # 5. Stoch
-    if use_stoch:
-        if last['STOCH_K'] < 20: long_score+=1; reasons_L.append("스토캐과매도")
-        elif last['STOCH_K'] > 80: short_score+=1; reasons_S.append("스토캐과매수")
-    # 6. CCI
-    if use_cci:
-        if last['CCI'] < -100: long_score+=1; reasons_L.append("CCI저점")
-        elif last['CCI'] > 100: short_score+=1; reasons_S.append("CCI고점")
-    # 7. MFI
-    if use_mfi:
-        if last['MFI'] < 20: long_score+=1; reasons_L.append("MFI저점")
-        elif last['MFI'] > 80: short_score+=1; reasons_S.append("MFI고점")
-    # 8. WillR
-    if use_willr:
-        if last['WILLR'] < -80: long_score+=1; reasons_L.append("WillR저점")
-        elif last['WILLR'] > -20: short_score+=1; reasons_S.append("WillR고점")
-    # 9. Volume
-    if use_vol:
-        if last['vol'] > last['VOL_MA'] * P['vol_mul']:
-            long_score+=1; short_score+=1; reasons_L.append("거래량급증"); reasons_S.append("거래량급증")
-    # 10. ADX
-    if use_adx:
-        if last['ADX'] > 25: long_score+=1; short_score+=1;
+# 3. 전략 계산
+active_pos = show_main_ui()
 
-    c1, c2 = st.columns(2)
-    c1.metric("📈 롱 점수", f"{long_score} / {target_vote}", delta=f"{long_score-target_vote}")
-    c2.metric("📉 숏 점수", f"{short_score} / {target_vote}", delta=f"{short_score-target_vote}")
-    
-    final_long = long_score >= target_vote
-    final_short = short_score >= target_vote
-    
-    if final_long: st.success(f"🔥 롱 진입 조건 만족! ({', '.join(reasons_L)})")
-    if final_short: st.error(f"🔥 숏 진입 조건 만족! ({', '.join(reasons_S)})")
+long_score = 0
+short_score = 0
+reasons_L = []
+reasons_S = []
 
-    st.divider()
-    if st.checkbox("🤖 자동매매 활성화"):
+if use_rsi:
+    if last['RSI'] <= P['rsi_buy']: long_score+=1; reasons_L.append(f"RSI과매도")
+    elif last['RSI'] >= P['rsi_sell']: short_score+=1; reasons_S.append(f"RSI과매수")
+if use_bb:
+    if last['close'] <= last['BB_LO']: long_score+=1; reasons_L.append("BB하단")
+    elif last['close'] >= last['BB_UP']: short_score+=1; reasons_S.append("BB상단")
+if use_cci:
+    if last['CCI'] < -100: long_score+=1; reasons_L.append("CCI저점")
+    elif last['CCI'] > 100: short_score+=1; reasons_S.append("CCI고점")
+if use_vol:
+    if last['vol'] > last['VOL_MA'] * P['vol_mul']: 
+        long_score+=1; short_score+=1; reasons_L.append("거래량급증"); reasons_S.append("거래량급증")
+
+c1, c2 = st.columns(2)
+c1.metric("📈 롱 점수", f"{long_score} / {target_vote}", delta=f"{long_score-target_vote}")
+c2.metric("📉 숏 점수", f"{short_score} / {target_vote}", delta=f"{short_score-target_vote}")
+
+final_long = long_score >= target_vote
+final_short = short_score >= target_vote
+
+if final_long: st.success(f"🔥 롱 진입 조건 만족! ({', '.join(reasons_L)})")
+if final_short: st.error(f"🔥 숏 진입 조건 만족! ({', '.join(reasons_S)})")
+
+# 4. 자동매매 & 수동주문
+t1, t2 = st.tabs(["🤖 자동매매", "⚡ 수동주문"])
+
+with t1:
+    if st.checkbox("자동매매 활성화", key="auto_trade"):
         if not active_pos:
             if final_long: execute_trade('long', reason=",".join(reasons_L))
             elif final_short: execute_trade('short', reason=",".join(reasons_S))
@@ -464,8 +524,7 @@ def show_strategy(active_pos):
         time.sleep(3)
         safe_rerun()
 
-def show_order(active_pos):
-    st.subheader("⚡ 수동 주문")
+with t2:
     c1, c2, c3, c4 = st.columns(4)
     def set_amt(pct): st.session_state['order_usdt'] = float(f"{usdt_free * pct:.2f}")
     if c1.button("20%"): set_amt(0.2)
@@ -479,23 +538,3 @@ def show_order(active_pos):
     if b2.button("숏 진입", use_container_width=True): execute_trade('short', reason="수동")
     if st.button("포지션 청산", use_container_width=True):
         if active_pos: execute_trade(active_pos['side'], True, "수동청산")
-
-# =========================================================
-# 🚀 메인 실행
-# =========================================================
-st.title(f"🔥 {symbol}")
-
-if is_mobile:
-    show_metrics()
-    t1, t2, t3 = st.tabs(["📊 차트", "⚡ 주문", "🧠 전략"])
-    with t1: pos = show_chart_and_pos()
-    with t2: show_order(pos)
-    with t3: show_strategy(pos)
-else:
-    show_metrics()
-    st.divider()
-    pos = show_chart_and_pos()
-    st.divider()
-    c1, c2 = st.columns([1, 1])
-    with c1: show_order(pos)
-    with c2: show_strategy(pos)
