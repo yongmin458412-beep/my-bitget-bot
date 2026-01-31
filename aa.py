@@ -19,7 +19,7 @@ IS_SANDBOX = True # 모의투자
 SETTINGS_FILE = "bot_settings.json"
 LOG_FILE = "trade_log.csv"
 
-st.set_page_config(layout="wide", page_title="비트겟 봇 (Perfect)")
+st.set_page_config(layout="wide", page_title="비트겟 봇 (Ultimate)")
 
 # ---------------------------------------------------------
 # 💾 설정 파일 관리
@@ -86,29 +86,15 @@ def get_daily_summary():
     except: return 0.0, 0
 
 # ---------------------------------------------------------
-# 📡 텔레그램 (중복 방지 및 버튼 기본 탑재)
+# 📡 텔레그램 (전송 + 리스너) - 잔고 표시 기능 추가됨
 # ---------------------------------------------------------
 def send_telegram(message, chart_df=None):
-    """
-    모든 메시지에 '실시간 현황 확인' 버튼을 기본으로 붙여서 전송합니다.
-    """
     if not tg_token or not tg_id: return
     try:
         url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-        
-        # 👇 [수정됨] 무조건 버튼 추가
-        keyboard = {
-            "inline_keyboard": [[
-                {"text": "🔍 실시간 현황 확인", "callback_data": "check_status"}
-            ]]
-        }
-        
-        payload = {
-            'chat_id': tg_id, 
-            'text': message, 
-            'parse_mode': 'HTML',
-            'reply_markup': json.dumps(keyboard) # 버튼 부착
-        }
+        # 모든 메시지에 버튼 부착
+        keyboard = {"inline_keyboard": [[{"text": "🔍 실시간 현황 확인", "callback_data": "check_status"}]]}
+        payload = {'chat_id': tg_id, 'text': message, 'parse_mode': 'HTML', 'reply_markup': json.dumps(keyboard)}
         
         requests.post(url, data=payload)
         
@@ -138,32 +124,43 @@ def telegram_listener(exchange_obj, symbol_name):
                         cb = update['callback_query']; cb_id = cb['id']; chat_id = cb['message']['chat']['id']
                         
                         if cb['data'] == 'check_status':
-                            # 버튼 클릭 시 답장 로직
-                            msg = "📉 <b>포지션 없음</b>\n봇이 대기 중입니다."
+                            # 1. 잔고 조회 (USDT/SUSDT 자동 찾기)
+                            try:
+                                bal = exchange_obj.fetch_balance({'type': 'swap'})
+                                # SUSDT 우선, 없으면 USDT, 없으면 SBTC
+                                if 'SUSDT' in bal: tgt_coin = 'SUSDT'
+                                elif 'USDT' in bal: tgt_coin = 'USDT'
+                                else: tgt_coin = 'SBTC'
+                                
+                                wallet_bal = float(bal[tgt_coin]['total']) if tgt_coin in bal else 0.0
+                            except: wallet_bal = 0.0
+
+                            # 2. 포지션 조회
+                            msg = ""; total_pnl = 0.0; has_pos = False
                             try:
                                 positions = exchange_obj.fetch_positions([symbol_name])
-                                has_pos = False
                                 for p in positions:
                                     if float(p['contracts']) > 0:
                                         roi = float(p['percentage'])
                                         pnl = float(p['unrealizedPnl'])
-                                        msg = f"📊 <b>포지션 현황</b>\n• 종목: {symbol_name}\n• <b>{p['side'].upper()}</b> x{p['leverage']}\n• 수익률: <b>{roi:.2f}%</b>\n• 수익금: ${pnl:.2f}"
-                                        has_pos = True
-                                        break
-                                if not has_pos:
-                                    msg = f"📉 <b>포지션 없음</b>\n현재 {symbol_name} 대기 중..."
-                            except: msg = "❌ 거래소 연결 실패"
+                                        total_pnl = pnl
+                                        msg = f"📊 <b>포지션 현황</b>\n• {symbol_name}\n• <b>{p['side'].upper()}</b> x{p['leverage']}\n• 수익률: <b>{roi:.2f}%</b>\n• 수익금: ${pnl:.2f}\n------------------\n"
+                                        has_pos = True; break
+                                if not has_pos: msg = f"📉 <b>포지션 없음</b>\n현재 대기 중...\n------------------\n"
+                            except: msg = "❌ 데이터 조회 실패\n"
+
+                            # 3. 총 자산 계산
+                            equity = wallet_bal + total_pnl
+                            msg += f"💰 <b>지갑 잔고:</b> ${wallet_bal:,.2f}\n💎 <b>총 추정 자산:</b> ${equity:,.2f}"
                             
-                            # 답장 보내기 (여기도 버튼 붙임)
-                            send_telegram(msg) 
-                            
-                            # 로딩바 없애기
+                            # 답장 (버튼 포함)
+                            send_telegram(msg)
                             requests.post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", data={'callback_query_id': cb_id})
             time.sleep(1)
         except: time.sleep(5)
 
 # ---------------------------------------------------------
-# 📡 거래소 연결 및 리스너 관리 (중복 해결 핵심)
+# 📡 거래소 연결 및 리스너 관리
 # ---------------------------------------------------------
 @st.cache_resource
 def init_exchange_and_listener():
@@ -187,18 +184,14 @@ markets = exchange.markets
 futures_symbols = [s for s in markets if markets[s].get('linear') and markets[s].get('swap')]
 symbol = st.sidebar.selectbox("코인 선택", futures_symbols, index=0)
 
-# 👇 [핵심] 좀비 쓰레드 방지 로직
-# 현재 실행 중인 모든 쓰레드를 검사해서, 이미 'TelegramListener'라는 이름의 쓰레드가 있으면 새로 안 만듭니다.
+# 리스너 시작 (중복 방지)
 thread_exists = False
 for t in threading.enumerate():
-    if t.name == "TelegramListener":
-        thread_exists = True
-        break
+    if t.name == "TelegramListener": thread_exists = True; break
 
 if not thread_exists:
     t = threading.Thread(target=telegram_listener, args=(exchange, symbol), daemon=True, name="TelegramListener")
     t.start()
-    print("✅ 텔레그램 리스너 시작됨 (한 번만 실행)")
 
 # 원웨이 모드 강제
 try:
@@ -258,8 +251,7 @@ if st.sidebar.button("📡 연결 상태 정밀진단"):
             st.write("✅ 비트겟 API 정상")
             
             st.write("2. 텔레그램 발송 시도...")
-            # 테스트 메시지에도 버튼이 자동으로 붙습니다.
-            send_telegram("✅ <b>시스템 점검 완료!</b>\n이상 없습니다.")
+            send_telegram("✅ <b>시스템 점검 완료!</b>\n아래 버튼을 눌러보세요.")
             st.write("✅ 텔레그램 발송 성공")
             
             status.update(label="점검 완료! 모든 시스템 정상.", state="complete")
@@ -324,17 +316,26 @@ try:
     last = df.iloc[-1]
     
     balance = exchange.fetch_balance({'type': 'swap'})
-    if 'USDT' in balance and float(balance['USDT']['free']) > 0:
-        usdt_free = float(balance['USDT']['free']); margin_coin_display = "USDT"
-    elif 'SUSDT' in balance and float(balance['SUSDT']['free']) > 0:
-        usdt_free = float(balance['SUSDT']['free']); margin_coin_display = "SUSDT"
-    elif 'SBTC' in balance and float(balance['SBTC']['free']) > 0:
-        usdt_free = float(balance['SBTC']['free']); margin_coin_display = "SBTC"
+    
+    # 잔고 자동 찾기
+    found_assets = {}
+    for coin, info in balance.items():
+        if isinstance(info, dict) and 'free' in info and info['free'] > 0:
+            found_assets[coin] = info['free']
+
+    if 'USDT' in found_assets: usdt_free = float(found_assets['USDT']); margin_coin_display = "USDT"
+    elif 'SUSDT' in found_assets: usdt_free = float(found_assets['SUSDT']); margin_coin_display = "SUSDT"
+    elif 'SBTC' in found_assets: usdt_free = float(found_assets['SBTC']); margin_coin_display = "SBTC"
+    else:
+        # 혹시 몰라서 total 뒤져보기
+        for coin, amt in balance.get('total', {}).items():
+            if float(amt) > 0: usdt_free = float(balance[coin]['free']); margin_coin_display = coin; break
+
 except Exception as e:
     st.error(f"데이터 에러: {e}"); st.stop()
 
 # ---------------------------------------------------------
-# ⚡ 주문 함수
+# ⚡ 주문 함수 - 잔고 알림 추가됨
 # ---------------------------------------------------------
 def execute_trade(side, is_close=False, reason=""):
     try:
@@ -367,17 +368,26 @@ def execute_trade(side, is_close=False, reason=""):
         krw_val = curr_price * 1450
         invest_amount = (float(qty) * curr_price) / p_leverage
         
+        # 주문 후 잔고 재조회
+        bal = exchange.fetch_balance({'type': 'swap'})
+        tgt_coin = 'SUSDT' if 'SUSDT' in bal else 'USDT'
+        try:
+            # USDT가 0이면 SUSDT를, 그것도 없으면 USDT(0)을
+            if 'SUSDT' in bal and float(bal['SUSDT']['total']) > 0: current_bal = float(bal['SUSDT']['total'])
+            elif 'USDT' in bal: current_bal = float(bal['USDT']['total'])
+            else: current_bal = 0.0
+        except: current_bal = 0.0
+
         msg = f"{emoji} <b>{side.upper()} {action_name} 완료</b>\n--------------------------------\n📍 <b>이유:</b> {reason}\n💲 <b>가격:</b> ${curr_price:,.2f}"
         if not is_close: msg += f"\n💸 <b>투자금:</b> ${invest_amount:,.2f}\n📊 <b>레버리지:</b> {p_leverage}배"
-        else: msg += f"\n📈 <b>실현 수익:</b> ${log_pnl:.2f} ({log_roi:.2f}%)\n--------------------------------\n📅 <b>오늘 수익:</b> ${daily_pnl:.2f} ({daily_cnt}회)"
-            
+        else: msg += f"\n📈 <b>실현 수익:</b> ${log_pnl:.2f} ({log_roi:.2f}%)\n📅 <b>오늘 수익:</b> ${daily_pnl:.2f} ({daily_cnt}회)"
+        msg += f"\n--------------------------------\n💰 <b>현재 잔고:</b> ${current_bal:,.2f}"
+
         st.success(msg.replace("<b>", "").replace("</b>", ""))
         safe_toast(msg.replace("<b>", "").replace("</b>", ""))
         chart_data = df.tail(60) if not is_close else None
         
-        # 여기서 버튼 옵션을 따로 줄 필요 없음 (함수 내에서 기본값 처리됨)
-        send_telegram(msg, chart_data) 
-        
+        send_telegram(msg, chart_data)
         safe_rerun()
     except Exception as e: st.error(f"주문 실패: {e}")
 
