@@ -12,9 +12,9 @@ import io
 # =========================================================
 # ⚙️ [설정] 기본 환경
 # =========================================================
-IS_SANDBOX = True # 실전시 False
+IS_SANDBOX = True # ⚠️ 실전 매매시 False로 변경 필수!
 
-st.set_page_config(layout="wide", page_title="비트겟 프로 봇 (Fixed)")
+st.set_page_config(layout="wide", page_title="비트겟 프로 봇 (Check)")
 
 if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = 100.0
 
@@ -22,12 +22,10 @@ if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = 100.0
 # 🔐 API 키 & 텔레그램 키 로딩 (Secrets)
 # ---------------------------------------------------------
 try:
-    # 비트겟 키
     api_key = st.secrets["API_KEY"]
     api_secret = st.secrets["API_SECRET"]
     api_password = st.secrets["API_PASSWORD"]
     
-    # 👇 [추가됨] 텔레그램 키 자동 로딩 (없으면 빈칸)
     default_tg_token = st.secrets.get("TG_TOKEN", "")
     default_tg_id = st.secrets.get("TG_CHAT_ID", "")
     
@@ -65,7 +63,7 @@ def send_telegram(token, chat_id, message, chart_df=None):
                 plt.plot(chart_df['time'], chart_df['BB_UP'], color='white', alpha=0.1)
                 plt.plot(chart_df['time'], chart_df['BB_LO'], color='white', alpha=0.1)
 
-            plt.title(f"Entry Snapshot")
+            plt.title(f"Signal Snapshot")
             plt.legend()
             plt.grid(True, alpha=0.2)
             
@@ -239,9 +237,30 @@ sl_pct = st.sidebar.number_input("💸 손절 제한 (%)", 1.0, 100.0, 10.0)
 
 st.sidebar.divider()
 st.sidebar.subheader("🔔 텔레그램")
-# 👇 [수정됨] Secrets에서 가져온 값을 기본값(value)으로 설정
 tg_token = st.sidebar.text_input("봇 토큰", value=default_tg_token, type="password")
 tg_id = st.sidebar.text_input("챗 ID", value=default_tg_id)
+
+# 👇 [신규 기능] 연결 상태 확인 버튼
+if st.sidebar.button("📡 연결 상태 확인 (Click)", use_container_width=True):
+    with st.sidebar.status("연결 확인 중...", expanded=True) as status:
+        # 1. 거래소 확인
+        try:
+            exchange.fetch_ticker(symbol)
+            st.write("✅ 비트겟 연결 성공!")
+        except Exception as e:
+            st.error(f"❌ 비트겟 연결 실패: {e}")
+            
+        # 2. 텔레그램 확인
+        if tg_token and tg_id:
+            try:
+                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': "✅ [테스트] 봇 연결 확인 완료!"})
+                st.write("✅ 텔레그램 발송 성공!")
+            except Exception as e:
+                st.error(f"❌ 텔레그램 실패: {e}")
+        else:
+            st.warning("⚠️ 텔레그램 설정이 없습니다.")
+            
+        status.update(label="확인 완료!", state="complete", expanded=True)
 
 # ---------------------------------------------------------
 # 📊 데이터 로딩 및 계산
@@ -387,7 +406,6 @@ def show_strategy(active_pos):
     reasons_L = []
     reasons_S = []
     
-    # 1. RSI
     if use_rsi:
         if last['RSI'] <= P['rsi_buy']: long_score+=1; reasons_L.append(f"RSI과매도")
         elif last['RSI'] >= P['rsi_sell']: short_score+=1; reasons_S.append(f"RSI과매수")
