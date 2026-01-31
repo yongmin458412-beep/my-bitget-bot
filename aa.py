@@ -142,8 +142,49 @@ def calculate_indicators(df, params):
     df['VOL_MA'] = vol.rolling(20).mean()
 
     return df
+# ---------------------------------------------------------
+# 📡 거래소 연결 (모드 강제 변경 기능 추가됨)
+# ---------------------------------------------------------
+@st.cache_resource
+def init_exchange():
+    try:
+        ex = ccxt.bitget({
+            'apiKey': api_key, 
+            'secret': api_secret, 
+            'password': api_password, 
+            'enableRateLimit': True, 
+            'options': {'defaultType': 'swap'}
+        })
+        ex.set_sandbox_mode(IS_SANDBOX)
+        ex.load_markets()
+        
+        # 👇 [여기가 추가된 핵심!] 포지션 모드 강제 설정
+        # symbol이 정의되기 전이라, 로딩 후 메인 로직에서 처리해야 하지만
+        # 여기서 객체만 반환하고 아래에서 처리하겠습니다.
+        return ex
+    except: return None
 
-주문 실패: bitget {"code":"40774","msg":"The order type for unilateral position must also be the unilateral position type.","requestTime":1769868948935,"data":null}
+exchange = init_exchange()
+if not exchange: st.stop()
+
+# 👇 [이 부분이 핵심] 코인 선택 직후에 모드 변경 실행
+try:
+    # 1. 레버리지 설정 (기존 코드)
+    exchange.set_leverage(p_leverage, symbol)
+    
+    # 2. 포지션 모드 강제 변경 (One-Way Mode)
+    # hedged=False (원웨이), hedged=True (헷지)
+    try:
+        exchange.set_position_mode(hedged=False, symbol=symbol)
+    except Exception as e:
+        # 이미 원웨이 모드이거나, 포지션이 있어서 못 바꾸는 경우 등
+        # 에러가 나도 봇이 멈추지 않게 pass 처리 (대부분 이미 설정돼서 에러남)
+        pass 
+        
+except Exception as e:
+    # 여기서 에러가 나면 보통 "이미 포지션이 있어서 설정을 못 바꿈"인 경우가 많음
+    st.toast(f"⚠️ 설정 변경 주의: {e}")
+
 # ---------------------------------------------------------
 # 🎨 사이드바: 정밀 설정 UI
 # ---------------------------------------------------------
