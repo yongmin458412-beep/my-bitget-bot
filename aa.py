@@ -19,7 +19,7 @@ IS_SANDBOX = True # 모의투자
 SETTINGS_FILE = "bot_settings.json"
 LOG_FILE = "trade_log.csv"
 
-st.set_page_config(layout="wide", page_title="비트겟 봇 (Fixed)")
+st.set_page_config(layout="wide", page_title="비트겟 봇 (Complete V2)")
 
 # ---------------------------------------------------------
 # 💾 설정 파일 관리
@@ -83,31 +83,28 @@ def get_analytics():
     try:
         df = pd.read_csv(LOG_FILE)
         if df.empty: return 0.0, 0.0, 0.0, 0
-        
         closed_trades = df[df['Action'].str.contains('청산')]
         total_pnl = closed_trades['PnL'].sum()
-        
         today = datetime.now().strftime("%Y-%m-%d")
         today_df = closed_trades[closed_trades['Date'] == today]
         daily_pnl = today_df['PnL'].sum()
-        
         last_roi = closed_trades.iloc[-1]['ROI'] if not closed_trades.empty else 0.0
-        
         return last_roi, daily_pnl, total_pnl, len(today_df)
     except: return 0.0, 0.0, 0.0, 0
 
 # ---------------------------------------------------------
-# 📡 텔레그램
+# 📡 텔레그램 (잔고 표시 완벽 수정)
 # ---------------------------------------------------------
 def get_balance_details(exchange_obj):
+    """(코인명, 사용가능잔고, 지갑총액) 반환"""
     try:
         bal = exchange_obj.fetch_balance({'type': 'swap'})
         if 'SUSDT' in bal: coin = 'SUSDT'
         elif 'USDT' in bal: coin = 'USDT'
         else: coin = 'SBTC'
         
-        free = float(bal[coin]['free'])
-        total = float(bal[coin]['total'])
+        free = float(bal[coin]['free'])   # 사용 가능 잔고
+        total = float(bal[coin]['total']) # 지갑 총액 (증거금 포함)
         return coin, free, total
     except:
         return "USDT", 0.0, 0.0
@@ -133,6 +130,7 @@ def send_telegram(message, chart_df=None):
     except: pass
 
 def telegram_listener(exchange_obj, symbol_name):
+    """버튼 클릭 시 상세 정보 반환"""
     last_update_id = 0
     while True:
         try:
@@ -144,7 +142,7 @@ def telegram_listener(exchange_obj, symbol_name):
                     if 'callback_query' in update:
                         cb = update['callback_query']; cb_id = cb['id']; chat_id = cb['message']['chat']['id']
                         if cb['data'] == 'check_status':
-                            coin, free, total = get_balance_details(exchange_obj)
+                            # 1. 포지션 상세 조회
                             msg = ""; unrealized_pnl = 0.0; has_pos = False
                             try:
                                 positions = exchange_obj.fetch_positions([symbol_name])
@@ -152,17 +150,31 @@ def telegram_listener(exchange_obj, symbol_name):
                                     if float(p['contracts']) > 0:
                                         unrealized_pnl = float(p['unrealizedPnl'])
                                         roi = float(p['percentage'])
-                                        msg = f"📊 <b>포지션 현황</b>\n• {symbol_name} <b>{p['side'].upper()}</b> x{p['leverage']}\n"
-                                        msg += f"• 수익률: <b>{roi:.2f}%</b>\n• 수익금: ${unrealized_pnl:.2f}\n------------------\n"
+                                        entry_price = float(p['entryPrice'])
+                                        # 증거금(사용금액) 안전 계산
+                                        margin = float(p.get('initialMargin', 0) or 0)
+                                        if margin == 0:
+                                            margin = (float(p['contracts']) * entry_price) / p['leverage']
+                                        
+                                        msg = f"📊 <b>포지션 현황</b>\n"
+                                        msg += f"• 종목: {symbol_name} <b>{p['side'].upper()}</b>\n"
+                                        msg += f"• 진입단가: ${entry_price:,.2f}\n"
+                                        msg += f"• 사용금액: ${margin:,.2f}\n"
+                                        msg += f"• 수익률: <b>{roi:.2f}%</b> (${unrealized_pnl:.2f})\n"
+                                        msg += f"------------------\n"
                                         has_pos = True; break
                                 if not has_pos: msg = f"📉 <b>포지션 없음</b> (대기 중)\n------------------\n"
                             except: msg = "❌ 데이터 조회 실패\n"
 
-                            equity = total + unrealized_pnl
-                            last_roi, d_pnl, t_pnl, _ = get_analytics()
+                            # 2. 잔고 상세 (사용가능 vs 총추정)
+                            coin, free, total = get_balance_details(exchange_obj)
+                            equity = total + unrealized_pnl # 총자산 = 지갑총액 + 미실현손익
+                            
+                            # 3. 누적 수익
+                            _, d_pnl, t_pnl, _ = get_analytics()
 
-                            msg += f"💰 <b>현재 잔고 (Free):</b> ${free:,.2f}\n"
-                            msg += f"💎 <b>총합 잔고 (Equity):</b> ${equity:,.2f}\n"
+                            msg += f"💰 <b>사용가능 잔고:</b> ${free:,.2f}\n"
+                            msg += f"💎 <b>총 추정 자산:</b> ${equity:,.2f}\n"
                             msg += f"------------------\n"
                             msg += f"📅 금일 수익: ${d_pnl:,.2f}\n"
                             msg += f"🏆 총 누적 수익: ${t_pnl:,.2f}"
@@ -248,6 +260,7 @@ p_leverage = st.sidebar.slider("레버리지", 1, 50, config['leverage'])
 tp_pct = st.sidebar.number_input("💰 익절 목표 (%)", 1.0, 500.0, config['tp'])
 sl_pct = st.sidebar.number_input("💸 손절 제한 (%)", 1.0, 100.0, config['sl'])
 
+# 👇 [복구됨] 테스트 버튼
 if st.sidebar.button("📡 텔레그램 연결 테스트"):
     send_telegram("✅ <b>연결 테스트 성공!</b>\n아래 버튼을 눌러보세요.")
     st.toast("테스트 발송 완료")
@@ -304,7 +317,7 @@ except Exception as e:
     st.error(f"데이터 에러: {e}"); st.stop()
 
 # ---------------------------------------------------------
-# ⚡ 주문 실행 함수 (에러 수정됨)
+# ⚡ 주문 실행 함수 (메시지 포맷 수정됨)
 # ---------------------------------------------------------
 def execute_trade(side, is_close=False, reason="", qty=0.0):
     try:
@@ -333,18 +346,25 @@ def execute_trade(side, is_close=False, reason="", qty=0.0):
         action_name = "청산" if is_close else "진입/추매"
         if is_close: log_trade(action_name, symbol, side, curr_price, qty, p_leverage, log_pnl, log_roi)
         
+        # 메시지 작성
         last_roi, d_pnl, t_pnl, _ = get_analytics()
         coin, free, total = get_balance_details(exchange)
-        unrealized = log_pnl if is_close else 0.0
+        
+        # 포지션이 청산되면 미실현손익=0, 아니면 현재 PnL 반영
+        unrealized = log_pnl if is_close else 0.0 
         equity = total + unrealized
         
+        invest_amt = (float(qty)*curr_price)/p_leverage # 사용금액
+
         msg = f"{emoji} <b>{side.upper()} {action_name} 완료</b>\n--------------------------------\n📍 <b>이유:</b> {reason}\n💲 <b>가격:</b> ${curr_price:,.2f}"
+        
         if is_close: 
             msg += f"\n📈 <b>실현 수익:</b> ${log_pnl:.2f} ({log_roi:.2f}%)\n📅 <b>금일 수익:</b> ${d_pnl:.2f}\n🏆 <b>총 누적 수익:</b> ${t_pnl:.2f}"
         else: 
-            msg += f"\n💸 <b>투자금(증거금):</b> ${(float(qty)*curr_price)/p_leverage:,.2f}"
+            msg += f"\n💸 <b>사용금액:</b> ${invest_amt:,.2f}"
         
-        msg += f"\n--------------------------------\n💰 <b>현재 잔고 (Free):</b> ${free:,.2f}\n💎 <b>총 추정 자산 (Equity):</b> ${equity:,.2f}"
+        # 잔고 2줄로 명확히 표시
+        msg += f"\n--------------------------------\n💰 <b>사용가능 잔고:</b> ${free:,.2f}\n💎 <b>총 추정 자산:</b> ${equity:,.2f}"
 
         st.success(msg.replace("<b>", "").replace("</b>", ""))
         send_telegram(msg, df.tail(60) if not is_close else None)
@@ -360,7 +380,17 @@ coin, free, total = get_balance_details(exchange)
 _, d_pnl, t_pnl, _ = get_analytics()
 pnl_color = "#4CAF50" if d_pnl >= 0 else "#FF5252"
 
-st.markdown(f"""<div style="background-color: #1e1e1e; padding: 15px; border-radius: 10px; margin-bottom: 10px; display: flex; justify-content: space-around;"><div style="text-align: center;"><span style="color: #888;">현재 잔고(Free)</span><br><span style="font-size: 1.5em; color: white;">${free:,.2f}</span></div><div style="text-align: center;"><span style="color: #888;">금일 수익</span><br><span style="font-size: 1.5em; color: {pnl_color};">${d_pnl:,.2f}</span></div><div style="text-align: center;"><span style="color: #888;">총 누적 수익</span><br><span style="font-size: 1.5em; color: {'#4CAF50' if t_pnl>=0 else '#FF5252'};">${t_pnl:,.2f}</span></div></div>""", unsafe_allow_html=True)
+# 상단 현황판 (총 추정 자산 추가)
+# unrealized pnl을 가져와야 정확한 equity가 나오므로 한번 더 조회
+unrealized_temp = 0.0
+try:
+    positions = exchange.fetch_positions([symbol])
+    for p in positions:
+        if float(p['contracts']) > 0: unrealized_temp = float(p['unrealizedPnl']); break
+except: pass
+equity_temp = total + unrealized_temp
+
+st.markdown(f"""<div style="background-color: #1e1e1e; padding: 15px; border-radius: 10px; margin-bottom: 10px; display: flex; justify-content: space-around;"><div style="text-align: center;"><span style="color: #888;">사용 가능 잔고</span><br><span style="font-size: 1.5em; color: white;">${free:,.2f}</span></div><div style="text-align: center;"><span style="color: #888;">총 추정 자산</span><br><span style="font-size: 1.5em; color: white;">${equity_temp:,.2f}</span></div><div style="text-align: center;"><span style="color: #888;">금일 수익</span><br><span style="font-size: 1.5em; color: {pnl_color};">${d_pnl:,.2f}</span></div></div>""", unsafe_allow_html=True)
 
 def show_main_ui():
     tv_studies = ["RSI@tv-basicstudies", "BB@tv-basicstudies"]
@@ -428,18 +458,16 @@ with t1:
             # 1. 익절
             if roi >= tp_pct: execute_trade(cur_side, True, "목표 달성")
             
-            # 2. 추매 (안전 로직: KeyError 수정됨)
+            # 2. 추매 (안전 로직)
             elif use_dca and roi <= dca_trigger:
-                # 현재 증거금 계산 (안전하게)
                 curr_margin = float(active_pos.get('initialMargin', 0) or 0.0)
                 if curr_margin == 0.0:
-                    # initialMargin 키가 없으면 (진입가*수량)/레버리지 로 역산
                     entry = float(active_pos['entryPrice'])
                     size = float(active_pos['contracts'])
                     curr_margin = (entry * size) / p_leverage
 
                 base_order = st.session_state['order_usdt']
-                limit_margin = base_order * (1 + dca_max_count) * 0.95 # 약간의 오차 허용
+                limit_margin = base_order * (1 + dca_max_count) * 0.95
                 
                 if curr_margin < limit_margin:
                     add_qty = float(active_pos['contracts']) # 1배수 물타기
