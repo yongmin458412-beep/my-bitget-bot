@@ -143,22 +143,7 @@ def calculate_indicators(df, params):
 
     return df
 
-# ---------------------------------------------------------
-# 📡 거래소 연결
-# ---------------------------------------------------------
-@st.cache_resource
-def init_exchange():
-    try:
-        ex = ccxt.bitget({'apiKey': api_key, 'secret': api_secret, 'password': api_password, 'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
-        # 👇 강제 샌드박스 모드
-        ex.set_sandbox_mode(IS_SANDBOX)
-        ex.load_markets()
-        return ex
-    except: return None
-
-exchange = init_exchange()
-if not exchange: st.stop()
-
+주문 실패: bitget {"code":"40774","msg":"The order type for unilateral position must also be the unilateral position type.","requestTime":1769868948935,"data":null}
 # ---------------------------------------------------------
 # 🎨 사이드바: 정밀 설정 UI
 # ---------------------------------------------------------
