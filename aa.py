@@ -12,9 +12,8 @@ from datetime import datetime
 # =========================================================
 IS_SANDBOX = True 
 
-st.set_page_config(layout="wide", page_title="비트겟 봇 (Mobile)")
+st.set_page_config(layout="wide", page_title="비트겟 봇 (Final)")
 
-# 세션 상태 초기화
 if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = 10.0
 
 # ---------------------------------------------------------
@@ -25,13 +24,11 @@ try:
     api_secret = st.secrets["API_SECRET"]
     api_password = st.secrets["API_PASSWORD"]
 except:
-    # 로컬 테스트용 (Secrets가 없을 때 에러 방지용 예비 코드)
-    # 배포 시에는 Secrets가 작동하므로 이 부분은 무시됨
     st.error("🚨 API 키가 설정되지 않았습니다. Streamlit Secrets를 설정해주세요.")
     st.stop()
 
 # ---------------------------------------------------------
-# 🛠️ 유틸리티 함수 정의
+# 🛠️ 유틸리티 함수
 # ---------------------------------------------------------
 def safe_rerun():
     time.sleep(0.5)
@@ -208,11 +205,11 @@ def execute_trade(side, is_close=False, reason=""):
         st.error(f"주문 에러: {e}")
 
 # =========================================================
-# 📱 UI 구성 함수들 (반드시 실행 로직보다 위에 있어야 함)
+# 📱 UI 구성 함수들
 # =========================================================
 
 def show_metrics():
-    # 상단 정보 표시 함수
+    # 상단 정보 표시
     cols = st.columns(2) if is_mobile else st.columns(4)
     cols[0].metric("현재가", f"${curr_price:,.2f}")
     
@@ -226,7 +223,7 @@ def show_metrics():
         cols[3].metric("거래량", f"{last['vol']:.0f}")
 
 def show_chart_and_position():
-    # 차트와 포지션 현황 표시 함수
+    # 차트와 포지션
     tv_studies = ["RSI@tv-basicstudies", "BB@tv-basicstudies"]
     studies_json = str(tv_studies).replace("'", '"')
     tv_symbol = "BITGET:" + symbol.split(':')[0].replace('/', '') + ".P"
@@ -290,7 +287,7 @@ def show_chart_and_position():
     return active_position
 
 def show_order_controls(active_pos):
-    # 주문 컨트롤 표시 함수
+    # 주문 컨트롤
     st.subheader("⚡ 주문")
     c1, c2, c3, c4 = st.columns(4)
     def set_amt(pct): st.session_state['order_usdt'] = float(f"{usdt_free * pct:.2f}")
@@ -309,15 +306,27 @@ def show_order_controls(active_pos):
         if active_pos: execute_trade(active_pos['side'], is_close=True, reason="수동")
 
 def show_bot_logic(active_pos):
-    # 봇 로직 및 상태 표시 함수
-    st.subheader("🧠 봇 상태")
+    # 봇 로직 및 상태 표시
+    st.subheader("🧠 봇 전략 설정")
     
-    if is_mobile:
-        use_rsi = st.checkbox("RSI", value=True)
-        use_bb = st.checkbox("볼린저밴드", value=True)
-    else:
-        use_rsi = True; use_bb = True
-        
+    # 👇 [복구됨] 보조지표 10종 선택 (Expander로 깔끔하게)
+    with st.expander("🔻 보조지표 선택 (클릭해서 열기/닫기)", expanded=True):
+        st.caption("체크된 지표들의 조건이 '모두' 맞아야 진입합니다 (AND 조건)")
+        c1, c2 = st.columns(2)
+        with c1:
+            use_rsi = st.checkbox("1. RSI (과매수/도)", value=True)
+            use_bb = st.checkbox("2. 볼린저밴드 (이탈)", value=True)
+            use_ma = st.checkbox("3. 이평선 (추세)", value=False)
+            use_macd = st.checkbox("4. MACD (교차)", value=False)
+            use_stoch = st.checkbox("5. 스토캐스틱", value=False)
+        with c2:
+            use_cci = st.checkbox("6. CCI", value=False)
+            use_willr = st.checkbox("7. Williams %R", value=False)
+            use_vol = st.checkbox("8. 거래량 폭발", value=False)
+            use_adx = st.checkbox("9. ADX (강도)", value=False)
+            use_sar = st.checkbox("10. MA골든크로스", value=False)
+
+    # 신호 계산
     signals_long = []
     signals_short = []
     
@@ -331,9 +340,35 @@ def show_bot_logic(active_pos):
         elif last['close'] >= last['BB_UP']: signals_short.append(True)
         else: signals_long.append(False); signals_short.append(False)
     
+    if use_ma:
+        if last['close'] > last['MA50']: signals_long.append(True)
+        else: signals_long.append(False)
+
+    if use_macd:
+        if last['MACD'] > last['MACD_Signal']: signals_long.append(True)
+        else: signals_long.append(False)
+
+    if use_stoch:
+        if last['STOCH_K'] < 20: signals_long.append(True)
+        else: signals_long.append(False)
+
+    if use_cci:
+        if last['CCI'] < -100: signals_long.append(True)
+        else: signals_long.append(False)
+        
+    if use_vol:
+        if last['vol'] > last['VOL_MA'] * 1.5: signals_long.append(True)
+        else: signals_long.append(False)
+    
+    # 종합 판단
+    # (체크된 게 하나도 없으면 False 처리)
+    active_count = sum([use_rsi, use_bb, use_ma, use_macd, use_stoch, use_cci, use_willr, use_vol, use_adx, use_sar])
+    
     final_long = all(signals_long) and (len(signals_long)>0)
     final_short = all(signals_short) and (len(signals_short)>0)
     
+    st.info(f"체크된 지표 수: {active_count}개")
+
     c1, c2 = st.columns(2)
     if final_long: c1.success("🔥 롱 조건 만족")
     else: c1.warning("롱 대기")
@@ -341,7 +376,9 @@ def show_bot_logic(active_pos):
     if final_short: c2.error("🔥 숏 조건 만족")
     else: c2.warning("숏 대기")
 
-    auto_on = st.checkbox("🤖 자동매매 활성화")
+    # 자동매매 스위치
+    st.divider()
+    auto_on = st.checkbox("🤖 자동매매 활성화 (체크 시 실행)")
     if auto_on:
         if not active_pos:
             if final_long: execute_trade('long', reason="자동")
@@ -354,7 +391,7 @@ def show_bot_logic(active_pos):
         safe_rerun()
 
 # =========================================================
-# 🚀 메인 실행 로직 (반드시 모든 함수 정의 후에 위치)
+# 🚀 메인 실행 로직
 # =========================================================
 
 st.title(f"🤖 {symbol}")
@@ -363,7 +400,7 @@ if is_mobile:
     # 📱 모바일 뷰 (탭 방식)
     show_metrics()
     
-    tab1, tab2, tab3 = st.tabs(["📊 차트/현황", "⚡ 주문/설정", "📝 봇 상태"])
+    tab1, tab2, tab3 = st.tabs(["📊 차트/현황", "⚡ 주문/설정", "📝 봇 전략"])
     
     with tab1:
         pos = show_chart_and_position()
@@ -375,7 +412,7 @@ if is_mobile:
         show_bot_logic(pos)
         
 else:
-    # 🖥️ 데스크탑 뷰 (기존 방식)
+    # 🖥️ 데스크탑 뷰
     show_metrics()
     st.divider()
     pos = show_chart_and_position()
