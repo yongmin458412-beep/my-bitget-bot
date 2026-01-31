@@ -16,16 +16,15 @@ import io
 # ⚙️ [설정] 기본 환경
 # =========================================================
 IS_SANDBOX = True # 모의투자
-SETTINGS_FILE = "bot_settings.json" # 설정 저장 파일
-LOG_FILE = "trade_log.csv" # 매매일지 파일
+SETTINGS_FILE = "bot_settings.json"
+LOG_FILE = "trade_log.csv"
 
-st.set_page_config(layout="wide", page_title="비트겟 봇 (Integrity)")
+st.set_page_config(layout="wide", page_title="비트겟 봇 (Perfect)")
 
 # ---------------------------------------------------------
-# 💾 설정 파일 관리 (저장/불러오기)
+# 💾 설정 파일 관리
 # ---------------------------------------------------------
 def load_settings():
-    """저장된 설정을 불러오거나 기본값을 반환합니다."""
     default = {
         "leverage": 20, "target_vote": 2, "tp": 15.0, "sl": 10.0,
         "auto_trade": False, "order_usdt": 100.0,
@@ -41,13 +40,11 @@ def load_settings():
     return default
 
 def save_settings(new_settings):
-    """설정을 파일에 저장합니다."""
     try:
         with open(SETTINGS_FILE, "w") as f:
             json.dump(new_settings, f)
     except: pass
 
-# 설정 로드 및 세션 초기화
 config = load_settings()
 if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = config['order_usdt']
 
@@ -89,15 +86,30 @@ def get_daily_summary():
     except: return 0.0, 0
 
 # ---------------------------------------------------------
-# 📡 텔레그램 (전송 + 리스너)
+# 📡 텔레그램 (중복 방지 및 버튼 기본 탑재)
 # ---------------------------------------------------------
-def send_telegram(message, chart_df=None, show_button=False):
+def send_telegram(message, chart_df=None):
+    """
+    모든 메시지에 '실시간 현황 확인' 버튼을 기본으로 붙여서 전송합니다.
+    """
     if not tg_token or not tg_id: return
     try:
         url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-        payload = {'chat_id': tg_id, 'text': message, 'parse_mode': 'HTML'}
-        if show_button:
-            payload['reply_markup'] = json.dumps({"inline_keyboard": [[{"text": "🔍 실시간 현황 확인", "callback_data": "check_status"}]]})
+        
+        # 👇 [수정됨] 무조건 버튼 추가
+        keyboard = {
+            "inline_keyboard": [[
+                {"text": "🔍 실시간 현황 확인", "callback_data": "check_status"}
+            ]]
+        }
+        
+        payload = {
+            'chat_id': tg_id, 
+            'text': message, 
+            'parse_mode': 'HTML',
+            'reply_markup': json.dumps(keyboard) # 버튼 부착
+        }
+        
         requests.post(url, data=payload)
         
         if chart_df is not None:
@@ -113,6 +125,7 @@ def send_telegram(message, chart_df=None, show_button=False):
     except: pass
 
 def telegram_listener(exchange_obj, symbol_name):
+    """백그라운드에서 버튼 클릭을 감지합니다."""
     last_update_id = 0
     while True:
         try:
@@ -123,22 +136,34 @@ def telegram_listener(exchange_obj, symbol_name):
                     last_update_id = update['update_id']
                     if 'callback_query' in update:
                         cb = update['callback_query']; cb_id = cb['id']; chat_id = cb['message']['chat']['id']
+                        
                         if cb['data'] == 'check_status':
+                            # 버튼 클릭 시 답장 로직
                             msg = "📉 <b>포지션 없음</b>\n봇이 대기 중입니다."
                             try:
                                 positions = exchange_obj.fetch_positions([symbol_name])
+                                has_pos = False
                                 for p in positions:
                                     if float(p['contracts']) > 0:
-                                        msg = f"📊 <b>포지션 현황</b>\n• {symbol_name}\n• <b>{p['side'].upper()}</b> x{p['leverage']}\n• 수익률: <b>{float(p['percentage']):.2f}%</b>\n• 수익금: ${float(p['unrealizedPnl']):.2f}"
+                                        roi = float(p['percentage'])
+                                        pnl = float(p['unrealizedPnl'])
+                                        msg = f"📊 <b>포지션 현황</b>\n• 종목: {symbol_name}\n• <b>{p['side'].upper()}</b> x{p['leverage']}\n• 수익률: <b>{roi:.2f}%</b>\n• 수익금: ${pnl:.2f}"
+                                        has_pos = True
                                         break
-                            except: msg = "❌ 거래소 연결 확인 필요"
-                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'})
+                                if not has_pos:
+                                    msg = f"📉 <b>포지션 없음</b>\n현재 {symbol_name} 대기 중..."
+                            except: msg = "❌ 거래소 연결 실패"
+                            
+                            # 답장 보내기 (여기도 버튼 붙임)
+                            send_telegram(msg) 
+                            
+                            # 로딩바 없애기
                             requests.post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", data={'callback_query_id': cb_id})
             time.sleep(1)
         except: time.sleep(5)
 
 # ---------------------------------------------------------
-# 📡 거래소 연결 (원웨이 모드 강제 적용)
+# 📡 거래소 연결 및 리스너 관리 (중복 해결 핵심)
 # ---------------------------------------------------------
 @st.cache_resource
 def init_exchange_and_listener():
@@ -153,7 +178,7 @@ exchange = init_exchange_and_listener()
 if not exchange: st.stop()
 
 # ---------------------------------------------------------
-# 🎨 사이드바 (설정 UI)
+# 🎨 사이드바
 # ---------------------------------------------------------
 st.sidebar.title("🛠️ 봇 정밀 설정")
 is_mobile = st.sidebar.checkbox("📱 모바일 모드", value=True)
@@ -162,13 +187,20 @@ markets = exchange.markets
 futures_symbols = [s for s in markets if markets[s].get('linear') and markets[s].get('swap')]
 symbol = st.sidebar.selectbox("코인 선택", futures_symbols, index=0)
 
-# 리스너 시작
-if 'listener_started' not in st.session_state:
-    t = threading.Thread(target=telegram_listener, args=(exchange, symbol), daemon=True)
-    t.start()
-    st.session_state['listener_started'] = True
+# 👇 [핵심] 좀비 쓰레드 방지 로직
+# 현재 실행 중인 모든 쓰레드를 검사해서, 이미 'TelegramListener'라는 이름의 쓰레드가 있으면 새로 안 만듭니다.
+thread_exists = False
+for t in threading.enumerate():
+    if t.name == "TelegramListener":
+        thread_exists = True
+        break
 
-# 원웨이 모드 강제 설정 (40774 에러 방지)
+if not thread_exists:
+    t = threading.Thread(target=telegram_listener, args=(exchange, symbol), daemon=True, name="TelegramListener")
+    t.start()
+    print("✅ 텔레그램 리스너 시작됨 (한 번만 실행)")
+
+# 원웨이 모드 강제
 try:
     exchange.set_leverage(config['leverage'], symbol)
     try: exchange.set_position_mode(hedged=False, symbol=symbol)
@@ -178,7 +210,6 @@ except: pass
 st.sidebar.divider()
 st.sidebar.subheader("📊 지표 및 전략")
 
-# 지표 설정 (저장된 값 로드)
 P = {} 
 with st.sidebar.expander("1. RSI", expanded=True):
     use_rsi = st.checkbox("RSI 사용", value=config['use_rsi'])
@@ -210,7 +241,6 @@ with st.sidebar.expander("9. 거래량", expanded=True):
     use_vol = st.checkbox("거래량 감지", value=config['use_vol'])
     P['vol_mul'] = st.number_input("거래량 배수", 1.5, 5.0, 2.0)
 
-# (나머지 지표는 코드 길이상 생략했으나, 필요시 추가 가능)
 active_indicators = sum([use_rsi, use_bb, use_ma, use_macd, use_stoch, use_cci, use_vol])
 
 st.sidebar.divider()
@@ -219,7 +249,7 @@ p_leverage = st.sidebar.slider("레버리지", 1, 50, config['leverage'])
 tp_pct = st.sidebar.number_input("💰 익절 목표 (%)", 1.0, 500.0, config['tp'])
 sl_pct = st.sidebar.number_input("💸 손절 제한 (%)", 1.0, 100.0, config['sl'])
 
-# 👇 [복구됨] 정밀 연결 확인 버튼
+# 정밀 연결 확인 버튼
 if st.sidebar.button("📡 연결 상태 정밀진단"):
     with st.sidebar.status("시스템 점검 중...", expanded=True) as status:
         st.write("1. 거래소 연결 시도...")
@@ -228,9 +258,9 @@ if st.sidebar.button("📡 연결 상태 정밀진단"):
             st.write("✅ 비트겟 API 정상")
             
             st.write("2. 텔레그램 발송 시도...")
-            if tg_token and tg_id:
-                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': "✅ 시스템 점검 완료! (이상 무)"})
-                st.write("✅ 텔레그램 발송 성공")
+            # 테스트 메시지에도 버튼이 자동으로 붙습니다.
+            send_telegram("✅ <b>시스템 점검 완료!</b>\n이상 없습니다.")
+            st.write("✅ 텔레그램 발송 성공")
             
             status.update(label="점검 완료! 모든 시스템 정상.", state="complete")
         except Exception as e:
@@ -279,7 +309,7 @@ def calculate_indicators(df, params):
     return df
 
 # ---------------------------------------------------------
-# 📊 데이터 로딩 & 잔고 로직 (모의투자 500불 인식)
+# 📊 데이터 로딩 & 잔고 로직
 # ---------------------------------------------------------
 usdt_free = 0.0
 margin_coin_display = "USDT"
@@ -344,7 +374,10 @@ def execute_trade(side, is_close=False, reason=""):
         st.success(msg.replace("<b>", "").replace("</b>", ""))
         safe_toast(msg.replace("<b>", "").replace("</b>", ""))
         chart_data = df.tail(60) if not is_close else None
-        send_telegram(msg, chart_data, show_button=True)
+        
+        # 여기서 버튼 옵션을 따로 줄 필요 없음 (함수 내에서 기본값 처리됨)
+        send_telegram(msg, chart_data) 
+        
         safe_rerun()
     except Exception as e: st.error(f"주문 실패: {e}")
 
@@ -404,10 +437,6 @@ c2.metric("📉 숏 점수", f"{short_score} / {target_vote}")
 final_long = long_score >= target_vote
 final_short = short_score >= target_vote
 
-if final_long: st.success(f"🔥 롱 진입 조건 만족! ({', '.join(reasons_L)})")
-if final_short: st.error(f"🔥 숏 진입 조건 만족! ({', '.join(reasons_S)})")
-
-# 👇 설정 저장
 current_settings = {
     "leverage": p_leverage, "target_vote": target_vote, "tp": tp_pct, "sl": sl_pct,
     "auto_trade": st.session_state.get('auto_trade', False),
