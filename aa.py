@@ -13,6 +13,9 @@ import sqlite3  # [New] DB 기능 추가
 from datetime import datetime, timedelta
 import google.generativeai as genai
 
+# 코드 맨 위에 이 줄을 복사해서 붙여넣으세요!
+import plotly.graph_objects as go
+
 # =========================================================
 # ⚙️ [시스템 기본 설정]
 # =========================================================
