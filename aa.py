@@ -657,7 +657,7 @@ except Exception as e:
     st.error(f"🚨 데이터 로딩 실패! 원인: {e}")
     st.stop()
 
-    # 1. 추세 모드 판단 로직 (이 줄이 빠져서 에러가 난 것입니다)
+# 1. 추세 모드 판단 로직 (이 줄이 빠져서 에러가 난 것입니다)
 # ADX가 25 이상이면 추세장, 아니면 횡보장으로 판단
 is_trend_mode = last['ADX'] >= 25 
 
@@ -668,7 +668,7 @@ mode_str = "🌊 추세장 (강한 상승/하락)" if is_trend_mode else "🦀 �
 st.title(f"🔥 {symbol} GPT-4o Trader")
 st.caption(f"모드: {mode_str} | 현재가: ${curr_price:,.2f}")
     
-    is_trend_mode = last['ADX'] >= 25 and config['use_dual_mode']
+is_trend_mode = last['ADX'] >= 25 and config['use_dual_mode']
 
 with st.expander("📊 지표 상태판 (Indicator Dashboard)", expanded=True):
     cols = st.columns(5)
