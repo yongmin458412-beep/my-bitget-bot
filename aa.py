@@ -698,7 +698,9 @@ with t3:
 with t4:
     # [New] DB 뷰어 통합
     st.subheader("📖 AI의 성장 일지 (DB Viewer)")
-    st.caption("AI가 매매 후 작성한 반성문과 피드백이 저장됩니다.")def telegram_thread(ex, symbol_name):
+    st.caption("AI가 매매 후 작성한 반성문과 피드백이 저장됩니다.")
+    
+    def telegram_thread(ex, symbol_name):
     """
     [수정됨] 텔레그램 수신 대기 + 15분마다 AI 자동 분석 및 리포팅 수행
     """
