@@ -637,28 +637,27 @@ def calc_indicators(df):
 # 📊 메인 화면 (UI 통합)
 # ---------------------------------------------------------
 # [이 코드로 덮어씌우세요]
+# [데이터 로딩 부분 수정]
 try:
-    # 1. 시세 조회 시도
+    # 1. 시세 조회
     ticker = exchange.fetch_ticker(symbol)
     curr_price = ticker['last']
     
-    # 2. 캔들 데이터 조회 시도
+    # 2. 캔들 데이터 조회
     ohlcv = exchange.fetch_ohlcv(symbol, '5m', limit=200)
     
     # 3. 데이터프레임 변환
     df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
     df['time'] = pd.to_datetime(df['time'], unit='ms')
     
-    # 4. 지표 계산
-    df, ind_status, last = calc_indicators(df)
+    # 4. 지표 계산 (변수명을 status로 통일!)
+    df, status, last = calc_indicators(df)  # 👈 여기가 핵심입니다! (ind_status -> status)
 
 except Exception as e:
-    # 🚨 여기가 중요합니다: 어떤 에러인지 화면에 출력해줍니다.
     st.error(f"🚨 데이터 로딩 실패! 원인: {e}")
-    st.caption("힌트: AuthenticationError면 키 문제, NetworkError면 인터넷 문제, ExchangeError면 샌드박스 설정 문제입니다.")
     st.stop()
     
-is_trend_mode = last['ADX'] >= 25 and config['use_dual_mode']
+    is_trend_mode = last['ADX'] >= 25 and config['use_dual_mode']
 mode_str = "🌊 추세장 (ZLSMA 전략)" if is_trend_mode else "🦀 횡보장 (RSI+BB 전략)"
 
 st.title(f"🔥 {symbol} AI Ultimate Agent")
