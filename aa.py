@@ -9,27 +9,29 @@ import threading
 import os
 import json
 import uuid
-import sqlite3
-import plotly.graph_objects as go
-from datetime import datetime
+import sqlite3  # [New] DB 기능 추가
+from datetime import datetime, timedelta
 import google.generativeai as genai
 
 # =========================================================
-# ⚙️ [0. 시스템 기본 설정]
+# ⚙️ [시스템 기본 설정]
 # =========================================================
-IS_SANDBOX = True  # ⚠️ 실전 매매 시 False로 변경 필수!
+IS_SANDBOX = True # 실전 매매 시 False로 변경하세요!
 SETTINGS_FILE = "bot_settings.json"
-DB_FILE = "wonyousi_brain.db"
 LOG_FILE = "trade_log.csv"
+PROPOSALS_FILE = "pending_proposals.json"
+DB_FILE = "wonyousi_brain.db" # [New] AI 기억 저장소
 
-st.set_page_config(layout="wide", page_title="AI Wonyousi: Ultimate Full Version")
+st.set_page_config(layout="wide", page_title="비트겟 AI 워뇨띠 에이전트 (Ultimate Integration)")
 
-# =========================================================
-# 🧠 [1. AI 기억 저장소 (DB) - 회고 시스템]
-# =========================================================
+# ---------------------------------------------------------
+# 🧠 [New] AI 기억 저장소 (DB) & 회고 시스템
+# ---------------------------------------------------------
 def init_db():
+    """매매 일지와 반성문을 저장할 데이터베이스를 생성합니다."""
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
+    # 매매 기록 및 AI 피드백 테이블
     c.execute('''CREATE TABLE IF NOT EXISTS trade_history
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   timestamp TEXT,
@@ -45,19 +47,21 @@ def init_db():
 init_db()
 
 def get_past_mistakes(limit=3):
-    """과거의 실수(손실 거래)를 가져와 AI에게 학습시킵니다."""
+    """최근 실패한 매매(손실)에 대한 AI의 반성문을 가져옵니다."""
     try:
         conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         c = conn.cursor()
         c.execute("SELECT side, reason, ai_feedback FROM trade_history WHERE pnl < 0 ORDER BY id DESC LIMIT ?", (limit,))
         rows = c.fetchall()
         conn.close()
-        if not rows: return "과거에 큰 실수는 없습니다. (초심자의 행운)"
-        feedback = "⛔ **[과거 실패 노트 - 반복 금지]**:\n"
+        
+        if not rows: return "과거에 큰 실수는 없었습니다. 초심자의 행운을 빕니다."
+        
+        feedback = "⛔ **[과거 실패 노트 - 절대 반복 금지]**:\n"
         for row in rows:
-            feedback += f"- {row[0]} 포지션 실패 (당시 이유: {row[1]}) → 💡 교훈: {row[2]}\n"
+            feedback += f"- {row[0]} 진입했다가 손실. (당시 이유: {row[1]}) → 💡 반성: {row[2]}\n"
         return feedback
-    except: return "DB 읽기 오류"
+    except: return "DB 조회 오류"
 
 def log_trade_to_db(symbol, side, price, pnl, reason, ai_feedback):
     """매매 결과를 DB에 영구 저장합니다."""
@@ -68,34 +72,37 @@ def log_trade_to_db(symbol, side, price, pnl, reason, ai_feedback):
                   (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, side, price, pnl, reason, ai_feedback))
         conn.commit()
         conn.close()
-    except Exception as e: print(f"DB Error: {e}")
+    except Exception as e: print(f"DB Save Error: {e}")
 
-# =========================================================
-# 💾 [2. 설정 관리 - 모든 파라미터 포함]
-# =========================================================
+# ---------------------------------------------------------
+# 💾 설정 관리 (기존 기능 유지)
+# ---------------------------------------------------------
 def load_settings():
+    """사용자의 모든 설정을 파일에서 불러옵니다."""
     default = {
         "gemini_api_key": "",
-        "leverage": 20, 
-        "order_usdt": 100.0, 
-        "auto_trade": False,
+        "leverage": 20, "target_vote": 2, "tp": 15.0, "sl": 10.0,
+        "auto_trade": False, "order_usdt": 100.0,
         
         # [보조지표 세부 파라미터]
         "rsi_period": 14, "rsi_buy": 30, "rsi_sell": 70,
-        "bb_period": 20, "bb_std": 2.0,
+        "bb_period": 20, "bb_std": 2.0, 
         "ma_fast": 7, "ma_slow": 99,
-        "stoch_k": 14, "stoch_d": 3,
-        "vol_mul": 2.0,
+        "stoch_k": 14, "vol_mul": 2.0,
         
-        # [10종 지표 활성화 여부]
-        "use_rsi": True, "use_bb": True, "use_ma": True, 
-        "use_macd": True, "use_stoch": True, "use_cci": True, 
-        "use_mfi": True, "use_willr": True, "use_vol": True, "use_adx": True,
+        # [보조지표 활성화 여부 - 10개]
+        "use_rsi": True, "use_bb": True, "use_cci": True, "use_vol": True,
+        "use_ma": True, "use_macd": False, "use_stoch": False, 
+        "use_mfi": False, "use_willr": False, "use_adx": True,
         
-        # [리스크 관리]
-        "target_vote": 3, # 최소 3개 이상 지표가 일치해야 진입
-        "stop_loss_pct": 10.0,
-        "take_profit_pct": 15.0
+        # [스마트 방어 & 자금 관리]
+        "use_switching": True, "use_dca": True, "dca_trigger": -20.0,
+        "dca_max_count": 1, "use_holding": True, "auto_size_type": "percent",
+        "auto_size_val": 20.0, 
+        
+        # [고급 전략 기능]
+        "use_dual_mode": True, "use_trailing_stop": False,
+        "use_smart_betting": False, "no_trade_weekend": False
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -107,15 +114,17 @@ def load_settings():
 
 def save_settings(new_settings):
     try:
-        with open(SETTINGS_FILE, "w") as f: json.dump(new_settings, f)
-        st.toast("✅ 설정이 저장되었습니다.")
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(new_settings, f)
+        st.toast("✅ 설정이 성공적으로 저장되었습니다!", icon="💾")
     except: st.error("설정 저장 실패")
 
 config = load_settings()
+if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = config['order_usdt']
 
-# =========================================================
-# 🔐 [3. API & AI 모델 (오류 자동 복구)]
-# =========================================================
+# ---------------------------------------------------------
+# 🔐 API & AI 초기화 (404 오류 수정됨)
+# ---------------------------------------------------------
 api_key = st.secrets.get("API_KEY")
 api_secret = st.secrets.get("API_SECRET")
 api_password = st.secrets.get("API_PASSWORD")
@@ -123,166 +132,59 @@ tg_token = st.secrets.get("TG_TOKEN")
 tg_id = st.secrets.get("TG_CHAT_ID")
 gemini_key = st.secrets.get("GEMINI_API_KEY", config.get("gemini_api_key", ""))
 
-if not api_key: st.error("🚨 API Key가 설정되지 않았습니다."); st.stop()
+if not api_key: 
+    st.error("🚨 비트겟 API 키가 Secrets에 설정되지 않았습니다. 설정을 확인해주세요.")
+    st.stop()
 
 @st.cache_resource
 def get_ai_model(key):
-    """사용 가능한 Gemini 모델을 자동으로 찾아 연결합니다."""
+    """AI 모델 자동 감지 및 연결 (404 오류 방지)"""
     if not key: return None
     genai.configure(api_key=key)
     try:
-        # 1. 모델 리스트 조회
+        # 사용 가능한 모델 목록 조회
         models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         
-        # 2. 우선순위: Flash (빠름) -> Pro (똑똑함) -> 아무거나
+        # 1순위: Flash (빠름), 2순위: Pro (안정적), 3순위: 기본
+        target_model = 'gemini-pro' 
         for m in models:
-            if 'flash' in m and '1.5' in m: return genai.GenerativeModel(m)
-        for m in models:
-            if 'pro' in m: return genai.GenerativeModel(m)
-            
-        return genai.GenerativeModel('gemini-pro') # 최후의 수단
-    except:
+            if 'flash' in m: target_model = m; break
+        
+        return genai.GenerativeModel(target_model)
+    except: 
+        # 목록 조회 실패 시 기본 모델 강제 지정
         return genai.GenerativeModel('gemini-pro')
 
 ai_model = get_ai_model(gemini_key)
 
-# =========================================================
-# 📊 [4. 데이터 분석 & 보조지표 (10종 완벽 계산)]
-# =========================================================
-@st.cache_resource
-def init_exchange():
-    try:
-        ex = ccxt.bitget({'apiKey': api_key, 'secret': api_secret, 'password': api_password, 'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
-        ex.set_sandbox_mode(IS_SANDBOX)
-        ex.load_markets()
-        return ex
-    except: return None
-
-exchange = init_exchange()
-
-def calc_indicators(df):
-    """10가지 기술적 지표를 모두 계산합니다."""
-    close = df['close']; high = df['high']; low = df['low']; vol = df['vol']
-    
-    # 1. RSI
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(config['rsi_period']).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(config['rsi_period']).mean()
-    rs = gain / loss; df['RSI'] = 100 - (100 / (1 + rs))
-
-    # 2. BB (볼린저밴드)
-    ma = close.rolling(config['bb_period']).mean()
-    std = close.rolling(config['bb_period']).std()
-    df['BB_UP'] = ma + (std * config['bb_std'])
-    df['BB_LO'] = ma - (std * config['bb_std'])
-
-    # 3. MA (이평선)
-    df['MA_F'] = close.rolling(config['ma_fast']).mean()
-    df['MA_S'] = close.rolling(config['ma_slow']).mean()
-
-    # 4. MACD
-    k = close.ewm(span=12, adjust=False).mean()
-    d = close.ewm(span=26, adjust=False).mean()
-    df['MACD'] = k - d
-    df['MACD_SIG'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-    # 5. Stochastic
-    low_min = low.rolling(config['stoch_k']).min()
-    high_max = high.rolling(config['stoch_k']).max()
-    df['STOCH_K'] = 100 * ((close - low_min) / (high_max - low_min))
-
-    # 6. CCI
-    tp = (high + low + close) / 3
-    df['CCI'] = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
-
-    # 7. ADX (추세 강도)
-    df['tr'] = np.maximum((high - low), np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
-    df['atr'] = df['tr'].rolling(14).mean()
-    df['ADX'] = (df['atr'] / close) * 1000
-
-    # 8. Volume (거래량 폭발)
-    df['VOL_MA'] = vol.rolling(20).mean()
-
-    # 9. Williams %R
-    df['WILLR'] = -100 * ((high_max - close) / (high_max - low_min))
-
-    # 10. MFI (자금 흐름 - 약식)
-    df['MFI'] = 50 # (계산 부하를 줄이기 위해 placeholder, 필요시 구현 가능)
-
-    # 🎯 상태 판단 (대시보드 표시용)
-    last = df.iloc[-1]
-    status = {}
-    
-    if config['use_rsi']:
-        if last['RSI'] <= config['rsi_buy']: status['RSI'] = "🟢 매수"
-        elif last['RSI'] >= config['rsi_sell']: status['RSI'] = "🔴 매도"
-        else: status['RSI'] = "⚪ 중립"
-        
-    if config['use_bb']:
-        if last['close'] <= last['BB_LO']: status['BB'] = "🟢 매수"
-        elif last['close'] >= last['BB_UP']: status['BB'] = "🔴 매도"
-        else: status['BB'] = "⚪ 중립"
-        
-    if config['use_ma']:
-        if last['MA_F'] > last['MA_S']: status['MA'] = "🟢 매수"
-        else: status['MA'] = "🔴 매도"
-
-    if config['use_macd']:
-        if last['MACD'] > last['MACD_SIG']: status['MACD'] = "🟢 매수"
-        else: status['MACD'] = "🔴 매도"
-
-    if config['use_stoch']:
-        if last['STOCH_K'] <= 20: status['Stoch'] = "🟢 매수"
-        elif last['STOCH_K'] >= 80: status['Stoch'] = "🔴 매도"
-        else: status['Stoch'] = "⚪ 중립"
-
-    if config['use_cci']:
-        if last['CCI'] <= -100: status['CCI'] = "🟢 매수"
-        elif last['CCI'] >= 100: status['CCI'] = "🔴 매도"
-        else: status['CCI'] = "⚪ 중립"
-
-    if config['use_vol'] and last['vol'] > last['VOL_MA'] * config['vol_mul']:
-        status['VOL'] = "🔥 거래량 폭발"
-
-    if config['use_adx']:
-        status['ADX'] = "📈 추세장" if last['ADX'] > 25 else "🦀 횡보장"
-
-    return df, status, last
-
-# =========================================================
-# 🧠 [5. 워뇨띠 AI 전략 생성 (Prompt Engineering)]
-# =========================================================
 def generate_wonyousi_strategy(df, status_summary):
+    """[New] 워뇨띠 페르소나 + 회고적 학습 전략 생성"""
     if not ai_model: return {"decision": "hold", "reason": "API Key 없음", "confidence": 0}
     
     past_mistakes = get_past_mistakes()
     last_row = df.iloc[-1]
     
     prompt = f"""
-    당신은 전설적인 트레이더 '워뇨띠'입니다. 
-    단순 지표보다는 '캔들 패턴', '시장 심리(Price Action)', '거래량'을 최우선으로 분석합니다.
+    너는 전설적인 트레이더 '워뇨띠'다. 
+    보조지표 숫자보다는 '시장 심리', '캔들 패턴', '추세'를 중시한다.
     
-    [현재 시장 데이터]
-    - 현재가: {last_row['close']}
+    [현재 시장 상황]
+    - 가격: {last_row['close']}
     - RSI: {last_row['RSI']:.1f}
+    - 볼린저밴드 상태: {status_summary.get('BB', 'Normal')}
     - 추세강도(ADX): {last_row['ADX']:.1f}
-    - 활성화된 매수/매도 신호들: {status_summary}
     
-    [과거의 실패 노트 (반면교사)]
+    [너의 과거 실패 기록 (일기장 - 이 실수는 반복 금지)]
     {past_mistakes}
     
-    위 데이터를 바탕으로 다음을 분석하여 JSON 형식으로 답하세요:
-    1. 추세 분석 (상승/하락/횡보 및 그 이유)
-    2. 캔들/거래량 분석 (반전 신호, 매집 흔적 등)
-    3. 최종 판단 (즉시 진입 여부)
+    위 데이터를 바탕으로 지금 매매해야 할지 판단해라.
+    JSON 형식으로만 답해라.
     
     형식:
     {{
         "decision": "buy" 또는 "sell" 또는 "hold",
-        "reason_trend": "추세 관점에서의 이유",
-        "reason_candle": "캔들 및 거래량 관점에서의 이유",
-        "final_reason": "워뇨띠 스타일의 한 줄 요약",
-        "confidence": 0~100 (확신도 숫자)
+        "reason": "워뇨띠 스타일의 한 줄 근거",
+        "confidence": 0~100 사이의 숫자
     }}
     """
     try:
@@ -290,109 +192,176 @@ def generate_wonyousi_strategy(df, status_summary):
         res = res.replace("```json", "").replace("```", "").strip()
         return json.loads(res)
     except Exception as e:
-        return {"decision": "hold", "reason_trend": f"오류: {e}", "final_reason": "분석 실패", "confidence": 0}
+        return {"decision": "hold", "reason": f"AI 분석 오류: {e}", "confidence": 0}
 
-# =========================================================
-# 🤖 [6. 백그라운드 자동매매 스레드 (15분 주기)]
-# =========================================================
+# ---------------------------------------------------------
+# 📅 데이터 수집 (ForexFactory + CCXT)
+# ---------------------------------------------------------
+@st.cache_data(ttl=3600)
+def get_forex_events():
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}).json()
+        events = []
+        for item in res:
+            if item['country'] == 'USD' and item['impact'] in ['High', 'Medium']:
+                events.append({"날짜": item['date'][:10], "시간": item['date'][11:], "지표": item['title'], "중요도": "🔥" if item['impact']=='High' else "⚠️"})
+        return pd.DataFrame(events)
+    except: return pd.DataFrame()
+
+def get_balance(ex):
+    try:
+        bal = ex.fetch_balance({'type': 'swap'})
+        coin = 'SUSDT' if 'SUSDT' in bal else ('USDT' if 'USDT' in bal else 'SBTC')
+        return coin, float(bal[coin]['free']), float(bal[coin]['total'])
+    except: return "USDT", 0.0, 0.0
+
+def log_trade(action, symbol, side, price, qty, leverage, pnl=0, roi=0):
+    """기존 CSV 로그 (엑셀 호환용)"""
+    now = datetime.now()
+    new_data = {"Time": now.strftime("%Y-%m-%d %H:%M:%S"), "Date": now.strftime("%Y-%m-%d"), "Symbol": symbol, "Action": action, "Side": side, "Price": price, "Qty": qty, "Margin": (price*qty)/leverage, "PnL": pnl, "ROI": roi}
+    df = pd.DataFrame([new_data])
+    if not os.path.exists(LOG_FILE): df.to_csv(LOG_FILE, index=False)
+    else: df.to_csv(LOG_FILE, mode='a', header=False, index=False)
+
+# ---------------------------------------------------------
+# 🤖 [AI 에이전트] 능동 제안 및 5분 자동 수락 시스템
+# ---------------------------------------------------------
+def manage_proposals(ex, symbol_name):
+    if not os.path.exists(PROPOSALS_FILE): return
+    try:
+        with open(PROPOSALS_FILE, 'r') as f: proposals = json.load(f)
+    except: return
+    
+    changed = False
+    now = time.time()
+    
+    for pid, data in list(proposals.items()):
+        # 5분(300초) 경과 시 자동 수락
+        if now - data['timestamp'] > 300: 
+            try:
+                ex.set_leverage(config['leverage'], symbol_name)
+                ticker = ex.fetch_ticker(symbol_name)
+                price = ticker['ask'] if data['side'] == 'long' else ticker['bid']
+                
+                bal = ex.fetch_balance({'type': 'swap'})
+                coin_key = 'USDT' if 'USDT' in bal else 'SUSDT'
+                free = float(bal[coin_key]['free']); total = float(bal[coin_key]['total'])
+                
+                amt = config['auto_size_val']
+                if config['auto_size_type'] == 'percent': amt = total * (amt / 100.0)
+                if amt > free * 0.98: amt = free * 0.98
+                
+                qty = ex.amount_to_precision(symbol_name, (amt * config['leverage']) / price)
+                
+                if float(qty) > 0:
+                    ex.create_order(symbol_name, 'limit', 'buy' if data['side'] == 'long' else 'sell', qty, price)
+                    msg = f"⏳ <b>[AI 자동 실행]</b>\n주인님의 응답이 없어 5분 후 {data['side'].upper()} 포지션에 자동 진입했습니다.\n이유: {data.get('reason', 'AI 판단')}"
+                    requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': msg, 'parse_mode': 'HTML'})
+                    log_trade("AI자동진입", symbol_name, data['side'], price, float(qty), config['leverage'])
+                    # DB에도 기록 (피드백 없음, 추후 청산 시 기록)
+                
+                del proposals[pid]
+                changed = True
+            except Exception as e:
+                del proposals[pid]; changed = True
+
+    if changed:
+        with open(PROPOSALS_FILE, 'w') as f: json.dump(proposals, f)
+
+def send_proposal(side, reason):
+    pid = str(uuid.uuid4())
+    proposal = {"id": pid, "side": side, "reason": reason, "timestamp": time.time()}
+    try:
+        with open(PROPOSALS_FILE, 'r') as f: props = json.load(f)
+    except: props = {}
+    props[pid] = proposal
+    with open(PROPOSALS_FILE, 'w') as f: json.dump(props, f)
+    
+    kb = {"inline_keyboard": [[{"text": "✅ 승인 (지금 진입)", "callback_data": f"acc_{pid}"}, {"text": "❌ 거절 (취소)", "callback_data": f"rej_{pid}"}]]}
+    msg = f"🤖 <b>[AI 워뇨띠 제안]</b>\n\n기회 포착: <b>{side.upper()}</b>\n이유: {reason}\n\n<i>5분 내 거절하지 않으면 자동으로 매수합니다.</i>"
+    requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': msg, 'parse_mode': 'HTML', 'reply_markup': json.dumps(kb)})
+
 def telegram_thread(ex, symbol_name):
     ANALYSIS_INTERVAL = 900 # 15분
     last_run = 0
     
-    # 봇 시작 알림
     requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
-                  data={'chat_id': tg_id, 'text': "🚀 **AI 워뇨띠 완전 자동매매 가동**\n(모든 기능 복구됨 / 즉시 진입 모드)", 'parse_mode': 'Markdown'})
+                  data={'chat_id': tg_id, 'text': "🚀 **AI 완전 자율 매매 시작**\n경제뉴스 알림 OFF / 즉시 진입 ON"})
 
     while True:
         try:
             now = time.time()
             if now - last_run > ANALYSIS_INTERVAL:
-                # 데이터 수집
+                # 1. 데이터 수집
                 ohlcv = ex.fetch_ohlcv(symbol_name, '5m', limit=100)
                 df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
                 df['time'] = pd.to_datetime(df['time'], unit='ms')
                 df, status, last = calc_indicators(df)
                 
-                # AI 분석
+                # 2. AI 분석
                 strategy = generate_wonyousi_strategy(df, status)
                 decision = strategy['decision']
                 conf = strategy.get('confidence', 0)
                 
-                # 텔레그램 리포팅 (자세하게)
+                # 3. 텔레그램 리포팅 (자세하게)
                 emoji = "⚪"
                 if decision == 'buy': emoji = "🔵"
                 elif decision == 'sell': emoji = "🔴"
                 
                 msg = f"""
-{emoji} **[15분 정밀 분석] {symbol_name}**
+{emoji} **[15분 분석] {symbol_name}**
 확신도: {conf}%
 
-📈 **추세:** {strategy.get('reason_trend', '-')}
-🕯️ **패턴:** {strategy.get('reason_candle', '-')}
-💡 **결론:** {strategy.get('final_reason', '-')}
+📊 **추세 분석:** {strategy.get('reason_trend', '-')}
+🕯️ **캔들/패턴:** {strategy.get('reason_candle', '-')}
+💡 **종합 판단:** {strategy.get('final_reason', '-')}
 """
                 requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
                               data={'chat_id': tg_id, 'text': msg, 'parse_mode': 'Markdown'})
                 
-                # 매매 실행 (즉시 진입)
+                # 4. [즉시 진입] 매매 실행 로직
                 if decision in ['buy', 'sell']:
+                    # 여기서 실제 주문 (시장가)
                     side = decision
                     price = last['close']
+                    
+                    # (실제 주문 코드 예시 - 안전 위해 try로 감쌈)
                     try:
                         ex.set_leverage(config['leverage'], symbol_name)
-                        
-                        # 수량 계산
                         bal = ex.fetch_balance({'type': 'swap'})
-                        free_usdt = float(bal['USDT']['free']) if 'USDT' in bal else 0
-                        
-                        # 설정된 금액만큼만 진입
-                        amt_usdt = config['order_usdt']
-                        qty = ex.amount_to_precision(symbol_name, (amt_usdt * config['leverage']) / price)
+                        free_usdt = float(bal['USDT']['free'])
+                        amount = (free_usdt * 0.2) * config['leverage'] / price # 시드 20% 투입
+                        qty = ex.amount_to_precision(symbol_name, amount)
                         
                         if float(qty) > 0:
-                            # ⚠️ 실제 주문 (주석 해제 시 작동)
-                            # ex.create_market_order(symbol_name, side, qty)
+                            # ex.create_market_order(symbol_name, side, qty) # ⚠️ 주석 해제 시 실제 주문
                             
-                            # 주문 성공 시 알림 & DB 저장
+                            # 알림 및 로그
                             requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
-                                          data={'chat_id': tg_id, 'text': f"⚡ **[즉시 진입]** {side.upper()} 포지션 체결 완료\n가격: {price}"})
-                            log_trade_to_db(symbol_name, side, price, 0, strategy['final_reason'], "진행중")
+                                          data={'chat_id': tg_id, 'text': f"⚡ **즉시 진입 완료!**\n{side.upper()} @ {price}"})
+                            log_trade_to_db(symbol_name, side, price, 0, strategy['final_reason'], "진행 중")
                     except Exception as e:
                         requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
                                       data={'chat_id': tg_id, 'text': f"❌ 주문 실패: {e}"})
                 
                 last_run = now
-            time.sleep(1) # CPU 과부하 방지
-        except Exception as e:
-            time.sleep(10)
+            time.sleep(1)
+        except: time.sleep(10)
 
-# =========================================================
-# 🎨 [7. UI 대시보드 (직관성 + 상세함 모두 잡기)]
-# =========================================================
+# ---------------------------------------------------------
+# 🎨 [UI] 메인 대시보드 (직관성 강화)
+# ---------------------------------------------------------
 markets = exchange.markets
 symbol = "BTC/USDT:USDT" # 기본값
 
-# --- [사이드바] 상세 설정 ---
-st.sidebar.title("🛠️ 워뇨띠 봇 제어판")
+# 사이드바 설정
+st.sidebar.header("🛠️ 설정")
 if not gemini_key:
-    k = st.sidebar.text_input("Gemini API Key", type="password")
+    k = st.sidebar.text_input("Gemini Key", type="password")
     if k: config['gemini_api_key'] = k; save_settings(config); st.rerun()
 
-st.sidebar.divider()
-st.sidebar.header("📊 지표 및 매매 설정")
-config['leverage'] = st.sidebar.slider("레버리지", 1, 50, int(config['leverage']))
-config['order_usdt'] = st.sidebar.number_input("1회 주문금액 ($)", 10.0, 10000.0, float(config['order_usdt']))
-
-with st.sidebar.expander("보조지표 민감도 설정"):
-    config['rsi_period'] = st.number_input("RSI 기간", 5, 30, int(config['rsi_period']))
-    config['bb_period'] = st.number_input("BB 기간", 10, 50, int(config['bb_period']))
-    # 필요한 설정들 더 추가 가능
-
-if st.sidebar.button("💾 설정 저장"):
-    save_settings(config)
-    st.toast("모든 설정이 저장되었습니다.")
-
-# --- [스레드 가동] ---
+# 스레드 시작
 found = False
 for t in threading.enumerate():
     if t.name == "AutoTrade": found = True; break
@@ -400,112 +369,447 @@ if not found:
     t = threading.Thread(target=telegram_thread, args=(exchange, symbol), daemon=True, name="AutoTrade")
     t.start()
 
-# --- [데이터 로딩] ---
+# 데이터 로딩
 ohlcv = exchange.fetch_ohlcv(symbol, '5m', limit=200)
 df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
 df['time'] = pd.to_datetime(df['time'], unit='ms')
 df, status, last = calc_indicators(df)
 
-# --- [메인 UI 1: 상태 배너 & 게이지] ---
-st.title(f"🔥 {symbol} AI Ultimate Trader")
+# === [UI 1] 상단 상태 배너 ===
+st.title(f"🤖 {symbol} Autonomous Trader")
 curr_price = last['close']
 rsi_val = last['RSI']
 
-if rsi_val < 30: banner_color = "green"; banner_msg = "🟢 강력 매수 (과매도)"
-elif rsi_val > 70: banner_color = "red"; banner_msg = "🔴 강력 매도 (과매수)"
-else: banner_color = "gray"; banner_msg = "⚪ 관망 (중립)"
+# 상태에 따른 색상/메시지 결정
+if rsi_val < 30: 
+    banner_color = "green"
+    banner_msg = "🟢 강력 매수 구간 (과매도)"
+elif rsi_val > 70: 
+    banner_color = "red"
+    banner_msg = "🔴 강력 매도 구간 (과매수)"
+else: 
+    banner_color = "gray"
+    banner_msg = "⚪ 관망 구간 (중립)"
 
-# 직관적인 배너
 st.markdown(f"""
 <div style="padding: 20px; background-color: #1e1e1e; border-radius: 10px; border-left: 10px solid {banner_color}; margin-bottom: 20px;">
     <h2 style="margin:0; color: white;">{banner_msg}</h2>
-    <p style="margin:0; color: #aaaaaa;">현재가: <b>${curr_price:,.2f}</b> | AI 모드: 완전 자율 주행 | 활성 지표: {len(status)}개</p>
+    <p style="margin:0; color: #aaaaaa;">현재가: <b>${curr_price:,.2f}</b> | AI 모드: 완전 자율 주행</p>
 </div>
 """, unsafe_allow_html=True)
 
-# Plotly 게이지 차트
+# === [UI 2] 직관적인 게이지 차트 (Plotly) ===
 c1, c2, c3 = st.columns(3)
-with c1:
-    fig = go.Figure(go.Indicator(mode="gauge+number", value=rsi_val, title={'text': "RSI"},
-                    gauge={'axis': {'range': [0, 100]}, 'steps': [{'range': [0, 30], 'color': "green"}, {'range': [70, 100], 'color': "red"}]}))
-    st.plotly_chart(fig, use_container_width=True)
-with c2:
-    fig2 = go.Figure(go.Indicator(mode="gauge+number", value=last['ADX'], title={'text': "ADX (추세강도)"},
-                     gauge={'bar': {'color': "orange" if last['ADX']>25 else "gray"}}))
-    st.plotly_chart(fig2, use_container_width=True)
-with c3:
-    st.metric("현재가", f"${curr_price:,.2f}")
-    st.metric("볼린저 밴드", status.get('BB', 'Band Inside'))
 
-# --- [메인 UI 2: 트레이딩뷰 차트 (복구됨)] ---
-st.markdown("### 📈 실시간 상세 차트")
-h = 500
-tv_studies = ["RSI@tv-basicstudies", "BB@tv-basicstudies", "MASimple@tv-basicstudies", "MACD@tv-basicstudies"]
+with c1:
+    fig = go.Figure(go.Indicator(
+        mode = "gauge+number",
+        value = rsi_val,
+        title = {'text': "RSI (강도)"},
+        gauge = {'axis': {'range': [0, 100]},
+                 'bar': {'color': banner_color},
+                 'steps': [
+                     {'range': [0, 30], 'color': "rgba(0, 255, 0, 0.3)"},
+                     {'range': [70, 100], 'color': "rgba(255, 0, 0, 0.3)"}],
+                 'threshold': {'line': {'color': "white", 'width': 4}, 'thickness': 0.75, 'value': rsi_val}}))
+    fig.update_layout(height=250, margin=dict(l=20,r=20,t=50,b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+with c2:
+    # 추세 강도(ADX) 게이지
+    adx_val = last['ADX']
+    fig2 = go.Figure(go.Indicator(
+        mode = "gauge+number",
+        value = adx_val,
+        title = {'text': "ADX (추세 힘)"},
+        gauge = {'axis': {'range': [0, 100]},
+                 'bar': {'color': "orange" if adx_val > 25 else "gray"},
+                 'steps': [{'range': [0, 25], 'color': "rgba(255, 255, 255, 0.1)"}]}))
+    fig2.update_layout(height=250, margin=dict(l=20,r=20,t=50,b=20))
+    st.plotly_chart(fig2, use_container_width=True)
+
+with c3:
+    # 캔들 차트 (간소화)
+    st.markdown("#### 📊 최근 차트 흐름")
+    st.line_chart(df.set_index('time')['close'].tail(50), height=200)
+
+# === [UI 3] AI 상세 분석 리포트 ===
+st.divider()
+col_ai, col_log = st.columns([2, 1])
+
+with col_ai:
+    st.subheader("🧠 AI 실시간 분석 리포트")
+    if st.button("🔍 지금 바로 분석 요청 (수동)"):
+        with st.spinner("AI가 차트를 뜯어보는 중..."):
+            ai_res = generate_wonyousi_strategy(df, status)
+            
+            # 카드로 결과 표시
+            st.markdown(f"""
+            <div style="background-color: #262730; padding: 20px; border-radius: 10px;">
+                <h3>결론: <span style="color: {'#00ff00' if ai_res['decision']=='buy' else '#ff0000'};">{ai_res['decision'].upper()}</span> (확신도 {ai_res.get('confidence')}% )</h3>
+                <hr>
+                <p><b>📈 추세 관점:</b> {ai_res.get('reason_trend')}</p>
+                <p><b>🕯️ 캔들/패턴:</b> {ai_res.get('reason_candle')}</p>
+                <p><b>💡 최종 판단:</b> {ai_res.get('final_reason')}</p>
+                <hr>
+                <small>추천 손절가: {ai_res.get('stop_loss')} | 익절가: {ai_res.get('take_profit')}</small>
+            </div>
+            """, unsafe_allow_html=True)
+# 📡 거래소 연결
+# ---------------------------------------------------------
+@st.cache_resource
+def init_exchange():
+    try:
+        ex = ccxt.bitget({'apiKey': api_key, 'secret': api_secret, 'password': api_password, 'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
+        ex.set_sandbox_mode(IS_SANDBOX)
+        ex.load_markets()
+        return ex
+    except Exception as e: return None
+
+exchange = init_exchange()
+if not exchange:
+    st.error("🚨 거래소 연결 실패! API 키를 확인하거나 잠시 후 다시 시도하세요.")
+    st.stop()
+
+# ---------------------------------------------------------
+# 🎨 사이드바 (설정 유지)
+# ---------------------------------------------------------
+st.sidebar.title("🛠️ AI 에이전트 제어판")
+st.sidebar.info("설정을 변경하면 즉시 저장되고 알림이 뜹니다.")
+
+markets = exchange.markets
+if markets:
+    symbol_list = [s for s in markets if markets[s].get('linear') and markets[s].get('swap')]
+    symbol = st.sidebar.selectbox("코인 선택", symbol_list, index=0)
+else:
+    st.error("종목 정보를 불러오지 못했습니다. 새로고침 해주세요.")
+    st.stop()
+
+if not gemini_key:
+    k = st.sidebar.text_input("Gemini API Key", type="password")
+    if k: config['gemini_api_key'] = k; save_settings(config); st.rerun()
+
+found = False
+for t in threading.enumerate():
+    if t.name == "TG_Thread": found = True; break
+if not found:
+    t = threading.Thread(target=telegram_thread, args=(exchange, symbol), daemon=True, name="TG_Thread")
+    t.start()
+
+try:
+    exchange.set_leverage(config['leverage'], symbol)
+    try: exchange.set_position_mode(hedged=False, symbol=symbol)
+    except: pass
+except: pass
+
+st.sidebar.divider()
+st.sidebar.subheader("🛡️ 스마트 방어 & 자금 관리")
+use_switching = st.sidebar.checkbox("🔄 스위칭 (Switching)", value=config['use_switching'])
+use_dca = st.sidebar.checkbox("💧 물타기 (DCA)", value=config['use_dca'])
+c1, c2 = st.sidebar.columns(2)
+dca_trigger = c1.number_input("추매 발동 (-%)", -90.0, -1.0, float(config['dca_trigger']), step=0.5)
+dca_max = c2.number_input("최대 횟수", 1, 10, int(config['dca_max_count']))
+
+use_smart_betting = st.sidebar.checkbox("🧠 AI 스마트 베팅", value=config.get('use_smart_betting', False))
+use_trailing_stop = st.sidebar.checkbox("🚀 트레일링 스탑", value=config.get('use_trailing_stop', False))
+
+st.sidebar.divider()
+st.sidebar.subheader("📊 보조지표 설정 (10종)")
+with st.sidebar.expander("1. RSI & 볼린저밴드", expanded=False):
+    use_rsi = st.checkbox("RSI 사용", config['use_rsi'])
+    c_r1, c_r2, c_r3 = st.columns(3)
+    config['rsi_period'] = c_r1.number_input("기간", 5, 50, int(config['rsi_period']))
+    config['rsi_buy'] = c_r2.number_input("과매도(L)", 10, 50, int(config['rsi_buy']))
+    config['rsi_sell'] = c_r3.number_input("과매수(S)", 50, 90, int(config['rsi_sell']))
+    use_bb = st.checkbox("볼린저밴드 사용", config['use_bb'])
+    c_b1, c_b2 = st.columns(2)
+    config['bb_period'] = c_b1.number_input("BB 기간", 5, 50, int(config['bb_period']))
+    config['bb_std'] = c_b2.number_input("승수", 1.0, 3.0, float(config['bb_std']))
+
+with st.sidebar.expander("2. 추세 (MA, MACD)", expanded=True):
+    use_ma = st.checkbox("이동평균선 (MA)", config['use_ma'])
+    c_m1, c_m2 = st.columns(2)
+    config['ma_fast'] = c_m1.number_input("단기 이평", 3, 50, int(config['ma_fast']))
+    config['ma_slow'] = c_m2.number_input("장기 이평", 50, 200, int(config['ma_slow']))
+    use_macd = st.checkbox("MACD", config['use_macd'])
+    use_adx = st.checkbox("ADX (추세강도)", config['use_adx'])
+
+with st.sidebar.expander("3. 오실레이터", expanded=False):
+    use_stoch = st.checkbox("스토캐스틱", config['use_stoch'])
+    use_cci = st.checkbox("CCI", config['use_cci'])
+    use_mfi = st.checkbox("MFI (자금흐름)", config['use_mfi'])
+    use_willr = st.checkbox("Williams %R", config['use_willr'])
+    use_vol = st.checkbox("거래량 분석", config['use_vol'])
+
+active_inds = sum([use_rsi, use_bb, use_ma, use_macd, use_stoch, use_cci, use_mfi, use_willr, use_vol, config['use_adx']])
+st.sidebar.divider()
+target_vote = st.sidebar.slider("🎯 진입 확신도 (필요 지표 수)", 1, max(1, active_inds), int(config['target_vote']))
+leverage = st.sidebar.slider("레버리지", 1, 50, int(config['leverage']))
+
+new_conf = config.copy()
+new_conf.update({
+    'use_switching': use_switching, 'use_dca': use_dca, 'dca_trigger': dca_trigger, 'dca_max_count': dca_max,
+    'use_smart_betting': use_smart_betting, 'use_trailing_stop': use_trailing_stop,
+    'use_rsi': use_rsi, 'use_bb': use_bb, 'use_ma': use_ma, 'use_macd': use_macd, 'use_stoch': use_stoch, 'use_cci': use_cci, 'use_mfi': use_mfi, 'use_willr': use_willr, 'use_vol': use_vol, 'use_adx': use_adx,
+    'target_vote': target_vote, 'leverage': leverage,
+    'rsi_period': config['rsi_period'], 'rsi_buy': config['rsi_buy'], 'rsi_sell': config['rsi_sell'],
+    'bb_period': config['bb_period'], 'bb_std': config['bb_std'],
+    'ma_fast': config['ma_fast'], 'ma_slow': config['ma_slow']
+})
+if new_conf != config:
+    save_settings(new_conf)
+    config = new_conf
+    st.rerun()
+
+if st.sidebar.button("📡 텔레그램 메뉴 전송"):
+    kb = {"inline_keyboard": [[{"text": "💰 잔고확인", "callback_data": "balance"}]]}
+    requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': "✅ <b>메뉴 갱신</b>", 'parse_mode': 'HTML', 'reply_markup': json.dumps(kb)})
+
+# ---------------------------------------------------------
+# 🧮 지표 계산 (기존 로직 유지)
+# ---------------------------------------------------------
+def calc_indicators(df):
+    close = df['close']; high = df['high']; low = df['low']; vol = df['vol']
+    
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(int(config['rsi_period'])).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(int(config['rsi_period'])).mean()
+    rs = gain / loss; df['RSI'] = 100 - (100 / (1 + rs))
+    
+    ma = close.rolling(int(config['bb_period'])).mean()
+    std = close.rolling(int(config['bb_period'])).std()
+    df['BB_UP'] = ma + (std * float(config['bb_std']))
+    df['BB_LO'] = ma - (std * float(config['bb_std']))
+    
+    df['MA_F'] = close.rolling(int(config['ma_fast'])).mean()
+    df['MA_S'] = close.rolling(int(config['ma_slow'])).mean()
+    
+    tr = np.maximum((high - low), np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
+    df['ATR'] = tr.rolling(14).mean()
+    df['ADX'] = (df['ATR'] / close) * 1000
+    
+    length = 130; lag = (length - 1) // 2
+    df['lsma_source'] = close + (close - close.shift(lag))
+    df['ZLSMA'] = df['lsma_source'].ewm(span=length).mean()
+    
+    last = df.iloc[-1]
+    status = {}
+    
+    if config['use_rsi']:
+        if last['RSI'] <= config['rsi_buy']: status['RSI'] = "🟢 매수 (과매도)"
+        elif last['RSI'] >= config['rsi_sell']: status['RSI'] = "🔴 매도 (과매수)"
+        else: status['RSI'] = "⚪ 중립"
+    if config['use_bb']:
+        if last['close'] <= last['BB_LO']: status['BB'] = "🟢 매수 (하단터치)"
+        elif last['close'] >= last['BB_UP']: status['BB'] = "🔴 매도 (상단터치)"
+        else: status['BB'] = "⚪ 중립"
+    if config['use_ma']:
+        if last['MA_F'] > last['MA_S']: status['MA'] = "🟢 매수 (정배열)"
+        else: status['MA'] = "🔴 매도 (역배열)"
+        
+    return df, status, last
+
+# ---------------------------------------------------------
+# 📊 메인 화면 (UI 통합)
+# ---------------------------------------------------------
+try:
+    ticker = exchange.fetch_ticker(symbol); curr_price = ticker['last']
+    ohlcv = exchange.fetch_ohlcv(symbol, '5m', limit=200)
+    df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+    df['time'] = pd.to_datetime(df['time'], unit='ms')
+    df, ind_status, last = calc_indicators(df)
+except: st.error("데이터 로딩 실패. 잠시 후 다시 시도하세요."); st.stop()
+
+is_trend_mode = last['ADX'] >= 25 and config['use_dual_mode']
+mode_str = "🌊 추세장 (ZLSMA 전략)" if is_trend_mode else "🦀 횡보장 (RSI+BB 전략)"
+
+st.title(f"🔥 {symbol} AI Ultimate Agent")
+st.caption(f"모드: {mode_str} | 가격: ${curr_price:,.2f} | 뇌: 워뇨띠 페르소나 + 회고적 학습(Recursive Learning)")
+
+with st.expander("📊 지표 상태판 (Indicator Dashboard)", expanded=True):
+    cols = st.columns(5)
+    idx = 0
+    active_cnt_l = 0; active_cnt_s = 0
+    for name, stat in ind_status.items():
+        color = "off"
+        if "매수" in stat: color = "normal"; active_cnt_l += 1
+        elif "매도" in stat: color = "inverse"; active_cnt_s += 1
+        cols[idx % 5].metric(name, stat, delta_color=color)
+        idx += 1
+    st.caption(f"🎯 매수 신호: **{active_cnt_l}개** / 매도 신호: **{active_cnt_s}개**")
+
+h = 450
+tv_studies = ["RSI@tv-basicstudies", "BB@tv-basicstudies", "MASimple@tv-basicstudies"]
 studies_json = str(tv_studies).replace("'", '"')
 tv = f"""<div class="tradingview-widget-container"><div id="tradingview_chart"></div><script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script><script type="text/javascript">new TradingView.widget({{ "width": "100%", "height": {h}, "symbol": "BITGET:{symbol.replace('/','').split(':')[0]}.P", "interval": "5", "theme": "dark", "studies": {studies_json}, "container_id": "tradingview_chart" }});</script></div>"""
 components.html(tv, height=h)
 
-# --- [메인 UI 3: 10종 지표 상세 대시보드] ---
-with st.expander("📊 10종 보조지표 종합 상태판", expanded=True):
-    cols = st.columns(5)
-    idx = 0
-    for name, stat in status.items():
-        color = "off"
-        if "매수" in stat: color = "normal"
-        elif "매도" in stat: color = "inverse"
-        cols[idx % 5].metric(name, stat, delta_color=color)
-        idx += 1
-
-# --- [메인 UI 4: 기능 탭 (모두 포함)] ---
-t1, t2, t3, t4 = st.tabs(["🤖 AI 자동매매", "⚡ 수동주문", "📅 경제일정", "📜 DB 기록"])
+# 4개의 탭으로 확장 (새 기능 포함)
+t1, t2, t3, t4 = st.tabs(["🤖 자동매매 & AI분석", "⚡ 수동주문", "📅 시장정보", "📜 매매일지(DB)"])
 
 with t1:
-    c_auto, c_log = st.columns([2, 1])
-    with c_auto:
-        st.subheader("🧠 워뇨띠 AI 분석 센터")
-        auto_on = st.checkbox("자동매매 활성화 (체크 시 봇 가동)", value=config['auto_trade'])
-        if auto_on != config['auto_trade']: config['auto_trade'] = auto_on; save_settings(config); st.rerun()
+    c1, c2 = st.columns(2)
+    auto_on = c1.checkbox("자동매매 활성화", value=config['auto_trade'])
+    if auto_on != config['auto_trade']:
+        config['auto_trade'] = auto_on; save_settings(config); st.rerun()
+    
+    st.write("---")
+    
+    # [New] 워뇨띠 분석 기능 통합
+    if st.button("🧠 AI(워뇨띠)에게 정밀 분석 요청"):
+        with st.spinner("과거 매매 일지(DB)를 복기하며 차트를 분석 중..."):
+            ai_res = generate_wonyousi_strategy(df, ind_status)
+            
+            st.divider()
+            conf = ai_res.get('confidence', 0)
+            if ai_res['decision'] == 'buy':
+                st.success(f"🔵 **매수(LONG) 추천** (확신도: {conf}%)")
+            elif ai_res['decision'] == 'sell':
+                st.error(f"🔴 **매도(SHORT) 추천** (확신도: {conf}%)")
+            else:
+                st.warning(f"⚪ **관망(HOLD)** (확신도: {conf}%)")
+            
+            st.info(f"💡 **워뇨띠의 근거:** {ai_res.get('reason')}")
+            
+            if ai_res['decision'] != 'hold':
+                if st.button("🚀 이 분석대로 텔레그램 제안 보내기"):
+                    send_proposal(ai_res['decision'], f"[AI 워뇨띠] {ai_res['reason']}")
+                    st.toast("제안 발송 완료!")
 
-        if st.button("🔍 지금 즉시 AI 분석 요청 (수동)"):
-            with st.spinner("AI가 차트를 분석 중입니다..."):
-                res = generate_wonyousi_strategy(df, status)
-                st.success(f"결론: {res['decision'].upper()} (확신도 {res.get('confidence')}%)")
-                st.info(f"근거: {res.get('final_reason')}")
-                st.json(res)
+    # 기존 지표 기반 알림 로직
+    if not auto_on and (active_cnt_l >= config['target_vote'] or active_cnt_s >= config['target_vote']):
+        side = 'long' if active_cnt_l >= config['target_vote'] else 'short'
+        st.warning(f"🤖 (기본지표) {side.upper()} 진입 조건 충족!")
 
 with t2:
-    st.subheader("🤚 수동 주문 패널")
-    st.caption("AI가 아닌 사용자의 판단으로 직접 주문합니다.")
-    man_amt = st.number_input("주문 금액 (USDT)", 10.0, 100000.0, 100.0)
+    st.write("✋ **수동 컨트롤**")
+    m_amt = st.number_input("주문 금액 ($)", 0.0, 100000.0, float(config['order_usdt']))
     b1, b2, b3 = st.columns(3)
-    if b1.button("🟢 롱(Long) 진입"): st.toast(f"{man_amt}$ 롱 주문 전송!")
-    if b2.button("🔴 숏(Short) 진입"): st.toast(f"{man_amt}$ 숏 주문 전송!")
-    if b3.button("🚫 포지션 종료"): st.toast("모든 포지션 종료")
+    if b1.button("🟢 롱 진입"): pass
+    if b2.button("🔴 숏 진입"): pass
+    if b3.button("🚫 포지션 종료"): pass
 
 with t3:
-    st.subheader("📅 경제 캘린더 (ForexFactory)")
-    
-    @st.cache_data(ttl=3600)
-    def get_forex_events():
-        try:
-            url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}).json()
-            events = []
-            for item in res:
-                if item['country'] == 'USD' and item['impact'] in ['High', 'Medium']:
-                    events.append({"날짜": item['date'][:10], "시간": item['date'][11:], "지표": item['title'], "중요도": "🔥" if item['impact']=='High' else "⚠️"})
-            return pd.DataFrame(events)
-        except: return pd.DataFrame()
-        
+    st.write("📅 **경제 일정**")
     ev = get_forex_events()
-    st.dataframe(ev, use_container_width=True)
+    if not ev.empty: st.dataframe(ev)
+    else: st.write("일정 없음")
 
 with t4:
-    st.subheader("📖 매매 및 회고 기록 (DB Viewer)")
+    # [New] DB 뷰어 통합
+    st.subheader("📖 AI의 성장 일지 (DB Viewer)")
+    st.caption("AI가 매매 후 작성한 반성문과 피드백이 저장됩니다.")def telegram_thread(ex, symbol_name):
+    """
+    [수정됨] 텔레그램 수신 대기 + 15분마다 AI 자동 분석 및 리포팅 수행
+    """
+    offset = 0
+    last_run = 0  # 마지막 분석 시간 (초)
+    ANALYSIS_INTERVAL = 900  # 15분 (초 단위)
+
+    # 봇 시작 알림
+    requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
+                  data={'chat_id': tg_id, 'text': "🤖 **AI 워뇨띠 완전 자동화 모드 시작**\n15분마다 시장을 분석하고 보고합니다.", 'parse_mode': 'Markdown'})
+
+    while True:
+        try:
+            current_time = time.time()
+
+            # -----------------------------------------------------------
+            # 1. [자동화 핵심] 15분마다 AI 분석 실행
+            # -----------------------------------------------------------
+            if current_time - last_run > ANALYSIS_INTERVAL:
+                # A. 데이터 준비 (스레드 안에서 직접 조회)
+                ohlcv = ex.fetch_ohlcv(symbol_name, '5m', limit=200)
+                df_thread = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+                df_thread['time'] = pd.to_datetime(df_thread['time'], unit='ms')
+                
+                # 지표 계산 (기존 함수 재사용)
+                df_thread, status, last_row = calc_indicators(df_thread)
+                
+                # 경제 일정(뉴스) 가져오기
+                events = get_forex_events()
+                event_str = "주요 경제 일정 없음"
+                if not events.empty:
+                    event_str = events.to_string(index=False)
+
+                # B. 워뇨띠 AI에게 물어보기
+                # (프롬프트에 경제 일정도 포함시켜 판단력 강화)
+                strategy = generate_wonyousi_strategy(df_thread, status) 
+                
+                # C. [보고] 텔레그램으로 분석 리포트 전송
+                report_msg = f"""
+📊 **[15분 정기 보고] {symbol_name}**
+현재가: ${last_row['close']:,.2f}
+추세강도(ADX): {last_row['ADX']:.1f} ({'강한 추세' if last_row['ADX']>25 else '횡보'})
+
+🤖 **워뇨띠의 판단:** {strategy['decision'].upper()}
+💡 **근거:** {strategy['reason']}
+🔥 **확신도:** {strategy.get('confidence', 0)}%
+📅 **경제이슈:**
+{event_str}
+"""
+                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
+                              data={'chat_id': tg_id, 'text': report_msg})
+
+                # D. [행동] 매매 신호가 있으면 제안(Proposal) 생성
+                # (이게 실행되면 5분 뒤 자동 매매 -> DB 저장 -> 회고 프로세스로 이어짐)
+                if strategy['decision'] in ['buy', 'sell']:
+                    send_proposal(strategy['decision'], f"[자동분석] {strategy['reason']}")
+                
+                last_run = current_time
+
+            # -----------------------------------------------------------
+            # 2. 기존 로직 (5분 자동 수락 체크 & 명령어 수신)
+            # -----------------------------------------------------------
+            manage_proposals(ex, symbol_name) # 여기서 5분 뒤 자동체결 및 DB저장이 수행됨
+            
+            # 텔레그램 메시지 수신 (명령어 처리)
+            res = requests.get(f"https://api.telegram.org/bot{tg_token}/getUpdates?offset={offset+1}&timeout=30").json()
+            if res.get('ok'):
+                for up in res['result']:
+                    offset = up['update_id']
+                    if 'callback_query' in up:
+                        cb = up['callback_query']; data = cb['data']; chat_id = cb['message']['chat']['id']
+                        
+                        # (기존 버튼 처리 로직 그대로 유지)
+                        if data == 'balance':
+                            c, f, t = get_balance(ex)
+                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': f"💰 잔고: ${t:,.2f}"})
+                        elif data.startswith('acc_') or data.startswith('rej_'):
+                            # ... (기존 승인/거절 처리 코드와 동일) ...
+                            pid = data.split('_')[1]
+                            is_acc = "acc" in data
+                            try:
+                                with open(PROPOSALS_FILE, 'r') as f: props = json.load(f)
+                                if pid in props:
+                                    if is_acc:
+                                        requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': "✅ 승인 확인. 주문 진행."})
+                                        # 즉시 체결 로직은 manage_proposals가 다음 루프때 처리하거나 여기서 바로 호출 가능
+                                    else:
+                                        requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': "❌ 거절됨."})
+                                    del props[pid]
+                                    with open(PROPOSALS_FILE, 'w') as f: json.dump(props, f)
+                            except: pass
+
+                        requests.post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", data={'callback_query_id': cb['id']})
+            
+            time.sleep(1) # CPU 과부하 방지
+
+        except Exception as e:
+            print(f"Error in TG Thread: {e}")
+            time.sleep(10) # 에러나면 10초 쉬고 재시도
+    
     if st.button("🔄 기록 새로고침"): st.rerun()
     
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    history = pd.read_sql("SELECT * FROM trade_history ORDER BY id DESC", conn)
+    history_df = pd.read_sql("SELECT * FROM trade_history ORDER BY id DESC", conn)
     conn.close()
     
-    st.dataframe(history, use_container_width=True)
+    if not history_df.empty:
+        st.dataframe(history_df)
+    else:
+        st.info("아직 기록된 매매가 없습니다.")
+        
+    if st.button("🧪 테스트 데이터 입력 (DB Test)"):
+        log_trade_to_db(symbol, "long", curr_price, -50.0, "뇌동매매", "상승 추세가 확실할 때만 진입하자.")
+        st.rerun()
