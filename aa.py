@@ -11,7 +11,7 @@ import json
 import uuid
 import sqlite3  # [New] DB 기능 추가
 from datetime import datetime, timedelta
-import google.generativeai as genai
+from openai import OpenAI
 
 # =========================================================
 # ⚙️ [시스템 기본 설정]
@@ -80,7 +80,7 @@ def log_trade_to_db(symbol, side, price, pnl, reason, ai_feedback):
 def load_settings():
     """사용자의 모든 설정을 파일에서 불러옵니다."""
     default = {
-        "gemini_api_key": "",
+        "openai_key": "",
         "leverage": 20, "target_vote": 2, "tp": 15.0, "sl": 10.0,
         "auto_trade": False, "order_usdt": 100.0,
         
@@ -130,7 +130,7 @@ api_secret = st.secrets.get("API_SECRET")
 api_password = st.secrets.get("API_PASSWORD")
 tg_token = st.secrets.get("TG_TOKEN")
 tg_id = st.secrets.get("TG_CHAT_ID")
-gemini_key = st.secrets.get("GEMINI_API_KEY", config.get("gemini_api_key", ""))
+openai_key = st.secrets.get("OPENAI_API_KEY", "")
 
 if not api_key: 
     st.error("🚨 비트겟 API 키가 Secrets에 설정되지 않았습니다. 설정을 확인해주세요.")
@@ -139,75 +139,67 @@ if not api_key:
 @st.cache_resource
 def get_ai_model(key):
     """AI 모델 자동 감지 및 연결 (404 오류 방지)"""
-    if not key: return None
-    genai.configure(api_key=key)
-    try:
-        # 사용 가능한 모델 목록 조회
-        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        
-        # 1순위: Flash (빠름), 2순위: Pro (안정적), 3순위: 기본
-        target_model = 'gemini-pro' 
-        for m in models:
-            if 'flash' in m: target_model = m; break
-        
-        return genai.GenerativeModel(target_model)
-    except: 
-        # 목록 조회 실패 시 기본 모델 강제 지정
-        return genai.GenerativeModel('gemini-pro')
-
-ai_model = get_ai_model(gemini_key)
+    if not openai_key:
+    st.error("🚨 OpenAI API Key가 없습니다. Secrets에 설정해주세요.")
+    st.stop()
+    
+client = OpenAI(api_key=openai_key)
 
 def generate_wonyousi_strategy(df, status_summary):
-    """[New] 워뇨띠 페르소나 + 회고적 학습 전략 생성 (429 에러 방어 포함)"""
-    if not ai_model: return {"decision": "hold", "reason": "API Key 없음", "confidence": 0}
+    """OpenAI GPT-4o를 이용한 정밀 분석"""
     
-    past_mistakes = get_past_mistakes()
+    # 1. 차트 데이터 정리
     last_row = df.iloc[-1]
+    past_mistakes = get_past_mistakes() # 기존 함수 활용
     
-    prompt = f"""
-    너는 전설적인 트레이더 '워뇨띠'다. 
-    보조지표 숫자보다는 '시장 심리', '캔들 패턴', '추세'를 중시한다.
+    # 2. 질문지(Prompt) 작성
+    system_msg = """
+    당신은 전설적인 코인 트레이더 '워뇨띠'입니다.
+    - 보조지표 수치보다 '시장 심리', '캔들 패턴', '추세'를 최우선으로 봅니다.
+    - 확실한 자리가 아니면 과감하게 '관망(hold)'을 외칩니다.
+    - 응답은 오직 JSON 형식으로만 해야 합니다.
+    """
     
-    [현재 시장 상황]
-    - 가격: {last_row['close']}
+    user_msg = f"""
+    [현재 시장 데이터]
+    - 현재가: {last_row['close']}
     - RSI: {last_row['RSI']:.1f}
     - 볼린저밴드 상태: {status_summary.get('BB', 'Normal')}
     - 추세강도(ADX): {last_row['ADX']:.1f}
     
-    [너의 과거 실패 기록 (일기장 - 이 실수는 반복 금지)]
+    [과거의 실패 기록 (반면교사)]
     {past_mistakes}
     
-    위 데이터를 바탕으로 지금 매매해야 할지 판단해라.
-    JSON 형식으로만 답해라.
+    위 데이터를 분석하여 매매 전략을 세우세요.
     
-    형식:
+    # 필수 응답 형식 (JSON):
     {{
         "decision": "buy" 또는 "sell" 또는 "hold",
-        "reason": "워뇨띠 스타일의 한 줄 근거",
-        "confidence": 0~100 사이의 숫자
+        "reason_trend": "추세 관점 분석",
+        "reason_candle": "캔들/거래량 패턴 분석",
+        "final_reason": "한 줄 핵심 요약",
+        "confidence": 0~100 (확신도 숫자)
     }}
     """
     
-    # 🛡️ [핵심 수정] 429 에러 발생 시 재시도 로직
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            res = ai_model.generate_content(prompt).text
-            res = res.replace("```json", "").replace("```", "").strip()
-            return json.loads(res)
-        except Exception as e:
-            # 429 에러(사용량 초과)가 발생하면
-            if "429" in str(e):
-                print(f"⚠️ API 한도 초과! {60}초 대기 후 재시도... ({attempt+1}/{max_retries})")
-                time.sleep(60) # 1분 대기 (무료 티어 제한 풀릴 때까지)
-                continue
-            else:
-                # 다른 에러면 그냥 종료
-                return {"decision": "hold", "reason": f"AI 분석 오류: {e}", "confidence": 0}
+    try:
+        # 3. GPT-4o에게 질문 (JSON 모드 사용)
+        response = client.chat.completions.create(
+            model="gpt-4o",  # 가장 똑똑한 모델
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg}
+            ],
+            response_format={"type": "json_object"}, # JSON 강제 출력 (오류 방지)
+            temperature=0.5
+        )
+        
+        # 4. 답변 해석
+        result_text = response.choices[0].message.content
+        return json.loads(result_text)
 
-    # 재시도해도 안 되면 휴식 선언
-    return {"decision": "hold", "reason": "API 한도 초과로 잠시 휴식 중입니다.", "confidence": 0}
-# ---------------------------------------------------------
+    except Exception as e:
+        return {"decision": "hold", "reason": f"OpenAI 오류: {e}", "confidence": 0}# ---------------------------------------------------------
 # 📅 데이터 수집 (ForexFactory + CCXT)
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600)
