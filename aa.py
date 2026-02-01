@@ -133,12 +133,7 @@ tg_id = st.secrets.get("TG_CHAT_ID")
 openai_key = st.secrets.get("OPENAI_API_KEY", "")
 
 @st.cache_resource
-def get_ai_model(key):
-    """AI 모델 자동 감지 및 연결 (404 오류 방지)"""
-    if not openai_key:
-    st.error("🚨 OpenAI API Key가 없습니다. Secrets에 설정해주세요.")
-    st.stop()
-    
+ 
 client = OpenAI(api_key=openai_key)
 
 def generate_wonyousi_strategy(df, status_summary):
