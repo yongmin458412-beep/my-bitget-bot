@@ -420,10 +420,13 @@ else:
     st.error("종목 정보를 불러오지 못했습니다. 새로고침 해주세요.")
     st.stop()
 
-if not gemini_key:
-    k = st.sidebar.text_input("Gemini API Key", type="password")
-    if k: config['gemini_api_key'] = k; save_settings(config); st.rerun()
-
+if not openai_key:
+    k = st.sidebar.text_input("OpenAI API Key 입력", type="password")
+    if k: 
+        config['openai_api_key'] = k
+        save_settings(config)
+        st.rerun()
+        
 found = False
 for t in threading.enumerate():
     if t.name == "TG_Thread": found = True; break
