@@ -132,10 +132,6 @@ tg_token = st.secrets.get("TG_TOKEN")
 tg_id = st.secrets.get("TG_CHAT_ID")
 openai_key = st.secrets.get("OPENAI_API_KEY", "")
 
-if not api_key: 
-    st.error("🚨 비트겟 API 키가 Secrets에 설정되지 않았습니다. 설정을 확인해주세요.")
-    st.stop()
-
 @st.cache_resource
 def get_ai_model(key):
     """AI 모델 자동 감지 및 연결 (404 오류 방지)"""
