@@ -662,9 +662,13 @@ c1, c2, c3 = st.columns(3)
 with c1:
     fig = go.Figure(go.Indicator(
         mode = "gauge+number", value = rsi_val, title = {'text': "RSI (강도)"},
-        gauge = {'axis': {'range': [0, 100]}, 'bar': {'color': banner_color},
-                 'steps': [{'range': [0, 30], 'color': "rgba(0, 255, 0, 0.3)"}, {'range': [70, 100], 'color': "rgba(255, 0, 0, 0.3)"}]},
-        threshold = {'line': {'color': "white", 'width': 4}, 'thickness': 0.75, 'value': rsi_val}))
+        gauge = {
+            'axis': {'range': [0, 100]}, 
+            'bar': {'color': banner_color},
+            'steps': [{'range': [0, 30], 'color': "rgba(0, 255, 0, 0.3)"}, {'range': [70, 100], 'color': "rgba(255, 0, 0, 0.3)"}],
+            'threshold': {'line': {'color': "white", 'width': 4}, 'thickness': 0.75, 'value': rsi_val}
+        }
+    ))
     fig.update_layout(height=250, margin=dict(l=20,r=20,t=50,b=20))
     st.plotly_chart(fig, use_container_width=True)
 
