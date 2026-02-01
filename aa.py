@@ -145,7 +145,7 @@ if not openai_key:
     st.stop()
 else:
     # 여기서 SyntaxError가 났던 부분입니다. 깔끔하게 다시 작성됨.
-    client = OpenAI(api_key=openai_key)
+    openai_client = OpenAI(api_key=openai_key)
 
 def generate_wonyousi_strategy(df, status_summary):
     """OpenAI GPT-4o를 이용한 정밀 분석"""
@@ -602,6 +602,14 @@ def calc_indicators(df):
     if config.get('use_adx', True):
         status['ADX'] = "📈 강한추세" if last['ADX'] > 25 else "🦀 횡보장"
 
+    # [지표 상태판 코드 근처에 추가]
+    with st.expander("📊 지표 상태판 (Indicator Dashboard)", expanded=True):
+    # ... (기존 for문 코드 생략) ...
+    
+    # 👇 [추가] 색상 설명 (범례)
+        st.caption("💡 **범례:** 🟢 매수신호(Buy) | 🔴 매도신호(Sell) | ⚪ 중립(Neutral)")
+        st.caption(f"🎯 매수 신호: **{active_cnt_l}개** / 매도 신호: **{active_cnt_s}개**")
+
     return df, status, last
 # ---------------------------------------------------------
 # 📊 메인 화면 (UI 통합)
@@ -652,7 +660,7 @@ with t1:
     # [New] 워뇨띠 분석 기능 통합
     if st.button("🧠 AI(워뇨띠)에게 정밀 분석 요청"):
         with st.spinner("과거 매매 일지(DB)를 복기하며 차트를 분석 중..."):
-            ai_res = generate_wonyousi_strategy(df, ind_status)
+            ai_res = generate_wonyousi_strategy(df, status)
             
             st.divider()
             conf = ai_res.get('confidence', 0)
