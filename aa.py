@@ -437,6 +437,7 @@ for t in threading.enumerate():
     if t.name == "TG_Thread": found = True; break
 if not found:
     t = threading.Thread(target=telegram_thread, args=(exchange, symbol), daemon=True, name="TG_Thread")
+    add_script_run_ctx(t) # 👈 [핵심] 이 줄을 추가하면 경고가 사라집니다!
     t.start()
 
 try:
