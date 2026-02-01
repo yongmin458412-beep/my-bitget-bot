@@ -670,18 +670,31 @@ st.caption(f"모드: {mode_str} | 현재가: ${curr_price:,.2f}")
     
 is_trend_mode = last['ADX'] >= 25 and config['use_dual_mode']
 
+# === [메인 UI 3: 10종 지표 상세 대시보드] ===
 with st.expander("📊 지표 상태판 (Indicator Dashboard)", expanded=True):
     cols = st.columns(5)
     idx = 0
-    active_cnt_l = 0; active_cnt_s = 0
-    for name, stat in ind_status.items():
+    
+    # 개수 세기 초기화
+    active_cnt_l = 0
+    active_cnt_s = 0
+    
+    # 👇 [핵심 수정] ind_status를 status로 변경했습니다!
+    for name, stat in status.items():
         color = "off"
-        if "매수" in stat: color = "normal"; active_cnt_l += 1
-        elif "매도" in stat: color = "inverse"; active_cnt_s += 1
+        if "매수" in stat: 
+            color = "normal"
+            active_cnt_l += 1
+        elif "매도" in stat: 
+            color = "inverse"
+            active_cnt_s += 1
+            
         cols[idx % 5].metric(name, stat, delta_color=color)
         idx += 1
-    st.caption(f"🎯 매수 신호: **{active_cnt_l}개** / 매도 신호: **{active_cnt_s}개**")
 
+    st.caption("💡 **범례:** 🟢 매수신호(Buy) | 🔴 매도신호(Sell) | ⚪ 중립(Neutral)")
+    st.caption(f"🎯 **종합 집계:** 매수 신호 **{active_cnt_l}개** / 매도 신호 **{active_cnt_s}개**")
+    
 h = 450
 tv_studies = ["RSI@tv-basicstudies", "BB@tv-basicstudies", "MASimple@tv-basicstudies"]
 studies_json = str(tv_studies).replace("'", '"')
