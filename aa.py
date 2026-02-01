@@ -149,32 +149,36 @@ else:
 
 def generate_wonyousi_strategy(df, status_summary):
     """OpenAI GPT-4o를 이용한 정밀 분석"""
+    if not openai_client: 
+        return {"decision": "hold", "final_reason": "OpenAI API Key가 설정되지 않았습니다.", "confidence": 0}
     
-    # 1. 차트 데이터 정리
+    past_mistakes = get_past_mistakes()
     last_row = df.iloc[-1]
-    past_mistakes = get_past_mistakes() # 기존 함수 활용
     
-    # 2. 질문지(Prompt) 작성
-    system_msg = """
+    # 시스템 프롬프트
+    system_prompt = """
     당신은 전설적인 코인 트레이더 '워뇨띠'입니다.
-    - 보조지표 수치보다 '시장 심리', '캔들 패턴', '추세'를 최우선으로 봅니다.
-    - 확실한 자리가 아니면 과감하게 '관망(hold)'을 외칩니다.
-    - 응답은 오직 JSON 형식으로만 해야 합니다.
+    원칙:
+    1. 지표 수치보다 '캔들 패턴', '거래량', '추세(Price Action)'를 최우선으로 봅니다.
+    2. 확실한 자리가 아니면 과감하게 '관망(hold)'을 외치세요.
+    3. 응답은 오직 JSON 형식으로만 해야 합니다.
     """
-    
-    user_msg = f"""
+
+    # 사용자 프롬프트
+    user_prompt = f"""
     [현재 시장 데이터]
     - 현재가: {last_row['close']}
     - RSI: {last_row['RSI']:.1f}
-    - 볼린저밴드 상태: {status_summary.get('BB', 'Normal')}
+    - 볼린저밴드: {status_summary.get('BB', 'Normal')}
     - 추세강도(ADX): {last_row['ADX']:.1f}
+    - 활성 매수 시그널: {status_summary}
     
-    [과거의 실패 기록 (반면교사)]
+    [과거의 실수 (반면교사)]
     {past_mistakes}
     
     위 데이터를 분석하여 매매 전략을 세우세요.
     
-    # 필수 응답 형식 (JSON):
+    # 응답 형식 (JSON):
     {{
         "decision": "buy" 또는 "sell" 또는 "hold",
         "reason_trend": "추세 관점 분석",
@@ -185,23 +189,22 @@ def generate_wonyousi_strategy(df, status_summary):
     """
     
     try:
-        # 3. GPT-4o에게 질문 (JSON 모드 사용)
-        response = client.chat.completions.create(
-            model="gpt-4o",  # 가장 똑똑한 모델
+        response = openai_client.chat.completions.create(
+            model="gpt-4o", 
             messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
             ],
-            response_format={"type": "json_object"}, # JSON 강제 출력 (오류 방지)
+            response_format={"type": "json_object"}, 
             temperature=0.5
         )
-        
-        # 4. 답변 해석
-        result_text = response.choices[0].message.content
-        return json.loads(result_text)
+        res_text = response.choices[0].message.content
+        return json.loads(res_text)
 
     except Exception as e:
-        return {"decision": "hold", "reason": f"OpenAI 오류: {e}", "confidence": 0}# ---------------------------------------------------------
+        # [핵심 수정] 에러 키를 'final_reason'으로 변경하여 UI에 표시되게 함
+        return {"decision": "hold", "final_reason": f"OpenAI 오류 발생: {e}", "confidence": 0}
+        
 # 📅 데이터 수집 (ForexFactory + CCXT)
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600)
@@ -507,46 +510,99 @@ if st.sidebar.button("📡 텔레그램 메뉴 전송"):
 # 🧮 지표 계산 (기존 로직 유지)
 # ---------------------------------------------------------
 def calc_indicators(df):
+    """10가지 기술적 지표 계산 및 상태 판단"""
+    if df.empty: return df, {}, None
+
     close = df['close']; high = df['high']; low = df['low']; vol = df['vol']
     
+    # --- [1. 지표 계산] ---
+    # RSI
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(int(config['rsi_period'])).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(int(config['rsi_period'])).mean()
     rs = gain / loss; df['RSI'] = 100 - (100 / (1 + rs))
-    
+
+    # BB
     ma = close.rolling(int(config['bb_period'])).mean()
     std = close.rolling(int(config['bb_period'])).std()
     df['BB_UP'] = ma + (std * float(config['bb_std']))
     df['BB_LO'] = ma - (std * float(config['bb_std']))
-    
+
+    # MA
     df['MA_F'] = close.rolling(int(config['ma_fast'])).mean()
     df['MA_S'] = close.rolling(int(config['ma_slow'])).mean()
-    
+
+    # MACD
+    k = close.ewm(span=12, adjust=False).mean()
+    d = close.ewm(span=26, adjust=False).mean()
+    df['MACD'] = k - d
+    df['MACD_SIG'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    # Stochastic
+    low_min = low.rolling(14).min()
+    high_max = high.rolling(14).max()
+    df['STOCH_K'] = 100 * ((close - low_min) / (high_max - low_min))
+
+    # CCI
+    tp = (high + low + close) / 3
+    df['CCI'] = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
+
+    # ADX
     tr = np.maximum((high - low), np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
-    df['ATR'] = tr.rolling(14).mean()
-    df['ADX'] = (df['ATR'] / close) * 1000
-    
-    length = 130; lag = (length - 1) // 2
-    df['lsma_source'] = close + (close - close.shift(lag))
-    df['ZLSMA'] = df['lsma_source'].ewm(span=length).mean()
-    
+    atr = tr.rolling(14).mean()
+    df['ADX'] = (atr / close) * 1000
+
+    # Volume MA
+    df['VOL_MA'] = vol.rolling(20).mean()
+
+    # --- [2. 상태 판단 (Dashboard 표시용)] ---
     last = df.iloc[-1]
     status = {}
     
-    if config['use_rsi']:
-        if last['RSI'] <= config['rsi_buy']: status['RSI'] = "🟢 매수 (과매도)"
-        elif last['RSI'] >= config['rsi_sell']: status['RSI'] = "🔴 매도 (과매수)"
+    # 1. RSI
+    if config.get('use_rsi', True):
+        if last['RSI'] <= config['rsi_buy']: status['RSI'] = "🟢 과매도"
+        elif last['RSI'] >= config['rsi_sell']: status['RSI'] = "🔴 과매수"
         else: status['RSI'] = "⚪ 중립"
-    if config['use_bb']:
-        if last['close'] <= last['BB_LO']: status['BB'] = "🟢 매수 (하단터치)"
-        elif last['close'] >= last['BB_UP']: status['BB'] = "🔴 매도 (상단터치)"
-        else: status['BB'] = "⚪ 중립"
-    if config['use_ma']:
-        if last['MA_F'] > last['MA_S']: status['MA'] = "🟢 매수 (정배열)"
-        else: status['MA'] = "🔴 매도 (역배열)"
-        
-    return df, status, last
+    
+    # 2. BB
+    if config.get('use_bb', True):
+        if last['close'] <= last['BB_LO']: status['BB'] = "🟢 하단터치"
+        elif last['close'] >= last['BB_UP']: status['BB'] = "🔴 상단터치"
+        else: status['BB'] = "⚪ 밴드내"
 
+    # 3. MA
+    if config.get('use_ma', True):
+        if last['MA_F'] > last['MA_S']: status['MA'] = "🟢 골든크로스"
+        else: status['MA'] = "🔴 데드크로스"
+
+    # 4. MACD
+    if config.get('use_macd', True):
+        if last['MACD'] > last['MACD_SIG']: status['MACD'] = "🟢 상승신호"
+        else: status['MACD'] = "🔴 하락신호"
+
+    # 5. Stochastic
+    if config.get('use_stoch', True):
+        if last['STOCH_K'] <= 20: status['Stoch'] = "🟢 저점"
+        elif last['STOCH_K'] >= 80: status['Stoch'] = "🔴 고점"
+        else: status['Stoch'] = "⚪ 중립"
+
+    # 6. CCI
+    if config.get('use_cci', True):
+        if last['CCI'] <= -100: status['CCI'] = "🟢 과매도"
+        elif last['CCI'] >= 100: status['CCI'] = "🔴 과매수"
+        else: status['CCI'] = "⚪ 중립"
+
+    # 7. Volume
+    if config.get('use_vol', True):
+        if last['vol'] > last['VOL_MA'] * 2.0: status['Vol'] = "🔥 거래량폭발"
+        else: status['Vol'] = "⚪ 일반"
+
+    # 8. ADX
+    if config.get('use_adx', True):
+        status['ADX'] = "📈 강한추세" if last['ADX'] > 25 else "🦀 횡보장"
+
+    return df, status, last
 # ---------------------------------------------------------
 # 📊 메인 화면 (UI 통합)
 # ---------------------------------------------------------
