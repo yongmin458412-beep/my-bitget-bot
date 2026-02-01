@@ -763,37 +763,37 @@ with t4:
             # -----------------------------------------------------------
             # 2. 기존 로직 (5분 자동 수락 체크 & 명령어 수신)
             # -----------------------------------------------------------
-            manage_proposals(ex, symbol_name) # 여기서 5분 뒤 자동체결 및 DB저장이 수행됨
-            
-            # 텔레그램 메시지 수신 (명령어 처리)
-            res = requests.get(f"https://api.telegram.org/bot{tg_token}/getUpdates?offset={offset+1}&timeout=30").json()
-            if res.get('ok'):
-                for up in res['result']:
-                    offset = up['update_id']
-                    if 'callback_query' in up:
-                        cb = up['callback_query']; data = cb['data']; chat_id = cb['message']['chat']['id']
-                        
-                        # (기존 버튼 처리 로직 그대로 유지)
-                        if data == 'balance':
-                            c, f, t = get_balance(ex)
-                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': f"💰 잔고: ${t:,.2f}"})
-                        elif data.startswith('acc_') or data.startswith('rej_'):
-                            # ... (기존 승인/거절 처리 코드와 동일) ...
-                            pid = data.split('_')[1]
-                            is_acc = "acc" in data
-                            try:
-                                with open(PROPOSALS_FILE, 'r') as f: props = json.load(f)
-                                if pid in props:
-                                    if is_acc:
-                                        requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': "✅ 승인 확인. 주문 진행."})
-                                        # 즉시 체결 로직은 manage_proposals가 다음 루프때 처리하거나 여기서 바로 호출 가능
-                                    else:
-                                        requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': "❌ 거절됨."})
-                                    del props[pid]
-                                    with open(PROPOSALS_FILE, 'w') as f: json.dump(props, f)
-                            except: pass
-
-                        requests.post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", data={'callback_query_id': cb['id']})
+                manage_proposals(ex, symbol_name) # 여기서 5분 뒤 자동체결 및 DB저장이 수행됨
+                
+                # 텔레그램 메시지 수신 (명령어 처리)
+                res = requests.get(f"https://api.telegram.org/bot{tg_token}/getUpdates?offset={offset+1}&timeout=30").json()
+                if res.get('ok'):
+                    for up in res['result']:
+                        offset = up['update_id']
+                        if 'callback_query' in up:
+                            cb = up['callback_query']; data = cb['data']; chat_id = cb['message']['chat']['id']
+                            
+                            # (기존 버튼 처리 로직 그대로 유지)
+                            if data == 'balance':
+                                c, f, t = get_balance(ex)
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': f"💰 잔고: ${t:,.2f}"})
+                            elif data.startswith('acc_') or data.startswith('rej_'):
+                                # ... (기존 승인/거절 처리 코드와 동일) ...
+                                pid = data.split('_')[1]
+                                is_acc = "acc" in data
+                                try:
+                                    with open(PROPOSALS_FILE, 'r') as f: props = json.load(f)
+                                    if pid in props:
+                                        if is_acc:
+                                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': "✅ 승인 확인. 주문 진행."})
+                                            # 즉시 체결 로직은 manage_proposals가 다음 루프때 처리하거나 여기서 바로 호출 가능
+                                        else:
+                                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': "❌ 거절됨."})
+                                        del props[pid]
+                                        with open(PROPOSALS_FILE, 'w') as f: json.dump(props, f)
+                                except: pass
+    
+                            requests.post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", data={'callback_query_id': cb['id']})
             
             time.sleep(1) # CPU 과부하 방지
 
