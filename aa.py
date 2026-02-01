@@ -669,10 +669,6 @@ st.title(f"🔥 {symbol} GPT-4o Trader")
 st.caption(f"모드: {mode_str} | 현재가: ${curr_price:,.2f}")
     
     is_trend_mode = last['ADX'] >= 25 and config['use_dual_mode']
-mode_str = "🌊 추세장 (ZLSMA 전략)" if is_trend_mode else "🦀 횡보장 (RSI+BB 전략)"
-
-st.title(f"🔥 {symbol} AI Ultimate Agent")
-st.caption(f"모드: {mode_str} | 가격: ${curr_price:,.2f} | 뇌: 워뇨띠 페르소나 + 회고적 학습(Recursive Learning)")
 
 with st.expander("📊 지표 상태판 (Indicator Dashboard)", expanded=True):
     cols = st.columns(5)
