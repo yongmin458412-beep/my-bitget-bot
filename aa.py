@@ -607,31 +607,31 @@ def calc_indicators(df):
 
     # [지표 상태판 코드 근처에 추가]
     # === [메인 UI 3: 10종 지표 상세 대시보드] ===
-with st.expander("📊 10종 보조지표 종합 상태판", expanded=True):
-    cols = st.columns(5)
-    idx = 0
+    with st.expander("📊 10종 보조지표 종합 상태판", expanded=True):
+        cols = st.columns(5)
+        idx = 0
+        
+        # 👇 [수정 1] 개수를 세기 위해 변수를 0으로 초기화합니다.
+        active_cnt_l = 0
+        active_cnt_s = 0
+        
+        for name, stat in status.items():
+            color = "off"
+            # 👇 [수정 2] 반복문을 돌면서 매수/매도 개수를 셉니다.
+            if "매수" in stat: 
+                color = "normal"
+                active_cnt_l += 1
+            elif "매도" in stat: 
+                color = "inverse"
+                active_cnt_s += 1
+                
+            cols[idx % 5].metric(name, stat, delta_color=color)
+            idx += 1
     
-    # 👇 [수정 1] 개수를 세기 위해 변수를 0으로 초기화합니다.
-    active_cnt_l = 0
-    active_cnt_s = 0
-    
-    for name, stat in status.items():
-        color = "off"
-        # 👇 [수정 2] 반복문을 돌면서 매수/매도 개수를 셉니다.
-        if "매수" in stat: 
-            color = "normal"
-            active_cnt_l += 1
-        elif "매도" in stat: 
-            color = "inverse"
-            active_cnt_s += 1
-            
-        cols[idx % 5].metric(name, stat, delta_color=color)
-        idx += 1
-
-    # 👇 [수정 3] 다 세어진 개수를 화면에 표시합니다.
-    st.caption("💡 **범례:** 🟢 매수신호(Buy) | 🔴 매도신호(Sell) | ⚪ 중립(Neutral)")
-    st.caption(f"🎯 **종합 집계:** 매수 신호 **{active_cnt_l}개** / 매도 신호 **{active_cnt_s}개**")
-    
+        # 👇 [수정 3] 다 세어진 개수를 화면에 표시합니다.
+        st.caption("💡 **범례:** 🟢 매수신호(Buy) | 🔴 매도신호(Sell) | ⚪ 중립(Neutral)")
+        st.caption(f"🎯 **종합 집계:** 매수 신호 **{active_cnt_l}개** / 매도 신호 **{active_cnt_s}개**")
+        
     return df, status, last
 # ---------------------------------------------------------
 # 📊 메인 화면 (UI 통합)
