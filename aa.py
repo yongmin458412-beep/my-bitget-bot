@@ -701,45 +701,45 @@ with t4:
     st.caption("AI가 매매 후 작성한 반성문과 피드백이 저장됩니다.")
     
     def telegram_thread(ex, symbol_name):
-    """
-    [수정됨] 텔레그램 수신 대기 + 15분마다 AI 자동 분석 및 리포팅 수행
-    """
-    offset = 0
-    last_run = 0  # 마지막 분석 시간 (초)
-    ANALYSIS_INTERVAL = 900  # 15분 (초 단위)
-
-    # 봇 시작 알림
-    requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
-                  data={'chat_id': tg_id, 'text': "🤖 **AI 워뇨띠 완전 자동화 모드 시작**\n15분마다 시장을 분석하고 보고합니다.", 'parse_mode': 'Markdown'})
-
-    while True:
-        try:
-            current_time = time.time()
-
-            # -----------------------------------------------------------
-            # 1. [자동화 핵심] 15분마다 AI 분석 실행
-            # -----------------------------------------------------------
-            if current_time - last_run > ANALYSIS_INTERVAL:
-                # A. 데이터 준비 (스레드 안에서 직접 조회)
-                ohlcv = ex.fetch_ohlcv(symbol_name, '5m', limit=200)
-                df_thread = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
-                df_thread['time'] = pd.to_datetime(df_thread['time'], unit='ms')
-                
-                # 지표 계산 (기존 함수 재사용)
-                df_thread, status, last_row = calc_indicators(df_thread)
-                
-                # 경제 일정(뉴스) 가져오기
-                events = get_forex_events()
-                event_str = "주요 경제 일정 없음"
-                if not events.empty:
-                    event_str = events.to_string(index=False)
-
-                # B. 워뇨띠 AI에게 물어보기
-                # (프롬프트에 경제 일정도 포함시켜 판단력 강화)
-                strategy = generate_wonyousi_strategy(df_thread, status) 
-                
-                # C. [보고] 텔레그램으로 분석 리포트 전송
-                report_msg = f"""
+        """
+        [수정됨] 텔레그램 수신 대기 + 15분마다 AI 자동 분석 및 리포팅 수행
+        """
+        offset = 0
+        last_run = 0  # 마지막 분석 시간 (초)
+        ANALYSIS_INTERVAL = 900  # 15분 (초 단위)
+    
+        # 봇 시작 알림
+        requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
+                      data={'chat_id': tg_id, 'text': "🤖 **AI 워뇨띠 완전 자동화 모드 시작**\n15분마다 시장을 분석하고 보고합니다.", 'parse_mode': 'Markdown'})
+    
+        while True:
+            try:
+                current_time = time.time()
+    
+                # -----------------------------------------------------------
+                # 1. [자동화 핵심] 15분마다 AI 분석 실행
+                # -----------------------------------------------------------
+                if current_time - last_run > ANALYSIS_INTERVAL:
+                    # A. 데이터 준비 (스레드 안에서 직접 조회)
+                    ohlcv = ex.fetch_ohlcv(symbol_name, '5m', limit=200)
+                    df_thread = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+                    df_thread['time'] = pd.to_datetime(df_thread['time'], unit='ms')
+                    
+                    # 지표 계산 (기존 함수 재사용)
+                    df_thread, status, last_row = calc_indicators(df_thread)
+                    
+                    # 경제 일정(뉴스) 가져오기
+                    events = get_forex_events()
+                    event_str = "주요 경제 일정 없음"
+                    if not events.empty:
+                        event_str = events.to_string(index=False)
+    
+                    # B. 워뇨띠 AI에게 물어보기
+                    # (프롬프트에 경제 일정도 포함시켜 판단력 강화)
+                    strategy = generate_wonyousi_strategy(df_thread, status) 
+                    
+                    # C. [보고] 텔레그램으로 분석 리포트 전송
+                    report_msg = f"""
 📊 **[15분 정기 보고] {symbol_name}**
 현재가: ${last_row['close']:,.2f}
 추세강도(ADX): {last_row['ADX']:.1f} ({'강한 추세' if last_row['ADX']>25 else '횡보'})
