@@ -350,6 +350,34 @@ def telegram_thread(ex, symbol_name):
         except: time.sleep(10)
 
 # ---------------------------------------------------------
+# 📡 거래소 연결 (이 부분이 빠져서 에러가 난 것입니다)
+# ---------------------------------------------------------
+@st.cache_resource
+def init_exchange():
+    try:
+        ex = ccxt.bitget({
+            'apiKey': api_key, 
+            'secret': api_secret, 
+            'password': api_password, 
+            'enableRateLimit': True, 
+            'options': {'defaultType': 'swap'}
+        })
+        ex.set_sandbox_mode(IS_SANDBOX)
+        ex.load_markets()
+        return ex
+    except Exception as e:
+        print(f"Exchange Init Error: {e}")
+        return None
+
+# 👇 [핵심] 이 줄이 없으면 NameError가 뜹니다! 꼭 있어야 합니다.
+exchange = init_exchange()
+
+# 만약 연결에 실패했다면 중단
+if not exchange:
+    st.error("🚨 거래소 연결 실패! API Key를 확인해주세요.")
+    st.stop()
+    
+# ---------------------------------------------------------
 # 🎨 [UI] 메인 대시보드 (직관성 강화)
 # ---------------------------------------------------------
 markets = exchange.markets
@@ -456,32 +484,6 @@ with col_ai:
             </div>
             """, unsafe_allow_html=True)
 # ---------------------------------------------------------
-# 📡 거래소 연결 (이 부분이 빠져서 에러가 난 것입니다)
-# ---------------------------------------------------------
-@st.cache_resource
-def init_exchange():
-    try:
-        ex = ccxt.bitget({
-            'apiKey': api_key, 
-            'secret': api_secret, 
-            'password': api_password, 
-            'enableRateLimit': True, 
-            'options': {'defaultType': 'swap'}
-        })
-        ex.set_sandbox_mode(IS_SANDBOX)
-        ex.load_markets()
-        return ex
-    except Exception as e:
-        print(f"Exchange Init Error: {e}")
-        return None
-
-# 👇 [핵심] 이 줄이 없으면 NameError가 뜹니다! 꼭 있어야 합니다.
-exchange = init_exchange()
-
-# 만약 연결에 실패했다면 중단
-if not exchange:
-    st.error("🚨 거래소 연결 실패! API Key를 확인해주세요.")
-    st.stop()# ---------------------------------------------------------
 # 🎨 사이드바 (설정 유지)
 # ---------------------------------------------------------
 st.sidebar.title("🛠️ AI 에이전트 제어판")
