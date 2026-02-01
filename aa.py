@@ -158,7 +158,7 @@ def get_ai_model(key):
 ai_model = get_ai_model(gemini_key)
 
 def generate_wonyousi_strategy(df, status_summary):
-    """[New] 워뇨띠 페르소나 + 회고적 학습 전략 생성"""
+    """[New] 워뇨띠 페르소나 + 회고적 학습 전략 생성 (429 에러 방어 포함)"""
     if not ai_model: return {"decision": "hold", "reason": "API Key 없음", "confidence": 0}
     
     past_mistakes = get_past_mistakes()
@@ -187,13 +187,26 @@ def generate_wonyousi_strategy(df, status_summary):
         "confidence": 0~100 사이의 숫자
     }}
     """
-    try:
-        res = ai_model.generate_content(prompt).text
-        res = res.replace("```json", "").replace("```", "").strip()
-        return json.loads(res)
-    except Exception as e:
-        return {"decision": "hold", "reason": f"AI 분석 오류: {e}", "confidence": 0}
+    
+    # 🛡️ [핵심 수정] 429 에러 발생 시 재시도 로직
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            res = ai_model.generate_content(prompt).text
+            res = res.replace("```json", "").replace("```", "").strip()
+            return json.loads(res)
+        except Exception as e:
+            # 429 에러(사용량 초과)가 발생하면
+            if "429" in str(e):
+                print(f"⚠️ API 한도 초과! {60}초 대기 후 재시도... ({attempt+1}/{max_retries})")
+                time.sleep(60) # 1분 대기 (무료 티어 제한 풀릴 때까지)
+                continue
+            else:
+                # 다른 에러면 그냥 종료
+                return {"decision": "hold", "reason": f"AI 분석 오류: {e}", "confidence": 0}
 
+    # 재시도해도 안 되면 휴식 선언
+    return {"decision": "hold", "reason": "API 한도 초과로 잠시 휴식 중입니다.", "confidence": 0}
 # ---------------------------------------------------------
 # 📅 데이터 수집 (ForexFactory + CCXT)
 # ---------------------------------------------------------
