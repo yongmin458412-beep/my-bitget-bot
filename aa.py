@@ -122,19 +122,30 @@ def save_settings(new_settings):
 config = load_settings()
 if 'order_usdt' not in st.session_state: st.session_state['order_usdt'] = config['order_usdt']
 
-# ---------------------------------------------------------
-# 🔐 API & AI 초기화 (404 오류 수정됨)
-# ---------------------------------------------------------
+# =========================================================
+# 🔐 [3. API & OpenAI 초기화] (이 부분을 통째로 교체하세요)
+# =========================================================
 api_key = st.secrets.get("API_KEY")
 api_secret = st.secrets.get("API_SECRET")
 api_password = st.secrets.get("API_PASSWORD")
 tg_token = st.secrets.get("TG_TOKEN")
 tg_id = st.secrets.get("TG_CHAT_ID")
-openai_key = st.secrets.get("OPENAI_API_KEY", "")
 
-@st.cache_resource
- 
-client = OpenAI(api_key=openai_key)
+# OpenAI 키 로드
+openai_key = st.secrets.get("OPENAI_API_KEY", config.get("openai_api_key", ""))
+
+# 비트겟 키 확인
+if not api_key: 
+    st.error("🚨 Bitget API Key가 설정되지 않았습니다.")
+    st.stop()
+
+# OpenAI 키 확인 및 연결
+if not openai_key:
+    st.error("🚨 OpenAI API Key가 없습니다. Secrets에 설정을 확인해주세요.")
+    st.stop()
+else:
+    # 여기서 SyntaxError가 났던 부분입니다. 깔끔하게 다시 작성됨.
+    client = OpenAI(api_key=openai_key)
 
 def generate_wonyousi_strategy(df, status_summary):
     """OpenAI GPT-4o를 이용한 정밀 분석"""
