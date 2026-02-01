@@ -376,6 +376,78 @@ exchange = init_exchange()
 if not exchange:
     st.error("🚨 거래소 연결 실패! API Key를 확인해주세요.")
     st.stop()
+
+# ---------------------------------------------------------
+# 📊 [복구] 10종 지표 계산 함수 (이게 없으면 오류남!)
+# ---------------------------------------------------------
+def calc_indicators(df):
+    """10가지 기술적 지표를 모두 계산합니다."""
+    # 데이터가 없으면 그냥 반환
+    if df.empty: return df, {}, None
+
+    close = df['close']; high = df['high']; low = df['low']; vol = df['vol']
+    
+    # 1. RSI
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(int(config['rsi_period'])).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(int(config['rsi_period'])).mean()
+    rs = gain / loss; df['RSI'] = 100 - (100 / (1 + rs))
+
+    # 2. BB (볼린저밴드)
+    ma = close.rolling(int(config['bb_period'])).mean()
+    std = close.rolling(int(config['bb_period'])).std()
+    df['BB_UP'] = ma + (std * float(config['bb_std']))
+    df['BB_LO'] = ma - (std * float(config['bb_std']))
+
+    # 3. MA (이평선)
+    df['MA_F'] = close.rolling(int(config['ma_fast'])).mean()
+    df['MA_S'] = close.rolling(int(config['ma_slow'])).mean()
+
+    # 4. MACD
+    k = close.ewm(span=12, adjust=False).mean()
+    d = close.ewm(span=26, adjust=False).mean()
+    df['MACD'] = k - d
+    df['MACD_SIG'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    # 5. Stochastic
+    low_min = low.rolling(int(config.get('stoch_k', 14))).min()
+    high_max = high.rolling(int(config.get('stoch_k', 14))).max()
+    df['STOCH_K'] = 100 * ((close - low_min) / (high_max - low_min))
+
+    # 6. CCI
+    tp = (high + low + close) / 3
+    df['CCI'] = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
+
+    # 7. ADX (추세 강도)
+    tr = np.maximum((high - low), np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
+    atr = tr.rolling(14).mean()
+    df['ADX'] = (atr / close) * 1000
+
+    # 8. Volume (거래량 폭발)
+    df['VOL_MA'] = vol.rolling(20).mean()
+
+    # 상태 판단 (대시보드 표시용)
+    last = df.iloc[-1]
+    status = {}
+    
+    if config['use_rsi']:
+        if last['RSI'] <= config['rsi_buy']: status['RSI'] = "🟢 매수"
+        elif last['RSI'] >= config['rsi_sell']: status['RSI'] = "🔴 매도"
+        else: status['RSI'] = "⚪ 중립"
+        
+    if config['use_bb']:
+        if last['close'] <= last['BB_LO']: status['BB'] = "🟢 매수"
+        elif last['close'] >= last['BB_UP']: status['BB'] = "🔴 매도"
+        else: status['BB'] = "⚪ 중립"
+        
+    if config['use_ma']:
+        if last['MA_F'] > last['MA_S']: status['MA'] = "🟢 매수"
+        else: status['MA'] = "🔴 매도"
+    
+    if config['use_adx']:
+        status['ADX'] = "📈 추세장" if last['ADX'] > 25 else "🦀 횡보장"
+
+    return df, status, last
     
 # ---------------------------------------------------------
 # 🎨 [UI] 메인 대시보드 (직관성 강화)
