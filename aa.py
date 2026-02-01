@@ -795,12 +795,12 @@ with t4:
     
                             requests.post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", data={'callback_query_id': cb['id']})
             
-            time.sleep(1) # CPU 과부하 방지
+                time.sleep(1) # CPU 과부하 방지
 
-        except Exception as e:
-            print(f"Error in TG Thread: {e}")
-            time.sleep(10) # 에러나면 10초 쉬고 재시도
-    
+            except Exception as e:
+                print(f"Error in TG Thread: {e}")
+                time.sleep(10) # 에러나면 10초 쉬고 재시도
+        
     if st.button("🔄 기록 새로고침"): st.rerun()
     
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
