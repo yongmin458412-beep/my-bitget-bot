@@ -20,7 +20,7 @@ IS_SANDBOX = True
 SETTINGS_FILE = "bot_settings.json"
 LOG_FILE = "trade_log.csv"
 
-st.set_page_config(layout="wide", page_title="비트겟 AI 퀀트 (System Check)")
+st.set_page_config(layout="wide", page_title="비트겟 AI 퀀트 (Auto-Detect)")
 
 def load_settings():
     default = {
@@ -67,79 +67,59 @@ gemini_key = st.secrets.get("GEMINI_API_KEY", config.get("gemini_api_key", ""))
 if not api_key: st.error("🚨 비트겟 API 키 없음"); st.stop()
 
 # ---------------------------------------------------------
-# 🧠 AI 연결 진단 및 실행 (핵심 수정 부분)
+# 🧠 AI 모델 자동 탐지 (핵심 해결책)
 # ---------------------------------------------------------
-def generate_ai_content(prompt):
+@st.cache_resource
+def get_valid_ai_model_name(api_key):
     """
-    여러 모델을 순차적으로 시도하고, 실패 시 구체적인 에러를 반환합니다.
+    구글 서버에 직접 접속해서 사용 가능한 모델 명단을 받아오고,
+    가장 성능이 좋은 모델 이름을 자동으로 반환합니다.
     """
-    if not gemini_key: return "⚠️ Gemini API 키가 입력되지 않았습니다."
+    if not api_key: return None, "키 없음"
     
-    genai.configure(api_key=gemini_key)
-    
-    # 시도할 모델 리스트 (최신 -> 구형 순)
-    models_to_try = [
-        'gemini-1.5-flash',       # 1순위: 최신/빠름
-        'gemini-1.5-flash-latest',# 2순위: 최신 별칭
-        'gemini-pro',             # 3순위: 구형 안정형
-        'gemini-1.0-pro'          # 4순위: 구형 호환
-    ]
-    
-    last_error = ""
-    
-    for model_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            return response.text # 성공 시 바로 반환
-        except Exception as e:
-            last_error = str(e)
-            continue # 실패 시 다음 모델 시도
-            
-    # 모든 모델 실패 시 상세 에러 메시지 반환
-    return f"❌ AI 연결 실패 (마지막 시도 에러):\n{last_error}\n\n💡 힌트: requirements.txt에 'google-generativeai>=0.8.3'이 있는지 확인하세요."
-
-def ask_gemini_briefing(status_data, market_data):
-    # 경제지표 로딩 (에러 방지용 try-except)
+    genai.configure(api_key=api_key)
     try:
-        events_df = get_forex_events()
-        if not events_df.empty:
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            today_ev = events_df[events_df['날짜'] == today_str]
-            eco_txt = today_ev.to_string() if not today_ev.empty else "오늘 주요 일정 없음"
-        else: eco_txt = "데이터 없음"
-    except: eco_txt = "로딩 실패"
-
-    prompt = f"""
-    [트레이딩 봇 상태]
-    - 포지션: {status_data['position']} ({status_data['roi']}%)
-    - 시장: 가격 ${market_data['price']}, RSI {market_data['rsi']}, ADX {market_data['adx']}
-    - 일정: {eco_txt}
-    
-    위 데이터를 바탕으로 현재 시장 상황과 대응 전략을 3줄로 요약해줘.
-    """
-    return generate_ai_content(prompt)
-
-def run_autopilot(df, current_config):
-    last = df.iloc[-1]
-    prompt = f"""
-    Analyze crypto market: RSI {last['RSI']:.1f}, ADX {last['ADX']:.1f}.
-    Return JSON settings: {{ "rsi_buy": int, "rsi_sell": int, "tp": float, "sl": float, "leverage": int, "reason": "Short explanation" }}
-    Only JSON.
-    """
-    res_text = generate_ai_content(prompt)
-    
-    # JSON 파싱 시도
-    try:
-        clean_text = res_text.replace("```json", "").replace("```", "").strip()
-        if "❌" in clean_text: return clean_text # 에러 메시지면 그대로 출력
+        # 사용 가능한 모델 리스트 조회
+        models = [m for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        model_names = [m.name for m in models]
         
-        res_json = json.loads(clean_text)
-        current_config.update(res_json)
-        save_settings(current_config)
-        return f"✅ 최적화 완료: {res_json.get('reason', '설정 변경됨')}"
-    except:
-        return f"❌ AI 응답 해석 실패: {res_text}"
+        # 우선순위: 1.5 Flash -> 1.5 Pro -> 1.0 Pro -> 아무거나
+        target_model = None
+        for m in model_names:
+            if 'gemini-1.5-flash' in m: target_model = m; break
+        
+        if not target_model:
+            for m in model_names:
+                if 'gemini-1.5-pro' in m: target_model = m; break
+        
+        if not target_model:
+            for m in model_names:
+                if 'gemini-pro' in m: target_model = m; break
+                
+        if not target_model and model_names:
+            target_model = model_names[0] # 아무거나라도 잡음
+            
+        if target_model:
+            return target_model, f"✅ 연결됨: {target_model}"
+        else:
+            return None, "❌ 사용 가능한 모델이 없습니다 (리스트 비어있음)"
+            
+    except Exception as e:
+        return None, f"❌ 모델 조회 실패: {str(e)}"
+
+# 앱 시작 시 모델 자동 스캔
+current_ai_model, ai_status_msg = get_valid_ai_model_name(gemini_key)
+
+def generate_ai_content(prompt):
+    if not current_ai_model: return f"AI 모델 오류: {ai_status_msg}"
+    
+    try:
+        genai.configure(api_key=gemini_key)
+        model = genai.GenerativeModel(current_ai_model)
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"AI 생성 오류: {str(e)}"
 
 # ---------------------------------------------------------
 # 📅 경제 지표
@@ -191,6 +171,39 @@ def log_trade(action, symbol, side, price, qty, leverage, pnl=0, roi=0):
     if not os.path.exists(LOG_FILE): df.to_csv(LOG_FILE, index=False)
     else: df.to_csv(LOG_FILE, mode='a', header=False, index=False)
 
+def ask_gemini_briefing(status_data, market_data):
+    events_df = get_forex_events()
+    if not events_df.empty:
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_ev = events_df[events_df['날짜'] == today]
+        eco_txt = today_ev.to_string() if not today_ev.empty else "오늘 주요 일정 없음"
+    else: eco_txt = "데이터 로딩 실패"
+
+    prompt = f"""
+    [트레이딩 봇 브리핑]
+    - 포지션: {status_data['position']} ({status_data['roi']}%)
+    - 시장: 가격 ${market_data['price']}, ADX {market_data['adx']}, RSI {market_data['rsi']}, 공포지수 {market_data['fng']}
+    - 일정: {eco_txt}
+    상황 진단과 대응 전략 3줄 요약.
+    """
+    return generate_ai_content(prompt)
+
+def run_autopilot(df, current_config):
+    last = df.iloc[-1]
+    prompt = f"""
+    Analyze crypto market: RSI {last['RSI']:.1f}, ADX {last['ADX']:.1f}.
+    Return JSON settings: {{ "rsi_buy": int, "rsi_sell": int, "tp": float, "sl": float, "leverage": int, "reason": "Short explanation" }}
+    Only JSON.
+    """
+    res_text = generate_ai_content(prompt)
+    try:
+        clean = res_text.replace("```json", "").replace("```", "").strip()
+        res_json = json.loads(clean)
+        current_config.update(res_json)
+        save_settings(current_config)
+        return f"✅ 최적화 완료 ({current_ai_model}): {res_json.get('reason','-')}"
+    except: return f"❌ AI 응답 오류: {res_text}"
+
 def send_telegram(message):
     if not tg_token or not tg_id: return
     try:
@@ -210,10 +223,9 @@ def telegram_listener(exchange_obj, symbol_name):
                     if 'callback_query' in up:
                         cb = up['callback_query']
                         if cb['data'] == 'ai_briefing':
-                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cb['message']['chat']['id'], 'text': "🤖 AI 분석 요청 접수..."})
-                            
+                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cb['message']['chat']['id'], 'text': "🤖 분석 중..."})
                             coin, free, total = get_balance_details(exchange_obj)
-                            pos_txt = "없음"; u_pnl = 0; roi = 0
+                            pos_txt = "없음"; roi=0; u_pnl=0
                             try:
                                 pos = exchange_obj.fetch_positions([symbol_name])
                                 for p in pos:
@@ -224,11 +236,10 @@ def telegram_listener(exchange_obj, symbol_name):
                             try:
                                 ohlcv = exchange_obj.fetch_ohlcv(symbol_name, '5m', limit=20)
                                 close = ohlcv[-1][4]
-                            except: close = 0
+                            except: close=0
                             
-                            ai_msg = ask_gemini_briefing({'position': pos_txt, 'roi': roi, 'pnl': u_pnl}, {'price': close, 'rsi': 50, 'adx': 25, 'fng': '-'})
-                            
-                            msg = f"🧠 <b>AI 분석 결과</b>\n\n{ai_msg}\n\n💰 <b>잔고:</b> ${free:,.2f}"
+                            ai_res = ask_gemini_briefing({'position': pos_txt, 'roi': roi, 'pnl': u_pnl}, {'price': close, 'rsi': 50, 'adx': 25, 'fng': '-'})
+                            msg = f"🧠 <b>AI 브리핑</b>\n\n{ai_res}\n\n💰 <b>잔고:</b> ${free:,.2f}"
                             requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cb['message']['chat']['id'], 'text': msg, 'parse_mode': 'HTML'})
                             requests.post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", data={'callback_query_id': cb['id']})
             time.sleep(1)
@@ -253,7 +264,13 @@ if not exchange: st.stop()
 # 🎨 사이드바
 # ---------------------------------------------------------
 st.sidebar.title("🛠️ 봇 제어판")
-st.sidebar.caption(f"🤖 AI Lib Ver: {genai.__version__}") # 버전 확인용
+is_mobile = st.sidebar.checkbox("📱 모바일 뷰", value=True)
+
+# AI 상태 표시 (진단 결과)
+if "✅" in ai_status_msg:
+    st.sidebar.success(ai_status_msg)
+else:
+    st.sidebar.error(ai_status_msg)
 
 markets = exchange.markets
 symbols = [s for s in markets if markets[s].get('linear') and markets[s].get('swap')]
@@ -292,7 +309,7 @@ st.sidebar.subheader("📊 지표 설정")
 with st.sidebar.expander("1. RSI & BB", expanded=False):
     use_rsi = st.checkbox("RSI", config['use_rsi'])
     c1, c2, c3 = st.columns(3)
-    config['rsi_period'] = c1.number_input("RSI기간", 5, 50, config['rsi_period'])
+    config['rsi_period'] = c1.number_input("기간", 5, 50, config['rsi_period'])
     config['rsi_buy'] = c2.number_input("매수선", 10, 50, config['rsi_buy'])
     config['rsi_sell'] = c3.number_input("매도선", 50, 90, config['rsi_sell'])
     use_bb = st.checkbox("BB", config['use_bb'])
@@ -346,7 +363,6 @@ if st.sidebar.button("📡 텔레그램 테스트"):
 # ---------------------------------------------------------
 def calculate_indicators(df):
     close = df['close']; high = df['high']; low = df['low']; vol = df['vol']
-    
     tr = np.maximum((high - low), np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
     df['ATR'] = tr.rolling(14).mean()
     df['ADX'] = (df['ATR'] / close) * 1000 
@@ -377,7 +393,6 @@ def calculate_indicators(df):
     
     exp12 = close.ewm(span=12).mean(); exp26 = close.ewm(span=26).mean()
     df['MACD'] = exp12 - exp26; df['MACD_SIG'] = df['MACD'].ewm(span=9).mean()
-    
     lowest_low = low.rolling(config['stoch_k']).min(); highest_high = high.rolling(config['stoch_k']).max()
     df['STOCH_K'] = 100 * ((close - lowest_low) / (highest_high - lowest_low))
     
