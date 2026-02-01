@@ -516,7 +516,7 @@ with c1:
                      {'range': [70, 100], 'color': "rgba(255, 0, 0, 0.3)"}],
                  'threshold': {'line': {'color': "white", 'width': 4}, 'thickness': 0.75, 'value': rsi_val}}))
     fig.update_layout(height=250, margin=dict(l=20,r=20,t=50,b=20))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, theme="streamlit", use_container_width=True)
 
 with c2:
     # 추세 강도(ADX) 게이지
@@ -787,108 +787,155 @@ with t4:
     st.subheader("📖 AI의 성장 일지 (DB Viewer)")
     st.caption("AI가 매매 후 작성한 반성문과 피드백이 저장됩니다.")
     
+    # ---------------------------------------------------------
+# 🤖 [Auto] 텔레그램 봇 (버튼 메뉴 + 자동매매 + 상태확인)
+# ---------------------------------------------------------
     def telegram_thread(ex, symbol_name):
-        """
-        [수정됨] 텔레그램 수신 대기 + 15분마다 AI 자동 분석 및 리포팅 수행
-        """
-        offset = 0
-        last_run = 0  # 마지막 분석 시간 (초)
-        ANALYSIS_INTERVAL = 900  # 15분 (초 단위)
-    
-        # 봇 시작 알림
+        ANALYSIS_INTERVAL = 900  # 15분
+        last_run = 0
+        
+        # 봇 시작 시 메뉴 전송
+        menu_kb = {
+            "inline_keyboard": [
+                [{"text": "💰 내 잔고", "callback_data": "balance"}, {"text": "📊 내 포지션", "callback_data": "position"}],
+                [{"text": "🧠 현재상황 분석", "callback_data": "analysis"}, {"text": "📡 AI 상태확인", "callback_data": "status"}]
+            ]
+        }
+        
         requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
-                      data={'chat_id': tg_id, 'text': "🤖 **AI 워뇨띠 완전 자동화 모드 시작**\n15분마다 시장을 분석하고 보고합니다.", 'parse_mode': 'Markdown'})
+                      data={'chat_id': tg_id, 'text': "🚀 **AI 워뇨띠 봇 가동**\n아래 메뉴를 눌러 확인하세요.", 
+                            'reply_markup': json.dumps(menu_kb), 'parse_mode': 'Markdown'})
+    
+        offset = 0
     
         while True:
             try:
-                current_time = time.time()
-    
-                # -----------------------------------------------------------
-                # 1. [자동화 핵심] 15분마다 AI 분석 실행
-                # -----------------------------------------------------------
-                if current_time - last_run > ANALYSIS_INTERVAL:
-                    # A. 데이터 준비 (스레드 안에서 직접 조회)
-                    ohlcv = ex.fetch_ohlcv(symbol_name, '5m', limit=200)
-                    df_thread = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
-                    df_thread['time'] = pd.to_datetime(df_thread['time'], unit='ms')
-                    
-                    # 지표 계산 (기존 함수 재사용)
-                    df_thread, status, last_row = calc_indicators(df_thread)
-                    
-                    # 경제 일정(뉴스) 가져오기
-                    events = get_forex_events()
-                    event_str = "주요 경제 일정 없음"
-                    if not events.empty:
-                        event_str = events.to_string(index=False)
-    
-                    # B. 워뇨띠 AI에게 물어보기
-                    # (프롬프트에 경제 일정도 포함시켜 판단력 강화)
-                    strategy = generate_wonyousi_strategy(df_thread, status) 
-                    
-                    # C. [보고] 텔레그램으로 분석 리포트 전송
-                    report_msg = f"""
-📊 **[15분 정기 보고] {symbol_name}**
-현재가: ${last_row['close']:,.2f}
-추세강도(ADX): {last_row['ADX']:.1f} ({'강한 추세' if last_row['ADX']>25 else '횡보'})
-
-🤖 **워뇨띠의 판단:** {strategy['decision'].upper()}
-💡 **근거:** {strategy['reason']}
-🔥 **확신도:** {strategy.get('confidence', 0)}%
-📅 **경제이슈:**
-{event_str}
-"""
-                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
-                              data={'chat_id': tg_id, 'text': report_msg})
-
-                # D. [행동] 매매 신호가 있으면 제안(Proposal) 생성
-                # (이게 실행되면 5분 뒤 자동 매매 -> DB 저장 -> 회고 프로세스로 이어짐)
-                if strategy['decision'] in ['buy', 'sell']:
-                    send_proposal(strategy['decision'], f"[자동분석] {strategy['reason']}")
+                now = time.time()
                 
-                last_run = current_time
-
-            # -----------------------------------------------------------
-            # 2. 기존 로직 (5분 자동 수락 체크 & 명령어 수신)
-            # -----------------------------------------------------------
-                manage_proposals(ex, symbol_name) # 여기서 5분 뒤 자동체결 및 DB저장이 수행됨
+                # [1] 15분 주기 자동 분석 로직
+                if now - last_run > ANALYSIS_INTERVAL:
+                    ohlcv = ex.fetch_ohlcv(symbol_name, '5m', limit=100)
+                    df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+                    df['time'] = pd.to_datetime(df['time'], unit='ms')
+                    df, status, last = calc_indicators(df)
+                    
+                    strategy = generate_wonyousi_strategy(df, status)
+                    decision = strategy['decision']
+                    
+                    # 텔레그램 정기 보고
+                    msg = f"🤖 **[15분 자동분석]**\n결론: {decision.upper()} ({strategy.get('confidence')}%)"
+                    requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': msg})
+                    
+                    if decision in ['buy', 'sell']:
+                        # 매매 로직 (즉시 진입)
+                        side = decision
+                        price = last['close']
+                        try:
+                            ex.set_leverage(config['leverage'], symbol_name)
+                            bal = ex.fetch_balance({'type': 'swap'})
+                            # 주문량 계산
+                            amt_usdt = config['order_usdt']
+                            qty = ex.amount_to_precision(symbol_name, (amt_usdt * config['leverage']) / price)
+                            
+                            if float(qty) > 0:
+                                # ex.create_market_order(symbol_name, side, qty) # ⚠️ 주석 해제 시 실주문
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
+                                              data={'chat_id': tg_id, 'text': f"⚡ **[즉시 진입]** {side.upper()} 체결\n가격: {price}"})
+                                log_trade_to_db(symbol_name, side, price, 0, strategy['final_reason'], "진행중")
+                        except Exception as e:
+                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': f"❌ 주문 실패: {e}"})
+                    
+                    last_run = now
+    
+                # [2] 텔레그램 메시지 & 버튼 처리 (폴링)
+                res = requests.get(f"https://api.telegram.org/bot{tg_token}/getUpdates?offset={offset+1}&timeout=1").json()
                 
-                # 텔레그램 메시지 수신 (명령어 처리)
-                res = requests.get(f"https://api.telegram.org/bot{tg_token}/getUpdates?offset={offset+1}&timeout=30").json()
                 if res.get('ok'):
                     for up in res['result']:
                         offset = up['update_id']
-                        if 'callback_query' in up:
-                            cb = up['callback_query']; data = cb['data']; chat_id = cb['message']['chat']['id']
-                            
-                            # (기존 버튼 처리 로직 그대로 유지)
-                            if data == 'balance':
-                                c, f, t = get_balance(ex)
-                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': f"💰 잔고: ${t:,.2f}"})
-                            elif data.startswith('acc_') or data.startswith('rej_'):
-                                # ... (기존 승인/거절 처리 코드와 동일) ...
-                                pid = data.split('_')[1]
-                                is_acc = "acc" in data
-                                try:
-                                    with open(PROPOSALS_FILE, 'r') as f: props = json.load(f)
-                                    if pid in props:
-                                        if is_acc:
-                                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': "✅ 승인 확인. 주문 진행."})
-                                            # 즉시 체결 로직은 manage_proposals가 다음 루프때 처리하거나 여기서 바로 호출 가능
-                                        else:
-                                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': "❌ 거절됨."})
-                                        del props[pid]
-                                        with open(PROPOSALS_FILE, 'w') as f: json.dump(props, f)
-                                except: pass
+                        
+                        # 1. 채팅 명령어 처리 (/start)
+                        if 'message' in up and 'text' in up['message']:
+                            text = up['message']['text']
+                            chat_id = up['message']['chat']['id']
+                            if text == "/start" or text == "/menu":
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
+                                              data={'chat_id': chat_id, 'text': "🛠️ **제어 패널**", 'reply_markup': json.dumps(menu_kb), 'parse_mode': 'Markdown'})
     
+                        # 2. 버튼 클릭(Callback) 처리
+                        if 'callback_query' in up:
+                            cb = up['callback_query']
+                            data = cb['data']
+                            chat_id = cb['message']['chat']['id']
+                            
+                            # A. 잔고 확인
+                            if data == 'balance':
+                                try:
+                                    bal = ex.fetch_balance({'type': 'swap'})
+                                    usdt = bal['USDT']['free']
+                                    total = bal['USDT']['total']
+                                    msg = f"💰 **내 지갑 현황**\n사용 가능: ${usdt:,.2f}\n총 자산: ${total:,.2f}"
+                                except: msg = "❌ 잔고 조회 실패"
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': msg, 'parse_mode': 'Markdown'})
+                            
+                            # B. 포지션 확인 (Bitget 전용)
+                            elif data == 'position':
+                                try:
+                                    positions = ex.fetch_positions([symbol_name])
+                                    active_pos = [p for p in positions if float(p['contracts']) > 0]
+                                    if not active_pos:
+                                        msg = "🧘 **현재 무포지션 상태입니다.**"
+                                    else:
+                                        p = active_pos[0]
+                                        side = p['side'].upper() # long/short
+                                        entry = float(p['entryPrice'])
+                                        upnl = float(p['unrealizedPnl'])
+                                        roe = p['percentage']
+                                        msg = f"📊 **현재 포지션 ({symbol_name})**\n방향: {side}\n평단가: ${entry:,.2f}\n수익금: ${upnl:.2f}\n수익률: {roe}%"
+                                except Exception as e: msg = f"❌ 포지션 조회 오류: {e}"
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': msg, 'parse_mode': 'Markdown'})
+    
+                            # C. 즉시 AI 분석
+                            elif data == 'analysis':
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': "🧠 AI가 차트를 분석 중입니다..."})
+                                # 데이터 수집 및 분석 (스레드 내 로직 재사용)
+                                ohlcv = ex.fetch_ohlcv(symbol_name, '5m', limit=100)
+                                df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+                                df['time'] = pd.to_datetime(df['time'], unit='ms')
+                                df, status, last = calc_indicators(df)
+                                strategy = generate_wonyousi_strategy(df, status)
+                                
+                                rpt = f"""
+    🔎 **실시간 AI 분석 보고**
+    결론: {strategy['decision'].upper()} (확신도 {strategy.get('confidence')}%)
+    
+    📈 추세: {strategy.get('reason_trend')}
+    🕯️ 패턴: {strategy.get('reason_candle')}
+    💡 요약: {strategy.get('final_reason')}
+    """
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': rpt, 'parse_mode': 'Markdown'})
+    
+                            # D. 봇 상태 확인
+                            elif data == 'status':
+                                next_run = ANALYSIS_INTERVAL - (now - last_run)
+                                status_msg = f"""
+    📡 **AI 시스템 상태: 정상 가동 중**
+    - 현재 모드: 완전 자동 (15분 주기)
+    - 다음 정기 분석까지: {int(next_run // 60)}분 {int(next_run % 60)}초 남음
+    - AI 연결: {'✅ 연결됨' if ai_model else '❌ 끊김'}
+    - 차트 감시 중... 이상 무!
+    """
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': status_msg})
+    
+                            # 버튼 로딩 애니메이션 종료
                             requests.post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", data={'callback_query_id': cb['id']})
-            
-                time.sleep(1) # CPU 과부하 방지
-
+    
+                time.sleep(1) # 과부하 방지
+    
             except Exception as e:
-                print(f"Error in TG Thread: {e}")
-                time.sleep(10) # 에러나면 10초 쉬고 재시도
-        
-    if st.button("🔄 기록 새로고침"): st.rerun()
+                print(f"Bot Error: {e}")
+                time.sleep(5)
+        if st.button("🔄 기록 새로고침"): st.rerun()
     
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     history_df = pd.read_sql("SELECT * FROM trade_history ORDER BY id DESC", conn)
