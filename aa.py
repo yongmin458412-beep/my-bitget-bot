@@ -14,41 +14,29 @@ import io
 import google.generativeai as genai
 
 # =========================================================
-# ⚙️ [시스템 설정] 기본 환경
+# ⚙️ [시스템 설정]
 # =========================================================
 IS_SANDBOX = True 
 SETTINGS_FILE = "bot_settings.json"
 LOG_FILE = "trade_log.csv"
 
-st.set_page_config(layout="wide", page_title="비트겟 AI 퀀트 (Robust)")
+st.set_page_config(layout="wide", page_title="비트겟 AI 퀀트 (System Check)")
 
 def load_settings():
-    """사용자의 모든 설정을 파일에서 불러옵니다."""
     default = {
         "gemini_api_key": "",
         "leverage": 20, "target_vote": 2, "tp": 15.0, "sl": 10.0,
         "auto_trade": False, "order_usdt": 100.0,
-        
-        # [지표 세부 파라미터]
         "rsi_period": 14, "rsi_buy": 30, "rsi_sell": 70,
-        "bb_period": 20, "bb_std": 2.0,
-        "ma_fast": 7, "ma_slow": 99,
+        "bb_period": 20, "bb_std": 2.0, "ma_fast": 7, "ma_slow": 99,
         "stoch_k": 14, "vol_mul": 2.0,
-        
-        # [지표 활성화 여부 - MA 기본값 True]
         "use_rsi": True, "use_bb": True, "use_cci": True, "use_vol": True,
         "use_ma": True, "use_macd": False, "use_stoch": False, 
         "use_mfi": False, "use_willr": False, "use_adx": True,
-        
-        # [스마트 방어 & 추매]
         "use_switching": True, "use_dca": True, "dca_trigger": -20.0, "dca_max_count": 1,
-        "use_holding": True,
-        
-        # [자금 관리 & 전략]
-        "auto_size_type": "percent", "auto_size_val": 20.0,
+        "use_holding": True, "auto_size_type": "percent", "auto_size_val": 20.0,
         "use_dual_mode": True
     }
-    
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r") as f:
@@ -76,12 +64,85 @@ tg_token = st.secrets.get("TG_TOKEN", "")
 tg_id = st.secrets.get("TG_CHAT_ID", "")
 gemini_key = st.secrets.get("GEMINI_API_KEY", config.get("gemini_api_key", ""))
 
-if not api_key: 
-    st.error("🚨 비트겟 API 키가 Secrets에 설정되지 않았습니다.")
-    st.stop()
+if not api_key: st.error("🚨 비트겟 API 키 없음"); st.stop()
 
 # ---------------------------------------------------------
-# 📅 경제 지표 (ForexFactory)
+# 🧠 AI 연결 진단 및 실행 (핵심 수정 부분)
+# ---------------------------------------------------------
+def generate_ai_content(prompt):
+    """
+    여러 모델을 순차적으로 시도하고, 실패 시 구체적인 에러를 반환합니다.
+    """
+    if not gemini_key: return "⚠️ Gemini API 키가 입력되지 않았습니다."
+    
+    genai.configure(api_key=gemini_key)
+    
+    # 시도할 모델 리스트 (최신 -> 구형 순)
+    models_to_try = [
+        'gemini-1.5-flash',       # 1순위: 최신/빠름
+        'gemini-1.5-flash-latest',# 2순위: 최신 별칭
+        'gemini-pro',             # 3순위: 구형 안정형
+        'gemini-1.0-pro'          # 4순위: 구형 호환
+    ]
+    
+    last_error = ""
+    
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            return response.text # 성공 시 바로 반환
+        except Exception as e:
+            last_error = str(e)
+            continue # 실패 시 다음 모델 시도
+            
+    # 모든 모델 실패 시 상세 에러 메시지 반환
+    return f"❌ AI 연결 실패 (마지막 시도 에러):\n{last_error}\n\n💡 힌트: requirements.txt에 'google-generativeai>=0.8.3'이 있는지 확인하세요."
+
+def ask_gemini_briefing(status_data, market_data):
+    # 경제지표 로딩 (에러 방지용 try-except)
+    try:
+        events_df = get_forex_events()
+        if not events_df.empty:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            today_ev = events_df[events_df['날짜'] == today_str]
+            eco_txt = today_ev.to_string() if not today_ev.empty else "오늘 주요 일정 없음"
+        else: eco_txt = "데이터 없음"
+    except: eco_txt = "로딩 실패"
+
+    prompt = f"""
+    [트레이딩 봇 상태]
+    - 포지션: {status_data['position']} ({status_data['roi']}%)
+    - 시장: 가격 ${market_data['price']}, RSI {market_data['rsi']}, ADX {market_data['adx']}
+    - 일정: {eco_txt}
+    
+    위 데이터를 바탕으로 현재 시장 상황과 대응 전략을 3줄로 요약해줘.
+    """
+    return generate_ai_content(prompt)
+
+def run_autopilot(df, current_config):
+    last = df.iloc[-1]
+    prompt = f"""
+    Analyze crypto market: RSI {last['RSI']:.1f}, ADX {last['ADX']:.1f}.
+    Return JSON settings: {{ "rsi_buy": int, "rsi_sell": int, "tp": float, "sl": float, "leverage": int, "reason": "Short explanation" }}
+    Only JSON.
+    """
+    res_text = generate_ai_content(prompt)
+    
+    # JSON 파싱 시도
+    try:
+        clean_text = res_text.replace("```json", "").replace("```", "").strip()
+        if "❌" in clean_text: return clean_text # 에러 메시지면 그대로 출력
+        
+        res_json = json.loads(clean_text)
+        current_config.update(res_json)
+        save_settings(current_config)
+        return f"✅ 최적화 완료: {res_json.get('reason', '설정 변경됨')}"
+    except:
+        return f"❌ AI 응답 해석 실패: {res_text}"
+
+# ---------------------------------------------------------
+# 📅 경제 지표
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600)
 def get_forex_events():
@@ -93,79 +154,9 @@ def get_forex_events():
         events = []
         for item in data:
             if item['country'] == 'USD' and item['impact'] in ['High', 'Medium']:
-                events.append({
-                    "날짜": item['date'][:10],
-                    "시간": item['date'][11:],
-                    "지표명": item['title'],
-                    "중요도": "🔥" if item['impact'] == 'High' else "⚠️",
-                    "예측": item.get('forecast', '-'),
-                    "이전": item.get('previous', '-')
-                })
+                events.append({"날짜": item['date'][:10], "시간": item['date'][11:], "지표": item['title'], "중요도": item['impact']})
         return pd.DataFrame(events)
     except: return pd.DataFrame()
-
-# ---------------------------------------------------------
-# 🧠 AI 기능 (자동 우회 로직 탑재)
-# ---------------------------------------------------------
-def generate_ai_content(prompt):
-    """
-    AI 모델 3가지를 순서대로 시도합니다.
-    1순위: gemini-1.5-flash (빠름)
-    2순위: gemini-pro (안정적)
-    3순위: gemini-1.0-pro (구형 호환)
-    """
-    if not gemini_key: return "⚠️ Gemini API 키가 없습니다."
-    
-    genai.configure(api_key=gemini_key)
-    models_to_try = ['gemini-1.5-flash', 'gemini-pro', 'gemini-1.0-pro']
-    
-    for model_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            return response.text # 성공하면 반환
-        except Exception as e:
-            continue # 실패하면 다음 모델 시도
-            
-    return "❌ 모든 AI 모델 연결 실패. API 키나 라이브러리를 확인하세요."
-
-def ask_gemini_briefing(status_data, market_data):
-    events_df = get_forex_events()
-    if not events_df.empty:
-        today = datetime.now().strftime("%Y-%m-%d")
-        today_ev = events_df[events_df['날짜'] == today]
-        eco_txt = today_ev.to_string() if not today_ev.empty else "오늘 주요 일정 없음"
-    else: eco_txt = "데이터 로딩 실패"
-
-    prompt = f"""
-    [트레이딩 봇 상태 브리핑]
-    1. 계좌: 포지션 {status_data['position']}, 손익 ${status_data['pnl']} ({status_data['roi']}%), 상태: {status_data['action_reason']}
-    2. 시장: 가격 ${market_data['price']}, ADX {market_data['adx']}, RSI {market_data['rsi']}, 공포지수 {market_data['fng']}
-    3. 일정: {eco_txt}
-    
-    위 정보를 바탕으로 현재 상황을 분석하고, 향후 대응(매수/매도/관망 등)을 3줄로 요약해줘.
-    """
-    return generate_ai_content(prompt)
-
-def run_autopilot(df, current_config):
-    last = df.iloc[-1]
-    summary = f"RSI:{last['RSI']:.1f}, ADX:{last['ADX']:.1f}, Price:{last['close']}"
-    prompt = f"""
-    Analyze crypto market: {summary}
-    Return JSON settings:
-    {{ "rsi_buy": int, "rsi_sell": int, "tp": float, "sl": float, "leverage": int, "reason": "Short Korean explanation" }}
-    Only JSON.
-    """
-    res_text = generate_ai_content(prompt)
-    
-    try:
-        clean_json = res_text.replace("```json", "").replace("```", "").strip()
-        res_json = json.loads(clean_json)
-        current_config.update(res_json)
-        save_settings(current_config)
-        return f"✅ 최적화 완료: {res_json['reason']}"
-    except:
-        return f"❌ AI 응답 오류: {res_text}"
 
 # ---------------------------------------------------------
 # 📡 데이터 & 텔레그램
@@ -185,47 +176,27 @@ def get_analytics():
         closed = df[df['Action'].str.contains('청산')]
         total_pnl = closed['PnL'].sum()
         today = datetime.now().strftime("%Y-%m-%d")
-        daily_pnl = closed[closed['Date'] == today]['PnL'].sum()
-        last_roi = closed.iloc[-1]['ROI'] if not closed.empty else 0.0
-        return last_roi, daily_pnl, total_pnl
+        daily = closed[closed['Date'] == today]['PnL'].sum()
+        return 0.0, daily, total_pnl
     except: return 0.0, 0.0, 0.0
 
 def log_trade(action, symbol, side, price, qty, leverage, pnl=0, roi=0):
     now = datetime.now()
-    margin = (price * qty) / leverage
     new_data = {
         "Time": now.strftime("%Y-%m-%d %H:%M:%S"), "Date": now.strftime("%Y-%m-%d"),
         "Symbol": symbol, "Action": action, "Side": side,
-        "Price": price, "Qty": qty, "Margin": margin, "PnL": pnl, "ROI": roi
+        "Price": price, "Qty": qty, "Margin": (price*qty)/leverage, "PnL": pnl, "ROI": roi
     }
     df = pd.DataFrame([new_data])
     if not os.path.exists(LOG_FILE): df.to_csv(LOG_FILE, index=False)
     else: df.to_csv(LOG_FILE, mode='a', header=False, index=False)
 
-def get_bot_status_reason(roi, dca_count, max_dca, holding, switching):
-    if roi <= -50.0: return "⚠️ 위험 구간"
-    if roi <= config['dca_trigger']:
-        if dca_count >= max_dca: return "✋ 추매 제한 (Wait)"
-        return "💧 추매 대기 중"
-    if roi <= config['sl'] * -1:
-        if holding: return "🛡️ 스마트 홀딩"
-        if switching: return "🔄 스위칭 대기"
-    return "✅ 모니터링 중"
-
-def send_telegram(message, chart_df=None):
+def send_telegram(message):
     if not tg_token or not tg_id: return
     try:
         url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
         kb = {"inline_keyboard": [[{"text": "🧠 AI 브리핑", "callback_data": "ai_briefing"}]]}
         requests.post(url, data={'chat_id': tg_id, 'text': message, 'parse_mode': 'HTML', 'reply_markup': json.dumps(kb)})
-        if chart_df is not None:
-            buf = io.BytesIO()
-            plt.figure(figsize=(10, 5))
-            plt.plot(chart_df['time'], chart_df['close'], color='yellow')
-            if 'ZLSMA' in chart_df.columns: plt.plot(chart_df['time'], chart_df['ZLSMA'], color='magenta')
-            plt.title("Chart"); plt.grid(True, alpha=0.2); ax = plt.gca(); ax.set_facecolor('black'); plt.gcf().patch.set_facecolor('black'); ax.tick_params(colors='white')
-            plt.savefig(buf, format='png', facecolor='black'); buf.seek(0)
-            requests.post(f"https://api.telegram.org/bot{tg_token}/sendPhoto", data={'chat_id': tg_id}, files={'photo': buf}); plt.close()
     except: pass
 
 def telegram_listener(exchange_obj, symbol_name):
@@ -239,7 +210,7 @@ def telegram_listener(exchange_obj, symbol_name):
                     if 'callback_query' in up:
                         cb = up['callback_query']
                         if cb['data'] == 'ai_briefing':
-                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cb['message']['chat']['id'], 'text': "🤖 데이터 분석 중..."})
+                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cb['message']['chat']['id'], 'text': "🤖 AI 분석 요청 접수..."})
                             
                             coin, free, total = get_balance_details(exchange_obj)
                             pos_txt = "없음"; u_pnl = 0; roi = 0
@@ -247,24 +218,17 @@ def telegram_listener(exchange_obj, symbol_name):
                                 pos = exchange_obj.fetch_positions([symbol_name])
                                 for p in pos:
                                     if float(p['contracts']) > 0:
-                                        pos_txt = f"{p['side']} x{p['leverage']}"
-                                        u_pnl = float(p['unrealizedPnl']); roi = float(p['percentage'])
+                                        pos_txt = f"{p['side']} x{p['leverage']}"; u_pnl = float(p['unrealizedPnl']); roi = float(p['percentage'])
                             except: pass
                             
                             try:
                                 ohlcv = exchange_obj.fetch_ohlcv(symbol_name, '5m', limit=20)
-                                close = ohlcv[-1][4]; adx=25.0; rsi=50.0 
-                            except: close=0; adx=0; rsi=0
+                                close = ohlcv[-1][4]
+                            except: close = 0
                             
-                            try: fng = requests.get("https://api.alternative.me/fng/").json()['data'][0]['value_classification']
-                            except: fng = "-"
-
-                            reason = get_bot_status_reason(roi, 1, config['dca_max_count'], config.get('use_holding',True), config['use_switching'])
-                            stat = {'position': pos_txt, 'pnl': u_pnl, 'roi': roi, 'balance': free, 'equity': total+u_pnl, 'action_reason': reason}
-                            mkt = {'price': close, 'adx': adx, 'rsi': rsi, 'fng': fng}
+                            ai_msg = ask_gemini_briefing({'position': pos_txt, 'roi': roi, 'pnl': u_pnl}, {'price': close, 'rsi': 50, 'adx': 25, 'fng': '-'})
                             
-                            ai_msg = ask_gemini_briefing(stat, mkt)
-                            msg = f"🧠 <b>AI 브리핑</b>\n\n{ai_msg}\n\n💰 <b>잔고:</b> ${free:,.2f}"
+                            msg = f"🧠 <b>AI 분석 결과</b>\n\n{ai_msg}\n\n💰 <b>잔고:</b> ${free:,.2f}"
                             requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cb['message']['chat']['id'], 'text': msg, 'parse_mode': 'HTML'})
                             requests.post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", data={'callback_query_id': cb['id']})
             time.sleep(1)
@@ -286,13 +250,14 @@ exchange = init_exchange()
 if not exchange: st.stop()
 
 # ---------------------------------------------------------
-# 🎨 사이드바 (설정)
+# 🎨 사이드바
 # ---------------------------------------------------------
 st.sidebar.title("🛠️ 봇 제어판")
-is_mobile = st.sidebar.checkbox("📱 모바일 뷰", value=True)
+st.sidebar.caption(f"🤖 AI Lib Ver: {genai.__version__}") # 버전 확인용
+
 markets = exchange.markets
 symbols = [s for s in markets if markets[s].get('linear') and markets[s].get('swap')]
-symbol = st.sidebar.selectbox("코인 선택", symbols, index=0)
+symbol = st.sidebar.selectbox("코인", symbols, index=0)
 
 if not gemini_key:
     g_key = st.sidebar.text_input("🧠 Gemini Key", value=config.get('gemini_api_key',''), type="password")
@@ -313,39 +278,37 @@ try:
 except: pass
 
 st.sidebar.divider()
-st.sidebar.subheader("🛡️ 스마트 방어")
+st.sidebar.subheader("🛡️ 방어 설정")
 use_switching = st.sidebar.checkbox("스위칭", value=config['use_switching'])
 use_holding = st.sidebar.checkbox("스마트 존버", value=config.get('use_holding', True))
 use_dca = st.sidebar.checkbox("추매 (DCA)", value=config['use_dca'])
 c_d1, c_d2 = st.sidebar.columns(2)
 dca_trigger = c_d1.number_input("추매 발동(%)", -90.0, -1.0, float(config['dca_trigger']), step=0.5)
 dca_max_count = c_d2.number_input("최대 횟수", 1, 10, int(config['dca_max_count']))
-use_dual_mode = st.sidebar.checkbox("⚔️ 이중 모드 (자동)", value=config.get('use_dual_mode', True))
+use_dual_mode = st.sidebar.checkbox("⚔️ 이중 모드", value=config.get('use_dual_mode', True))
 
 st.sidebar.divider()
 st.sidebar.subheader("📊 지표 설정")
-
 with st.sidebar.expander("1. RSI & BB", expanded=False):
     use_rsi = st.checkbox("RSI", config['use_rsi'])
     c1, c2, c3 = st.columns(3)
-    config['rsi_period'] = c1.number_input("기간", 5, 50, config['rsi_period'])
+    config['rsi_period'] = c1.number_input("RSI기간", 5, 50, config['rsi_period'])
     config['rsi_buy'] = c2.number_input("매수선", 10, 50, config['rsi_buy'])
     config['rsi_sell'] = c3.number_input("매도선", 50, 90, config['rsi_sell'])
     use_bb = st.checkbox("BB", config['use_bb'])
     c4, c5 = st.columns(2)
-    config['bb_period'] = c4.number_input("BB 기간", 5, 50, config['bb_period'])
-    config['bb_std'] = c5.number_input("BB 승수", 1.0, 3.0, config['bb_std'])
+    config['bb_period'] = c4.number_input("BB기간", 5, 50, config['bb_period'])
+    config['bb_std'] = c5.number_input("BB승수", 1.0, 3.0, config['bb_std'])
 
-# [이동평균선(MA) 설정 복구]
-with st.sidebar.expander("2. 추세 (MA, MACD, ADX)", expanded=True):
-    use_ma = st.checkbox("이동평균선 (MA)", value=config['use_ma'])
+with st.sidebar.expander("2. 추세 (MA...)", expanded=True):
+    use_ma = st.checkbox("MA (이평선)", value=config['use_ma'])
     c_m1, c_m2 = st.columns(2)
-    config['ma_fast'] = c_m1.number_input("단기 이평", 3, 50, int(config['ma_fast']))
-    config['ma_slow'] = c_m2.number_input("장기 이평", 50, 200, int(config['ma_slow']))
+    config['ma_fast'] = c_m1.number_input("단기", 3, 50, int(config['ma_fast']))
+    config['ma_slow'] = c_m2.number_input("장기", 50, 200, int(config['ma_slow']))
     use_macd = st.checkbox("MACD", config['use_macd'])
     use_adx = st.checkbox("ADX", config['use_adx'])
 
-with st.sidebar.expander("3. 기타 (Stoch, CCI...)", expanded=False):
+with st.sidebar.expander("3. 기타 지표", expanded=False):
     use_stoch = st.checkbox("Stoch", config['use_stoch'])
     config['stoch_k'] = st.number_input("K", 5, 50, config['stoch_k'])
     use_cci = st.checkbox("CCI", config['use_cci'])
@@ -404,15 +367,14 @@ def calculate_indicators(df):
     df['BB_UP'] = df['BB_MA'] + (df['BB_STD'] * config['bb_std'])
     df['BB_LO'] = df['BB_MA'] - (df['BB_STD'] * config['bb_std'])
     
-    # [이동평균선 계산 복구]
     df['MA_FAST'] = close.rolling(int(config['ma_fast'])).mean()
     df['MA_SLOW'] = close.rolling(int(config['ma_slow'])).mean()
     
     tp = (high + low + close) / 3
     sma = tp.rolling(20).mean(); mad = tp.rolling(20).apply(lambda x: np.mean(np.abs(x - np.mean(x))))
     df['CCI'] = (tp - sma) / (0.015 * mad)
-    
     df['VOL_MA'] = vol.rolling(20).mean()
+    
     exp12 = close.ewm(span=12).mean(); exp26 = close.ewm(span=26).mean()
     df['MACD'] = exp12 - exp26; df['MACD_SIG'] = df['MACD'].ewm(span=9).mean()
     
@@ -425,7 +387,6 @@ def calculate_indicators(df):
     mfi_ratio = pos_flow / neg_flow
     df['MFI'] = 100 - (100 / (1 + mfi_ratio))
     df['WILLR'] = -100 * ((highest_high - close) / (highest_high - lowest_low))
-    
     return df
 
 # ---------------------------------------------------------
@@ -441,7 +402,6 @@ try:
     
     is_trend_mode = last['ADX'] >= 25 and config['use_dual_mode']
     mode_str = "🌊 추세장 (ZLSMA)" if is_trend_mode else "🦀 횡보장 (RSI+BB)"
-    
 except Exception as e: st.error(f"데이터 로딩 실패: {e}"); st.stop()
 
 # =========================================================
@@ -464,7 +424,6 @@ try:
 except: pass
 equity = total + temp_pnl
 _, d_pnl, t_pnl = get_analytics()
-pnl_color = "#4CAF50" if d_pnl >= 0 else "#FF5252"
 
 st.markdown(f"""
 <div style="background-color: #1e1e1e; padding: 20px; border-radius: 10px; display: flex; justify-content: space-around; margin-bottom: 20px;">
@@ -566,7 +525,6 @@ with tab1:
         if use_bb:
             if last['close'] <= last['BB_LO']: long_score+=1; reasons_L.append("BB")
             elif last['close'] >= last['BB_UP']: short_score+=1; reasons_S.append("BB")
-        # [이동평균선 투표 로직 복구]
         if use_ma:
             if last['MA_FAST'] > last['MA_SLOW']: long_score+=1; reasons_L.append("MA정배열")
             elif last['MA_FAST'] < last['MA_SLOW']: short_score+=1; reasons_S.append("MA역배열")
@@ -637,7 +595,6 @@ with tab2:
     if cols[1].button("50%"): set_manual(0.5)
     if cols[2].button("80%"): set_manual(0.8)
     if cols[3].button("Full"): set_manual(1.0)
-    
     manual_amt = st.number_input("주문 금액 ($)", 0.0, free, key='order_usdt')
     b1, b2, b3 = st.columns(3)
     if b1.button("🟢 롱 진입", use_container_width=True): execute_trade('long', reason="수동", manual_amt=manual_amt)
