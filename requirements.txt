@@ -2,6 +2,6 @@ streamlit
 ccxt
 pandas
 numpy
-requests
 matplotlib
+requests
 google-generativeai>=0.8.3
