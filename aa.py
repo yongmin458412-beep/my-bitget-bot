@@ -14,29 +14,41 @@ import io
 import google.generativeai as genai
 
 # =========================================================
-# ⚙️ [시스템 설정]
+# ⚙️ [시스템 설정] 기본 환경
 # =========================================================
 IS_SANDBOX = True 
 SETTINGS_FILE = "bot_settings.json"
 LOG_FILE = "trade_log.csv"
 
-st.set_page_config(layout="wide", page_title="비트겟 AI 퀀트 (Unlimited)")
+st.set_page_config(layout="wide", page_title="비트겟 AI 퀀트 (Masterpiece)")
 
 def load_settings():
+    """사용자의 모든 설정을 파일에서 불러옵니다."""
     default = {
         "gemini_api_key": "",
         "leverage": 20, "target_vote": 2, "tp": 15.0, "sl": 10.0,
         "auto_trade": False, "order_usdt": 100.0,
+        
+        # [지표 세부 파라미터]
         "rsi_period": 14, "rsi_buy": 30, "rsi_sell": 70,
-        "bb_period": 20, "bb_std": 2.0, "ma_fast": 7, "ma_slow": 99,
+        "bb_period": 20, "bb_std": 2.0,
+        "ma_fast": 7, "ma_slow": 99,
         "stoch_k": 14, "vol_mul": 2.0,
+        
+        # [지표 활성화 여부]
         "use_rsi": True, "use_bb": True, "use_cci": True, "use_vol": True,
         "use_ma": True, "use_macd": False, "use_stoch": False, 
         "use_mfi": False, "use_willr": False, "use_adx": True,
+        
+        # [스마트 방어 & 추매]
         "use_switching": True, "use_dca": True, "dca_trigger": -20.0, "dca_max_count": 1,
-        "use_holding": True, "auto_size_type": "percent", "auto_size_val": 20.0,
+        "use_holding": True,
+        
+        # [자금 관리 & 전략]
+        "auto_size_type": "percent", "auto_size_val": 20.0,
         "use_dual_mode": True
     }
+    
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r") as f:
@@ -64,10 +76,12 @@ tg_token = st.secrets.get("TG_TOKEN", "")
 tg_id = st.secrets.get("TG_CHAT_ID", "")
 gemini_key = st.secrets.get("GEMINI_API_KEY", config.get("gemini_api_key", ""))
 
-if not api_key: st.error("🚨 비트겟 API 키 없음"); st.stop()
+if not api_key: 
+    st.error("🚨 비트겟 API 키가 Secrets에 설정되지 않았습니다.")
+    st.stop()
 
 # ---------------------------------------------------------
-# 🧠 AI 연결 (재시도 로직 추가됨)
+# 🧠 AI 연결 (자동 모델 감지 & 재시도)
 # ---------------------------------------------------------
 @st.cache_resource
 def get_ai_model_name(api_key):
@@ -87,9 +101,7 @@ def get_ai_model_name(api_key):
 current_model_name = get_ai_model_name(gemini_key)
 
 def generate_ai_content_safe(prompt):
-    """
-    [핵심] 429 오류 발생 시 자동으로 대기 후 재시도하는 함수
-    """
+    """429 오류 발생 시 자동 대기 후 재시도"""
     if not gemini_key: return "⚠️ API 키 없음"
     
     genai.configure(api_key=gemini_key)
@@ -103,14 +115,12 @@ def generate_ai_content_safe(prompt):
         except Exception as e:
             err_msg = str(e)
             if "429" in err_msg or "Quota" in err_msg:
-                wait_time = (attempt + 1) * 5 # 5초, 10초, 15초 대기
-                st.toast(f"⏳ 사용량 초과. {wait_time}초 후 재시도... ({attempt+1}/{max_retries})")
+                wait_time = (attempt + 1) * 3
                 time.sleep(wait_time)
                 continue
             else:
                 return f"❌ AI 오류: {err_msg}"
-    
-    return "❌ 사용량 초과로 실패했습니다. 잠시 후 다시 시도하세요."
+    return "❌ 사용량 초과. 잠시 후 다시 시도하세요."
 
 def ask_gemini_briefing(status_data, market_data):
     events_df = get_forex_events()
@@ -342,8 +352,14 @@ active_indicators = sum([use_rsi, use_bb, use_ma, use_macd, use_stoch, use_cci, 
 st.sidebar.divider()
 target_vote = st.sidebar.slider("🎯 진입 신호 강도", 1, max(1, active_indicators), config['target_vote'])
 p_leverage = st.sidebar.slider("레버리지", 1, 50, config['leverage'])
-tp_pct = st.sidebar.number_input("💰 익절 (%)", 1.0, 500.0, float(config['tp']))
-sl_pct = st.sidebar.number_input("💸 손절 (%)", 1.0, 100.0, float(config['sl']))
+
+# [에러 해결 부분] 값 보정(Clamping) 및 범위 확장
+# 저장된 값이 1.0보다 작거나 500.0보다 크면 강제로 맞춤
+safe_tp = max(1.0, min(float(config['tp']), 500.0))
+safe_sl = max(1.0, min(float(config['sl']), 500.0))
+
+tp_pct = st.sidebar.number_input("💰 익절 (%)", 1.0, 500.0, safe_tp)
+sl_pct = st.sidebar.number_input("💸 손절 (%)", 1.0, 500.0, safe_sl) # Max를 500으로 증가
 
 new_conf = config.copy()
 new_conf.update({
@@ -614,6 +630,7 @@ with tab2:
     if cols[1].button("50%"): set_manual(0.5)
     if cols[2].button("80%"): set_manual(0.8)
     if cols[3].button("Full"): set_manual(1.0)
+    
     manual_amt = st.number_input("주문 금액 ($)", 0.0, free, key='order_usdt')
     b1, b2, b3 = st.columns(3)
     if b1.button("🟢 롱 진입", use_container_width=True): execute_trade('long', reason="수동", manual_amt=manual_amt)
