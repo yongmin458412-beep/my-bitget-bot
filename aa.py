@@ -12,6 +12,8 @@ import uuid
 import sqlite3  # [New] DB 기능 추가
 from datetime import datetime, timedelta
 from openai import OpenAI
+# [추가] 스레드 컨텍스트 오류 해결용
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 # =========================================================
 # ⚙️ [시스템 기본 설정]
