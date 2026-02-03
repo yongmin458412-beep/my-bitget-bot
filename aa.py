@@ -822,7 +822,7 @@ with t1:
         status_placeholder.success("✅ 전체 스캔 완료!")
         st.dataframe(pd.DataFrame(results))
         
-        with t2:
+with t2:
     st.write("✋ **수동 컨트롤**")
     m_amt = st.number_input("주문 금액 ($)", 0.0, 100000.0, float(config['order_usdt']))
     b1, b2, b3 = st.columns(3)
