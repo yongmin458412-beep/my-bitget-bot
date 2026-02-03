@@ -812,23 +812,44 @@ with t3:
     else: st.write("일정 없음")
 
 with t4:
-    # [New] DB 뷰어 통합
-    st.subheader("📖 AI의 성장 일지 (DB Viewer)")
-    st.caption("AI가 매매 후 작성한 반성문과 피드백이 저장됩니다.")
+    # [수정됨] CSV 파일 뷰어로 변경
+    st.subheader("📖 AI의 성장 일지 (Trade Log)")
+    st.caption("AI가 매매 후 작성한 기록과 반성문이 이곳에 저장됩니다.")
     
-    if st.button("🔄 기록 새로고침"): st.rerun()
+    col_ref, col_down = st.columns([1, 4])
+    if col_ref.button("🔄 기록 새로고침"): 
+        st.rerun()
     
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    history_df = pd.read_sql("SELECT * FROM trade_history ORDER BY id DESC", conn)
-    conn.close()
-    
-    if not history_df.empty:
-        st.dataframe(history_df)
+    # 1. CSV 파일 읽어오기
+    if os.path.exists(LOG_FILE):
+        try:
+            history_df = pd.read_csv(LOG_FILE)
+            
+            # 최신순 정렬 (Time 컬럼 기준)
+            if 'Time' in history_df.columns:
+                history_df = history_df.sort_values(by='Time', ascending=False)
+            
+            # 2. 데이터 표시
+            st.dataframe(history_df, use_container_width=True, hide_index=True)
+            
+            # 3. 다운로드 버튼 제공
+            with col_down:
+                csv = history_df.to_csv(index=False).encode('utf-8-sig')
+                st.download_button("💾 엑셀로 다운로드", csv, "trade_log.csv", "text/csv")
+                
+        except Exception as e:
+            st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
     else:
-        st.info("아직 기록된 매매가 없습니다.")
+        st.info("📭 아직 기록된 매매가 없습니다.")
         
-    if st.button("🧪 테스트 데이터 입력 (DB Test)"):
-        log_trade_to_db(symbol, "long", curr_price, -50.0, "뇌동매매", "상승 추세가 확실할 때만 진입하자.")
+    st.divider()
+    
+    # 4. 테스트 버튼 (새로운 log_trade 함수 형식에 맞춤)
+    if st.button("🧪 테스트 데이터 입력 (기록 확인용)"):
+        # 가짜 데이터: 코인, 포지션, 진입가, 청산가, 손익금, 수익률, 이유
+        log_trade("BTC/TEST", "long", 50000, 49000, -100, -2.0, "테스트: 손절 로직 확인용")
+        st.success("테스트 데이터가 입력되었습니다! 위 표를 확인하세요.")
+        time.sleep(1)
         st.rerun()
 
 # [여기서부터 파일 맨 끝에 추가하세요]
