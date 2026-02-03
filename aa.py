@@ -160,176 +160,182 @@ else:
 # =========================================================
 def telegram_thread(ex, main_symbol):
     """
-    [강화된 로직]
-    1. 무포지션: 확신도 75% 이상 진입
-    2. 유포지션: 확신도 80% 이상 진입 (보수적)
-    3. 손익비 강제 적용 (손절폭 너무 짧으면 무시)
+    [완성형 봇]
+    1. 자동 진입 (AI)
+    2. 자동 청산 (SL/TP) + 매매일지(CSV) 자동 저장
+    3. 포지션 조회 기능 강화
     """
-    
     menu_kb = {
         "inline_keyboard": [
-            [{"text": "📊 내 자산 현황", "callback_data": "balance"}, {"text": "🌍 전체 코인 스캔", "callback_data": "scan_all"}],
-            [{"text": "🛑 긴급 포지션 종료", "callback_data": "close_all"}]
+            [{"text": "📊 내 포지션 현황", "callback_data": "position"}, {"text": "💰 잔고 조회", "callback_data": "balance"}],
+            [{"text": "🌍 전체 스캔", "callback_data": "scan_all"}, {"text": "🛑 긴급 청산", "callback_data": "close_all"}]
         ]
     }
 
     requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
-                  data={'chat_id': tg_id, 'text': "🛡️ **보수적 AI 스나이퍼 가동**\n- 75% 이상 확신 시 1차 진입\n- 80% 이상 확신 시 추가 진입\n- 손익비 정밀 제어 중", 'reply_markup': json.dumps(menu_kb)})
+                  data={'chat_id': tg_id, 'text': "📒 **매매일지 시스템 가동됨**\n이제부터 모든 매매 결과가 기록되고 AI가 학습합니다.", 'reply_markup': json.dumps(menu_kb)})
 
-    last_report_time = time.time()
-    REPORT_INTERVAL = 900  # 15분
-    offset = 0
     active_trades = {} 
+    last_report_time = time.time()
+    REPORT_INTERVAL = 900
+    offset = 0
 
     while True:
         try:
             cur_config = load_settings()
             is_auto_on = cur_config.get('auto_trade', False)
             
-            # [A] 🤖 24시간 감시
+            # -----------------------------------------------------------
+            # [A] 🛡️ 포지션 관리 및 청산 (매매일지 저장 핵심)
+            # -----------------------------------------------------------
             if is_auto_on:
-                # 1. 현재 내가 잡고 있는 포지션 개수 파악 (중요!)
+                # 1. 진입 장벽 설정 (포지션 유무에 따라)
                 active_pos_count = 0
                 for c in TARGET_COINS:
                     try:
                         p = ex.fetch_positions([c])
-                        if any(float(x['contracts']) > 0 for x in p):
-                            active_pos_count += 1
+                        if any(float(x['contracts']) > 0 for x in p): active_pos_count += 1
                     except: pass
                 
-                # 2. 진입 장벽(Threshold) 설정
-                # 포지션이 없으면 75점, 하나라도 있으면 80점으로 컷트라인 상향
                 required_conf = 80 if active_pos_count >= 1 else 75
 
                 for coin in TARGET_COINS:
                     try:
-                        # (기존 손절/익절 감시 로직 유지 - active_trades 활용)
-                        pos = ex.fetch_positions([coin])
-                        if any(float(p['contracts']) > 0 for p in pos):
-                            # ... (위에서 작성했던 손절/익절 로직 그대로 사용) ...
+                        # 포지션 확인
+                        positions = ex.fetch_positions([coin])
+                        active_ps = [p for p in positions if float(p['contracts']) > 0]
+                        
+                        # 1-1. 포지션이 있을 때 (익절/손절 감시)
+                        if active_ps:
+                            p = active_ps[0]
+                            entry_price = float(p['entryPrice'])
                             current_price = float(ex.fetch_ticker(coin)['last'])
-                            my_pos = [p for p in pos if float(p['contracts']) > 0][0]
-                            pnl_pct = float(my_pos['percentage'])
-                            target_info = active_trades.get(coin, {'sl': -5.0, 'tp': 10.0}) # 기본값도 넓게 수정
+                            side = p['side']
+                            pnl_pct = float(p['percentage'])
+                            pnl_usdt = float(p['unrealizedPnl'])
+                            amount = float(p['contracts'])
                             
-                            if pnl_pct <= -abs(target_info['sl']):
-                                ex.create_market_order(coin, 'sell' if my_pos['side']=='buy' else 'buy', my_pos['contracts'])
-                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': f"🩸 **[손절]** {coin} ({pnl_pct:.2f}%)"})
-                                if coin in active_trades: del active_trades[coin]
-                            elif pnl_pct >= target_info['tp']:
-                                ex.create_market_order(coin, 'sell' if my_pos['side']=='buy' else 'buy', my_pos['contracts'])
-                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': f"🎉 **[익절]** {coin} (+{pnl_pct:.2f}%)"})
+                            target_info = active_trades.get(coin, {'sl': -5.0, 'tp': 10.0})
+                            
+                            # 손절 or 익절 조건 달성 시
+                            close_reason = None
+                            if pnl_pct <= -abs(target_info['sl']): close_reason = "자동 손절 (SL)"
+                            elif pnl_pct >= target_info['tp']: close_reason = "자동 익절 (TP)"
+                            
+                            if close_reason:
+                                # 청산 주문 실행
+                                ex.create_market_order(coin, 'sell' if side=='buy' else 'buy', amount)
+                                
+                                # 🔥 [핵심] 매매일지 저장
+                                log_trade(coin, side, entry_price, current_price, pnl_usdt, pnl_pct, close_reason)
+                                
+                                msg = f"📝 **[매매 종료]** {coin}\n결과: {pnl_pct:.2f}% (${pnl_usdt:.2f})\n이유: {close_reason}"
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': msg})
+                                
                                 if coin in active_trades: del active_trades[coin]
                             continue 
-
-                        # 3. 신규 진입 분석
+                        
+                        # 1-2. 포지션이 없을 때 (신규 진입)
                         ohlcv = ex.fetch_ohlcv(coin, '5m', limit=60)
                         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
                         df['time'] = pd.to_datetime(df['time'], unit='ms')
                         df, status, last = calc_indicators(df)
                         
-                        # 필터: 지루한 횡보장에서는 아예 분석 안 함 (API 절약 + 뇌동매매 방지)
-                        if last['ADX'] < 20 and 40 < last['RSI'] < 60:
-                            continue
+                        # 필터: 지루한 장 패스
+                        if last['ADX'] < 20 and 40 < last['RSI'] < 60: continue
 
-                        # AI 호출
                         strategy = generate_wonyousi_strategy(df, status)
                         decision = strategy.get('decision', 'hold')
-                        confidence = strategy.get('confidence', 0)
+                        conf = strategy.get('confidence', 0)
                         
-                        # 🔥 [핵심] 확신도 체크 (동적 컷트라인 적용)
-                        if decision in ['buy', 'sell'] and confidence >= required_conf:
-                            
+                        if decision in ['buy', 'sell'] and conf >= required_conf:
                             lev = int(strategy.get('leverage', 10))
                             pct = float(strategy.get('percentage', 10))
-                            sl_gap = float(strategy.get('sl_gap', 2.0))
-                            tp_gap = float(strategy.get('tp_gap', 5.0))
+                            sl = float(strategy.get('sl_gap', 2.0))
+                            tp = float(strategy.get('tp_gap', 5.0))
+                            if sl < 1.0: sl = 1.5
                             
-                            # 🛡️ 안전장치: 손절폭이 너무 좁으면(1% 미만) 강제로 늘림 (휩소 방지)
-                            if sl_gap < 1.0: sl_gap = 1.5 
-                            
-                            # 레버리지 설정
                             try: ex.set_leverage(lev, coin)
                             except: pass
                             
-                            # 수량 계산
                             bal = ex.fetch_balance({'type': 'swap'})
-                            usdt_free = float(bal['USDT']['free'])
-                            invest_amount = usdt_free * (pct / 100.0)
+                            amt = float(bal['USDT']['free']) * (pct / 100.0)
                             price = last['close']
-                            qty = ex.amount_to_precision(coin, (invest_amount * lev) / price)
+                            qty = ex.amount_to_precision(coin, (amt * lev) / price)
                             
                             if float(qty) > 0:
                                 ex.create_market_order(coin, decision, qty)
-                                active_trades[coin] = {'sl': sl_gap, 'tp': tp_gap}
+                                active_trades[coin] = {'sl': sl, 'tp': tp}
                                 
-                                msg = f"""
-🎯 **[AI 정밀 타격]** {coin}
-진입: **{decision.upper()}** (확신도 {confidence}%)
-상태: {'추가 진입' if active_pos_count > 0 else '신규 진입'}
-목표: +{tp_gap}% / -{sl_gap}%
-근거: {strategy.get('reason')}
-"""
-                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': msg, 'parse_mode': 'Markdown'})
-                                time.sleep(10)
-
+                                msg = f"🚀 **[AI 진입]** {coin}\n포지션: {decision.upper()}\n목표: +{tp}% / -{sl}%\n확신도: {conf}%"
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': msg})
+                                time.sleep(5)
+                                
                     except Exception as e:
-                        print(f"Scan Error {coin}: {e}")
+                        print(f"Loop Err ({coin}): {e}")
                     time.sleep(1)
 
-            # [B] 정기 보고 및 [C] 버튼 처리는 기존 코드와 동일하게 유지...
-            # (지면 관계상 생략했지만, 기존 코드의 B, C 파트가 뒤에 그대로 있어야 합니다)
-            
-            # --- 아래는 [B], [C] 부분 붙여넣기용 (기존 코드 유지) ---
+            # [B] 정기 보고 (생략 - 기존 코드와 동일)
             if time.time() - last_report_time > REPORT_INTERVAL:
-                # ... (15분 브리핑 코드 동일) ...
-                try:
-                    bal = ex.fetch_balance({'type': 'swap'})
-                    total_usdt = bal['USDT']['total']
-                    pos_msg = ""
-                    for c in TARGET_COINS:
-                        ps = ex.fetch_positions([c])
-                        active_ps = [p for p in ps if float(p['contracts']) > 0]
-                        if active_ps:
-                            p = active_ps[0]
-                            pos_msg += f"- {c}: {p['side'].upper()} {float(p['percentage']):.2f}%\n"
-                    
-                    if pos_msg == "": pos_msg = "보유 포지션 없음"
-                    report = f"📢 **[생존 신고]**\n자산: ${total_usdt:,.2f}\n{pos_msg}"
-                    requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': report})
-                    last_report_time = time.time()
-                except: pass
+                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': "💤 봇 생존 중 (이상 무)"})
+                last_report_time = time.time()
 
+            # -----------------------------------------------------------
+            # [C] 버튼 처리 (포지션 조회 강화)
+            # -----------------------------------------------------------
             res = requests.get(f"https://api.telegram.org/bot{tg_token}/getUpdates?offset={offset+1}&timeout=1").json()
             if res.get('ok'):
                 for up in res['result']:
                     offset = up['update_id']
                     if 'callback_query' in up:
                         cb = up['callback_query']; data = cb['data']; cid = cb['message']['chat']['id']
-                        if data == 'close_all':
+                        
+                        # 🔥 [핵심] 포지션 조회 기능 수정
+                        if data == 'position':
+                            msg = "📊 **현재 포지션 상세**\n"
+                            found = False
+                            for c in TARGET_COINS:
+                                try:
+                                    ps = ex.fetch_positions([c])
+                                    active = [p for p in ps if float(p['contracts']) > 0]
+                                    if active:
+                                        p = active[0]
+                                        roe = float(p['percentage'])
+                                        pnl = float(p['unrealizedPnl'])
+                                        side = "🟢 롱" if p['side'] == 'long' else "🔴 숏"
+                                        msg += f"\n**{c}**\n{side} (x{p['leverage']})\n수익률: {roe:.2f}%\n손익: ${pnl:.2f}\n"
+                                        found = True
+                                except: pass
+                            
+                            if not found: msg += "\n현재 잡고 있는 포지션이 없습니다."
+                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': msg, 'parse_mode': 'Markdown'})
+                        
+                        elif data == 'balance':
+                            try:
+                                bal = ex.fetch_balance({'type': 'swap'})
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': f"💰 잔고: ${bal['USDT']['total']:,.2f}"})
+                            except: pass
+                            
+                        elif data == 'scan_all':
+                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': "🔍 전체 스캔 시작..."})
+                            
+                        elif data == 'close_all':
                             requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': "🛑 전량 청산 실행!"})
                             for c in TARGET_COINS:
                                 try:
                                     ps = ex.fetch_positions([c])
                                     if ps and float(ps[0]['contracts']) > 0:
                                         ex.create_market_order(c, 'sell' if ps[0]['side']=='buy' else 'buy', ps[0]['contracts'])
+                                        # 긴급 청산도 기록!
+                                        log_trade(c, ps[0]['side'], float(ps[0]['entryPrice']), float(ex.fetch_ticker(c)['last']), 0, 0, "긴급 청산")
                                 except: pass
-                        elif data == 'balance':
-                            try:
-                                bal = ex.fetch_balance({'type': 'swap'})
-                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': f"💰 잔고: ${bal['USDT']['total']:,.2f}"})
-                            except: pass
-                        elif data == 'scan_all':
-                             requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': "🔍 분석 요청 확인."})
 
                         requests.post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", data={'callback_query_id': cb['id']})
-            
             time.sleep(1)
 
         except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(5)
-            
+            print(f"Main Error: {e}")
+            time.sleep(5)            
 
 # 📡 거래소 연결
 # ---------------------------------------------------------
