@@ -800,42 +800,81 @@ t1, t2, t3, t4 = st.tabs(["🤖 자동매매 & AI분석", "⚡ 수동주문", "�
 # [수정할 위치: 탭1(t1) 내부의 수동 분석 버튼 코드]
 
 with t1:
-    c_auto, c_log = st.columns([2, 1])
+    st.subheader("🧠 워뇨띠 AI 전략 센터")
+    
+    # 자동매매 스위치
+    c_auto, c_stat = st.columns([3, 1])
     with c_auto:
-        st.subheader("🧠 GPT-4o 정밀 분석")
-        
-        # 자동매매 체크박스
-        auto_on = st.checkbox("자동매매 활성화 (15분 주기)", value=config.get('auto_trade', False))
+        auto_on = st.checkbox("🤖 24시간 자동매매 활성화 (텔레그램 연동)", value=config.get('auto_trade', False))
         if auto_on != config.get('auto_trade', False):
             config['auto_trade'] = auto_on
             save_settings(config)
             st.rerun()
+    with c_stat:
+        st.caption("상태: " + ("🟢 가동중" if auto_on else "🔴 정지"))
 
-        # 👇 [여기를 수정하세요] 버튼 클릭 시 동작 코드
-        if st.button("🔍 수동 AI 분석 (GPT-4o)"):
-            with st.spinner("워뇨띠가 차트를 분석 중입니다..."):
-                # 1. AI 분석 실행
+    st.divider()
+
+    # 👇 [수정됨] 버튼을 2개로 분리 (컬럼 활용)
+    col_btn1, col_btn2 = st.columns(2)
+
+    # 버튼 1: 현재 차트만 분석
+    if col_btn1.button("🔍 현재 차트 분석 (This Coin)"):
+        with st.spinner(f"'{symbol}' 차트를 정밀 분석 중입니다..."):
+            try:
                 ai_res = generate_wonyousi_strategy(df, status)
                 
-                # 2. 결과 표시 (None 해결: final_reason을 가져오도록 변경)
                 decision = ai_res.get('decision', 'hold').upper()
-                confidence = ai_res.get('confidence', 0)
-                reason = ai_res.get('final_reason', "이유를 불러오지 못했습니다.") # 👈 핵심 수정!
-                
-                # 3. 화면 출력
+                conf = ai_res.get('confidence', 0)
+                reason = ai_res.get('final_reason', ai_res.get('reason', '알 수 없음'))
+
                 if decision == 'BUY':
-                    st.success(f"결론: 🟢 **매수 (BUY)** (확신도 {confidence}%)")
+                    st.success(f"결론: 🟢 **매수 (BUY)** (확신도 {conf}%)")
                 elif decision == 'SELL':
-                    st.error(f"결론: 🔴 **매도 (SELL)** (확신도 {confidence}%)")
+                    st.error(f"결론: 🔴 **매도 (SELL)** (확신도 {conf}%)")
                 else:
-                    st.warning(f"결론: ⚪ **관망 (HOLD)** (확신도 {confidence}%)")
+                    st.warning(f"결론: ⚪ **관망 (HOLD)** (확신도 {conf}%)")
                 
-                st.info(f"💡 **워뇨띠의 근거:** {reason}")
+                st.info(f"💡 **근거:** {reason}")
+            except Exception as e:
+                st.error(f"❌ 분석 중 오류가 발생했습니다: {e}")
+
+    # 버튼 2: 전체 코인 스캔
+    if col_btn2.button("🌍 전체 코인 스캔 (All Coins)"):
+        status_placeholder = st.empty()
+        status_placeholder.info("🕵️ 5개 코인을 순차적으로 분석 중... (약 10~20초 소요)")
+        
+        results = []
+        progress_bar = st.progress(0)
+        
+        for i, coin in enumerate(TARGET_COINS):
+            try:
+                # 데이터 가져오기
+                ohlcv_t = exchange.fetch_ohlcv(coin, '5m', limit=100)
+                df_t = pd.DataFrame(ohlcv_t, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+                df_t['time'] = pd.to_datetime(df_t['time'], unit='ms')
+                df_t, stat_t, last_t = calc_indicators(df_t)
                 
-                # 상세 JSON 데이터도 보여줌 (디버깅용)
-                with st.expander("🔍 분석 데이터 원본"):
-                    st.json(ai_res)
-with t2:
+                # AI 분석
+                res = generate_wonyousi_strategy(df_t, stat_t)
+                
+                # 결과 저장
+                results.append({
+                    "코인": coin.split('/')[0],
+                    "현재가": f"${last_t['close']:,.2f}",
+                    "결론": res['decision'].upper(),
+                    "확신도": f"{res.get('confidence',0)}%",
+                    "근거": res.get('final_reason', '요약 불가')[:30] + "..." # 너무 길어서 자름
+                })
+            except Exception as e:
+                results.append({"코인": coin, "결론": "Error", "근거": str(e)})
+            
+            progress_bar.progress((i + 1) / len(TARGET_COINS))
+        
+        status_placeholder.success("✅ 전체 스캔 완료!")
+        st.dataframe(pd.DataFrame(results))
+        
+        with t2:
     st.write("✋ **수동 컨트롤**")
     m_amt = st.number_input("주문 금액 ($)", 0.0, 100000.0, float(config['order_usdt']))
     b1, b2, b3 = st.columns(3)
