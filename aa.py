@@ -544,6 +544,21 @@ studies_json = str(tv_studies).replace("'", '"')
 tv = f"""<div class="tradingview-widget-container"><div id="tradingview_chart"></div><script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script><script type="text/javascript">new TradingView.widget({{ "width": "100%", "height": {h}, "symbol": "BITGET:{symbol.replace('/','').split(':')[0]}.P", "interval": "5", "theme": "dark", "studies": {studies_json}, "container_id": "tradingview_chart" }});</script></div>"""
 components.html(tv, height=h)
 
+# ---------------------------------------------------------
+# 📅 데이터 수집 (ForexFactory) - UI 표시용 함수 (복구)
+# ---------------------------------------------------------
+@st.cache_data(ttl=3600)
+def get_forex_events():
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}).json()
+        events = []
+        for item in res:
+            if item['country'] == 'USD' and item['impact'] in ['High', 'Medium']:
+                events.append({"날짜": item['date'][:10], "시간": item['date'][11:], "지표": item['title'], "중요도": "🔥" if item['impact']=='High' else "⚠️"})
+        return pd.DataFrame(events)
+    except: return pd.DataFrame()
+        
 # 4개의 탭으로 확장 (새 기능 포함)
 t1, t2, t3, t4 = st.tabs(["🤖 자동매매 & AI분석", "⚡ 수동주문", "📅 시장정보", "📜 매매일지(DB)"])
 
