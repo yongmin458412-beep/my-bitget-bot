@@ -149,154 +149,9 @@ else:
     # 여기서 SyntaxError가 났던 부분입니다. 깔끔하게 다시 작성됨.
     openai_client = OpenAI(api_key=openai_key)
 
-def generate_wonyousi_strategy(df, status_summary):
-    """OpenAI GPT-4o를 이용한 정밀 분석"""
-    if not openai_client: 
-        return {"decision": "hold", "final_reason": "OpenAI API Key가 설정되지 않았습니다.", "confidence": 0}
-    
-    past_mistakes = get_past_mistakes()
-    last_row = df.iloc[-1]
-    
-    # 시스템 프롬프트
-    system_prompt = """
-    당신은 전설적인 코인 트레이더 '워뇨띠'입니다.
-    원칙:
-    1. 지표 수치보다 '캔들 패턴', '거래량', '추세(Price Action)'를 최우선으로 봅니다.
-    2. 확실한 자리가 아니면 과감하게 '관망(hold)'을 외치세요.
-    3. 응답은 오직 JSON 형식으로만 해야 합니다.
-    """
-
-    # 사용자 프롬프트
-    user_prompt = f"""
-    [현재 시장 데이터]
-    - 현재가: {last_row['close']}
-    - RSI: {last_row['RSI']:.1f}
-    - 볼린저밴드: {status_summary.get('BB', 'Normal')}
-    - 추세강도(ADX): {last_row['ADX']:.1f}
-    - 활성 매수 시그널: {status_summary}
-    
-    [과거의 실수 (반면교사)]
-    {past_mistakes}
-    
-    위 데이터를 분석하여 매매 전략을 세우세요.
-    
-    # 응답 형식 (JSON):
-    {{
-        "decision": "buy" 또는 "sell" 또는 "hold",
-        "reason_trend": "추세 관점 분석",
-        "reason_candle": "캔들/거래량 패턴 분석",
-        "final_reason": "한 줄 핵심 요약",
-        "confidence": 0~100 (확신도 숫자)
-    }}
-    """
-    
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o", 
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"}, 
-            temperature=0.5
-        )
-        res_text = response.choices[0].message.content
-        return json.loads(res_text)
-
-    except Exception as e:
-        # [핵심 수정] 에러 키를 'final_reason'으로 변경하여 UI에 표시되게 함
-        return {"decision": "hold", "final_reason": f"OpenAI 오류 발생: {e}", "confidence": 0}
-        
-# 📅 데이터 수집 (ForexFactory + CCXT)
-# ---------------------------------------------------------
-@st.cache_data(ttl=3600)
-def get_forex_events():
-    try:
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}).json()
-        events = []
-        for item in res:
-            if item['country'] == 'USD' and item['impact'] in ['High', 'Medium']:
-                events.append({"날짜": item['date'][:10], "시간": item['date'][11:], "지표": item['title'], "중요도": "🔥" if item['impact']=='High' else "⚠️"})
-        return pd.DataFrame(events)
-    except: return pd.DataFrame()
-
-def get_balance(ex):
-    try:
-        bal = ex.fetch_balance({'type': 'swap'})
-        coin = 'SUSDT' if 'SUSDT' in bal else ('USDT' if 'USDT' in bal else 'SBTC')
-        return coin, float(bal[coin]['free']), float(bal[coin]['total'])
-    except: return "USDT", 0.0, 0.0
-
-def log_trade(action, symbol, side, price, qty, leverage, pnl=0, roi=0):
-    """기존 CSV 로그 (엑셀 호환용)"""
-    now = datetime.now()
-    new_data = {"Time": now.strftime("%Y-%m-%d %H:%M:%S"), "Date": now.strftime("%Y-%m-%d"), "Symbol": symbol, "Action": action, "Side": side, "Price": price, "Qty": qty, "Margin": (price*qty)/leverage, "PnL": pnl, "ROI": roi}
-    df = pd.DataFrame([new_data])
-    if not os.path.exists(LOG_FILE): df.to_csv(LOG_FILE, index=False)
-    else: df.to_csv(LOG_FILE, mode='a', header=False, index=False)
-
-# ---------------------------------------------------------
-# 🤖 [AI 에이전트] 능동 제안 및 5분 자동 수락 시스템
-# ---------------------------------------------------------
-def manage_proposals(ex, symbol_name):
-    if not os.path.exists(PROPOSALS_FILE): return
-    try:
-        with open(PROPOSALS_FILE, 'r') as f: proposals = json.load(f)
-    except: return
-    
-    changed = False
-    now = time.time()
-    
-    for pid, data in list(proposals.items()):
-        # 5분(300초) 경과 시 자동 수락
-        if now - data['timestamp'] > 300: 
-            try:
-                ex.set_leverage(config['leverage'], symbol_name)
-                ticker = ex.fetch_ticker(symbol_name)
-                price = ticker['ask'] if data['side'] == 'long' else ticker['bid']
-                
-                bal = ex.fetch_balance({'type': 'swap'})
-                coin_key = 'USDT' if 'USDT' in bal else 'SUSDT'
-                free = float(bal[coin_key]['free']); total = float(bal[coin_key]['total'])
-                
-                amt = config['auto_size_val']
-                if config['auto_size_type'] == 'percent': amt = total * (amt / 100.0)
-                if amt > free * 0.98: amt = free * 0.98
-                
-                qty = ex.amount_to_precision(symbol_name, (amt * config['leverage']) / price)
-                
-                if float(qty) > 0:
-                    ex.create_order(symbol_name, 'limit', 'buy' if data['side'] == 'long' else 'sell', qty, price)
-                    msg = f"⏳ <b>[AI 자동 실행]</b>\n주인님의 응답이 없어 5분 후 {data['side'].upper()} 포지션에 자동 진입했습니다.\n이유: {data.get('reason', 'AI 판단')}"
-                    requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': msg, 'parse_mode': 'HTML'})
-                    log_trade("AI자동진입", symbol_name, data['side'], price, float(qty), config['leverage'])
-                    # DB에도 기록 (피드백 없음, 추후 청산 시 기록)
-                
-                del proposals[pid]
-                changed = True
-            except Exception as e:
-                del proposals[pid]; changed = True
-
-    if changed:
-        with open(PROPOSALS_FILE, 'w') as f: json.dump(proposals, f)
-
-def send_proposal(side, reason):
-    pid = str(uuid.uuid4())
-    proposal = {"id": pid, "side": side, "reason": reason, "timestamp": time.time()}
-    try:
-        with open(PROPOSALS_FILE, 'r') as f: props = json.load(f)
-    except: props = {}
-    props[pid] = proposal
-    with open(PROPOSALS_FILE, 'w') as f: json.dump(props, f)
-    
-    kb = {"inline_keyboard": [[{"text": "✅ 승인 (지금 진입)", "callback_data": f"acc_{pid}"}, {"text": "❌ 거절 (취소)", "callback_data": f"rej_{pid}"}]]}
-    msg = f"🤖 <b>[AI 워뇨띠 제안]</b>\n\n기회 포착: <b>{side.upper()}</b>\n이유: {reason}\n\n<i>5분 내 거절하지 않으면 자동으로 매수합니다.</i>"
-    requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': msg, 'parse_mode': 'HTML', 'reply_markup': json.dumps(kb)})
-
 def telegram_thread(ex, symbol_name):
     """
-    [수정됨] 텔레그램 수신 대기 + 15분마다 AI 자동 분석 및 리포팅 수행
+    [수정됨] 경제 뉴스 제거 + 15분마다 AI 자동 분석 및 리포팅 수행
     """
     offset = 0
     last_run = 0  # 마지막 분석 시간 (초)
@@ -304,7 +159,7 @@ def telegram_thread(ex, symbol_name):
 
     # 봇 시작 알림
     requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
-                  data={'chat_id': tg_id, 'text': "🤖 **AI 워뇨띠 완전 자동화 모드 시작**\n15분마다 시장을 분석하고 보고합니다.", 'parse_mode': 'Markdown'})
+                  data={'chat_id': tg_id, 'text': "🤖 **AI 워뇨띠 자동화 모드 시작**\n(경제뉴스 알림 OFF)", 'parse_mode': 'Markdown'})
 
     while True:
         try:
@@ -319,38 +174,29 @@ def telegram_thread(ex, symbol_name):
                 df_thread = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
                 df_thread['time'] = pd.to_datetime(df_thread['time'], unit='ms')
                 
-                # 지표 계산 (기존 함수 재사용)
+                # 지표 계산
                 df_thread, status, last_row = calc_indicators(df_thread)
                 
-                # 경제 일정(뉴스) 가져오기
-                events = get_forex_events()
-                event_str = "주요 경제 일정 없음"
-                if not events.empty:
-                    event_str = events.to_string(index=False)
-
                 # B. 워뇨띠 AI에게 물어보기
-                # (프롬프트에 경제 일정도 포함시켜 판단력 강화)
                 strategy = generate_wonyousi_strategy(df_thread, status) 
                 
-                # C. [보고] 텔레그램으로 분석 리포트 전송
+                # C. [보고] 텔레그램으로 분석 리포트 전송 (경제뉴스 제거됨)
                 report_msg = f"""
 📊 **[15분 정기 보고] {symbol_name}**
 현재가: ${last_row['close']:,.2f}
 추세강도(ADX): {last_row['ADX']:.1f} ({'강한 추세' if last_row['ADX']>25 else '횡보'})
 
 🤖 **워뇨띠의 판단:** {strategy['decision'].upper()}
-💡 **근거:** {strategy['reason']}
+💡 **근거:** {strategy.get('final_reason', strategy.get('reason', '분석 완료'))}
 🔥 **확신도:** {strategy.get('confidence', 0)}%
-📅 **경제이슈:**
-{event_str}
 """
                 requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
                               data={'chat_id': tg_id, 'text': report_msg})
 
                 # D. [행동] 매매 신호가 있으면 제안(Proposal) 생성
-                # (이게 실행되면 5분 뒤 자동 매매 -> DB 저장 -> 회고 프로세스로 이어짐)
                 if strategy['decision'] in ['buy', 'sell']:
-                    send_proposal(strategy['decision'], f"[자동분석] {strategy['reason']}")
+                    reason_txt = strategy.get('final_reason', strategy.get('reason', 'AI 판단'))
+                    send_proposal(strategy['decision'], f"[자동분석] {reason_txt}")
                 
                 last_run = current_time
 
@@ -367,12 +213,11 @@ def telegram_thread(ex, symbol_name):
                     if 'callback_query' in up:
                         cb = up['callback_query']; data = cb['data']; chat_id = cb['message']['chat']['id']
                         
-                        # (기존 버튼 처리 로직 그대로 유지)
+                        # (기존 버튼 처리 로직)
                         if data == 'balance':
                             c, f, t = get_balance(ex)
                             requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': f"💰 잔고: ${t:,.2f}"})
                         elif data.startswith('acc_') or data.startswith('rej_'):
-                            # ... (기존 승인/거절 처리 코드와 동일) ...
                             pid = data.split('_')[1]
                             is_acc = "acc" in data
                             try:
@@ -380,7 +225,6 @@ def telegram_thread(ex, symbol_name):
                                 if pid in props:
                                     if is_acc:
                                         requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': "✅ 승인 확인. 주문 진행."})
-                                        # 즉시 체결 로직은 manage_proposals가 다음 루프때 처리하거나 여기서 바로 호출 가능
                                     else:
                                         requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': chat_id, 'text': "❌ 거절됨."})
                                     del props[pid]
@@ -393,8 +237,7 @@ def telegram_thread(ex, symbol_name):
 
         except Exception as e:
             print(f"Error in TG Thread: {e}")
-            time.sleep(10) # 에러나면 10초 쉬고 재시도
-# ---------------------------------------------------------
+            time.sleep(10) # 에러나면 10초 쉬고 재시도# ---------------------------------------------------------
 # 📡 거래소 연결
 # ---------------------------------------------------------
 @st.cache_resource
