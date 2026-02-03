@@ -26,6 +26,15 @@ DB_FILE = "wonyousi_brain.db" # [New] AI 기억 저장소
 
 st.set_page_config(layout="wide", page_title="비트겟 AI 워뇨띠 에이전트 (Ultimate Integration)")
 
+# [추가] 감시 대상 코인 리스트 (UI와 봇이 공유)
+TARGET_COINS = [
+    "BTC/USDT:USDT", 
+    "ETH/USDT:USDT", 
+    "SOL/USDT:USDT", 
+    "XRP/USDT:USDT", 
+    "DOGE/USDT:USDT"
+]
+
 # ---------------------------------------------------------
 # 🧠 [New] AI 기억 저장소 (DB) & 회고 시스템
 # ---------------------------------------------------------
@@ -269,6 +278,96 @@ def telegram_thread(ex, main_symbol):
                         if data == 'scan_all':
                             requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': "🔍 전체 코인을 강제로 스캔합니다..."})
                             # 강제 스캔 로직은 다음 루프에서 자동 실행됨
+                        def telegram_thread(ex, main_symbol):
+    """
+    [수정됨] 
+    1. '전체 코인 스캔' 버튼 클릭 시, 매매 신호가 없어도 무조건 분석 결과를 요약 보고합니다.
+    2. 자동매매 체크박스와 상관없이 버튼 기능은 항상 작동합니다.
+    """
+    
+    # 메뉴 정의
+    menu_kb = {
+        "inline_keyboard": [
+            [{"text": "🧠 전체 코인 스캔 (즉시분석)", "callback_data": "scan_all"}, {"text": "💰 내 잔고", "callback_data": "balance"}],
+            [{"text": "📊 포지션 현황", "callback_data": "position"}, {"text": "📅 경제 캘린더", "callback_data": "calendar"}]
+        ]
+    }
+
+    # 시작 알림
+    requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", 
+                  data={'chat_id': tg_id, 'text': "🤖 **AI 워뇨띠 대기 중**\n명령을 기다립니다.", 'reply_markup': json.dumps(menu_kb), 'parse_mode': 'Markdown'})
+
+    last_report_time = time.time()
+    REPORT_INTERVAL = 900  # 15분
+    offset = 0
+
+    while True:
+        try:
+            cur_config = load_settings()
+            is_auto_on = cur_config.get('auto_trade', False)
+            
+            # === [A] 자동매매 감시 루프 (켜져 있을 때만 침묵 수행) ===
+            if is_auto_on:
+                for coin in TARGET_COINS:
+                    try:
+                        # (비용 절약을 위해) 간단한 지표 스캔 후 흥미로울 때만 GPT 호출
+                        ohlcv = ex.fetch_ohlcv(coin, '5m', limit=60)
+                        df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+                        df['time'] = pd.to_datetime(df['time'], unit='ms')
+                        df, status, last = calc_indicators(df)
+                        
+                        # 특이사항 필터 (RSI 과열/침체, 거래량 폭발 등)
+                        is_interesting = (last['RSI'] < 30 or last['RSI'] > 70 or last['ADX'] > 30)
+                        
+                        if is_interesting:
+                            strategy = generate_wonyousi_strategy(df, status)
+                            if strategy['decision'] in ['buy', 'sell'] and strategy.get('confidence', 0) >= 70:
+                                # 매매 로직 (실전 시 주석 해제)
+                                # ex.set_leverage(...)
+                                # ex.create_market_order(...)
+                                msg = f"⚡ **[자동매매 포착]**\n코인: {coin}\n진입: {strategy['decision'].upper()}\n이유: {strategy.get('final_reason')}"
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': tg_id, 'text': msg})
+                                time.sleep(5)
+                    except: pass
+                    time.sleep(1)
+
+            # === [B] 텔레그램 버튼 처리 (여기가 핵심!) ===
+            res = requests.get(f"https://api.telegram.org/bot{tg_token}/getUpdates?offset={offset+1}&timeout=1").json()
+            if res.get('ok'):
+                for up in res['result']:
+                    offset = up['update_id']
+                    
+                    if 'callback_query' in up:
+                        cb = up['callback_query']; data = cb['data']; cid = cb['message']['chat']['id']
+                        
+                        # [핵심] 전체 코인 스캔 버튼
+                        if data == 'scan_all':
+                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': "🕵️ **전체 코인 정밀 분석 중...**\n(시간이 조금 걸립니다)"})
+                            
+                            report = "🌍 **전체 코인 분석 결과**\n"
+                            
+                            for coin in TARGET_COINS:
+                                try:
+                                    # 데이터 조회
+                                    ohlcv = ex.fetch_ohlcv(coin, '5m', limit=100)
+                                    df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+                                    df['time'] = pd.to_datetime(df['time'], unit='ms')
+                                    df, status, last = calc_indicators(df)
+                                    
+                                    # GPT 분석
+                                    res = generate_wonyousi_strategy(df, status)
+                                    
+                                    # 결과 한 줄 요약
+                                    icon = "⚪"
+                                    if res['decision'] == 'buy': icon = "🟢"
+                                    elif res['decision'] == 'sell': icon = "🔴"
+                                    
+                                    report += f"{icon} **{coin.split('/')[0]}**: {res['decision'].upper()} ({res.get('confidence',0)}%)\n"
+                                except Exception as e:
+                                    report += f"❌ {coin.split('/')[0]}: 분석 실패 ({str(e)[:10]}...)\n"
+                            
+                            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': report, 'parse_mode': 'Markdown'})
+
                         
                         elif data == 'balance':
                             try:
