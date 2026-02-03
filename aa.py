@@ -626,40 +626,44 @@ components.html(tv, height=h)
 # 4개의 탭으로 확장 (새 기능 포함)
 t1, t2, t3, t4 = st.tabs(["🤖 자동매매 & AI분석", "⚡ 수동주문", "📅 시장정보", "📜 매매일지(DB)"])
 
+# [수정할 위치: 탭1(t1) 내부의 수동 분석 버튼 코드]
+
 with t1:
-    c1, c2 = st.columns(2)
-    auto_on = c1.checkbox("자동매매 활성화", value=config['auto_trade'])
-    if auto_on != config['auto_trade']:
-        config['auto_trade'] = auto_on; save_settings(config); st.rerun()
-    
-    st.write("---")
-    
-    # [New] 워뇨띠 분석 기능 통합
-    if st.button("🧠 AI(워뇨띠)에게 정밀 분석 요청"):
-        with st.spinner("과거 매매 일지(DB)를 복기하며 차트를 분석 중..."):
-            ai_res = generate_wonyousi_strategy(df, status)
-            
-            st.divider()
-            conf = ai_res.get('confidence', 0)
-            if ai_res['decision'] == 'buy':
-                st.success(f"🔵 **매수(LONG) 추천** (확신도: {conf}%)")
-            elif ai_res['decision'] == 'sell':
-                st.error(f"🔴 **매도(SHORT) 추천** (확신도: {conf}%)")
-            else:
-                st.warning(f"⚪ **관망(HOLD)** (확신도: {conf}%)")
-            
-            st.info(f"💡 **워뇨띠의 근거:** {ai_res.get('reason')}")
-            
-            if ai_res['decision'] != 'hold':
-                if st.button("🚀 이 분석대로 텔레그램 제안 보내기"):
-                    send_proposal(ai_res['decision'], f"[AI 워뇨띠] {ai_res['reason']}")
-                    st.toast("제안 발송 완료!")
+    c_auto, c_log = st.columns([2, 1])
+    with c_auto:
+        st.subheader("🧠 GPT-4o 정밀 분석")
+        
+        # 자동매매 체크박스
+        auto_on = st.checkbox("자동매매 활성화 (15분 주기)", value=config.get('auto_trade', False))
+        if auto_on != config.get('auto_trade', False):
+            config['auto_trade'] = auto_on
+            save_settings(config)
+            st.rerun()
 
-    # 기존 지표 기반 알림 로직
-    if not auto_on and (active_cnt_l >= config['target_vote'] or active_cnt_s >= config['target_vote']):
-        side = 'long' if active_cnt_l >= config['target_vote'] else 'short'
-        st.warning(f"🤖 (기본지표) {side.upper()} 진입 조건 충족!")
-
+        # 👇 [여기를 수정하세요] 버튼 클릭 시 동작 코드
+        if st.button("🔍 수동 AI 분석 (GPT-4o)"):
+            with st.spinner("워뇨띠가 차트를 분석 중입니다..."):
+                # 1. AI 분석 실행
+                ai_res = generate_wonyousi_strategy(df, status)
+                
+                # 2. 결과 표시 (None 해결: final_reason을 가져오도록 변경)
+                decision = ai_res.get('decision', 'hold').upper()
+                confidence = ai_res.get('confidence', 0)
+                reason = ai_res.get('final_reason', "이유를 불러오지 못했습니다.") # 👈 핵심 수정!
+                
+                # 3. 화면 출력
+                if decision == 'BUY':
+                    st.success(f"결론: 🟢 **매수 (BUY)** (확신도 {confidence}%)")
+                elif decision == 'SELL':
+                    st.error(f"결론: 🔴 **매도 (SELL)** (확신도 {confidence}%)")
+                else:
+                    st.warning(f"결론: ⚪ **관망 (HOLD)** (확신도 {confidence}%)")
+                
+                st.info(f"💡 **워뇨띠의 근거:** {reason}")
+                
+                # 상세 JSON 데이터도 보여줌 (디버깅용)
+                with st.expander("🔍 분석 데이터 원본"):
+                    st.json(ai_res)
 with t2:
     st.write("✋ **수동 컨트롤**")
     m_amt = st.number_input("주문 금액 ($)", 0.0, 100000.0, float(config['order_usdt']))
