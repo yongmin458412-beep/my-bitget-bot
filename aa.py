@@ -38,53 +38,50 @@ TARGET_COINS = [
 # ---------------------------------------------------------
 # 🧠 [New] AI 기억 저장소 (DB) & 회고 시스템
 # ---------------------------------------------------------
-def init_db():
-    """매매 일지와 반성문을 저장할 데이터베이스를 생성합니다."""
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    c = conn.cursor()
-    # 매매 기록 및 AI 피드백 테이블
-    c.execute('''CREATE TABLE IF NOT EXISTS trade_history
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  timestamp TEXT,
-                  symbol TEXT,
-                  side TEXT,
-                  price REAL,
-                  pnl REAL,
-                  reason TEXT,
-                  ai_feedback TEXT)''')
-    conn.commit()
-    conn.close()
+# =========================================================
+# 📝 매매 일지 시스템 (CSV 저장 + AI 피드백)
+# =========================================================
+LOG_FILE = "trade_log.csv"
 
-init_db()
-
-def get_past_mistakes(limit=3):
-    """최근 실패한 매매(손실)에 대한 AI의 반성문을 가져옵니다."""
+def log_trade(coin, side, entry_price, exit_price, pnl_amount, pnl_percent, reason):
+    """매매 종료 시 기록을 남깁니다."""
     try:
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("SELECT side, reason, ai_feedback FROM trade_history WHERE pnl < 0 ORDER BY id DESC LIMIT ?", (limit,))
-        rows = c.fetchall()
-        conn.close()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        new_data = pd.DataFrame([{
+            "Time": now,
+            "Coin": coin,
+            "Side": side,
+            "Entry": entry_price,
+            "Exit": exit_price,
+            "PnL_USDT": pnl_amount,
+            "PnL_Percent": pnl_percent,
+            "Reason": reason
+        }])
         
-        if not rows: return "과거에 큰 실수는 없었습니다. 초심자의 행운을 빕니다."
-        
-        feedback = "⛔ **[과거 실패 노트 - 절대 반복 금지]**:\n"
-        for row in rows:
-            feedback += f"- {row[0]} 진입했다가 손실. (당시 이유: {row[1]}) → 💡 반성: {row[2]}\n"
-        return feedback
-    except: return "DB 조회 오류"
+        # 파일이 없으면 새로 만들고, 있으면 이어붙이기
+        if not os.path.exists(LOG_FILE):
+            new_data.to_csv(LOG_FILE, index=False, encoding='utf-8-sig')
+        else:
+            new_data.to_csv(LOG_FILE, mode='a', header=False, index=False, encoding='utf-8-sig')
+    except Exception as e:
+        print(f"Log Error: {e}")
 
-def log_trade_to_db(symbol, side, price, pnl, reason, ai_feedback):
-    """매매 결과를 DB에 영구 저장합니다."""
+def get_past_mistakes():
+    """AI에게 '너 지난번에 이렇게 잃었어'라고 알려줄 데이터를 가져옵니다."""
     try:
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("INSERT INTO trade_history (timestamp, symbol, side, price, pnl, reason, ai_feedback) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                  (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, side, price, pnl, reason, ai_feedback))
-        conn.commit()
-        conn.close()
-    except Exception as e: print(f"DB Save Error: {e}")
-
+        if not os.path.exists(LOG_FILE): return "과거 매매 기록 없음."
+        
+        df = pd.read_csv(LOG_FILE)
+        # 손실이 가장 컸던(수익률이 낮은) 순서대로 5개 추출
+        worst_trades = df.sort_values(by='PnL_Percent', ascending=True).head(5)
+        
+        summary = ""
+        for _, row in worst_trades.iterrows():
+            summary += f"- {row['Coin']} {row['Side']} 진입했다가 {row['PnL_Percent']}% 손실 (이유: {row.get('Reason', '기록없음')})\n"
+        
+        return summary if summary else "큰 손실 기록 없음."
+    except:
+        return "기록 조회 실패"
 # ---------------------------------------------------------
 # 💾 설정 관리 (기존 기능 유지)
 # ---------------------------------------------------------
@@ -577,10 +574,8 @@ def calc_indicators(df):
 
 def generate_wonyousi_strategy(df, status_summary):
     """
-    [최종 수정] 
-    - 손익비(Risk/Reward) 중심 설계
-    - 잦은 매매 금지 (확실한 자리만)
-    - JSON 포맷 준수
+    [AI 뇌 구조]
+    과거 실수(매매일지)를 참고하여 같은 실수를 반복하지 않도록 합니다.
     """
     try:
         my_key = st.secrets.get("OPENAI_API_KEY")
@@ -590,38 +585,30 @@ def generate_wonyousi_strategy(df, status_summary):
 
     last_row = df.iloc[-1]
     
-    # 시스템 프롬프트: 보수적인 스나이퍼 설정
-    system_prompt = """
-    당신은 '손실을 극도로 싫어하는' 고수 트레이더입니다.
+    # 🔥 [핵심] 과거의 실수를 불러옵니다.
+    past_mistakes = get_past_mistakes()
+
+    system_prompt = f"""
+    당신은 전설적인 암호화폐 트레이더입니다.
+    
+    [당신의 과거 실수 (반면교사)]
+    {past_mistakes}
     
     [매매 원칙]
-    1. '확신도(confidence)'가 낮으면 무조건 'hold'를 외치세요. 애매하면 쉬는 게 돈 버는 겁니다.
-    2. 진입 시, 손익비(Risk/Reward Ratio)는 최소 1:2 이상이어야 합니다. (익절폭이 손절폭의 2배 이상)
-    3. 레버리지가 높으므로 손절가(sl_gap)를 너무 타이트하게 잡으면 노이즈에 털립니다. 지지/저항선을 기준으로 여유를 주세요.
-    4. 잦은 진입은 파산의 지름길입니다. 하루에 1~3번의 '완벽한 기회'만 노리세요.
-    
-    [응답 형식 (반드시 JSON)]
-    {
-        "decision": "buy" 또는 "sell" 또는 "hold",
-        "percentage": 5~30 (자산 대비 투입 비중),
-        "leverage": 5~20 (확신도에 비례),
-        "sl_gap": 1.5~5.0 (진입가 대비 손절 %, 너무 짧으면 안됨),
-        "tp_gap": 3.0~10.0 (진입가 대비 익절 %),
-        "confidence": 0~100 (정수),
-        "reason": "한글로 상세한 진입 근거 및 손익비 설명"
-    }
+    1. 위의 과거 실수와 비슷한 패턴이면 절대 진입하지 마세요.
+    2. 확신도(confidence)가 75 미만이면 무조건 'hold' 하세요.
+    3. 손익비(Risk/Reward)는 최소 1:2 이상이어야 합니다.
+    4. 반드시 JSON 포맷으로만 응답하세요.
     """
     
     user_prompt = f"""
     [시장 데이터]
     - 현재가: {last_row['close']}
     - RSI: {last_row['RSI']:.1f}
-    - ADX: {last_row['ADX']:.1f} (추세 강도)
+    - ADX: {last_row['ADX']:.1f}
     - 볼린저밴드: {status_summary.get('BB', '중간')}
     
-    위 데이터를 보고 정말 확실한 자리인지 판단하세요.
-    - 단순히 보조지표가 떴다고 들어가지 마세요. 
-    - 휩소(속임수) 가능성을 항상 염두에 두세요.
+    지금 진입해도 안전한가요? 과거 실수를 반복하지 마세요.
     """
     
     try:
@@ -632,11 +619,11 @@ def generate_wonyousi_strategy(df, status_summary):
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"}, 
-            temperature=0.4 # 창의성을 낮추고 냉철하게 판단하도록 설정
+            temperature=0.4 
         )
         return json.loads(response.choices[0].message.content)
     except Exception as e:
-        return {"decision": "hold", "reason": f"API 에러: {e}", "confidence": 0}
+        return {"decision": "hold", "final_reason": f"에러: {e}", "confidence": 0}
         
 # 👆 [여기까지 복사]
 
