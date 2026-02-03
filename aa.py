@@ -771,3 +771,28 @@ with t4:
     if st.button("🧪 테스트 데이터 입력 (DB Test)"):
         log_trade_to_db(symbol, "long", curr_price, -50.0, "뇌동매매", "상승 추세가 확실할 때만 진입하자.")
         st.rerun()
+
+# === [메인 UI 3: 10종 지표 상세 대시보드] ===
+with st.expander("📊 지표 상태판 (Indicator Dashboard)", expanded=True):
+    cols = st.columns(5)
+    idx = 0
+    
+    # 개수 세기 초기화
+    active_cnt_l = 0
+    active_cnt_s = 0
+    
+    # 👇 [핵심 수정] ind_status를 status로 변경했습니다!
+    for name, stat in status.items():
+        color = "off"
+        if "매수" in stat: 
+            color = "normal"
+            active_cnt_l += 1
+        elif "매도" in stat: 
+            color = "inverse"
+            active_cnt_s += 1
+            
+        cols[idx % 5].metric(name, stat, delta_color=color)
+        idx += 1
+
+    st.caption("💡 **범례:** 🟢 매수신호(Buy) | 🔴 매도신호(Sell) | ⚪ 중립(Neutral)")
+    st.caption(f"🎯 **종합 집계:** 매수 신호 **{active_cnt_l}개** / 매도 신호 **{active_cnt_s}개**")
