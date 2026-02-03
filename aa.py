@@ -477,6 +477,68 @@ def calc_indicators(df):
         
     return df, status, last
 
+# 👇 [여기서부터 복사] calc_indicators 함수 바로 밑에 붙여넣으세요!
+
+def generate_wonyousi_strategy(df, status_summary):
+    """OpenAI GPT-4o를 이용한 정밀 분석 (연결 보장형)"""
+    
+    # 1. 함수 안에서 직접 키를 가져와서 연결 (오류 방지)
+    try:
+        my_key = st.secrets.get("OPENAI_API_KEY")
+        if not my_key:
+            return {"decision": "hold", "final_reason": "API Key 설정 오류", "confidence": 0}
+        client = OpenAI(api_key=my_key)
+    except Exception as e:
+        return {"decision": "hold", "final_reason": f"OpenAI 연결 실패: {e}", "confidence": 0}
+
+    # 2. 데이터 준비
+    # (만약 get_past_mistakes 함수가 없다면 빈 리스트 처리)
+    try: past_mistakes = get_past_mistakes()
+    except: past_mistakes = "없음"
+    
+    last_row = df.iloc[-1]
+    
+    system_msg = """
+    당신은 전설적인 트레이더 '워뇨띠'입니다.
+    - 캔들 패턴, 거래량, 추세를 최우선으로 분석합니다.
+    - 확실하지 않으면 '관망(hold)'하세요.
+    - 응답은 반드시 JSON 형식이어야 합니다.
+    """
+    
+    user_msg = f"""
+    [시장 데이터]
+    - 현재가: {last_row['close']}
+    - RSI: {last_row['RSI']:.1f}
+    - 볼린저밴드: {status_summary.get('BB', 'Normal')}
+    - ADX: {last_row['ADX']:.1f}
+    - 매수/매도 신호: {status_summary}
+    
+    [과거 실수]
+    {past_mistakes}
+    
+    매매 판단을 JSON으로 주세요.
+    Key: decision(buy/sell/hold), reason_trend, reason_candle, final_reason, confidence(int)
+    """
+    
+    # 3. AI에게 질문
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.5
+        )
+        result = json.loads(response.choices[0].message.content)
+        return result
+
+    except Exception as e:
+        return {"decision": "hold", "final_reason": f"분석 중 에러: {e}", "confidence": 0}
+
+# 👆 [여기까지 복사]
+
 
 # ---------------------------------------------------------
 # 📅 데이터 수집 (ForexFactory) - UI 표시용 함수 (복구)
