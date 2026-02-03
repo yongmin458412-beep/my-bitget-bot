@@ -163,17 +163,17 @@ else:
 # =========================================================
 def telegram_thread(ex, main_symbol):
     """
-    [실전 매매 버전]
-    1. AI가 레버리지/비중 직접 결정 -> 즉시 체결
-    2. 15분마다 전체 자산/포지션/시장 브리핑
-    3. 손절/익절 자동 감시
+    [문법 오류 수정됨]
+    1. AI 실전 매매 (레버리지/비중 자동)
+    2. 15분 정기 보고
+    3. 텔레그램 메뉴 버튼 기능 (오류 수정 완료)
     """
     
     # 1. 감시 대상 및 메뉴
     menu_kb = {
         "inline_keyboard": [
             [{"text": "📊 내 자산 현황", "callback_data": "balance"}, {"text": "🌍 전체 코인 스캔", "callback_data": "scan_all"}],
-            [{"text": "🛑 긴급 모든 포지션 종료", "callback_data": "close_all"}] # 비상탈출 버튼 추가
+            [{"text": "🛑 긴급 모든 포지션 종료", "callback_data": "close_all"}]
         ]
     }
 
@@ -239,7 +239,7 @@ def telegram_thread(ex, main_symbol):
                             strategy = generate_wonyousi_strategy(df, status)
                             decision = strategy.get('decision', 'hold')
                             
-                            # [진입 조건] 매수/매도 의견이고, 확신도가 있어야 함 (Confidence 로직 대신 명확한 decision 위주)
+                            # [진입 조건] 매수/매도 의견이고, 확신도가 있어야 함
                             if decision in ['buy', 'sell']:
                                 # AI가 정한 레버리지와 비중 가져오기
                                 lev = int(strategy.get('leverage', 5))
@@ -249,7 +249,7 @@ def telegram_thread(ex, main_symbol):
                                 
                                 # 레버리지 설정
                                 try: ex.set_leverage(lev, coin)
-                                except: pass # 이미 설정된 경우 패스
+                                except: pass 
                                 
                                 # 주문 수량 계산
                                 bal = ex.fetch_balance({'type': 'swap'})
@@ -260,7 +260,7 @@ def telegram_thread(ex, main_symbol):
                                 qty = ex.amount_to_precision(coin, (invest_amount * lev) / price)
                                 
                                 if float(qty) > 0:
-                                    # 🔥 [주문 실행] 주석 해제됨! 진짜 돈 나갑니다!
+                                    # 🔥 [주문 실행]
                                     ex.create_market_order(coin, decision, qty)
                                     
                                     # 목표가 저장
@@ -285,7 +285,7 @@ def telegram_thread(ex, main_symbol):
                     time.sleep(1) # API 보호
 
             # =========================================================
-            # [B] 🕒 15분 정기 브리핑 (내 포지션 + 시장 요약)
+            # [B] 🕒 15분 정기 브리핑
             # =========================================================
             if time.time() - last_report_time > REPORT_INTERVAL:
                 try:
@@ -332,7 +332,7 @@ AI 감시 상태: {"🟢 ON" if is_auto_on else "🔴 OFF"}
                     print(f"Report Error: {e}")
 
             # =========================================================
-            # [C] 텔레그램 명령 처리 (비상 탈출 포함)
+            # [C] 텔레그램 명령 처리 (수정된 부분)
             # =========================================================
             res = requests.get(f"https://api.telegram.org/bot{tg_token}/getUpdates?offset={offset+1}&timeout=1").json()
             if res.get('ok'):
@@ -353,11 +353,13 @@ AI 감시 상태: {"🟢 ON" if is_auto_on else "🔴 OFF"}
                             requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': "✅ 모든 포지션 종료 완료."})
 
                         elif data == 'balance':
-                            try:
+                            try:  # 👈 여기에 except가 없어서 에러가 났었습니다.
                                 bal = ex.fetch_balance({'type': 'swap'})
                                 msg = f"💰 총 자산: ${bal['USDT']['total']:,.2f}\n가능 잔고: ${bal['USDT']['free']:,.2f}"
                                 requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': msg})
-                        
+                            except:
+                                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': "❌ 잔고 조회 실패"})
+
                         elif data == 'scan_all':
                             requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", data={'chat_id': cid, 'text': "🔍 전체 시장 분석 요청 접수. 잠시만 기다려주세요..."})
                             # (자동 감시 루프에서 처리되거나 별도 로직 구현 가능)
