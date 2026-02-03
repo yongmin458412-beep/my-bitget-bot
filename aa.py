@@ -772,27 +772,35 @@ with t4:
         log_trade_to_db(symbol, "long", curr_price, -50.0, "뇌동매매", "상승 추세가 확실할 때만 진입하자.")
         st.rerun()
 
-# === [메인 UI 3: 10종 지표 상세 대시보드] ===
-with st.expander("📊 지표 상태판 (Indicator Dashboard)", expanded=True):
-    cols = st.columns(5)
-    idx = 0
-    
-    # 개수 세기 초기화
-    active_cnt_l = 0
-    active_cnt_s = 0
-    
-    # 👇 [핵심 수정] ind_status를 status로 변경했습니다!
-    for name, stat in status.items():
-        color = "off"
-        if "매수" in stat: 
-            color = "normal"
-            active_cnt_l += 1
-        elif "매도" in stat: 
-            color = "inverse"
-            active_cnt_s += 1
-            
-        cols[idx % 5].metric(name, stat, delta_color=color)
-        idx += 1
+# [여기서부터 파일 맨 끝에 추가하세요]
+# ---------------------------------------------------------
+# 🔍 [디버깅] 사이드바 맨 아래 OpenAI 연결 테스트 버튼
+# ---------------------------------------------------------
+st.sidebar.divider()
+st.sidebar.header("🔍 긴급 점검")
 
-    st.caption("💡 **범례:** 🟢 매수신호(Buy) | 🔴 매도신호(Sell) | ⚪ 중립(Neutral)")
-    st.caption(f"🎯 **종합 집계:** 매수 신호 **{active_cnt_l}개** / 매도 신호 **{active_cnt_s}개**")
+if st.sidebar.button("🤖 OpenAI 연결 테스트"):
+    try:
+        # 1. 키 확인
+        if not openai_key:
+            st.sidebar.error("❌ API 키가 없습니다. secrets.toml을 확인하세요.")
+        else:
+            # 2. 간단한 인사 요청
+            test_client = OpenAI(api_key=openai_key)
+            response = test_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "테스트입니다. 1+1은?"}],
+                max_tokens=10
+            )
+            ans = response.choices[0].message.content
+            st.sidebar.success(f"✅ 연결 성공!\n응답: {ans}")
+            
+    except Exception as e:
+        # 에러 내용을 붉은색으로 자세히 보여줌
+        st.sidebar.error(f"❌ 연결 실패!\n원인: {e}")
+        
+        # 자주 발생하는 에러 친절 설명
+        if "insufficient_quota" in str(e):
+            st.sidebar.warning("💰 잔고 부족! OpenAI API 설정 페이지에서 'Credit Balance'를 충전해야 합니다. (ChatGPT Plus 결제와는 다릅니다)")
+        elif "invalid_api_key" in str(e):
+            st.sidebar.warning("🔑 키 오류! sk-로 시작하는 키가 맞는지, 공백은 없는지 확인하세요.")
