@@ -165,66 +165,63 @@ else:
 # ---------------------------------------------------------
 # 🧮 지표 계산 함수 (수정됨: 안전장치 강화)
 # ---------------------------------------------------------
+# ---------------------------------------------------------
+# 1. 지표 계산 함수 (안전장치 강화 버전)
+# ---------------------------------------------------------
 def calc_indicators(df):
     try:
-        # 1. 데이터 검증
+        # 데이터 검증
         if df is None or df.empty or len(df) < 15:
             return df, {}, None
 
-        # 2. 지표 계산 (TA 라이브러리)
-        # [RSI]
+        # 지표 계산
         df['RSI'] = ta.momentum.rsi(df['close'], window=14)
         
-        # [볼린저밴드]
         bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
         df['BB_upper'] = bb.bollinger_hband()
         df['BB_lower'] = bb.bollinger_lband()
         
-        # [이동평균선 & MACD]
         df['SMA_20'] = ta.trend.sma_indicator(df['close'], window=20)
-        df['SMA_60'] = ta.trend.sma_indicator(df['close'], window=60)
+        df['ADX'] = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
+        
+        # MACD
         macd = ta.trend.MACD(df['close'])
         df['MACD'] = macd.macd()
         df['MACD_signal'] = macd.macd_signal()
         
-        # [ADX]
-        df['ADX'] = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
-
-        # 3. 중요: NaN 제거 (앞부분 데이터 정리)
+        # NaN 제거 (이게 없으면 RSI 오류가 납니다)
         df = df.dropna()
         if df.empty: return df, {}, None
 
-        # 4. 상태 평가 (UI에 표시할 텍스트 생성)
+        # 상태 평가
         last = df.iloc[-1]
         status = {}
-
-        # RSI 상태
+        
+        # RSI
         if last['RSI'] > 70: status['RSI'] = "🔴 과매수"
         elif last['RSI'] < 30: status['RSI'] = "🟢 과매도"
         else: status['RSI'] = "⚪ 중립"
-
-        # 볼린저밴드 상태
+        
+        # 볼린저밴드
         if last['close'] > last['BB_upper']: status['BB'] = "🔴 상단 돌파"
         elif last['close'] < last['BB_lower']: status['BB'] = "🟢 하단 이탈"
         else: status['BB'] = "⚪ 밴드 내"
         
-        # 이평선 추세
-        if last['close'] > last['SMA_20']: status['MA'] = "📈 상승세"
-        else: status['MA'] = "📉 하락세"
-        
-        # MACD 신호
-        if last['MACD'] > last['MACD_signal']: status['MACD'] = "Golden Cross"
-        else: status['MACD'] = "Dead Cross"
+        # MACD
+        if last['MACD'] > last['MACD_signal']: status['MACD'] = "📈 골든크로스"
+        else: status['MACD'] = "📉 데드크로스"
         
         # ADX
         status['ADX'] = "🔥 추세장" if last['ADX'] >= 25 else "💤 횡보장"
+        
+        # 이평선
+        if last['close'] > last['SMA_20']: status['MA'] = "📈 상승세"
+        else: status['MA'] = "📉 하락세"
 
         return df, status, last
-
     except Exception as e:
         print(f"Calc Error: {e}")
         return df, {}, None
-
 
 def generate_wonyousi_strategy(df, status_summary):
     """AI 전략 수립 함수"""
@@ -800,19 +797,22 @@ def telegram_thread(ex, main_symbol):
 # =========================================================
 # [메인 로직] 데이터 로딩 및 화면 출력 (에러 수정됨)
 # =========================================================
+# =========================================================
+# [메인 로직] 데이터 로딩 & 화면 출력 (핀셋 수정)
+# =========================================================
 df = None
 status = {}
 last = None
 data_loaded = False
 
 try:
-    # 🔥 [핵심 수정] 변수가 없으면 기본값(5분봉)을 사용하도록 안전장치 추가
-    # (이렇게 하면 timeframe is not defined 에러가 사라집니다)
-    target_timeframe = timeframe if 'timeframe' in locals() else "5m"
-    target_symbol = symbol if 'symbol' in locals() else "BTC/USDT:USDT"
-    
+    # 🚨 [에러 해결] timeframe 변수가 없으면 기본값 사용 (NameError 방지)
+    # 기존 기능(사이드바 설정)을 유지하면서 안전장치만 달았습니다.
+    current_symbol = symbol if 'symbol' in locals() else "BTC/USDT:USDT"
+    current_tf = timeframe if 'timeframe' in locals() else "5m"
+
     # 1. 데이터 가져오기
-    ohlcv = exchange.fetch_ohlcv(target_symbol, target_timeframe, limit=100)
+    ohlcv = exchange.fetch_ohlcv(current_symbol, current_tf, limit=100)
     
     if ohlcv:
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
@@ -821,36 +821,33 @@ try:
         # 2. 지표 계산
         df, status, last = calc_indicators(df)
         
-        # 3. 데이터 유효성 검사 ('RSI' 키가 확실히 있는지 확인)
+        # 3. 데이터 유효성 검사 (RSI가 있어야 성공)
         if last is not None and 'RSI' in last:
             data_loaded = True
 
 except Exception as e:
-    st.error(f"데이터 로딩 중 오류 발생: {e}")
+    st.error(f"⚠️ 데이터 로딩 중 문제 발생: {e}")
 
 # ---------------------------------------------------------
-# [화면 출력] 데이터가 준비되었을 때만 그립니다.
+# [화면 출력] 차트와 지표판 복구
 # ---------------------------------------------------------
 st.divider()
 
 if data_loaded:
     # 1. 상단 4단 브리핑
-    st.subheader(f"📊 {target_symbol} 실시간 현황 ({target_timeframe})")
+    st.subheader(f"📊 {current_symbol} 실시간 현황 ({current_tf})")
     c1, c2, c3, c4 = st.columns(4)
     
     c1.metric("현재가", f"${last['close']:,.2f}")
     
-    rsi = last['RSI']
-    c_rsi = "inverse" if rsi > 70 else ("off" if rsi < 30 else "normal")
-    c2.metric("RSI (강도)", f"{rsi:.1f}", delta=status.get('RSI'), delta_color=c_rsi)
+    rsi_val = last['RSI']
+    c_rsi = "inverse" if rsi_val > 70 else ("off" if rsi_val < 30 else "normal")
+    c2.metric("RSI", f"{rsi_val:.1f}", delta=status.get('RSI'), delta_color=c_rsi)
     
-    c3.metric("ADX (추세)", f"{last['ADX']:.1f}", delta=status.get('ADX'))
-    
-    bw = last['BB_upper'] - last['BB_lower']
-    pos = (last['close'] - last['BB_lower']) / bw if bw > 0 else 0.5
-    c4.metric("BB 위치", f"{pos*100:.0f}%", delta=status.get('BB'))
+    c3.metric("ADX", f"{last['ADX']:.1f}", delta=status.get('ADX'))
+    c4.metric("볼린저", status.get('BB'))
 
-    # 2. 10종 지표 종합 상태판
+    # 2. [복구됨] 10종 지표 종합 상태판
     st.divider()
     st.markdown("### 🚦 지표 종합 상태판")
     
@@ -859,33 +856,29 @@ if data_loaded:
     if "과매도" in status.get('RSI', ''): score += 1
     if "하단" in status.get('BB', ''): score += 1
     if "상승세" in status.get('MA', ''): score += 1
-    if "Golden" in status.get('MACD', ''): score += 1
+    if "골든" in status.get('MACD', '') or "Golden" in status.get('MACD', ''): score += 1
     
-    # 상태판 디자인
-    judge = "⚖️ 중립/관망"
+    judge = "⚪ 관망"
     if score >= 2: judge = "🟢 매수 우위"
     elif score <= -1: judge = "🔴 매도 우위"
     
-    st.info(f"**종합 판단:** {judge} (매수 긍정 요인: {score}개)")
+    st.info(f"**종합 판단:** {judge} (매수 시그널: {score}개)")
     
-    with st.expander("🔍 지표 상세 내역 보기"):
-        ec1, ec2, ec3, ec4 = st.columns(4)
-        ec1.write(f"**RSI:** {status.get('RSI')}")
-        ec2.write(f"**BB:** {status.get('BB')}")
-        ec3.write(f"**MA:** {status.get('MA')}")
-        ec4.write(f"**MACD:** {status.get('MACD')}")
+    with st.expander("🔍 지표 상세값 보기"):
+        st.write(status)
 
-    # 3. 메인 차트
-    st.markdown("#### 📈 가격 추세 차트")
+    # 3. [복구됨] 차트 그리기
+    st.markdown("#### 📈 가격 차트")
     st.line_chart(df.set_index('time')['close'])
 
 else:
     # 로딩 중 화면
-    st.warning(f"⏳ 데이터를 불러오는 중입니다...")
-    st.caption("잠시만 기다려주세요. 계속 안 되면 'Rerun'을 눌러주세요.")
-    # 데이터가 없으면 아래 탭 코드가 실행되어 에러나는 것을 방지하기 위해 멈춤
-    st.stop()
-    
+    st.warning(f"⏳ '{current_symbol}' 데이터를 불러오고 있습니다...")
+    st.caption("10초 이상 걸리면 우측 상단 'Rerun'을 눌러주세요.")
+    # 데이터가 없으면 아래 탭(t1~t4)이 실행되면서 에러가 날 수 있으므로 여기서 멈춤
+    st.stop() 
+
+# (이 밑에 t1, t2, t3, t4 탭 코드는 건드리지 마세요! 그대로 두시면 됩니다.)    
 # (이 아래에 t1, t2, t3, t4 탭 코드가 그대로 있으면 됩니다)
 
 # 4개의 탭으로 확장 (새 기능 포함)
