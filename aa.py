@@ -822,56 +822,6 @@ else:
     st.info("💡 팁: 에러가 계속되면 우측 상단 'Rerun'을 눌러보세요.")
 
 
-# [메인 UI 1] 시장 데이터 브리핑 (Dashboard)
-# =========================================================
-st.subheader(f"📊 {symbol} 실시간 현황")
-
-# (이 아래부터는 기존 UI 코드가 이어지면 됩니다)
-if last is not None:
-    # ... (기존 UI 코드 계속)
-
-# =========================================================
-# [메인 UI 1] 시장 데이터 브리핑 (Dashboard)
-# =========================================================
-st.subheader(f"📊 {symbol} 실시간 현황")
-
-# 🔥 이제 last가 None이어도 에러가 나지 않습니다.
-if last is not None:
-    # 1. 추세 판단 (ADX 기준)
-    is_trend = last['ADX'] >= 25
-    trend_str = "🔥 강력한 추세장" if is_trend else "💤 지루한 횡보장"
-    
-    # 2. 4단 컬럼 데이터 표시
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("현재가 (Price)", f"${last['close']:,.2f}")
-    
-    with col2:
-        rsi_val = last['RSI']
-        # RSI 색상 처리
-        rsi_color = "normal"
-        if rsi_val > 70: rsi_color = "inverse" # 빨강
-        elif rsi_val < 30: rsi_color = "off"     # 초록/회색
-        st.metric("RSI (강도)", f"{rsi_val:.1f}", delta=status.get('RSI'), delta_color=rsi_color)
-        
-    with col3:
-        adx_val = last['ADX']
-        st.metric("ADX (추세)", f"{adx_val:.1f}", delta=trend_str)
-        
-    with col4:
-        # 볼린저밴드 위치
-        bb_width = last['BB_upper'] - last['BB_lower']
-        if bb_width > 0:
-            bb_pos = (last['close'] - last['BB_lower']) / bb_width
-            st.metric("BB 위치", f"{bb_pos*100:.0f}%", delta=status.get('BB'))
-        else:
-            st.metric("BB 위치", "계산 불가")
-
-else:
-    # 데이터가 로딩되지 않았을 때
-    st.warning("⚠️ 차트 데이터를 불러오는 중이거나, 데이터가 부족합니다.")
-    
 # =========================================================
 # [메인 UI 3] 10종 지표 종합 요약 (심플 버전)
 # =========================================================
