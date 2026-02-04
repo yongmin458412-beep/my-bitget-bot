@@ -8,62 +8,156 @@ import requests
 import threading
 import os
 import json
-import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
+
 from openai import OpenAI
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 # =========================================================
-# ✅ (선택) ta 라이브러리 있으면 사용, 없으면 폴백으로 직접 계산
-# =========================================================
-try:
-    import ta  # pip install ta (있으면 더 편함)
-    HAS_TA = True
-except Exception:
-    HAS_TA = False
-
-# =========================================================
 # ⚙️ 기본 설정
 # =========================================================
-IS_SANDBOX = True  # 실전 매매 시 False로 변경
+st.set_page_config(layout="wide", page_title="비트겟 AI 워뇨띠 에이전트 (Ultimate)")
+
+IS_SANDBOX = True  # 실전매매면 False
 SETTINGS_FILE = "bot_settings.json"
-LOG_FILE = "trade_log.csv"
-STATE_FILE = "runtime_state.json"  # 런타임 상태(쿨다운/트레이드관리) 저장
 
-st.set_page_config(layout="wide", page_title="비트겟 AI 워뇨띠 에이전트 (실전 운영판)")
+RUNTIME_STATE_FILE = "runtime_state.json"   # 네가 말한 런타임 상태 파일
+TRADE_LOG_FILE = "trade_log.csv"            # 체결/청산 기록(표/다운로드용)
 
-TARGET_COINS = [
-    "BTC/USDT:USDT",
-    "ETH/USDT:USDT",
-    "SOL/USDT:USDT",
-    "XRP/USDT:USDT",
-    "DOGE/USDT:USDT",
-]
+# 감시 코인 (Bitget swap 심볼)
+TARGET_COINS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT"]
 
 # =========================================================
-# ✅ 실전 운영 파라미터(우리가 합의한 것)
+# 💾 설정 관리
 # =========================================================
-MAX_POSITIONS = 2           # 동시 포지션 2개
-RISK_PER_TRADE = 0.005      # 트레이드당 계좌 0.5% 리스크
-MAX_MARGIN_PCT = 0.20       # 한 포지션 마진 최대 20% 캡(안전)
+def load_settings():
+    default = {
+        "openai_api_key": "",
 
-MIN_LEV, MAX_LEV = 3, 8     # 레버리지 범위(안정 운영)
-ATR_MULT = 1.5              # 손절폭 = ATR% * ATR_MULT
-MIN_STOP_PCT_PRICE = 0.5    # 가격기준 최소 손절폭(%)
-MAX_STOP_PCT_PRICE = 2.5    # 가격기준 최대 손절폭(%)
+        "auto_trade": False,
+        "max_positions": 2,         # ✅ 동시에 잡는 포지션 수 (추천: 2)
+        "leverage": 5,              # 기본 레버리지(최종은 AI가 제안)
+        "order_usdt": 100.0,
 
-TP1_FRACTION = 0.5          # 1R에서 절반 익절
-TRAIL_R = 0.8               # TP1 이후: 고점대비 0.8R 되밀리면 트레일링 청산
+        # 손익비/부분익절(꾸준한 수익실현용)
+        "tp1_gap": 0.5,             # ✅ 0.5% 도달 시 부분익절
+        "tp1_size": 30,             # ✅ 30% 부분익절
+        "move_sl_to_be": True,      # ✅ TP1 후 손절을 본절로 당김
 
-COOLDOWN_AFTER_SL_MIN = 45  # 손절 후 해당 코인 재진입 금지
-CONSEC_LOSS_LIMIT = 3       # 3연손절이면 휴식
-PAUSE_AFTER_CONSEC_LOSS_MIN = 120
-DAILY_MAX_LOSS_PCT = 0.02   # 하루 -2%면 자동매매 중지(보호)
+        # 지표 파라미터
+        "rsi_period": 14, "rsi_buy": 30, "rsi_sell": 70,
+        "bb_period": 20, "bb_std": 2.0,
+        "ma_fast": 7, "ma_slow": 99,
+        "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
+        "adx_period": 14,
+        "stoch_k": 14, "stoch_d": 3,
+        "cci_period": 20,
+        "mfi_period": 14,
+        "willr_period": 14,
+        "vol_sma": 20, "vol_mul": 2.0,
 
-CORR_LIMIT = 0.80           # 상관 0.8 넘으면 2번째 포지션 제외(유사베팅 방지)
-SPREAD_LIMIT_PCT = 0.06     # 스프레드 0.06% 넘으면 진입 패스(체결 손해 방지)
+        # 지표 사용 여부(10종)
+        "use_rsi": True,
+        "use_bb": True,
+        "use_ma": True,
+        "use_macd": True,
+        "use_adx": True,
+        "use_stoch": True,
+        "use_cci": True,
+        "use_mfi": True,
+        "use_willr": True,
+        "use_vol": True,
 
-SCAN_INTERVAL_SEC = 30      # 신규 진입 스캔 주기(초)
+        # 필터/안전장치
+        "min_sl_gap": 2.5,          # ✅ 너무 타이트한 손절 금지
+        "min_rr": 1.8,              # ✅ 최소 손익비(대략 1:1.8 이상)
+        "cooldown_minutes": 15,     # ✅ 코인별 재진입 쿨다운
+        "max_consec_losses": 3,     # ✅ 연속 손실 제한
+        "pause_minutes": 60,        # ✅ 연속 손실이면 자동 정지 시간
+    }
+
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            default.update(saved)
+        except:
+            pass
+    return default
+
+
+def save_settings(cfg: dict):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        st.toast("✅ 설정 저장 완료", icon="💾")
+    except:
+        st.error("설정 저장 실패")
+
+
+config = load_settings()
+
+# =========================================================
+# 🧠 런타임 상태(runtime_state.json)
+# =========================================================
+def default_runtime_state():
+    return {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "day_start_equity": 0.0,
+        "daily_realized_pnl": 0.0,
+        "consec_losses": 0,
+        "pause_until": 0,     # epoch seconds
+        "cooldowns": {},      # {symbol: epoch_until}
+        "trades": {}          # {symbol: {...}}
+    }
+
+
+def load_runtime_state():
+    if not os.path.exists(RUNTIME_STATE_FILE):
+        s = default_runtime_state()
+        save_runtime_state(s)
+        return s
+    try:
+        with open(RUNTIME_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        s = default_runtime_state()
+        save_runtime_state(s)
+        return s
+
+
+def save_runtime_state(state: dict):
+    try:
+        with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except:
+        pass
+
+
+def maybe_roll_daily_state(state: dict, current_equity: float):
+    today = datetime.now().strftime("%Y-%m-%d")
+    if state.get("date") != today:
+        state["date"] = today
+        state["day_start_equity"] = float(current_equity)
+        state["daily_realized_pnl"] = 0.0
+        state["consec_losses"] = 0
+        state["pause_until"] = 0
+        state["cooldowns"] = {}
+        state["trades"] = {}
+        save_runtime_state(state)
+
+
+# =========================================================
+# 📝 매매 로그(trade_log.csv) - 보기/다운로드용
+# =========================================================
+def append_trade_log(row: dict):
+    cols = ["Time", "Symbol", "Event", "Side", "Qty", "Price", "PnL_USDT", "PnL_Pct", "Note"]
+    df = pd.DataFrame([{c: row.get(c, "") for c in cols}])
+    if not os.path.exists(TRADE_LOG_FILE):
+        df.to_csv(TRADE_LOG_FILE, index=False, encoding="utf-8-sig")
+    else:
+        df.to_csv(TRADE_LOG_FILE, mode="a", header=False, index=False, encoding="utf-8-sig")
+
 
 # =========================================================
 # 🔐 Secrets 로드
@@ -75,57 +169,16 @@ api_password = st.secrets.get("API_PASSWORD")
 tg_token = st.secrets.get("TG_TOKEN")
 tg_id = st.secrets.get("TG_CHAT_ID")
 
-openai_key = st.secrets.get("OPENAI_API_KEY")
+openai_key = st.secrets.get("OPENAI_API_KEY", config.get("openai_api_key", ""))
 
-if not api_key:
-    st.error("🚨 Bitget API Key가 secrets에 없습니다 (API_KEY).")
+if not api_key or not api_secret or not api_password:
+    st.error("🚨 Bitget API 키(secrets)가 비어있습니다. Streamlit secrets.toml 확인!")
     st.stop()
 
 if not openai_key:
-    st.error("🚨 OpenAI API Key가 secrets에 없습니다 (OPENAI_API_KEY).")
-    st.stop()
-
-openai_client = OpenAI(api_key=openai_key)
-
-# =========================================================
-# 💾 설정 로드/저장
-# =========================================================
-def load_settings():
-    default = {
-        "auto_trade": False,
-        "order_usdt": 100.0,
-        "leverage_ui": 5,
-
-        # 지표 파라미터
-        "rsi_period": 14, "rsi_buy": 30, "rsi_sell": 70,
-        "bb_period": 20, "bb_std": 2.0,
-        "ma_fast": 7, "ma_slow": 99,
-        "stoch_k": 14,
-        "vol_mul": 2.0,
-
-        # 지표 사용 여부(10종)
-        "use_rsi": True, "use_bb": True, "use_ma": True, "use_macd": True,
-        "use_stoch": True, "use_cci": True, "use_mfi": True, "use_willr": True,
-        "use_adx": True, "use_vol": True,
-    }
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            default.update(saved)
-        except:
-            pass
-    return default
-
-def save_settings(s):
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(s, f, ensure_ascii=False, indent=2)
-        st.toast("✅ 설정 저장 완료", icon="💾")
-    except:
-        st.error("설정 저장 실패")
-
-config = load_settings()
+    st.warning("⚠️ OpenAI 키가 없어서 AI 분석은 HOLD만 나옵니다. (secrets 또는 설정에서 입력)")
+else:
+    openai_client = OpenAI(api_key=openai_key)
 
 # =========================================================
 # 📡 거래소 연결
@@ -146,1053 +199,1086 @@ def init_exchange():
 exchange = init_exchange()
 
 # =========================================================
-# 📈 TradingView 위젯
+# 📈 보조지표(ta 없이 직접 계산) - 10종
 # =========================================================
-def to_tv_symbol(ccxt_symbol: str) -> str:
-    # 예: BTC/USDT:USDT -> BITGET:BTCUSDT.P
-    base = ccxt_symbol.split("/")[0].replace(":", "")
-    quote = "USDT"
-    return f"BITGET:{base}{quote}.P"
-
-def tf_to_tv_interval(tf: str) -> str:
-    m = {"1m":"1","3m":"3","5m":"5","15m":"15","30m":"30","1h":"60","2h":"120","4h":"240","1d":"D"}
-    return m.get(tf, "5")
-
-def render_tradingview(ccxt_symbol: str, timeframe: str, height: int = 520, theme: str = "dark"):
-    tv_symbol = to_tv_symbol(ccxt_symbol)
-    interval = tf_to_tv_interval(timeframe)
-    container_id = f"tv_{uuid.uuid4().hex}"
-
-    html = f"""
-    <div class="tradingview-widget-container" style="height:{height}px;width:100%;">
-      <div id="{container_id}" style="height:{height}px;width:100%;"></div>
-    </div>
-    <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-    <script type="text/javascript">
-      new TradingView.widget({{
-        "autosize": true,
-        "symbol": "{tv_symbol}",
-        "interval": "{interval}",
-        "timezone": "Asia/Seoul",
-        "theme": "{theme}",
-        "style": "1",
-        "locale": "kr",
-        "enable_publishing": false,
-        "hide_top_toolbar": false,
-        "hide_legend": false,
-        "allow_symbol_change": true,
-        "save_image": false,
-        "container_id": "{container_id}"
-      }});
-    </script>
-    """
-    components.html(html, height=height+20, scrolling=False)
-
-# =========================================================
-# 🧮 폴백 지표 계산(ta 없을 때)
-# =========================================================
-def _ema(s, span):
+def ema(s: pd.Series, span: int):
     return s.ewm(span=span, adjust=False).mean()
 
-def _rsi(close, period=14):
+def rsi(close: pd.Series, period: int = 14):
     delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-    rs = avg_gain / (avg_loss + 1e-12)
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
     return 100 - (100 / (1 + rs))
 
-def _bbands(close, period=20, dev=2.0):
+def bollinger(close: pd.Series, period: int = 20, std: float = 2.0):
     mid = close.rolling(period).mean()
-    std = close.rolling(period).std()
-    upper = mid + dev * std
-    lower = mid - dev * std
-    return upper, mid, lower
+    sd = close.rolling(period).std()
+    upper = mid + std * sd
+    lower = mid - std * sd
+    return mid, upper, lower
 
-def _macd(close, fast=12, slow=26, signal=9):
-    macd = _ema(close, fast) - _ema(close, slow)
-    sig = _ema(macd, signal)
-    hist = macd - sig
-    return macd, sig, hist
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    macd_line = ema(close, fast) - ema(close, slow)
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
-def _stoch(high, low, close, k=14, d=3):
-    ll = low.rolling(k).min()
-    hh = high.rolling(k).max()
-    k_line = 100 * (close - ll) / ((hh - ll) + 1e-12)
-    d_line = k_line.rolling(d).mean()
-    return k_line, d_line
-
-def _cci(high, low, close, n=20):
-    tp = (high + low + close) / 3.0
-    sma = tp.rolling(n).mean()
-    mad = tp.rolling(n).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
-    return (tp - sma) / ((0.015 * mad) + 1e-12)
-
-def _mfi(high, low, close, volume, n=14):
-    tp = (high + low + close) / 3.0
-    mf = tp * volume
-    direction = tp.diff()
-    pos = mf.where(direction > 0, 0.0)
-    neg = mf.where(direction < 0, 0.0).abs()
-    pos_sum = pos.rolling(n).sum()
-    neg_sum = neg.rolling(n).sum()
-    mfr = pos_sum / (neg_sum + 1e-12)
-    return 100 - (100 / (1 + mfr))
-
-def _willr(high, low, close, n=14):
-    hh = high.rolling(n).max()
-    ll = low.rolling(n).min()
-    return -100 * (hh - close) / ((hh - ll) + 1e-12)
-
-def _adx(high, low, close, n=14):
+def true_range(high, low, close):
     prev_close = close.shift(1)
-    tr = pd.concat([(high-low), (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr
 
+def adx(high, low, close, period: int = 14):
     up_move = high.diff()
     down_move = -low.diff()
+
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    tr_smooth = pd.Series(tr).ewm(alpha=1/n, adjust=False).mean()
-    plus_smooth = pd.Series(plus_dm).ewm(alpha=1/n, adjust=False).mean()
-    minus_smooth = pd.Series(minus_dm).ewm(alpha=1/n, adjust=False).mean()
+    tr = true_range(high, low, close)
+    atr = tr.rolling(period).mean()
 
-    plus_di = 100 * (plus_smooth / (tr_smooth + 1e-12))
-    minus_di = 100 * (minus_smooth / (tr_smooth + 1e-12))
-    dx = 100 * ((plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-12))
-    adx = dx.ewm(alpha=1/n, adjust=False).mean()
-    return adx
+    plus_di = 100 * (pd.Series(plus_dm, index=high.index).rolling(period).mean() / atr)
+    minus_di = 100 * (pd.Series(minus_dm, index=high.index).rolling(period).mean() / atr)
 
-def calc_atr(df, n=14):
-    high = df["high"]; low = df["low"]; close = df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([(high-low), (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
+    adx_val = dx.rolling(period).mean()
+    return adx_val, plus_di, minus_di
 
-# =========================================================
-# 🧮 10종 지표 계산(ta 있으면 ta / 없으면 폴백)
-# =========================================================
+def stoch(high, low, close, k_period: int = 14, d_period: int = 3):
+    lowest_low = low.rolling(k_period).min()
+    highest_high = high.rolling(k_period).max()
+    k = 100 * (close - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)
+    d = k.rolling(d_period).mean()
+    return k, d
+
+def cci(high, low, close, period: int = 20):
+    tp = (high + low + close) / 3.0
+    sma_tp = tp.rolling(period).mean()
+    mad = (tp - sma_tp).abs().rolling(period).mean()
+    cci_val = (tp - sma_tp) / (0.015 * mad.replace(0, np.nan))
+    return cci_val
+
+def mfi(high, low, close, volume, period: int = 14):
+    tp = (high + low + close) / 3.0
+    mf = tp * volume
+    direction = tp.diff()
+    pos_mf = mf.where(direction > 0, 0.0)
+    neg_mf = mf.where(direction < 0, 0.0).abs()
+    pos_sum = pos_mf.rolling(period).sum()
+    neg_sum = neg_mf.rolling(period).sum()
+    mfr = pos_sum / (neg_sum.replace(0, np.nan))
+    return 100 - (100 / (1 + mfr))
+
+def williams_r(high, low, close, period: int = 14):
+    hh = high.rolling(period).max()
+    ll = low.rolling(period).min()
+    wr = -100 * (hh - close) / (hh - ll).replace(0, np.nan)
+    return wr
+
 def calc_indicators(df: pd.DataFrame, cfg: dict):
-    try:
-        if df is None or df.empty or len(df) < 120:
-            return df, {}, None
+    if df is None or df.empty or len(df) < 120:
+        return df, {}, None
 
-        # 컬럼 통일
-        if "volume" not in df.columns and "vol" in df.columns:
-            df["volume"] = df["vol"]
+    df = df.copy()
 
-        if HAS_TA:
-            df["RSI"] = ta.momentum.rsi(df["close"], window=int(cfg["rsi_period"]))
+    # 10종 계산
+    if cfg["use_rsi"]:
+        df["RSI"] = rsi(df["close"], cfg["rsi_period"])
 
-            bb = ta.volatility.BollingerBands(df["close"], window=int(cfg["bb_period"]), window_dev=float(cfg["bb_std"]))
-            df["BB_upper"] = bb.bollinger_hband()
-            df["BB_mid"] = bb.bollinger_mavg()
-            df["BB_lower"] = bb.bollinger_lband()
+    if cfg["use_bb"]:
+        mid, up, low_ = bollinger(df["close"], cfg["bb_period"], cfg["bb_std"])
+        df["BB_mid"], df["BB_upper"], df["BB_lower"] = mid, up, low_
 
-            df["MA_fast"] = ta.trend.sma_indicator(df["close"], window=int(cfg["ma_fast"]))
-            df["MA_slow"] = ta.trend.sma_indicator(df["close"], window=int(cfg["ma_slow"]))
+    if cfg["use_ma"]:
+        df["MA_fast"] = df["close"].rolling(cfg["ma_fast"]).mean()
+        df["MA_slow"] = df["close"].rolling(cfg["ma_slow"]).mean()
 
-            macd = ta.trend.MACD(df["close"])
-            df["MACD"] = macd.macd()
-            df["MACD_signal"] = macd.macd_signal()
-            df["MACD_hist"] = macd.macd_diff()
+    if cfg["use_macd"]:
+        m, s, h = macd(df["close"], cfg["macd_fast"], cfg["macd_slow"], cfg["macd_signal"])
+        df["MACD"], df["MACD_signal"], df["MACD_hist"] = m, s, h
 
-            stoch = ta.momentum.StochasticOscillator(df["high"], df["low"], df["close"], window=int(cfg["stoch_k"]), smooth_window=3)
-            df["STO_K"] = stoch.stoch()
-            df["STO_D"] = stoch.stoch_signal()
+    if cfg["use_adx"]:
+        a, pdi, mdi = adx(df["high"], df["low"], df["close"], cfg["adx_period"])
+        df["ADX"], df["PDI"], df["MDI"] = a, pdi, mdi
 
-            df["CCI"] = ta.trend.cci(df["high"], df["low"], df["close"], window=20)
-            df["MFI"] = ta.volume.money_flow_index(df["high"], df["low"], df["close"], df["volume"], window=14)
-            df["WILLR"] = ta.momentum.williams_r(df["high"], df["low"], df["close"], lbp=14)
-            df["ADX"] = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
+    if cfg["use_stoch"]:
+        k, d = stoch(df["high"], df["low"], df["close"], cfg["stoch_k"], cfg["stoch_d"])
+        df["STO_K"], df["STO_D"] = k, d
 
+    if cfg["use_cci"]:
+        df["CCI"] = cci(df["high"], df["low"], df["close"], cfg["cci_period"])
+
+    if cfg["use_mfi"]:
+        df["MFI"] = mfi(df["high"], df["low"], df["close"], df["vol"], cfg["mfi_period"])
+
+    if cfg["use_willr"]:
+        df["WILLR"] = williams_r(df["high"], df["low"], df["close"], cfg["willr_period"])
+
+    if cfg["use_vol"]:
+        df["VOL_SMA"] = df["vol"].rolling(cfg["vol_sma"]).mean()
+
+    df = df.dropna()
+    if df.empty:
+        return df, {}, None
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    status = {}
+    # RSI 상태(“탈출” 강조)
+    if cfg["use_rsi"]:
+        buy_th = cfg["rsi_buy"]
+        sell_th = cfg["rsi_sell"]
+        if prev["RSI"] < buy_th and last["RSI"] >= buy_th:
+            status["RSI"] = "🟢 과매도 탈출(반등)"
+        elif prev["RSI"] > sell_th and last["RSI"] <= sell_th:
+            status["RSI"] = "🔴 과매수 탈출(눌림)"
         else:
-            df["RSI"] = _rsi(df["close"], int(cfg["rsi_period"]))
-            df["BB_upper"], df["BB_mid"], df["BB_lower"] = _bbands(df["close"], int(cfg["bb_period"]), float(cfg["bb_std"]))
-            df["MA_fast"] = df["close"].rolling(int(cfg["ma_fast"])).mean()
-            df["MA_slow"] = df["close"].rolling(int(cfg["ma_slow"])).mean()
-            df["MACD"], df["MACD_signal"], df["MACD_hist"] = _macd(df["close"])
-            df["STO_K"], df["STO_D"] = _stoch(df["high"], df["low"], df["close"], int(cfg["stoch_k"]))
-            df["CCI"] = _cci(df["high"], df["low"], df["close"], 20)
-            df["MFI"] = _mfi(df["high"], df["low"], df["close"], df["volume"], 14)
-            df["WILLR"] = _willr(df["high"], df["low"], df["close"], 14)
-            df["ADX"] = _adx(df["high"], df["low"], df["close"], 14)
+            status["RSI"] = "⚪ 중립"
 
-        # 거래량 스파이크
-        df["VOL_MA"] = df["volume"].rolling(20).mean()
-        df["VOL_SPIKE"] = df["volume"] / (df["VOL_MA"] + 1e-12)
-
-        df = df.dropna()
-        if df.empty:
-            return df, {}, None
-
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        status = {}
-
-        # 상태(10종)
-        status["RSI"] = "🔴 과매수" if last["RSI"] >= cfg["rsi_sell"] else ("🟢 과매도" if last["RSI"] <= cfg["rsi_buy"] else "⚪ 중립")
-        status["RSI_FLOW"] = "↗️ 반등" if last["RSI"] > prev["RSI"] else "↘️ 약화"
-
-        if last["close"] > last["BB_upper"]:
-            status["BB"] = "🔴 상단 돌파"
-        elif last["close"] < last["BB_lower"]:
-            status["BB"] = "🟢 하단 이탈"
+    # BB
+    if cfg["use_bb"]:
+        if last["close"] < last["BB_lower"]:
+            status["BB"] = "🟢 하단 이탈(과매도)"
+        elif last["close"] > last["BB_upper"]:
+            status["BB"] = "🔴 상단 돌파(과열)"
         else:
             status["BB"] = "⚪ 밴드 내"
 
-        status["MA"] = "📈 (단기>장기)" if last["MA_fast"] > last["MA_slow"] else "📉 (단기<장기)"
-        status["MACD"] = "📈 골든" if last["MACD"] > last["MACD_signal"] else "📉 데드"
-        status["STOCH"] = "🔴 과열" if last["STO_K"] > 80 else ("🟢 침체" if last["STO_K"] < 20 else "⚪ 중립")
-        status["CCI"] = "🔴 과열" if last["CCI"] > 100 else ("🟢 침체" if last["CCI"] < -100 else "⚪ 중립")
-        status["MFI"] = "🔴 과열" if last["MFI"] > 80 else ("🟢 침체" if last["MFI"] < 20 else "⚪ 중립")
-        status["WILLR"] = "🔴 과열" if last["WILLR"] > -20 else ("🟢 침체" if last["WILLR"] < -80 else "⚪ 중립")
+    # MA
+    if cfg["use_ma"]:
+        if prev["MA_fast"] <= prev["MA_slow"] and last["MA_fast"] > last["MA_slow"]:
+            status["MA"] = "📈 골든크로스"
+        elif prev["MA_fast"] >= prev["MA_slow"] and last["MA_fast"] < last["MA_slow"]:
+            status["MA"] = "📉 데드크로스"
+        else:
+            status["MA"] = "⚪ 유지"
+
+    # MACD
+    if cfg["use_macd"]:
+        if prev["MACD"] <= prev["MACD_signal"] and last["MACD"] > last["MACD_signal"]:
+            status["MACD"] = "📈 골든크로스"
+        elif prev["MACD"] >= prev["MACD_signal"] and last["MACD"] < last["MACD_signal"]:
+            status["MACD"] = "📉 데드크로스"
+        else:
+            status["MACD"] = "⚪ 유지"
+
+    # ADX
+    if cfg["use_adx"]:
         status["ADX"] = "🔥 추세장" if last["ADX"] >= 25 else "💤 횡보장"
-        status["VOL"] = "🔥 거래량 폭증" if last["VOL_SPIKE"] >= float(cfg["vol_mul"]) else "⚪ 보통"
 
-        return df, status, last
+    # Stoch
+    if cfg["use_stoch"]:
+        if prev["STO_K"] <= prev["STO_D"] and last["STO_K"] > last["STO_D"] and last["STO_K"] < 30:
+            status["STOCH"] = "🟢 바닥 반등"
+        elif prev["STO_K"] >= prev["STO_D"] and last["STO_K"] < last["STO_D"] and last["STO_K"] > 70:
+            status["STOCH"] = "🔴 꼭대기 꺾임"
+        else:
+            status["STOCH"] = "⚪ 중립"
 
-    except Exception as e:
-        print("Calc Error:", e)
-        return df, {}, None
+    # CCI
+    if cfg["use_cci"]:
+        if last["CCI"] < -100:
+            status["CCI"] = "🟢 과매도"
+        elif last["CCI"] > 100:
+            status["CCI"] = "🔴 과매수"
+        else:
+            status["CCI"] = "⚪ 중립"
 
-# =========================================================
-# 💾 런타임 상태(쿨다운/연손절/일손실/트레이드) 저장
-# =========================================================
-def _now_ts():
-    return int(time.time())
+    # MFI
+    if cfg["use_mfi"]:
+        if last["MFI"] < 20:
+            status["MFI"] = "🟢 과매도"
+        elif last["MFI"] > 80:
+            status["MFI"] = "🔴 과매수"
+        else:
+            status["MFI"] = "⚪ 중립"
 
-def _today_str():
-    return datetime.now().strftime("%Y-%m-%d")
+    # Williams %R
+    if cfg["use_willr"]:
+        if last["WILLR"] < -80:
+            status["WILLR"] = "🟢 과매도"
+        elif last["WILLR"] > -20:
+            status["WILLR"] = "🔴 과매수"
+        else:
+            status["WILLR"] = "⚪ 중립"
 
-def load_runtime_state():
-    base = {
-        "date": _today_str(),
-        "day_start_equity": None,
-        "daily_realized_pnl": 0.0,
-        "consec_losses": 0,
-        "pause_until": 0,
-        "cooldowns": {},  # coin -> ts
-        "trades": {}      # coin -> trade_info
-    }
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            base.update(saved)
-        except:
-            pass
-    return base
+    # Volume
+    if cfg["use_vol"]:
+        if last["VOL_SMA"] > 0 and last["vol"] >= last["VOL_SMA"] * cfg["vol_mul"]:
+            status["VOL"] = "🔥 거래량 급증"
+        else:
+            status["VOL"] = "⚪ 보통"
 
-def save_runtime_state(state):
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except:
-        pass
+    return df, status, last
 
-def _rollover_daily(state, equity_now: float):
-    today = _today_str()
-    if state.get("date") != today:
-        state["date"] = today
-        state["day_start_equity"] = equity_now
-        state["daily_realized_pnl"] = 0.0
-        state["consec_losses"] = 0
-        state["pause_until"] = 0
-        state["cooldowns"] = {}
-        save_runtime_state(state)
 
-def _is_paused(state):
-    return _now_ts() < int(state.get("pause_until", 0))
+def score_signals(status: dict):
+    """롱/숏 투표 점수화(단순판)"""
+    long_score = 0
+    short_score = 0
 
-def _daily_stop_hit(state, equity_now: float):
-    start = state.get("day_start_equity")
-    if start is None:
-        state["day_start_equity"] = equity_now
-        save_runtime_state(state)
-        return False
-    return equity_now <= float(start) * (1.0 - DAILY_MAX_LOSS_PCT)
+    txt = " ".join(status.values())
 
-def _set_coin_cooldown(state, coin):
-    state.setdefault("cooldowns", {})[coin] = _now_ts() + COOLDOWN_AFTER_SL_MIN * 60
+    if "과매도 탈출" in txt or "바닥 반등" in txt:
+        long_score += 2
+    if "골든크로스" in txt:
+        long_score += 1
+    if "하단 이탈" in txt or "과매도" in txt:
+        long_score += 1
 
-def _coin_in_cooldown(state, coin):
-    return _now_ts() < int(state.get("cooldowns", {}).get(coin, 0))
+    if "과매수 탈출" in txt or "꼭대기 꺾임" in txt:
+        short_score += 2
+    if "데드크로스" in txt:
+        short_score += 1
+    if "상단 돌파" in txt or "과매수" in txt:
+        short_score += 1
 
-def _hit_consec_loss_pause(state):
-    state["pause_until"] = _now_ts() + PAUSE_AFTER_CONSEC_LOSS_MIN * 60
+    # 추세장일 때는 신호 신뢰도 약간 가중
+    if status.get("ADX") == "🔥 추세장":
+        if long_score > short_score:
+            long_score += 1
+        elif short_score > long_score:
+            short_score += 1
 
-# =========================================================
-# 🧠 순환매/레짐/상관/스프레드/리스크 수량
-# =========================================================
-def returns_series(close: pd.Series):
-    return close.pct_change().fillna(0.0)
+    return long_score, short_score
 
-def corr_of_returns(df_a, df_b, n=60):
-    ra = returns_series(df_a["close"]).tail(n)
-    rb = returns_series(df_b["close"]).tail(n)
-    if len(ra) < 10 or len(rb) < 10:
-        return 0.0
-    return float(ra.corr(rb))
-
-def get_spread_pct(ex, symbol):
-    try:
-        t = ex.fetch_ticker(symbol)
-        bid = t.get("bid")
-        ask = t.get("ask")
-        if not bid or not ask or bid <= 0:
-            return 0.0
-        return (ask - bid) / bid * 100.0
-    except:
-        return 0.0
-
-def rotation_score(coin_df, btc_df):
-    c = coin_df["close"]
-    b = btc_df["close"]
-    ret_5m  = (c.iloc[-1] / c.iloc[-2]  - 1.0) if len(c) >= 2 else 0.0
-    ret_15m = (c.iloc[-1] / c.iloc[-4]  - 1.0) if len(c) >= 4 else 0.0
-    ret_1h  = (c.iloc[-1] / c.iloc[-13] - 1.0) if len(c) >= 13 else 0.0
-
-    btc_1h  = (b.iloc[-1] / b.iloc[-13] - 1.0) if len(b) >= 13 else 0.0
-    rs = ret_1h - btc_1h  # BTC 대비 상대강도
-
-    vol = coin_df["volume"]
-    vol_ma = vol.rolling(20).mean()
-    vspike = float((vol.iloc[-1] / (vol_ma.iloc[-1] + 1e-12))) if len(vol_ma.dropna()) > 0 else 1.0
-    vspike = min(max(vspike, 0.0), 5.0)
-
-    score = (ret_1h*100*0.6 + ret_15m*100*0.3 + ret_5m*100*0.1) + (rs*100*0.8) + ((vspike-1.0)*2.0)
-    return float(score), float(vspike), float(rs*100)
-
-def btc_regime(btc_df):
-    close = btc_df["close"]
-    if len(close) < 30:
-        return "neutral"
-
-    ret_1h = (close.iloc[-1] / close.iloc[-13] - 1.0) * 100
-    atr = calc_atr(btc_df, 14)
-    atr_pct = float(atr.iloc[-1] / close.iloc[-1] * 100) if not np.isnan(atr.iloc[-1]) else 0.0
-
-    if ret_1h <= -1.0 or atr_pct >= 1.2:
-        return "risk_off"
-    if ret_1h >= 1.0 and atr_pct < 1.2:
-        return "risk_on"
-    return "neutral"
-
-def calc_qty_by_risk(ex, symbol, price, equity_free_usdt, leverage, stop_pct_price):
-    risk_usdt = equity_free_usdt * RISK_PER_TRADE
-    stop_dist = price * (stop_pct_price / 100.0)
-    if stop_dist <= 0:
-        return "0"
-
-    qty_risk = risk_usdt / stop_dist
-
-    max_margin = equity_free_usdt * MAX_MARGIN_PCT
-    qty_cap = (max_margin * leverage) / price
-
-    qty = min(qty_risk, qty_cap)
-    qty = max(qty, 0.0)
-    return ex.amount_to_precision(symbol, qty)
-
-def close_side_from_position_side(pos_side: str):
-    s = (pos_side or "").lower()
-    return "sell" if s in ["long", "buy"] else "buy"
 
 # =========================================================
-# 🧠 AI 최종 확인 (쉬운 설명 강제)
+# 🤖 AI 전략(손익비/부분익절/쉬운 설명 포함)
 # =========================================================
-def generate_wonyousi_strategy(df, status_summary, rot_score, btc_state, hint):
-    try:
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
+def generate_ai_strategy(symbol: str, df: pd.DataFrame, status: dict, cfg: dict):
+    if not openai_key:
+        return {
+            "decision": "hold",
+            "confidence": 0,
+            "leverage": cfg["leverage"],
+            "percentage": 10,
+            "sl_gap": max(cfg["min_sl_gap"], 2.5),
+            "tp_gap": max(cfg["min_sl_gap"] * cfg["min_rr"], 5.0),
+            "tp1_gap": cfg["tp1_gap"],
+            "tp1_size": cfg["tp1_size"],
+            "reason_simple": "OpenAI 키가 없어서 관망합니다.",
+            "reason_detail": "OPENAI_API_KEY 설정 후 다시 시도하세요."
+        }
 
-        system_prompt = f"""
-너는 자동매매 봇의 '최종 확인'이다.
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    long_score, short_score = score_signals(status)
+
+    system_prompt = f"""
+너는 '수익실현을 꾸준히' 하는 신중한 트레이더다.
+
+[목표]
+- 손절이 너무 잦지 않게(=손절폭 너무 작게 금지)
+- 손익비가 좋은 거래만(최소 손익비 {cfg['min_rr']} 이상)
+- 부분익절로 '작게라도 자주' 실현 (TP1: {cfg['tp1_gap']}%에서 {cfg['tp1_size']}% 정리)
 
 [규칙]
-- 애매하면 HOLD.
-- 레버리지는 {MIN_LEV}~{MAX_LEV}.
-- 쉬운 설명(easy_reason)은 어려운 단어(RSI/MACD 등) 쓰지 말고, 2~3줄로 아주 쉽게 설명.
-- 시스템이 이미 방향 힌트를 주었다. 반대로 가려면 confidence를 매우 낮추거나 HOLD로 해라.
+1) RSI는 '극단 구간 진입'이 아니라 '탈출(반등/눌림)'을 더 중요하게 본다.
+2) 손절폭 sl_gap 은 최소 {cfg['min_sl_gap']}% 이상.
+3) 레버리지는 3~10 범위 권장(과한 레버리지 금지).
+4) 확신도가 낮으면 무조건 hold.
 
 [응답 JSON]
-{{
-  "decision": "buy"|"sell"|"hold",
-  "confidence": 0~100,
-  "leverage": {MIN_LEV}~{MAX_LEV},
-  "easy_reason": "쉬운 설명 2~3줄",
-  "detail_reason": "짧은 근거"
-}}
-        """.strip()
+decision: buy/sell/hold
+confidence: 0~100
+percentage: 5~30
+leverage: 3~10
+sl_gap: 2.5~7.0
+tp_gap: sl_gap*{cfg['min_rr']} 이상(가능하면 더)
+tp1_gap: {cfg['tp1_gap']}
+tp1_size: {cfg['tp1_size']}
+reason_simple: 초보도 이해 가능한 한글 2~3줄
+reason_detail: 기술적 근거(지표/흐름)
+"""
 
-        user_prompt = f"""
-[상황]
-- 현재가: {float(last["close"]):.6f}
-- 바로 전: {float(prev["close"]):.6f} -> {float(last["close"]):.6f}
-- 순환매 점수: {rot_score:.2f}
-- BTC 상태: {btc_state}
-- 시스템 힌트: {hint.get("direction_hint")} (이유: {hint.get("why")})
+    user_prompt = f"""
+[심볼] {symbol}
+[가격] 현재가 {last['close']}
+[흐름] 직전->현재 RSI: {prev.get('RSI', np.nan)} -> {last.get('RSI', np.nan)}
+[추세] ADX: {last.get('ADX', np.nan)}
+[요약] {status}
+[점수] long_score={long_score}, short_score={short_score}
 
-지표요약(참고):
-{status_summary}
-        """.strip()
+주의: "손절이 1.5% 같은 초타이트"는 금지. 손익비가 맞아야 한다.
+"""
 
-        response = openai_client.chat.completions.create(
+    try:
+        resp = openai_client.chat.completions.create(
             model="gpt-4o",
-            messages=[{"role":"system","content":system_prompt},
-                      {"role":"user","content":user_prompt}],
-            response_format={"type":"json_object"},
-            temperature=0.25
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.25,
         )
-        return json.loads(response.choices[0].message.content)
+        out = json.loads(resp.choices[0].message.content)
 
+        # ✅ 안전장치 보정
+        out["sl_gap"] = float(max(out.get("sl_gap", cfg["min_sl_gap"]), cfg["min_sl_gap"]))
+        out["leverage"] = int(min(max(int(out.get("leverage", cfg["leverage"])), 3), 10))
+        out["percentage"] = float(min(max(float(out.get("percentage", 10)), 5), 30))
+
+        # tp_gap 최소 손익비 보정
+        min_tp = out["sl_gap"] * float(cfg["min_rr"])
+        out["tp_gap"] = float(max(float(out.get("tp_gap", min_tp)), min_tp))
+
+        out["tp1_gap"] = float(cfg["tp1_gap"])
+        out["tp1_size"] = int(cfg["tp1_size"])
+        return out
     except Exception as e:
-        return {"decision":"hold","confidence":0,"leverage":5,"easy_reason":"AI 오류로 관망","detail_reason":str(e)}
+        return {
+            "decision": "hold",
+            "confidence": 0,
+            "leverage": cfg["leverage"],
+            "percentage": 10,
+            "sl_gap": max(cfg["min_sl_gap"], 2.5),
+            "tp_gap": max(cfg["min_sl_gap"] * cfg["min_rr"], 5.0),
+            "tp1_gap": cfg["tp1_gap"],
+            "tp1_size": cfg["tp1_size"],
+            "reason_simple": "AI 호출 중 오류로 관망합니다.",
+            "reason_detail": f"에러: {e}"
+        }
+
 
 # =========================================================
-# 🤖 텔레그램 + 자동매매 스레드 (실전 운영판)
+# 🧾 포지션/손익 계산 보조
+# =========================================================
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except:
+        return default
+
+def compute_roi_pct(side: str, entry: float, mark: float, lev: float):
+    if entry <= 0:
+        return 0.0
+    direction = 1.0 if side in ["long", "buy"] else -1.0
+    return direction * ((mark - entry) / entry) * 100.0 * max(1.0, lev)
+
+def get_active_positions(ex, symbols):
+    try:
+        ps = ex.fetch_positions(symbols=symbols)
+        act = []
+        for p in ps:
+            contracts = safe_float(p.get("contracts", 0))
+            if contracts > 0:
+                act.append(p)
+        return act
+    except:
+        return []
+
+def is_paused(state: dict):
+    return time.time() < safe_float(state.get("pause_until", 0))
+
+def in_cooldown(state: dict, symbol: str):
+    until = safe_float(state.get("cooldowns", {}).get(symbol, 0))
+    return time.time() < until
+
+def set_cooldown(state: dict, symbol: str, minutes: int):
+    state.setdefault("cooldowns", {})
+    state["cooldowns"][symbol] = int(time.time() + minutes * 60)
+    save_runtime_state(state)
+
+
+# =========================================================
+# 🔁 “순환매(로테이션)” 간단 구현: 5개 중 ‘움직임 큰’ 2개만 신규진입
+# =========================================================
+def pick_rotation_symbols(ex, symbols, timeframe="5m", limit=60, top_n=2):
+    # 최근 1시간(5m*12) 변동이 큰 코인 2개만 뽑기
+    scored = []
+    for sym in symbols:
+        try:
+            ohlcv = ex.fetch_ohlcv(sym, timeframe, limit=limit)
+            if not ohlcv or len(ohlcv) < 15:
+                continue
+            df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","vol"])
+            close = df["close"]
+            # 1시간 전 대비 변화율(절댓값)
+            base = float(close.iloc[-13]) if len(close) >= 13 else float(close.iloc[0])
+            now = float(close.iloc[-1])
+            chg = abs((now - base) / base) * 100 if base > 0 else 0
+            # 거래량도 같이 반영(간단히)
+            v = float(df["vol"].iloc[-1])
+            scored.append((sym, chg, v))
+        except:
+            pass
+
+    if not scored:
+        return symbols[:top_n]
+
+    # 변화율 우선, 동률이면 거래량
+    scored.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    return [x[0] for x in scored[:top_n]]
+
+
+# =========================================================
+# 🤖 텔레그램 스레드(자동매매)
 # =========================================================
 def telegram_thread(ex):
     state = load_runtime_state()
-    last_scan = 0
+
+    offset = 0
+    last_report = 0
+    REPORT_INTERVAL = 900
 
     def tg_send(text):
+        if not tg_token or not tg_id:
+            return
         try:
             requests.post(
                 f"https://api.telegram.org/bot{tg_token}/sendMessage",
-                data={"chat_id": tg_id, "text": text}
+                data={"chat_id": tg_id, "text": text},
+                timeout=5,
             )
         except:
             pass
 
-    tg_send(
-        "✅ 실전 운영판 시작\n"
-        "- 동시 2포지션\n"
-        "- 트레이드당 리스크 0.5%\n"
-        "- 순환매(돈 몰리는 코인 우선)\n"
-        "- 부분익절/본절/트레일링\n"
-        "- 쿨다운/연손절/일손실 보호"
-    )
+    tg_send("🚀 봇 가동 시작 (자동매매 스레드)")
 
     while True:
         try:
-            cur_cfg = load_settings()
-            is_auto_on = cur_cfg.get("auto_trade", False)
+            cfg = load_settings()
+            state = load_runtime_state()
 
-            # 잔고
-            bal = ex.fetch_balance({"type":"swap"})
-            usdt_free = float(bal["USDT"]["free"])
-            usdt_total = float(bal["USDT"]["total"])
-
-            _rollover_daily(state, usdt_total)
-
-            # 일손실 제한
-            if _daily_stop_hit(state, usdt_total):
-                if is_auto_on:
-                    tg_send("🛑 오늘 손실 한도(-2%) 도달. 자동매매 쉬어요.")
-                time.sleep(10)
-                continue
-
-            # 연손절 휴식
-            if _is_paused(state):
-                time.sleep(5)
-                continue
-
-            # 포지션 조회
+            # 잔고로 일일 시작자산 롤링
             try:
-                positions = ex.fetch_positions(symbols=TARGET_COINS)
+                bal = ex.fetch_balance({"type": "swap"})
+                equity = safe_float(bal["USDT"]["total"])
             except:
-                positions = []
-                for c in TARGET_COINS:
-                    try:
-                        positions += ex.fetch_positions([c])
-                    except:
-                        pass
+                equity = state.get("day_start_equity", 0.0)
 
-            active_positions = [p for p in positions if float(p.get("contracts", 0) or 0) > 0]
-            open_count = len(active_positions)
+            maybe_roll_daily_state(state, equity)
 
-            # -------------------------
-            # 1) 오픈 포지션 관리
-            # -------------------------
-            for p in active_positions:
-                coin = p.get("symbol")
-                if not coin:
-                    continue
-
-                pnl_pct = float(p.get("percentage", 0) or 0)  # ROI%
-                contracts = float(p.get("contracts", 0) or 0)
-                pos_side = (p.get("side") or "").lower()
-                close_side = close_side_from_position_side(pos_side)
-
-                trade = state.setdefault("trades", {}).get(coin)
-                if not trade:
-                    # 처음 발견한 포지션: 안전 기본값 생성
-                    state["trades"][coin] = {
-                        "sl": 4.0, "r": 4.0, "tp1": 4.0, "tp2": 8.0,
-                        "tp1_done": False, "peak": pnl_pct,
-                        "trail_floor": 0.0, "opened_ts": _now_ts(),
-                        "easy_reason": "", "detail_reason": ""
-                    }
-                    trade = state["trades"][coin]
-                    save_runtime_state(state)
-
-                # peak 업데이트
-                trade["peak"] = max(float(trade.get("peak", pnl_pct)), pnl_pct)
-
-                # (A) 손절
-                if pnl_pct <= -abs(float(trade["sl"])):
-                    try:
-                        qty_close = ex.amount_to_precision(coin, contracts)
-                        ex.create_market_order(coin, close_side, qty_close, params={"reduceOnly": True})
-                    except:
-                        pass
-
-                    state["consec_losses"] = int(state.get("consec_losses", 0)) + 1
-                    _set_coin_cooldown(state, coin)
-
-                    tg_send(
-                        f"🩸 손절: {coin} ({pnl_pct:.2f}%)\n"
-                        f"→ 같은 코인은 {COOLDOWN_AFTER_SL_MIN}분 쉬어요."
-                    )
-
-                    if state["consec_losses"] >= CONSEC_LOSS_LIMIT:
-                        _hit_consec_loss_pause(state)
-                        tg_send(f"⏸️ {CONSEC_LOSS_LIMIT}연속 손절. {PAUSE_AFTER_CONSEC_LOSS_MIN}분 휴식합니다.")
-
-                    if coin in state["trades"]:
-                        del state["trades"][coin]
-                    save_runtime_state(state)
-                    continue
-
-                # (B) TP1 부분익절(1R에서 절반)
-                if not trade.get("tp1_done", False) and pnl_pct >= float(trade["tp1"]):
-                    try:
-                        qty_part = contracts * TP1_FRACTION
-                        qty_part = float(ex.amount_to_precision(coin, qty_part))
-                        if qty_part > 0:
-                            ex.create_market_order(coin, close_side, qty_part, params={"reduceOnly": True})
-                    except:
-                        pass
-
-                    trade["tp1_done"] = True
-                    trade["trail_floor"] = 0.0
-                    save_runtime_state(state)
-
-                    tg_send(
-                        f"✅ 부분익절(TP1): {coin} (+{pnl_pct:.2f}%)\n"
-                        f"→ 이제 손해 안 나게 이익 지키는 모드!"
-                    )
-
-                # (C) TP2 최종 익절(2R)
-                if pnl_pct >= float(trade["tp2"]):
-                    try:
-                        qty_close = ex.amount_to_precision(coin, contracts)
-                        ex.create_market_order(coin, close_side, qty_close, params={"reduceOnly": True})
-                    except:
-                        pass
-
-                    state["consec_losses"] = 0
-                    tg_send(f"🎉 익절(TP2): {coin} (+{pnl_pct:.2f}%)")
-
-                    if coin in state["trades"]:
-                        del state["trades"][coin]
-                    save_runtime_state(state)
-                    continue
-
-                # (D) TP1 이후 트레일링(피크 - 0.8R 되밀리면 종료)
-                if trade.get("tp1_done", False):
-                    r = float(trade.get("r", 4.0))
-                    peak = float(trade.get("peak", pnl_pct))
-                    trail_floor = max(0.0, peak - (TRAIL_R * r))
-                    trade["trail_floor"] = trail_floor
-                    save_runtime_state(state)
-
-                    if pnl_pct <= trail_floor:
-                        try:
-                            qty_close = ex.amount_to_precision(coin, contracts)
-                            ex.create_market_order(coin, close_side, qty_close, params={"reduceOnly": True})
-                        except:
-                            pass
-
-                        state["consec_losses"] = 0
-                        tg_send(f"🟡 트레일링 청산: {coin}\n→ 이익 지키고 종료! (현재 {pnl_pct:.2f}%)")
-
-                        if coin in state["trades"]:
-                            del state["trades"][coin]
-                        save_runtime_state(state)
-                        continue
-
-            # -------------------------
-            # 2) 신규 진입
-            # -------------------------
-            if not is_auto_on:
-                time.sleep(2)
-                continue
-
-            if open_count >= MAX_POSITIONS:
-                time.sleep(2)
-                continue
-
-            if _now_ts() - last_scan < SCAN_INTERVAL_SEC:
+            # 자동매매 OFF면 텔레그램 버튼만 처리
+            if not cfg.get("auto_trade", False):
                 time.sleep(1)
                 continue
 
-            last_scan = _now_ts()
+            # 연속 손실로 일시정지
+            if is_paused(state):
+                time.sleep(2)
+                continue
 
-            # BTC 기준 데이터(레짐/순환매)
-            btc_symbol = "BTC/USDT:USDT"
-            btc_ohlcv = ex.fetch_ohlcv(btc_symbol, "5m", limit=200)
-            btc_df = pd.DataFrame(btc_ohlcv, columns=["time","open","high","low","close","vol"])
-            btc_df["time"] = pd.to_datetime(btc_df["time"], unit="ms")
-            btc_df["volume"] = btc_df["vol"]
-            btc_state = btc_regime(btc_df)
+            # 1) 현재 포지션 관리 (TP1/TP/SL)
+            active_positions = get_active_positions(ex, TARGET_COINS)
 
-            # 후보 스캔(5개 코인)
-            scanned = []
-            for coin in TARGET_COINS:
-                if _coin_in_cooldown(state, coin):
-                    continue
+            for p in active_positions:
+                sym = p.get("symbol")
+                side = p.get("side", "long")  # bitget: long/short
+                contracts = safe_float(p.get("contracts", 0))
+                lev = safe_float(p.get("leverage", cfg["leverage"]))
+                entry = safe_float(p.get("entryPrice", 0))
+                mark = safe_float(p.get("markPrice", 0)) or safe_float(p.get("last", 0))
 
-                # 스프레드 필터
-                sp = get_spread_pct(ex, coin)
-                if sp >= SPREAD_LIMIT_PCT:
-                    continue
+                roi_pct = safe_float(p.get("percentage", None))
+                if roi_pct is None:
+                    roi_pct = compute_roi_pct(side, entry, mark, lev)
 
-                ohlcv = ex.fetch_ohlcv(coin, "5m", limit=200)
-                df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","vol"])
-                df["time"] = pd.to_datetime(df["time"], unit="ms")
-                df["volume"] = df["vol"]
+                trade_meta = state.get("trades", {}).get(sym, {})
+                sl = float(trade_meta.get("sl_gap", cfg["min_sl_gap"]))
+                tp = float(trade_meta.get("tp_gap", sl * cfg["min_rr"]))
+                tp1_gap = float(trade_meta.get("tp1_gap", cfg["tp1_gap"]))
+                tp1_size = int(trade_meta.get("tp1_size", cfg["tp1_size"]))
+                tp1_done = bool(trade_meta.get("tp1_done", False))
 
-                df_calc, status, last = calc_indicators(df, cur_cfg)
-                if last is None or df_calc is None or df_calc.empty:
-                    continue
+                # ✅ TP1 부분익절
+                if (not tp1_done) and roi_pct >= tp1_gap and contracts > 0:
+                    close_qty = contracts * (tp1_size / 100.0)
+                    close_qty = float(ex.amount_to_precision(sym, close_qty))
 
-                score, vspike, rs = rotation_score(df_calc, btc_df)
+                    if close_qty > 0:
+                        close_side = "sell" if side == "long" else "buy"
+                        try:
+                            ex.create_market_order(sym, close_side, close_qty)
+                        except:
+                            pass
 
-                direction_hint = "buy" if score >= 1.0 else ("sell" if score <= -1.0 else "hold")
-                if direction_hint == "hold":
-                    continue
+                        # TP1 후 본절 스탑(메타만 업데이트: 실제 스탑 주문 대신 봇이 감시)
+                        state.setdefault("trades", {}).setdefault(sym, {})
+                        state["trades"][sym]["tp1_done"] = True
+                        if cfg.get("move_sl_to_be", True):
+                            state["trades"][sym]["be_price"] = entry  # 본절 기준가
+                        save_runtime_state(state)
 
-                # BTC 위험장에서는 알트 롱 신규 진입 보수적으로
-                if btc_state == "risk_off" and direction_hint == "buy" and coin != btc_symbol:
-                    continue
+                        append_trade_log({
+                            "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "Symbol": sym,
+                            "Event": "TP1(부분익절)",
+                            "Side": side,
+                            "Qty": close_qty,
+                            "Price": mark,
+                            "PnL_USDT": "",
+                            "PnL_Pct": f"{roi_pct:.2f}",
+                            "Note": "0.5% 도달 부분익절"
+                        })
+                        tg_send(f"✅ TP1 부분익절: {sym} ({roi_pct:.2f}%)")
 
-                scanned.append({
-                    "coin": coin,
-                    "df": df_calc,
-                    "status": status,
-                    "last": last,
-                    "score": score,
-                    "hint": {"direction_hint": direction_hint, "why": f"순환매 점수 {score:.1f} (돈이 이쪽으로 몰리는 편)"}
-                })
+                # ✅ 본절 방어(= TP1 이후, ROI가 0 근처로 되돌면 나가기)
+                be_price = trade_meta.get("be_price", None)
+                if be_price and contracts > 0:
+                    # 단순하게 ROI <= 0.1%면 정리(원하면 0.0으로 바꿔도 됨)
+                    if roi_pct <= 0.1:
+                        close_side = "sell" if side == "long" else "buy"
+                        try:
+                            ex.create_market_order(sym, close_side, contracts)
+                        except:
+                            pass
 
-            scanned.sort(key=lambda x: abs(x["score"]), reverse=True)
+                        append_trade_log({
+                            "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "Symbol": sym,
+                            "Event": "BE(본절정리)",
+                            "Side": side,
+                            "Qty": contracts,
+                            "Price": mark,
+                            "PnL_USDT": "",
+                            "PnL_Pct": f"{roi_pct:.2f}",
+                            "Note": "TP1 후 본절 방어"
+                        })
+                        tg_send(f"🛡️ 본절 정리: {sym} ({roi_pct:.2f}%)")
 
-            # 이미 포지션 1개 있으면 상관 필터 적용
-            active_coin = active_positions[0]["symbol"] if open_count >= 1 else None
-            active_df = None
-            if active_coin:
-                try:
-                    aohlcv = ex.fetch_ohlcv(active_coin, "5m", limit=200)
-                    active_df = pd.DataFrame(aohlcv, columns=["time","open","high","low","close","vol"])
-                    active_df["volume"] = active_df["vol"]
-                except:
-                    active_df = None
+                        # 쿨다운
+                        set_cooldown(state, sym, cfg["cooldown_minutes"])
+                        state["trades"].pop(sym, None)
+                        save_runtime_state(state)
+                        continue
 
-            required_conf = 85 if open_count >= 1 else 80
+                # ✅ SL/TP 청산
+                if contracts > 0:
+                    if roi_pct <= -abs(sl):
+                        close_side = "sell" if side == "long" else "buy"
+                        try:
+                            ex.create_market_order(sym, close_side, contracts)
+                        except:
+                            pass
 
-            for item in scanned:
-                if open_count >= MAX_POSITIONS:
-                    break
+                        state["consec_losses"] = int(state.get("consec_losses", 0)) + 1
+                        # 연속 손실이면 일시정지
+                        if state["consec_losses"] >= cfg["max_consec_losses"]:
+                            state["pause_until"] = int(time.time() + cfg["pause_minutes"] * 60)
 
-                coin = item["coin"]
-                df_calc = item["df"]
-                status = item["status"]
-                last = item["last"]
-                score = item["score"]
-                hint = item["hint"]
+                        append_trade_log({
+                            "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "Symbol": sym,
+                            "Event": "SL(손절)",
+                            "Side": side,
+                            "Qty": contracts,
+                            "Price": mark,
+                            "PnL_USDT": "",
+                            "PnL_Pct": f"{roi_pct:.2f}",
+                            "Note": f"손절폭 {sl}%"
+                        })
+                        tg_send(f"🩸 손절: {sym} ({roi_pct:.2f}%) / 연속손실 {state['consec_losses']}")
+                        set_cooldown(state, sym, cfg["cooldown_minutes"])
+                        state["trades"].pop(sym, None)
+                        save_runtime_state(state)
 
-                # 두 번째 포지션이면 상관 높은 코인 제외
-                if active_df is not None:
+                    elif roi_pct >= tp:
+                        close_side = "sell" if side == "long" else "buy"
+                        try:
+                            ex.create_market_order(sym, close_side, contracts)
+                        except:
+                            pass
+
+                        # 승리면 연속손실 리셋
+                        state["consec_losses"] = 0
+
+                        append_trade_log({
+                            "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "Symbol": sym,
+                            "Event": "TP(익절)",
+                            "Side": side,
+                            "Qty": contracts,
+                            "Price": mark,
+                            "PnL_USDT": "",
+                            "PnL_Pct": f"{roi_pct:.2f}",
+                            "Note": f"익절폭 {tp}%"
+                        })
+                        tg_send(f"🎉 익절: {sym} (+{roi_pct:.2f}%)")
+                        set_cooldown(state, sym, cfg["cooldown_minutes"])
+                        state["trades"].pop(sym, None)
+                        save_runtime_state(state)
+
+            # 2) 신규 진입(순환매: 5개 중 2개만)
+            active_positions = get_active_positions(ex, TARGET_COINS)
+            if len(active_positions) < int(cfg["max_positions"]):
+                rotation = pick_rotation_symbols(ex, TARGET_COINS, top_n=min(2, len(TARGET_COINS)))
+
+                for sym in rotation:
+                    if len(get_active_positions(ex, TARGET_COINS)) >= int(cfg["max_positions"]):
+                        break
+
+                    if in_cooldown(state, sym):
+                        continue
+
+                    # 이미 포지션 있으면 패스
+                    already = [p for p in get_active_positions(ex, [sym]) if safe_float(p.get("contracts", 0)) > 0]
+                    if already:
+                        continue
+
                     try:
-                        c = corr_of_returns(active_df, df_calc, n=60)
-                        if c >= CORR_LIMIT:
+                        ohlcv = ex.fetch_ohlcv(sym, "5m", limit=200)
+                        df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","vol"])
+                        df["time"] = pd.to_datetime(df["time"], unit="ms")
+                        df, status, last = calc_indicators(df, cfg)
+                        if last is None:
                             continue
-                    except:
+
+                        # 횡보장 필터(대충) - 너무 애매하면 진입 금지
+                        if cfg["use_adx"] and last.get("ADX", 0) < 18 and cfg["use_rsi"]:
+                            # RSI 중립 + ADX 약하면 관망
+                            if 35 <= last.get("RSI", 50) <= 65:
+                                continue
+
+                        ai = generate_ai_strategy(sym, df, status, cfg)
+                        decision = ai.get("decision", "hold")
+                        conf = int(ai.get("confidence", 0))
+
+                        # 확신도 컷(보수적으로)
+                        required_conf = 85 if len(active_positions) >= 1 else 80
+                        if decision not in ["buy", "sell"] or conf < required_conf:
+                            continue
+
+                        lev = int(ai["leverage"])
+                        sl = float(ai["sl_gap"])
+                        tp = float(ai["tp_gap"])
+
+                        # 레버리지 설정
+                        try:
+                            ex.set_leverage(lev, sym)
+                        except:
+                            pass
+
+                        # 수량 계산(잔고 * percentage)
+                        bal = ex.fetch_balance({"type": "swap"})
+                        free_usdt = safe_float(bal["USDT"]["free"])
+                        use_usdt = free_usdt * (float(ai["percentage"]) / 100.0)
+                        price = float(last["close"])
+                        qty = (use_usdt * lev) / price if price > 0 else 0
+                        qty = float(ex.amount_to_precision(sym, qty))
+
+                        if qty <= 0:
+                            continue
+
+                        # 진입
+                        ex.create_market_order(sym, decision, qty)
+
+                        # 런타임 trade meta 저장
+                        state.setdefault("trades", {})[sym] = {
+                            "side": "long" if decision == "buy" else "short",
+                            "qty": qty,
+                            "leverage": lev,
+                            "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "sl_gap": sl,
+                            "tp_gap": tp,
+                            "tp1_gap": cfg["tp1_gap"],
+                            "tp1_size": cfg["tp1_size"],
+                            "tp1_done": False,
+                            "be_price": None
+                        }
+                        save_runtime_state(state)
+
+                        append_trade_log({
+                            "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "Symbol": sym,
+                            "Event": "ENTRY(진입)",
+                            "Side": state["trades"][sym]["side"],
+                            "Qty": qty,
+                            "Price": price,
+                            "PnL_USDT": "",
+                            "PnL_Pct": "",
+                            "Note": ai.get("reason_simple", "")
+                        })
+
+                        tg_send(
+                            f"🎯 진입: {sym}\n"
+                            f"- 방향: {state['trades'][sym]['side']} (conf {conf}%)\n"
+                            f"- 레버리지: x{lev}\n"
+                            f"- 목표: TP {tp}% / SL {sl}%\n"
+                            f"- TP1: +{cfg['tp1_gap']}%에 {cfg['tp1_size']}% 정리\n"
+                            f"- 이유: {ai.get('reason_simple','')}"
+                        )
+
+                        time.sleep(5)
+
+                    except Exception as e:
+                        # 코인 하나 실패해도 계속
                         pass
 
-                # AI 최종 확인(쉬운 설명 포함)
-                ai = generate_wonyousi_strategy(df_calc, status, score, btc_state, hint)
-                decision = ai.get("decision", "hold")
-                conf = float(ai.get("confidence", 0))
-                lev = int(ai.get("leverage", 5))
-                lev = max(MIN_LEV, min(MAX_LEV, lev))
-
-                if decision not in ["buy", "sell"] or conf < required_conf:
-                    continue
-
-                # 힌트 반대면 더 보수적으로
-                if decision != hint["direction_hint"] and conf < 90:
-                    continue
-
-                price = float(last["close"])
-
-                # ATR 기반 손절폭(가격 기준 %)
-                atr = calc_atr(df_calc, 14)
-                atr_pct = float(atr.iloc[-1] / price * 100) if atr is not None and not np.isnan(atr.iloc[-1]) else 1.0
-                stop_pct_price = atr_pct * ATR_MULT
-                stop_pct_price = max(MIN_STOP_PCT_PRICE, min(MAX_STOP_PCT_PRICE, stop_pct_price))
-
-                # 리스크 0.5% 기반 수량 계산
-                qty = calc_qty_by_risk(ex, coin, price, usdt_free, lev, stop_pct_price)
-                if float(qty) <= 0:
-                    continue
-
-                # 레버리지 설정
+            # 3) 정기 생존보고
+            if time.time() - last_report > REPORT_INTERVAL:
                 try:
-                    ex.set_leverage(lev, coin)
+                    bal = ex.fetch_balance({"type": "swap"})
+                    eq = safe_float(bal["USDT"]["total"])
+                    tg_send(f"💤 생존신고: 총자산 ${eq:,.2f} / 연속손실 {state.get('consec_losses',0)}")
                 except:
                     pass
-
-                # 진입
-                try:
-                    ex.create_market_order(coin, decision, qty)
-                except Exception as e:
-                    print("Order error:", e)
-                    continue
-
-                # 1R/2R 목표(ROI 기준)
-                r_roi = stop_pct_price * lev
-                sl = r_roi
-                tp1 = r_roi
-                tp2 = r_roi * 2
-
-                state.setdefault("trades", {})[coin] = {
-                    "sl": float(sl),
-                    "r": float(r_roi),
-                    "tp1": float(tp1),
-                    "tp2": float(tp2),
-                    "tp1_done": False,
-                    "peak": 0.0,
-                    "trail_floor": 0.0,
-                    "opened_ts": _now_ts(),
-                    "easy_reason": ai.get("easy_reason", ""),
-                    "detail_reason": ai.get("detail_reason", ""),
-                }
-                save_runtime_state(state)
-
-                easy = ai.get("easy_reason", "(설명 없음)")
-                tg_send(
-                    f"🎯 진입: {coin} / {decision.upper()} (conf {conf}%, x{lev})\n"
-                    f"- 계획: 손절 -{sl:.1f}% / 1차 +{tp1:.1f}% / 2차 +{tp2:.1f}%\n"
-                    f"- 쉬운 이유: {easy}"
-                )
-
-                open_count += 1
-                time.sleep(3)
+                last_report = time.time()
 
             time.sleep(1)
 
-        except Exception as e:
-            print("Thread Error:", e)
+        except Exception:
             time.sleep(5)
 
-# =========================================================
-# 🧾 OHLCV 로드
-# =========================================================
-def fetch_ohlcv_df(ex, sym: str, tf: str, limit: int = 200):
-    ohlcv = ex.fetch_ohlcv(sym, tf, limit=limit)
-    df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
-    df["time"] = pd.to_datetime(df["time"], unit="ms")
-    return df
 
 # =========================================================
-# ✅ 사이드바 UI
+# ✅ 사이드바(설정)
 # =========================================================
-st.sidebar.title("🛠️ 설정")
+st.sidebar.title("🛠️ AI 에이전트 제어판")
 
-symbol = st.sidebar.selectbox("코인 선택", TARGET_COINS, index=0)
-timeframe = st.sidebar.selectbox("타임프레임", ["1m","3m","5m","15m","30m","1h","4h","1d"], index=2)
+# OpenAI 키(옵션: UI 저장)
+if not openai_key:
+    k = st.sidebar.text_input("OpenAI API Key 입력", type="password")
+    if k:
+        config["openai_api_key"] = k
+        save_settings(config)
+        st.rerun()
 
 st.sidebar.divider()
-st.sidebar.subheader("🤖 자동매매")
-auto_on = st.sidebar.checkbox("자동매매 ON (텔레그램)", value=config.get("auto_trade", False))
-if auto_on != config.get("auto_trade", False):
-    config["auto_trade"] = auto_on
-    save_settings(config)
-    st.rerun()
-
-st.sidebar.caption(f"동시 포지션: {MAX_POSITIONS}개 / 리스크: 0.5% / 레버리지: {MIN_LEV}~{MAX_LEV}")
+config["auto_trade"] = st.sidebar.checkbox("🤖 24시간 자동매매 ON", value=config.get("auto_trade", False))
+config["max_positions"] = st.sidebar.slider("동시 포지션 수(추천 2)", 1, 5, int(config.get("max_positions", 2)))
+config["leverage"] = st.sidebar.slider("기본 레버리지(참고)", 1, 20, int(config.get("leverage", 5)))
+config["order_usdt"] = st.sidebar.number_input("기본 주문금액(참고)", 10.0, 100000.0, float(config.get("order_usdt", 100.0)))
 
 st.sidebar.divider()
-st.sidebar.subheader("📊 지표 파라미터")
-c1, c2, c3 = st.sidebar.columns(3)
-config["rsi_period"] = c1.number_input("RSI 기간", 5, 50, int(config["rsi_period"]))
-config["rsi_buy"] = c2.number_input("RSI 과매도", 10, 50, int(config["rsi_buy"]))
-config["rsi_sell"] = c3.number_input("RSI 과매수", 50, 90, int(config["rsi_sell"]))
-
-c4, c5 = st.sidebar.columns(2)
-config["bb_period"] = c4.number_input("BB 기간", 10, 50, int(config["bb_period"]))
-config["bb_std"] = c5.number_input("BB 표준편차", 1.0, 4.0, float(config["bb_std"]))
-
-c6, c7 = st.sidebar.columns(2)
-config["ma_fast"] = c6.number_input("MA fast", 3, 50, int(config["ma_fast"]))
-config["ma_slow"] = c7.number_input("MA slow", 50, 200, int(config["ma_slow"]))
-
-config["stoch_k"] = st.sidebar.number_input("Stoch K", 5, 50, int(config["stoch_k"]))
-config["vol_mul"] = st.sidebar.number_input("거래량 폭증 배수", 1.2, 5.0, float(config["vol_mul"]))
+st.sidebar.subheader("💰 수익실현(꾸준히)")
+config["tp1_gap"] = st.sidebar.number_input("TP1(부분익절) 트리거(%)", 0.1, 5.0, float(config.get("tp1_gap", 0.5)), step=0.1)
+config["tp1_size"] = st.sidebar.slider("TP1 청산 비율(%)", 10, 80, int(config.get("tp1_size", 30)))
+config["move_sl_to_be"] = st.sidebar.checkbox("TP1 후 본절 방어", value=config.get("move_sl_to_be", True))
 
 st.sidebar.divider()
-if st.sidebar.button("💾 설정 저장"):
-    save_settings(config)
+st.sidebar.subheader("🛡️ 안전장치")
+config["min_sl_gap"] = st.sidebar.number_input("최소 손절폭(%)", 1.0, 10.0, float(config.get("min_sl_gap", 2.5)), step=0.1)
+config["min_rr"] = st.sidebar.number_input("최소 손익비(대략)", 1.0, 5.0, float(config.get("min_rr", 1.8)), step=0.1)
+config["cooldown_minutes"] = st.sidebar.slider("코인별 쿨다운(분)", 0, 120, int(config.get("cooldown_minutes", 15)))
+config["max_consec_losses"] = st.sidebar.slider("연속손실 제한", 1, 10, int(config.get("max_consec_losses", 3)))
+config["pause_minutes"] = st.sidebar.slider("연속손실 시 정지(분)", 5, 240, int(config.get("pause_minutes", 60)))
 
 st.sidebar.divider()
-st.sidebar.header("🔍 점검")
-if st.sidebar.button("🤖 OpenAI 연결 테스트"):
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role":"user","content":"테스트입니다. 1+1은?"}],
-            max_tokens=10
-        )
-        st.sidebar.success("✅ 연결 성공: " + resp.choices[0].message.content)
-    except Exception as e:
-        st.sidebar.error(f"❌ 연결 실패: {e}")
+st.sidebar.subheader("📊 10종 보조지표 ON/OFF")
+config["use_rsi"] = st.sidebar.checkbox("RSI", value=config.get("use_rsi", True))
+config["use_bb"] = st.sidebar.checkbox("볼린저밴드", value=config.get("use_bb", True))
+config["use_ma"] = st.sidebar.checkbox("이평(MA)", value=config.get("use_ma", True))
+config["use_macd"] = st.sidebar.checkbox("MACD", value=config.get("use_macd", True))
+config["use_adx"] = st.sidebar.checkbox("ADX", value=config.get("use_adx", True))
+config["use_stoch"] = st.sidebar.checkbox("스토캐스틱", value=config.get("use_stoch", True))
+config["use_cci"] = st.sidebar.checkbox("CCI", value=config.get("use_cci", True))
+config["use_mfi"] = st.sidebar.checkbox("MFI", value=config.get("use_mfi", True))
+config["use_willr"] = st.sidebar.checkbox("Williams %R", value=config.get("use_willr", True))
+config["use_vol"] = st.sidebar.checkbox("거래량", value=config.get("use_vol", True))
+
+# 저장
+save_settings(config)
 
 # =========================================================
-# ✅ 자동매매 스레드 시작(1회)
+# ✅ 자동매매 스레드(중복 실행 방지)
 # =========================================================
-if "bot_thread_started" not in st.session_state:
-    st.session_state["bot_thread_started"] = False
-
-if not st.session_state["bot_thread_started"]:
-    th = threading.Thread(target=telegram_thread, args=(exchange,), daemon=True, name="TG_Thread")
-    add_script_run_ctx(th)
-    th.start()
-    st.session_state["bot_thread_started"] = True
+found = any(t.name == "TG_Thread" for t in threading.enumerate())
+if not found:
+    t = threading.Thread(target=telegram_thread, args=(exchange,), daemon=True, name="TG_Thread")
+    add_script_run_ctx(t)
+    t.start()
 
 # =========================================================
-# ✅ 메인 화면
+# 🧾 잔고/포지션(사이드바 + 메인 요약)
 # =========================================================
-st.title("📌 비트겟 AI 워뇨띠 에이전트 (실전 운영판)")
+def fetch_wallet_and_positions():
+    bal = exchange.fetch_balance({"type": "swap"})
+    usdt_free = safe_float(bal["USDT"]["free"])
+    usdt_total = safe_float(bal["USDT"]["total"])
+    ps = get_active_positions(exchange, TARGET_COINS)
+    return usdt_free, usdt_total, ps
 
-top1, top2, top3 = st.columns([2, 2, 3])
-with top1:
-    st.metric("선택 코인", symbol)
-with top2:
-    st.metric("타임프레임", timeframe)
-with top3:
-    st.metric("자동매매", "🟢 ON" if config.get("auto_trade") else "🔴 OFF")
+usdt_free, usdt_total, active_positions = (0.0, 0.0, [])
+try:
+    usdt_free, usdt_total, active_positions = fetch_wallet_and_positions()
+except:
+    pass
 
-# 데이터 로드
-data_loaded = False
+with st.sidebar:
+    st.divider()
+    st.header("내 지갑 현황 (Wallet)")
+    st.metric("총 자산(USDT)", f"${usdt_total:,.2f}")
+    st.metric("주문 가능", f"${usdt_free:,.2f}")
+
+    st.divider()
+    st.subheader("보유 포지션")
+    if active_positions:
+        for p in active_positions:
+            sym = p.get("symbol", "")
+            side = p.get("side", "long")
+            lev = safe_float(p.get("leverage", 0))
+            entry = safe_float(p.get("entryPrice", 0))
+            mark = safe_float(p.get("markPrice", 0)) or safe_float(p.get("last", 0))
+            roi = safe_float(p.get("percentage", None))
+            if roi is None:
+                roi = compute_roi_pct(side, entry, mark, lev)
+            st.info(f"**{sym}**  |  {'🟢 Long' if side=='long' else '🔴 Short'} x{lev}\n\n"
+                    f"ROI: **{roi:.2f}%**")
+    else:
+        st.caption("현재 무포지션(관망 중)")
+
+# =========================================================
+# 🎯 메인 화면: 상단 요약 + 트레이딩뷰 차트 + 10종지표 + 탭
+# =========================================================
+st.title("📌 비트겟 AI 워뇨띠 에이전트")
+
+top1, top2, top3, top4 = st.columns(4)
+top1.metric("총자산(USDT)", f"${usdt_total:,.2f}")
+top2.metric("주문가능(USDT)", f"${usdt_free:,.2f}")
+top3.metric("포지션 수", f"{len(active_positions)} / {config['max_positions']}")
+top4.metric("자동매매", "🟢 ON" if config["auto_trade"] else "🔴 OFF")
+
+st.divider()
+
+# 코인 선택(메인)
+symbol = st.selectbox("차트 코인 선택", TARGET_COINS, index=0)
+timeframe = st.selectbox("타임프레임", ["1m","5m","15m","1h","4h","1d"], index=1)
+
+# =========================================================
+# 📌 트레이딩뷰 차트 임베드(메인)
+# - Bitget 심볼이 TradingView에서 다를 수 있어 안정적으로 BINANCE 기준 표시
+# =========================================================
+def tv_symbol_from_bitget(sym: str):
+    base = sym.split("/")[0].replace(":USDT","")
+    return f"BINANCE:{base}USDT"
+
+tv_symbol = tv_symbol_from_bitget(symbol)
+
+tv_html = f"""
+<!-- TradingView Widget BEGIN -->
+<div class="tradingview-widget-container" style="height:600px; width:100%;">
+  <div id="tradingview_chart" style="height:600px; width:100%;"></div>
+  <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+  <script type="text/javascript">
+  new TradingView.widget(
+  {{
+    "autosize": true,
+    "symbol": "{tv_symbol}",
+    "interval": "{timeframe}",
+    "timezone": "Asia/Seoul",
+    "theme": "light",
+    "style": "1",
+    "locale": "ko",
+    "withdateranges": true,
+    "hide_side_toolbar": false,
+    "allow_symbol_change": true,
+    "details": true,
+    "hotlist": false,
+    "calendar": false,
+    "container_id": "tradingview_chart"
+  }}
+  );
+  </script>
+</div>
+<!-- TradingView Widget END -->
+"""
+components.html(tv_html, height=620, scrolling=True)
+
+st.divider()
+
+# =========================================================
+# 📊 데이터 로드 + 10종 지표판
+# =========================================================
 df = None
 status = {}
 last = None
 
 try:
-    df0 = fetch_ohlcv_df(exchange, symbol, timeframe, limit=220)
-    # timeframe은 화면용이므로, 지표/운영은 여기서 계산
-    df, status, last = calc_indicators(df0, config)
-    data_loaded = last is not None
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=250)
+    df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","vol"])
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    df, status, last = calc_indicators(df, config)
 except Exception as e:
-    st.error(f"⚠️ 데이터 로딩 오류: {e}")
+    st.error(f"데이터 로딩 실패: {e}")
 
-if not data_loaded:
-    st.warning("⏳ 데이터 로딩 중... (리런해보세요)")
+if last is None:
+    st.warning("⏳ 지표 계산을 위한 데이터가 부족합니다. (타임프레임/코인 바꿔보세요)")
     st.stop()
 
-# =========================================================
-# ✅ 메인 레이아웃: 좌(차트/지표) + 우(지갑/포지션/AI)
-# =========================================================
-left, right = st.columns([3.2, 1.8], gap="large")
+st.subheader("🚦 10종 보조지표 종합 상태판")
+long_score, short_score = score_signals(status)
 
-with left:
-    st.subheader("📈 TradingView 차트")
-    render_tradingview(symbol, timeframe, height=520, theme="dark")
+judge = "⚪ 관망"
+if long_score >= short_score + 2:
+    judge = "🟢 매수 우위"
+elif short_score >= long_score + 2:
+    judge = "🔴 매도 우위"
 
-    st.divider()
-    st.subheader("🚦 10종 보조지표 상태판")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("현재가", f"{float(last['close']):,.4f}")
+c2.metric("롱 점수", f"{long_score}")
+c3.metric("숏 점수", f"{short_score}")
+c4.metric("종합", judge)
 
-    rows = []
-    def add_row(name, val, state):
-        rows.append({"지표": name, "값": val, "상태": state})
-
-    add_row("RSI", f"{last['RSI']:.1f}", f"{status.get('RSI','')} {status.get('RSI_FLOW','')}")
-    add_row("Bollinger", f"{last['BB_mid']:.4f}", status.get("BB",""))
-    add_row("MA(fast/slow)", f"{last['MA_fast']:.4f}/{last['MA_slow']:.4f}", status.get("MA",""))
-    add_row("MACD", f"{last['MACD']:.6f}", status.get("MACD",""))
-    add_row("Stoch(K/D)", f"{last['STO_K']:.1f}/{last['STO_D']:.1f}", status.get("STOCH",""))
-    add_row("CCI", f"{last['CCI']:.1f}", status.get("CCI",""))
-    add_row("MFI", f"{last['MFI']:.1f}", status.get("MFI",""))
-    add_row("Williams %R", f"{last['WILLR']:.1f}", status.get("WILLR",""))
-    add_row("ADX", f"{last['ADX']:.1f}", status.get("ADX",""))
-    add_row("Volume Spike", f"{last['VOL_SPIKE']:.2f}x", status.get("VOL",""))
-
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    st.caption("※ 자동매매는 데모(IS_SANDBOX=True)에서 충분히 검증 후 실전 전환하세요.")
-
-with right:
-    st.subheader("💰 내 잔고 / 포지션")
-    try:
-        bal = exchange.fetch_balance({"type":"swap"})
-        usdt_free = float(bal["USDT"]["free"])
-        usdt_total = float(bal["USDT"]["total"])
-        st.metric("총 자산(USDT)", f"${usdt_total:,.2f}")
-        st.metric("주문 가능(USDT)", f"${usdt_free:,.2f}")
-    except Exception as e:
-        st.error(f"잔고 조회 실패: {e}")
-
-    st.divider()
-    st.subheader("📌 현재 포지션")
-    try:
-        positions = exchange.fetch_positions(symbols=TARGET_COINS)
-        active_positions = [p for p in positions if float(p.get("contracts", 0) or 0) > 0]
-
-        if not active_positions:
-            st.info("무포지션 (관망 중)")
-        else:
-            for p in active_positions:
-                sym = (p.get("symbol","")).split(":")[0]
-                side = (p.get("side","")).lower()
-                side_label = "🟢 Long" if side in ["long","buy"] else "🔴 Short"
-                pnl = float(p.get("unrealizedPnl", 0) or 0)
-                roi = float(p.get("percentage", 0) or 0)
-                lev = p.get("leverage", "?")
-                st.info(f"**{sym}** ({side_label} x{lev})\n\n수익률: **{roi:.2f}%** / 손익: **${pnl:.2f}**")
-    except Exception as e:
-        st.error(f"포지션 조회 실패: {e}")
-
-    st.divider()
-    st.subheader("🤖 지금 이 코인 AI 분석")
-    if st.button("🔍 AI가 쉽게 설명해주기"):
-        with st.spinner("AI가 최종 체크 중..."):
-            # 현재 코인도 순환매 점수/레짐 기준으로 한 번 보여주기
-            try:
-                btc_df0 = fetch_ohlcv_df(exchange, "BTC/USDT:USDT", "5m", limit=220)
-                btc_df0["volume"] = btc_df0["volume"]
-                btc_calc, _, _ = calc_indicators(btc_df0, config)
-                btc_state = btc_regime(btc_calc if btc_calc is not None else btc_df0)
-
-                # current symbol 로테이션 점수(참고)
-                if symbol == "BTC/USDT:USDT":
-                    score = 2.0
-                else:
-                    score, _, _ = rotation_score(df, btc_calc if btc_calc is not None else btc_df0)
-
-                hint = {"direction_hint": "buy" if score >= 1.0 else ("sell" if score <= -1.0 else "hold"),
-                        "why": f"순환매 점수 {score:.1f}"}
-
-                ai = generate_wonyousi_strategy(df, status, float(score), btc_state, hint)
-                st.success("✅ 쉬운 설명")
-                st.write(ai.get("easy_reason","(없음)"))
-
-                with st.expander("자세한 근거(고급)"):
-                    st.write(ai)
-            except Exception as e:
-                st.error(f"AI 분석 오류: {e}")
+with st.expander("지표 상세 보기"):
+    st.json(status)
 
 # =========================================================
-# ✅ 탭(t1~t4)
+# 📌 탭 구성: t1~t4
 # =========================================================
-st.divider()
 t1, t2, t3, t4 = st.tabs(["🤖 자동매매 & AI분석", "⚡ 수동주문", "📅 시장정보", "📜 매매일지"])
 
+# ---------------- t1 ----------------
 with t1:
-    st.subheader("🧠 자동매매 & AI분석")
-    st.caption("AI는 최종 확인만 하고, 진입/청산/리스크/안전장치는 시스템이 관리합니다. (설명은 쉽게!)")
+    st.subheader("🧠 AI 분석(쉽게 설명 포함)")
 
-    c_auto, c_stat = st.columns([3, 1])
-    with c_auto:
-        auto_on2 = st.checkbox("🤖 24시간 자동매매 활성화", value=config.get("auto_trade", False))
-        if auto_on2 != config.get("auto_trade", False):
-            config["auto_trade"] = auto_on2
-            save_settings(config)
-            st.rerun()
-    with c_stat:
-        st.caption("상태: " + ("🟢 가동중" if config.get("auto_trade") else "🔴 정지"))
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("🔍 현재 코인 AI 분석"):
+            with st.spinner("AI가 손익비/부분익절 포함해서 판단 중..."):
+                ai = generate_ai_strategy(symbol, df, status, config)
+                decision = ai.get("decision", "hold").upper()
+                conf = ai.get("confidence", 0)
+
+                if decision == "BUY":
+                    st.success(f"결론: 🟢 BUY (확신도 {conf}%)")
+                elif decision == "SELL":
+                    st.error(f"결론: 🔴 SELL (확신도 {conf}%)")
+                else:
+                    st.warning(f"결론: ⚪ HOLD (확신도 {conf}%)")
+
+                st.info("✅ 쉬운 설명\n\n" + ai.get("reason_simple", ""))
+                with st.expander("🔍 상세 근거(조금 더 기술적)"):
+                    st.write(ai.get("reason_detail", ""))
+
+                st.write("📌 제안값")
+                st.write({
+                    "leverage": ai.get("leverage"),
+                    "percentage(%)": ai.get("percentage"),
+                    "sl_gap(%)": ai.get("sl_gap"),
+                    "tp_gap(%)": ai.get("tp_gap"),
+                    "tp1_gap(%)": ai.get("tp1_gap"),
+                    "tp1_size(%)": ai.get("tp1_size"),
+                })
+
+    with colB:
+        st.caption("자동매매는 사이드바에서 ON/OFF 됩니다. (텔레그램 연동은 스레드에서 관리)")
+
+# ---------------- t2 ----------------
+with t2:
+    st.subheader("⚡ 수동 주문(뼈대)")
+    st.caption("원하면 여기 수동진입/청산도 Bitget 주문까지 실제 구현해줄게.")
+    amt = st.number_input("주문금액(USDT)", 10.0, 100000.0, float(config["order_usdt"]))
+    b1, b2, b3 = st.columns(3)
+    if b1.button("🟢 롱 진입(미구현)"):
+        st.info("미구현")
+    if b2.button("🔴 숏 진입(미구현)"):
+        st.info("미구현")
+    if b3.button("🚫 포지션 종료(미구현)"):
+        st.info("미구현")
+
+# ---------------- t3 ----------------
+with t3:
+    st.subheader("📅 경제 캘린더(한글)")
+    st.caption("중요 일정은 변동성이 커질 수 있어요. (TradingView 경제캘린더 위젯 사용) :contentReference[oaicite:1]{index=1}")
+
+    st.info("💡 쉽게 보기\n"
+            "- **중요도 높은 발표(금리/물가/CPI/고용)** 전후로 휩쏘(급등락)가 잘 나와요.\n"
+            "- 그래서 자동매매는 **‘확신도 높은 자리’만** 들어가게 설계했고, **TP1(부분익절) + 본절방어**로 수익을 자주 잠그는 구조예요.\n"
+            "TradingView도 경제캘린더를 통해 주요 이벤트를 추적하라고 안내합니다. :contentReference[oaicite:2]{index=2}")
+
+    econ_html = """
+<!-- TradingView Widget BEGIN -->
+<div class="tradingview-widget-container" style="height:600px; width:100%;">
+  <div class="tradingview-widget-container__widget"></div>
+  <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-events.js" async>
+  {
+    "colorTheme": "light",
+    "isTransparent": false,
+    "width": "100%",
+    "height": "600",
+    "locale": "ko",
+    "importanceFilter": "0,1",
+    "currencyFilter": "USD,KRW,EUR,JPY,CNY"
+  }
+  </script>
+</div>
+<!-- TradingView Widget END -->
+"""
+    components.html(econ_html, height=620, scrolling=True)
+
+# ---------------- t4 ----------------
+with t4:
+    st.subheader("📜 매매일지(런타임 상태 + 로그)")
+
+    state = load_runtime_state()
+
+    # 상단 상태 요약
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("날짜", state.get("date", ""))
+    c2.metric("시작자산", f"{safe_float(state.get('day_start_equity',0)):.2f} USDT")
+    c3.metric("연속손실", str(state.get("consec_losses", 0)))
+    pause_until = int(state.get("pause_until", 0) or 0)
+    pause_txt = "없음" if time.time() >= pause_until else datetime.fromtimestamp(pause_until).strftime("%m-%d %H:%M")
+    c4.metric("자동정지", pause_txt)
 
     st.divider()
-    col1, col2 = st.columns(2)
 
-    if col1.button("🔍 현재 코인: AI 쉬운 설명"):
-        with st.spinner("AI 확인 중..."):
-            try:
-                btc_df0 = fetch_ohlcv_df(exchange, "BTC/USDT:USDT", "5m", limit=220)
-                btc_calc, _, _ = calc_indicators(btc_df0, config)
-                btc_state = btc_regime(btc_calc if btc_calc is not None else btc_df0)
+    # 런타임 trades/cooldowns 보기
+    colL, colR = st.columns(2)
+    with colL:
+        st.markdown("### 🧠 runtime_state.json (현재 상태)")
+        with st.expander("원본 JSON 보기"):
+            st.json(state)
 
-                score = 2.0 if symbol == "BTC/USDT:USDT" else rotation_score(df, btc_calc if btc_calc is not None else btc_df0)[0]
-                hint = {"direction_hint": "buy" if score >= 1.0 else ("sell" if score <= -1.0 else "hold"),
-                        "why": f"순환매 점수 {score:.1f}"}
+    with colR:
+        st.markdown("### 🔥 현재 트레이드 메타(trades)")
+        trades = state.get("trades", {})
+        if trades:
+            st.dataframe(pd.DataFrame([{"symbol": k, **v} for k, v in trades.items()]), use_container_width=True)
+        else:
+            st.caption("현재 저장된 트레이드 메타가 없습니다.")
 
-                ai = generate_wonyousi_strategy(df, status, float(score), btc_state, hint)
+        st.markdown("### ⏱️ 쿨다운(cooldowns)")
+        cds = state.get("cooldowns", {})
+        if cds:
+            rows = []
+            now = time.time()
+            for k, v in cds.items():
+                left = int(max(0, v - now))
+                rows.append({"symbol": k, "cooldown_until": datetime.fromtimestamp(v).strftime("%m-%d %H:%M:%S"), "sec_left": left})
+            st.dataframe(pd.DataFrame(rows).sort_values("sec_left"), use_container_width=True)
+        else:
+            st.caption("쿨다운 없음")
 
-                st.write("### ✅ 결론")
-                st.write(f"- 결정: **{ai.get('decision','hold').upper()}** / 확신도: **{ai.get('confidence',0)}%** / 레버리지: **x{ai.get('leverage',5)}**")
-                st.write("### ✅ 쉬운 설명")
-                st.info(ai.get("easy_reason","(없음)"))
+    st.divider()
 
-                with st.expander("자세한 설명(고급)"):
-                    st.write(ai.get("detail_reason",""))
-            except Exception as e:
-                st.error(f"분석 오류: {e}")
-
-    if col2.button("🌍 전체 코인 순환매 랭킹(상위 우선)"):
-        with st.spinner("5개 코인 스캔 중..."):
-            try:
-                btc_df0 = fetch_ohlcv_df(exchange, "BTC/USDT:USDT", "5m", limit=220)
-                btc_calc, _, _ = calc_indicators(btc_df0, config)
-                btc_state = btc_regime(btc_calc if btc_calc is not None else btc_df0)
-
-                rows = []
-                for c in TARGET_COINS:
-                    dfx = fetch_ohlcv_df(exchange, c, "5m", limit=220)
-                    dfx, stx, lastx = calc_indicators(dfx, config)
-                    if lastx is None:
-                        continue
-                    score, vspike, rs = rotation_score(dfx, btc_calc if btc_calc is not None else btc_df0)
-                    rows.append({
-                        "코인": c.split("/")[0],
-                        "순환매점수": round(score, 2),
-                        "BTC대비강도": round(rs, 2),
-                        "거래량": f"{vspike:.2f}x",
-                        "힌트": "롱(유리)" if score >= 1.0 else ("숏(유리)" if score <= -1.0 else "애매")
-                    })
-
-                df_rank = pd.DataFrame(rows).sort_values(by="순환매점수", key=lambda s: s.abs(), ascending=False)
-                st.caption(f"BTC 상태: **{btc_state}**  (risk_off면 알트 롱 신규진입이 보수적으로 동작)")
-                st.dataframe(df_rank, use_container_width=True, hide_index=True)
-            except Exception as e:
-                st.error(f"스캔 오류: {e}")
-
-with t2:
-    st.subheader("⚡ 수동주문(자리만)")
-    st.caption("원하면 여기에 실제 수동 주문/청산 로직도 붙여줄 수 있어요.")
-    m_amt = st.number_input("주문 금액($)", 0.0, 100000.0, float(config.get("order_usdt", 100.0)))
-    b1, b2, b3 = st.columns(3)
-    if b1.button("🟢 롱 진입"):
-        st.info("여기 롱 진입 로직 연결 가능")
-    if b2.button("🔴 숏 진입"):
-        st.info("여기 숏 진입 로직 연결 가능")
-    if b3.button("🚫 포지션 종료"):
-        st.info("여기 종료 로직 연결 가능")
-
-with t3:
-    st.subheader("📅 시장정보")
-    st.write("원하면 경제일정/뉴스를 붙여서 리스크 구간 진입을 더 보수적으로 만들 수 있어요.")
-
-with t4:
-    st.subheader("📜 매매일지(선택)")
-    st.caption("지금 버전은 런타임 상태(runtime_state.json)로 운영합니다. (원하면 trade_log.csv 기록도 추가 가능)")
-    if os.path.exists(STATE_FILE):
+    # trade_log.csv 보기/다운로드
+    st.markdown("### 📄 trade_log.csv (체결/청산 로그)")
+    if os.path.exists(TRADE_LOG_FILE):
         try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                st.json(json.load(f))
+            log_df = pd.read_csv(TRADE_LOG_FILE)
+            if "Time" in log_df.columns:
+                log_df = log_df.sort_values("Time", ascending=False)
+            st.dataframe(log_df, use_container_width=True, hide_index=True)
+
+            csv = log_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("💾 CSV 다운로드", csv, "trade_log.csv", "text/csv")
         except Exception as e:
-            st.error(f"상태 파일 읽기 오류: {e}")
+            st.error(f"로그 읽기 실패: {e}")
     else:
-        st.info("아직 runtime_state.json이 없습니다. 자동매매가 돌면 생성됩니다.")
+        st.caption("아직 trade_log.csv가 없습니다. (진입/청산이 발생하면 자동 생성)")
+
+    st.divider()
+    if st.button("🧪 테스트 로그 1줄 추가"):
+        append_trade_log({
+            "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Symbol": "BTC/TEST",
+            "Event": "TEST",
+            "Side": "long",
+            "Qty": 0.001,
+            "Price": 12345,
+            "PnL_USDT": "",
+            "PnL_Pct": "",
+            "Note": "로그 출력 확인"
+        })
+        st.success("추가 완료! 위 표 새로고침하면 보입니다.")
