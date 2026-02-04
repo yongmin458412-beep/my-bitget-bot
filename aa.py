@@ -399,98 +399,87 @@ if st.sidebar.button("📡 텔레그램 메뉴 전송"):
 # 🧮 지표 계산 (기존 로직 유지)
 # ---------------------------------------------------------
 def calc_indicators(df):
-    """10가지 기술적 지표 계산 및 상태 판단"""
-    if df.empty: return df, {}, None
+    """
+    보조지표 계산 함수 (에러 방지 강화판)
+    """
+    try:
+        # 데이터가 없으면 바로 안전하게 리턴
+        if df is None or df.empty or len(df) < 20:
+            return df, {}, None
 
-    close = df['close']; high = df['high']; low = df['low']; vol = df['vol']
-    
-    # --- [1. 지표 계산] ---
-    # RSI
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(int(config['rsi_period'])).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(int(config['rsi_period'])).mean()
-    rs = gain / loss; df['RSI'] = 100 - (100 / (1 + rs))
+        # 1. RSI (14)
+        df['RSI'] = ta.momentum.rsi(df['close'], window=14)
 
-    # BB
-    ma = close.rolling(int(config['bb_period'])).mean()
-    std = close.rolling(int(config['bb_period'])).std()
-    df['BB_UP'] = ma + (std * float(config['bb_std']))
-    df['BB_LO'] = ma - (std * float(config['bb_std']))
+        # 2. 볼린저밴드 (20, 2)
+        bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
+        df['BB_upper'] = bb.bollinger_hband()
+        df['BB_lower'] = bb.bollinger_lband()
+        df['BB_mid'] = bb.bollinger_mavg()
 
-    # MA
-    df['MA_F'] = close.rolling(int(config['ma_fast'])).mean()
-    df['MA_S'] = close.rolling(int(config['ma_slow'])).mean()
+        # 3. MACD
+        macd = ta.trend.MACD(df['close'])
+        df['MACD'] = macd.macd()
+        df['MACD_signal'] = macd.macd_signal()
 
-    # MACD
-    k = close.ewm(span=12, adjust=False).mean()
-    d = close.ewm(span=26, adjust=False).mean()
-    df['MACD'] = k - d
-    df['MACD_SIG'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        # 4. 이동평균선 (SMA)
+        df['SMA_20'] = ta.trend.sma_indicator(df['close'], window=20)
+        df['SMA_60'] = ta.trend.sma_indicator(df['close'], window=60)
 
-    # Stochastic
-    low_min = low.rolling(14).min()
-    high_max = high.rolling(14).max()
-    df['STOCH_K'] = 100 * ((close - low_min) / (high_max - low_min))
+        # 5. 스토캐스틱
+        stoch = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close'])
+        df['Stoch_k'] = stoch.stoch()
+        df['Stoch_d'] = stoch.stoch_signal()
 
-    # CCI
-    tp = (high + low + close) / 3
-    df['CCI'] = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
+        # 6. ADX (추세 강도)
+        df['ADX'] = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
 
-    # ADX
-    tr = np.maximum((high - low), np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
-    atr = tr.rolling(14).mean()
-    df['ADX'] = (atr / close) * 1000
+        # 7. CCI
+        df['CCI'] = ta.trend.cci(df['high'], df['low'], df['close'], window=14)
 
-    # Volume MA
-    df['VOL_MA'] = vol.rolling(20).mean()
+        # 8. Williams %R
+        df['Williams'] = ta.momentum.williams_r(df['high'], df['low'], df['close'], lbp=14)
 
-    # --- [2. 상태 판단 (Dashboard 표시용)] ---
-    last = df.iloc[-1]
-    status = {}
-    
-    # 1. RSI
-    if config.get('use_rsi', True):
-        if last['RSI'] <= config['rsi_buy']: status['RSI'] = "🟢 과매도"
-        elif last['RSI'] >= config['rsi_sell']: status['RSI'] = "🔴 과매수"
+        # 9. 파라볼릭 SAR
+        df['SAR'] = ta.trend.psar_down(df['high'], df['low'], df['close'])
+
+        # 10. OBV (거래량)
+        df['OBV'] = ta.volume.on_balance_volume(df['close'], df['vol'])
+
+        # --- 상태 평가 ---
+        last = df.iloc[-1]
+        status = {}
+
+        # RSI
+        if last['RSI'] > 70: status['RSI'] = "🔴 과매수"
+        elif last['RSI'] < 30: status['RSI'] = "🟢 과매도"
         else: status['RSI'] = "⚪ 중립"
-    
-    # 2. BB
-    if config.get('use_bb', True):
-        if last['close'] <= last['BB_LO']: status['BB'] = "🟢 하단터치"
-        elif last['close'] >= last['BB_UP']: status['BB'] = "🔴 상단터치"
-        else: status['BB'] = "⚪ 밴드내"
 
-    # 3. MA
-    if config.get('use_ma', True):
-        if last['MA_F'] > last['MA_S']: status['MA'] = "🟢 골든크로스"
-        else: status['MA'] = "🔴 데드크로스"
+        # 볼린저밴드
+        if last['close'] > last['BB_upper']: status['BB'] = "🔴 상단 터치"
+        elif last['close'] < last['BB_lower']: status['BB'] = "🟢 하단 터치"
+        else: status['BB'] = "⚪ 밴드 내"
 
-    # 4. MACD
-    if config.get('use_macd', True):
-        if last['MACD'] > last['MACD_SIG']: status['MACD'] = "🟢 상승신호"
-        else: status['MACD'] = "🔴 하락신호"
+        # 이동평균선
+        if last['close'] > last['SMA_20'] > last['SMA_60']: status['MA'] = "🚀 정배열"
+        elif last['close'] < last['SMA_20'] < last['SMA_60']: status['MA'] = "📉 역배열"
+        else: status['MA'] = "⚠️ 혼조세"
 
-    # 5. Stochastic
-    if config.get('use_stoch', True):
-        if last['STOCH_K'] <= 20: status['Stoch'] = "🟢 저점"
-        elif last['STOCH_K'] >= 80: status['Stoch'] = "🔴 고점"
-        else: status['Stoch'] = "⚪ 중립"
+        # MACD
+        if last['MACD'] > last['MACD_signal']: status['MACD'] = "📈 골든크로스"
+        else: status['MACD'] = "📉 데드크로스"
+        
+        # 거래량 (OBV) - 간단한 전일 대비
+        if len(df) > 1 and df.iloc[-1]['OBV'] > df.iloc[-2]['OBV']:
+            status['Vol'] = "🔥 매수세 유입"
+        else:
+            status['Vol'] = "💧 매도세 우위"
 
-    # 6. CCI
-    if config.get('use_cci', True):
-        if last['CCI'] <= -100: status['CCI'] = "🟢 과매도"
-        elif last['CCI'] >= 100: status['CCI'] = "🔴 과매수"
-        else: status['CCI'] = "⚪ 중립"
+        return df, status, last
 
-    # 7. Volume
-    if config.get('use_vol', True):
-        if last['vol'] > last['VOL_MA'] * 2.0: status['Vol'] = "🔥 거래량폭발"
-        else: status['Vol'] = "⚪ 일반"
-
-    # 8. ADX
-    if config.get('use_adx', True):
-        status['ADX'] = "📈 강한추세" if last['ADX'] > 25 else "🦀 횡보장"
-
+    except Exception as e:
+        print(f"Indicator Error: {e}")
+        # 🔥 여기가 핵심: 에러가 나도 3개를 반드시 돌려줌
+        return df, {}, None
     
 def generate_wonyousi_strategy(df, status_summary):
     """
