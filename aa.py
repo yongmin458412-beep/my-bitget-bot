@@ -520,6 +520,73 @@ def calc_indicators(df):
         
     return df, status, last
 
+def generate_wonyousi_strategy(df, status_summary):
+    """
+    [전략 수정: 스윙/반등 확인형]
+    1. 과매도/과매수 해소 시점(Reversal) 포착
+    2. 레버리지 축소 + 손절폭 확대 (개미털기 방지)
+    3. 확신도 기준 상향
+    """
+    try:
+        my_key = st.secrets.get("OPENAI_API_KEY")
+        if not my_key: return {"decision": "hold", "confidence": 0}
+        client = OpenAI(api_key=my_key)
+    except: return {"decision": "hold", "confidence": 0}
+
+    # 최근 데이터 2개를 가져와서 추세 변화를 봅니다.
+    last_row = df.iloc[-1]
+    prev_row = df.iloc[-2]
+    
+    past_mistakes = get_past_mistakes()
+
+    system_prompt = f"""
+    당신은 신중한 '스윙 트레이더'입니다.
+    
+    [과거 실수]
+    {past_mistakes}
+    
+    [핵심 전략]
+    1. **진입 타이밍:** 과매도(RSI 30)나 과매수(RSI 70) 구간에 '진입'하는 게 아니라, 그 구간을 **'탈출할 때(반등)'** 진입하세요. (떨어지는 칼날 잡기 금지)
+    2. **손절/익절:** 세력의 노이즈(휩소)를 견딜 수 있게 손절폭(sl_gap)을 넉넉히 잡으세요. (최소 2.5% 이상)
+    3. **레버리지:** 손절폭이 넓으므로 레버리지는 **3~10배**로 낮게 잡으세요. 20배는 금지입니다.
+    
+    [응답 형식 (JSON)]
+    {{
+        "decision": "buy" / "sell" / "hold",
+        "percentage": 10~30,
+        "leverage": 3~10 (저배율 권장),
+        "sl_gap": 2.5~6.0 (넉넉한 손절폭),
+        "tp_gap": 5.0~15.0 (큰 익절폭),
+        "confidence": 0~100,
+        "reason": "타이밍과 손익비에 대한 상세 근거"
+    }}
+    """
+    
+    user_prompt = f"""
+    [시장 데이터 흐름]
+    - 현재가: {last_row['close']}
+    - RSI 흐름: {prev_row['RSI']:.1f} -> {last_row['RSI']:.1f} (반등 중인지 확인!)
+    - ADX: {last_row['ADX']:.1f}
+    - 볼린저밴드: {status_summary.get('BB', '중간')}
+    
+    RSI가 극단적 수치에서 돌아오고 있나요? 확실한 반전 신호가 아니면 80점 이상 주지 마세요.
+    """
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o", 
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            response_format={"type": "json_object"}, 
+            temperature=0.3 # 매우 냉철하게
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        return {"decision": "hold", "final_reason": f"에러: {e}", "confidence": 0}
+        
+
 # 👇 [여기서부터 복사] calc_indicators 함수 바로 밑에 붙여넣으세요!
 
 def telegram_thread(ex, main_symbol):
