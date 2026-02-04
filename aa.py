@@ -798,7 +798,7 @@ def telegram_thread(ex, main_symbol):
             
 # 👆 [여기까지 복사]
 # =========================================================
-# [메인 로직] 데이터 로딩 및 화면 출력 (수정됨)
+# [메인 로직] 데이터 로딩 및 화면 출력 (에러 수정됨)
 # =========================================================
 df = None
 status = {}
@@ -806,9 +806,13 @@ last = None
 data_loaded = False
 
 try:
+    # 🔥 [핵심 수정] 변수가 없으면 기본값(5분봉)을 사용하도록 안전장치 추가
+    # (이렇게 하면 timeframe is not defined 에러가 사라집니다)
+    target_timeframe = timeframe if 'timeframe' in locals() else "5m"
+    target_symbol = symbol if 'symbol' in locals() else "BTC/USDT:USDT"
+    
     # 1. 데이터 가져오기
-    # (사이드바에서 설정한 symbol, timeframe 변수를 사용합니다)
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+    ohlcv = exchange.fetch_ohlcv(target_symbol, target_timeframe, limit=100)
     
     if ohlcv:
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
@@ -830,8 +834,8 @@ except Exception as e:
 st.divider()
 
 if data_loaded:
-    # 1. 상단 4단 브리핑 (현재가 / RSI / ADX / BB)
-    st.subheader(f"📊 {symbol} 실시간 현황")
+    # 1. 상단 4단 브리핑
+    st.subheader(f"📊 {target_symbol} 실시간 현황 ({target_timeframe})")
     c1, c2, c3, c4 = st.columns(4)
     
     c1.metric("현재가", f"${last['close']:,.2f}")
@@ -846,11 +850,11 @@ if data_loaded:
     pos = (last['close'] - last['BB_lower']) / bw if bw > 0 else 0.5
     c4.metric("BB 위치", f"{pos*100:.0f}%", delta=status.get('BB'))
 
-    # 2. [복구됨] 10종 지표 종합 상태판
+    # 2. 10종 지표 종합 상태판
     st.divider()
     st.markdown("### 🚦 지표 종합 상태판")
     
-    # 점수 계산 (매수 시그널 개수)
+    # 점수 계산
     score = 0
     if "과매도" in status.get('RSI', ''): score += 1
     if "하단" in status.get('BB', ''): score += 1
@@ -871,17 +875,17 @@ if data_loaded:
         ec3.write(f"**MA:** {status.get('MA')}")
         ec4.write(f"**MACD:** {status.get('MACD')}")
 
-    # 3. [복구됨] 메인 차트
+    # 3. 메인 차트
     st.markdown("#### 📈 가격 추세 차트")
     st.line_chart(df.set_index('time')['close'])
 
 else:
-    # 로딩 중 화면 (RSI 오류 대신 이 화면이 뜹니다)
-    st.warning(f"⏳ '{symbol}' 데이터를 불러오는 중입니다...")
-    st.caption("10초 이상 화면이 바뀌지 않으면 우측 상단 'Rerun'을 눌러주세요.")
-    # 데이터가 없으면 아래 코드가 실행되지 않게 여기서 멈춤
+    # 로딩 중 화면
+    st.warning(f"⏳ 데이터를 불러오는 중입니다...")
+    st.caption("잠시만 기다려주세요. 계속 안 되면 'Rerun'을 눌러주세요.")
+    # 데이터가 없으면 아래 탭 코드가 실행되어 에러나는 것을 방지하기 위해 멈춤
     st.stop()
-
+    
 # (이 아래에 t1, t2, t3, t4 탭 코드가 그대로 있으면 됩니다)
 
 # 4개의 탭으로 확장 (새 기능 포함)
