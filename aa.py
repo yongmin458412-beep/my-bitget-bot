@@ -15,7 +15,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx
 # =========================================================
 # 기본 설정
 # =========================================================
-st.set_page_config(layout="wide", page_title="Bitget AI Bot (Aggressive) - Control Panel")
+st.set_page_config(layout="wide", page_title="Bitget AI Bot - Control Panel")
 
 IS_SANDBOX = True  # 실전이면 False
 SETTINGS_FILE = "bot_settings.json"
@@ -30,7 +30,6 @@ TARGET_COINS = [
     "DOGE/USDT:USDT",
 ]
 
-# TradingView 심볼 매핑(원하면 여기 수정)
 TV_SYMBOL_MAP = {
     "BTC/USDT:USDT": "BINANCE:BTCUSDT",
     "ETH/USDT:USDT": "BINANCE:ETHUSDT",
@@ -51,17 +50,30 @@ def safe_float(x, default=0.0):
     except:
         return default
 
-
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
 
 def utc_now():
     return datetime.utcnow()
 
+def read_json(path, default_obj):
+    if not os.path.exists(path):
+        return default_obj
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return default_obj
+
+def write_json(path, obj):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+    except:
+        pass
 
 # =========================================================
-# 설정 관리
+# 설정 관리 (Streamlit 제어판용)
 # =========================================================
 def load_settings():
     default = {
@@ -69,52 +81,81 @@ def load_settings():
         "auto_trade": False,
         "telegram_enabled": True,
 
-        # Streamlit 화면 선택
+        # 모드: SAFE / AGGRESSIVE
+        "trade_mode": "SAFE",
+
+        # AI 글로벌옵션 자동 적용 ON/OFF
+        "use_ai_global": True,
+
+        # 리포트/루프
+        "manage_interval_sec": 2,
+        "entry_scan_interval_sec": 10,
+        "report_interval_sec": 900,
+
+        # UI
         "ui_symbol": TARGET_COINS[0],
         "ui_interval_tf": "5",
 
-        # 공격모드(기본 ON)
-        "aggressive_mode": True,
+        # 추천 가드레일(원금 손실 최소화 목적)
+        # - 사용자가 원하면 꺼도 됨(제어판에서)
+        "enable_hard_guardrails": True,
+        "hard_max_leverage_safe": 10,
+        "hard_max_leverage_aggressive": 20,
+        "hard_max_risk_pct_safe": 15.0,         # free USDT의 최대 몇 %까지 진입 자금으로 쓸지
+        "hard_max_risk_pct_aggressive": 30.0,
 
-        # 봇 루프 주기
-        "manage_interval_sec": 2,
-        "entry_scan_interval_sec": 10,
+        # 손절 짧게 / 익절 길게 기본 성향 (AI에게도 프롬프트로 전달)
+        "prefer_short_sl": True,
+        "prefer_long_tp_trend": True,
 
-        # 텔레그램 메뉴 전송 주기(생존신고)
-        "report_interval_sec": 900,
+        # TP 연장 허용 (추세면 TP 도달 후 1회 연장)
+        "allow_tp_extend": True,
+        "tp_extend_mult": 1.7,  # TP 연장 배수
+
+        # 로그 보기
+        "log_rows_ui": 200,
     }
     if os.path.exists(SETTINGS_FILE):
         try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
+            saved = read_json(SETTINGS_FILE, {})
             default.update(saved)
         except:
             pass
     return default
 
-
 def save_settings(cfg):
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except:
-        pass
-
+    write_json(SETTINGS_FILE, cfg)
 
 config = load_settings()
 
 # =========================================================
-# 런타임 상태(runtime_state.json)
+# runtime_state.json (봇 상태 + AI 투명성 데이터 저장)
 # =========================================================
 def default_runtime_state():
     return {
         "date": datetime.now().strftime("%Y-%m-%d"),
         "day_start_equity": 0.0,
         "daily_realized_pnl": 0.0,
+        "consec_losses": 0,
+        "pause_until": 0,
+        "cooldowns": {},
 
-        # AI가 매번 결정하는 글로벌 옵션(손실제한/쿨다운/동시포지션 등)
+        # 현재 진입 메타(봇 내부 관리)
+        "trades": {},
+
+        # 텔레그램 offset
+        "tg_offset": 0,
+
+        # 마지막 상태 메모
+        "last_bot_note": "",
+
+        # AI 투명성: 최근 입력/출력 저장(심볼별)
+        "last_ai_inputs": {},
+        "last_ai_outputs": {},
+
+        # AI 글로벌옵션(적용값)
         "ai_global": {
-            "max_positions": 2,
+            # 여기 값들은 AI가 추천해도 되고, 네가 제어판으로 override 해도 됨
             "cooldown_minutes": 10,
             "max_consec_losses": 3,
             "pause_minutes": 30,
@@ -122,39 +163,17 @@ def default_runtime_state():
             "news_block_before_min": 15,
             "news_block_after_min": 15,
         },
-
-        "consec_losses": 0,
-        "pause_until": 0,
-        "cooldowns": {},  # symbol -> until epoch
-        "trades": {},     # symbol -> trade meta
-
-        "tg_offset": 0,
-        "last_bot_note": "",
-        "last_ai_brief": {},
     }
 
-
 def load_runtime_state():
-    if not os.path.exists(RUNTIME_STATE_FILE):
+    s = read_json(RUNTIME_STATE_FILE, None)
+    if not isinstance(s, dict):
         s = default_runtime_state()
         save_runtime_state(s)
-        return s
-    try:
-        with open(RUNTIME_STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        s = default_runtime_state()
-        save_runtime_state(s)
-        return s
-
+    return s
 
 def save_runtime_state(state):
-    try:
-        with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except:
-        pass
-
+    write_json(RUNTIME_STATE_FILE, state)
 
 def maybe_roll_daily_state(state, equity_now: float):
     today = datetime.now().strftime("%Y-%m-%d")
@@ -169,30 +188,26 @@ def maybe_roll_daily_state(state, equity_now: float):
         state["last_bot_note"] = "데일리 리셋"
         save_runtime_state(state)
 
-
 def is_paused(state):
     return time.time() < safe_float(state.get("pause_until", 0))
-
 
 def in_cooldown(state, symbol):
     until = safe_float(state.get("cooldowns", {}).get(symbol, 0))
     return time.time() < until
-
 
 def set_cooldown(state, symbol, minutes: int):
     state.setdefault("cooldowns", {})
     state["cooldowns"][symbol] = int(time.time() + int(minutes) * 60)
     save_runtime_state(state)
 
-
 # =========================================================
-# trade_log.csv (AI 회고 포함)
+# trade_log.csv (파일에는 자세히, UI에는 한줄평)
 # =========================================================
 TRADE_LOG_COLUMNS = [
-    "Time", "Symbol", "Event", "Side", "Qty", "EntryPrice", "ExitPrice",
-    "PnL_USDT", "PnL_Percent",
+    "Time", "Mode", "Symbol", "Event", "Side", "Qty",
+    "EntryPrice", "ExitPrice", "PnL_USDT", "PnL_Percent",
     "Leverage", "RiskPct", "TP_Target", "SL_Target",
-    "Reason", "Review"
+    "Reason", "Review", "OneLine"
 ]
 
 def append_trade_log(row: dict):
@@ -202,8 +217,7 @@ def append_trade_log(row: dict):
     else:
         df.to_csv(TRADE_LOG_FILE, mode="a", header=False, index=False, encoding="utf-8-sig")
 
-
-def read_trade_log(n=30):
+def read_trade_log(n=200):
     if not os.path.exists(TRADE_LOG_FILE):
         return pd.DataFrame(columns=TRADE_LOG_COLUMNS)
     try:
@@ -214,9 +228,20 @@ def read_trade_log(n=30):
     except:
         return pd.DataFrame(columns=TRADE_LOG_COLUMNS)
 
+def make_oneline_summary(row: dict):
+    # 보기 쉬운 한줄평(네가 보는 용도)
+    t = row.get("Time", "")
+    sym = row.get("Symbol", "")
+    ev = row.get("Event", "")
+    pnlp = row.get("PnL_Percent", "")
+    mode = row.get("Mode", "")
+    easy = row.get("Review", "") or row.get("Reason", "")
+    easy = str(easy).replace("\n", " ")
+    easy = easy[:40] + ("..." if len(easy) > 40 else "")
+    return f"{t} | {mode} | {sym} | {ev} | {pnlp}% | {easy}"
 
 def summarize_recent_mistakes():
-    df = read_trade_log(50)
+    df = read_trade_log(80)
     if df.empty:
         return "기록 없음"
     try:
@@ -224,11 +249,10 @@ def summarize_recent_mistakes():
         worst = df.sort_values("PnL_Percent", ascending=True).head(5)
         lines = []
         for _, r in worst.iterrows():
-            lines.append(f"- {r['Symbol']} {r['Side']} {r['PnL_Percent']:.2f}% ({str(r.get('Reason',''))[:40]})")
+            lines.append(f"- {r['Symbol']} {r.get('Side','')} {r['PnL_Percent']:.2f}% ({str(r.get('Reason',''))[:35]})")
         return "\n".join(lines) if lines else "큰 손실 기록 없음"
     except:
-        return "기록 요약 실패"
-
+        return "손실 요약 실패"
 
 # =========================================================
 # Secrets
@@ -251,9 +275,8 @@ if openai_key:
     except:
         openai_client = None
 
-
 # =========================================================
-# Exchange 생성(봇 스레드와 UI 분리)
+# Exchange (UI용 / 봇 스레드용 분리)
 # =========================================================
 def create_exchange():
     ex = ccxt.bitget({
@@ -271,17 +294,14 @@ def create_exchange():
         pass
     return ex
 
-
 @st.cache_resource
 def init_exchange_ui():
     return create_exchange()
 
-
 exchange = init_exchange_ui()
 
-
 # =========================================================
-# 지표 계산(ta 없이 10종)
+# 지표 10종(ta 없이 구현) + 투명성 출력용
 # =========================================================
 def ema(s: pd.Series, span: int):
     return s.ewm(span=span, adjust=False).mean()
@@ -384,12 +404,11 @@ def calc_indicators(df: pd.DataFrame):
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # 상태 텍스트(AI 입력용)
     status = {
-        "RSI": f"{prev['RSI']:.1f}->{last['RSI']:.1f}",
-        "BB": "above" if last["close"] > last["BB_upper"] else ("below" if last["close"] < last["BB_lower"] else "inside"),
-        "MA": "golden" if (prev["MA_fast"] <= prev["MA_slow"] and last["MA_fast"] > last["MA_slow"]) else ("dead" if (prev["MA_fast"] >= prev["MA_slow"] and last["MA_fast"] < last["MA_slow"]) else "flat"),
-        "MACD": "golden" if (prev["MACD"] <= prev["MACD_signal"] and last["MACD"] > last["MACD_signal"]) else ("dead" if (prev["MACD"] >= prev["MACD_signal"] and last["MACD"] < last["MACD_signal"]) else "flat"),
+        "RSI_flow": f"{prev['RSI']:.1f}->{last['RSI']:.1f}",
+        "BB_pos": "above" if last["close"] > last["BB_upper"] else ("below" if last["close"] < last["BB_lower"] else "inside"),
+        "MA_cross": "golden" if (prev["MA_fast"] <= prev["MA_slow"] and last["MA_fast"] > last["MA_slow"]) else ("dead" if (prev["MA_fast"] >= prev["MA_slow"] and last["MA_fast"] < last["MA_slow"]) else "flat"),
+        "MACD_cross": "golden" if (prev["MACD"] <= prev["MACD_signal"] and last["MACD"] > last["MACD_signal"]) else ("dead" if (prev["MACD"] >= prev["MACD_signal"] and last["MACD"] < last["MACD_signal"]) else "flat"),
         "ADX": float(last["ADX"]),
         "STO": f"{last['STO_K']:.1f}/{last['STO_D']:.1f}",
         "CCI": float(last["CCI"]),
@@ -399,11 +418,62 @@ def calc_indicators(df: pd.DataFrame):
         "ATR_PCT": float(last["ATR_PCT"]),
     }
 
-    return df, {"last": last, "prev": prev, "status": status}
+    # 투명성용 '지표 값' 묶음
+    indicator_values = {
+        "close": float(last["close"]),
+        "RSI": float(last["RSI"]),
+        "BB_upper": float(last["BB_upper"]),
+        "BB_lower": float(last["BB_lower"]),
+        "MA_fast": float(last["MA_fast"]),
+        "MA_slow": float(last["MA_slow"]),
+        "MACD": float(last["MACD"]),
+        "MACD_signal": float(last["MACD_signal"]),
+        "ADX": float(last["ADX"]),
+        "STO_K": float(last["STO_K"]),
+        "STO_D": float(last["STO_D"]),
+        "CCI": float(last["CCI"]),
+        "MFI": float(last["MFI"]),
+        "WILLR": float(last["WILLR"]),
+        "VOL": float(last["vol"]),
+        "VOL_SMA20": float(last["VOL_SMA"]),
+        "ATR_PCT": float(last["ATR_PCT"]),
+    }
 
+    return df, {"last": last, "prev": prev, "status": status, "values": indicator_values}
 
 # =========================================================
-# 텔레그램
+# TradingView(다크모드)
+# =========================================================
+def render_tradingview(symbol_tv: str, interval: str = "5", height: int = 520):
+    html = f"""
+<div class="tradingview-widget-container">
+  <div id="tradingview_chart"></div>
+  <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+  <script type="text/javascript">
+  new TradingView.widget(
+  {{
+    "autosize": true,
+    "symbol": "{symbol_tv}",
+    "interval": "{interval}",
+    "timezone": "Asia/Seoul",
+    "theme": "dark",
+    "style": "1",
+    "locale": "kr",
+    "toolbar_bg": "#1f1f1f",
+    "enable_publishing": false,
+    "hide_top_toolbar": false,
+    "hide_legend": false,
+    "save_image": false,
+    "container_id": "tradingview_chart"
+  }}
+  );
+  </script>
+</div>
+"""
+    components.html(html, height=height, scrolling=False)
+
+# =========================================================
+# 텔레그램 유틸 + 메뉴
 # =========================================================
 def tg_send(token, chat_id, text, reply_markup=None):
     if not token or not chat_id:
@@ -440,14 +510,13 @@ def tg_send_document(token, chat_id, filepath, caption=""):
     except:
         pass
 
-
 TG_MENU = {
     "inline_keyboard": [
         [{"text": "📊 브리핑", "callback_data": "brief"},
          {"text": "🌍 스캔(5)", "callback_data": "scan"}],
         [{"text": "💰 잔고", "callback_data": "balance"},
          {"text": "📌 포지션", "callback_data": "pos"}],
-        [{"text": "🧾 매매일지(최근)", "callback_data": "log_recent"},
+        [{"text": "🧾 로그(한줄)", "callback_data": "log_recent"},
          {"text": "📎 CSV파일", "callback_data": "log_file"}],
         [{"text": "🤖 ON/OFF", "callback_data": "toggle"},
          {"text": "🛑 전량청산", "callback_data": "close_all"}],
@@ -455,10 +524,9 @@ TG_MENU = {
 }
 
 # =========================================================
-# 경제캘린더(가벼운 회피용, 실패해도 봇은 계속)
+# 경제캘린더(중요뉴스 시간 회피용) - 실패해도 봇은 계속
 # =========================================================
 def fetch_econ_calendar():
-    # ForexFactory JSON(간단 회피)
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     try:
         r = requests.get(url, timeout=7)
@@ -511,7 +579,6 @@ def is_news_block(ai_global: dict, cal_df: pd.DataFrame):
     after = int(ai_global.get("news_block_after_min", 15))
 
     now = utc_now()
-    # “높음”만 회피(공격모드라도 갑툭튀 급등락 방지에 체감 큼)
     for _, r in cal_df.iterrows():
         if str(r.get("impact_ko","")) != "높음":
             continue
@@ -522,253 +589,8 @@ def is_news_block(ai_global: dict, cal_df: pd.DataFrame):
             return (True, f"{r.get('currency','')} {r.get('title','')} ({r.get('impact_ko','')})")
     return (False, None)
 
-
 # =========================================================
-# AI: “모든 옵션” 매번 결정 (공격 모드)
-# =========================================================
-def ai_decide(symbol: str, pack: dict, state: dict, aggressive: bool = True):
-    """
-    return JSON:
-    {
-      "decision": "buy/sell/hold",
-      "confidence": 0-100,
-      "risk": {
-        "leverage": ...,
-        "risk_pct": ...,          # free USDT 중 몇 % 쓸지
-        "sl_gap": ...,            # ROI% 기준 손절
-        "tp_target": ...,         # ROI% 기준 최종 목표(익절)
-        "tp1_gap": ..., "tp1_size": ...,
-        "tp2_gap": ..., "tp2_size": ...,
-        "use_trailing": true/false,
-        "trail_start": ..., "trail_gap": ...
-      },
-      "global": {
-        "max_positions": ...,
-        "cooldown_minutes": ...,
-        "max_consec_losses": ...,
-        "pause_minutes": ...,
-        "news_avoid": true/false,
-        "news_block_before_min": ...,
-        "news_block_after_min": ...
-      },
-      "reason": "...",
-      "easy": "...(아주 쉽게)",
-      "review_template": "...(나중 회고할 때 기준)"
-    }
-    """
-    # OpenAI 없으면: 간단 기본(공격)
-    if openai_client is None:
-        last = pack["last"]
-        atrp = safe_float(last.get("ATR_PCT", 1.0), 1.0)
-        return {
-            "decision": "hold",
-            "confidence": 0,
-            "risk": {
-                "leverage": 5,
-                "risk_pct": 10,
-                "sl_gap": max(1.5, atrp * 1.2),
-                "tp_target": max(3.0, atrp * 2.5),
-                "tp1_gap": 0.5, "tp1_size": 30,
-                "tp2_gap": 2.0, "tp2_size": 30,
-                "use_trailing": True,
-                "trail_start": 1.2, "trail_gap": 0.6,
-            },
-            "global": {
-                "max_positions": 2,
-                "cooldown_minutes": 10,
-                "max_consec_losses": 3,
-                "pause_minutes": 30,
-                "news_avoid": True,
-                "news_block_before_min": 15,
-                "news_block_after_min": 15,
-            },
-            "reason": "AI키 없음(기본값).",
-            "easy": "지금은 AI키가 없어서 관망/기본설정이에요.",
-            "review_template": "손절이면: 변동성 대비 SL이 너무 좁았는지, 진입이 급했는지 점검"
-        }
-
-    mistakes = summarize_recent_mistakes()
-    s = pack["status"]
-    last = pack["last"]
-
-    system = f"""
-너는 '공격적인 자동매매 매니저'야.
-목표: 빠른 수익 기회는 잡되, 손실은 회고로 개선해서 다음에 더 잘하기.
-요청: 사용자는 "모든 옵션을 네가 매번 유동적으로 결정"하길 원해. (캡/제한 없음)
-
-중요:
-- 과도한 진입은 연속손실을 부른다. 대신 "기회가 좋아 보이면 과감, 애매하면 홀드".
-- 너는 risk, TP/SL 구조, 트레일링, 손실 제한(연속손실, pause), 쿨다운, 동시포지션 수까지 모두 결정.
-- 출력은 반드시 JSON 하나.
-
-[최근 손실 Top5]
-{mistakes}
-
-[응답 JSON 스키마]
-{{
- "decision":"buy/sell/hold",
- "confidence":0-100,
- "risk":{{
-   "leverage":1-50,
-   "risk_pct":1-100,
-   "sl_gap":0.3-20.0,
-   "tp_target":0.3-50.0,
-   "tp1_gap":0.1-10.0, "tp1_size":10-90,
-   "tp2_gap":0.1-30.0, "tp2_size":10-90,
-   "use_trailing":true/false,
-   "trail_start":0.1-30.0, "trail_gap":0.1-30.0
- }},
- "global":{{
-   "max_positions":1-5,
-   "cooldown_minutes":0-120,
-   "max_consec_losses":1-10,
-   "pause_minutes":5-240,
-   "news_avoid":true/false,
-   "news_block_before_min":0-60,
-   "news_block_after_min":0-60
- }},
- "reason":"전문가용 근거(지표 기반)",
- "easy":"초등학생도 이해 가능한 쉬운 설명(2~4줄)",
- "review_template":"이 포지션이 끝났을 때 회고할 체크리스트 3개"
-}}
-"""
-
-    user = {
-        "symbol": symbol,
-        "price": safe_float(last.get("close", 0)),
-        "atr_pct": safe_float(last.get("ATR_PCT", 0)),
-        "rsi_flow": s.get("RSI"),
-        "bb": s.get("BB"),
-        "ma": s.get("MA"),
-        "macd": s.get("MACD"),
-        "adx": safe_float(s.get("ADX", 0)),
-        "vol_spike": bool(s.get("VOL_SPIKE", False)),
-        "stoch": s.get("STO"),
-        "cci": safe_float(s.get("CCI", 0)),
-        "mfi": safe_float(s.get("MFI", 0)),
-        "willr": safe_float(s.get("WILLR", 0)),
-        "aggressive": aggressive,
-        "open_positions": len(state.get("trades", {})),
-        "consec_losses": int(state.get("consec_losses", 0)),
-    }
-
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user, ensure_ascii=False)}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.35
-        )
-        out = json.loads(resp.choices[0].message.content)
-
-        # ---- 기술적 검증(제한X, 오류방지용만) ----
-        out.setdefault("decision", "hold")
-        out.setdefault("confidence", 0)
-        out.setdefault("risk", {})
-        out.setdefault("global", {})
-        out.setdefault("reason", "")
-        out.setdefault("easy", "")
-        out.setdefault("review_template", "")
-
-        r = out["risk"]
-        g = out["global"]
-
-        # 수치화(음수/NaN 방지)
-        def clamp_min(v, m, default):
-            v = safe_float(v, default)
-            return max(v, m)
-
-        r["leverage"] = int(clamp_min(r.get("leverage", 5), 1, 5))
-        r["risk_pct"] = clamp_min(r.get("risk_pct", 10), 1.0, 10)
-        r["sl_gap"] = clamp_min(r.get("sl_gap", 2.0), 0.1, 2.0)
-        r["tp_target"] = clamp_min(r.get("tp_target", 3.0), 0.1, 3.0)
-        r["tp1_gap"] = clamp_min(r.get("tp1_gap", 0.5), 0.1, 0.5)
-        r["tp1_size"] = int(clamp_min(r.get("tp1_size", 30), 1, 30))
-        r["tp2_gap"] = clamp_min(r.get("tp2_gap", 2.0), 0.1, 2.0)
-        r["tp2_size"] = int(clamp_min(r.get("tp2_size", 30), 1, 30))
-        r["use_trailing"] = bool(r.get("use_trailing", True))
-        r["trail_start"] = clamp_min(r.get("trail_start", 1.2), 0.1, 1.2)
-        r["trail_gap"] = clamp_min(r.get("trail_gap", 0.1), 0.1, 0.6)
-
-        g["max_positions"] = int(clamp_min(g.get("max_positions", 2), 1, 2))
-        g["cooldown_minutes"] = int(max(0, safe_float(g.get("cooldown_minutes", 10), 10)))
-        g["max_consec_losses"] = int(clamp_min(g.get("max_consec_losses", 3), 1, 3))
-        g["pause_minutes"] = int(clamp_min(g.get("pause_minutes", 30), 5, 30))
-        g["news_avoid"] = bool(g.get("news_avoid", True))
-        g["news_block_before_min"] = int(max(0, safe_float(g.get("news_block_before_min", 15), 15)))
-        g["news_block_after_min"] = int(max(0, safe_float(g.get("news_block_after_min", 15), 15)))
-
-        # tp_target은 sl_gap보다 작게 주면 이상하니(제한이라기보다 논리 정합성)
-        if r["tp_target"] < r["sl_gap"] * 0.3:
-            r["tp_target"] = r["sl_gap"] * 0.6
-
-        return out
-
-    except Exception as e:
-        # 실패 시 최소 기본
-        last = pack["last"]
-        atrp = safe_float(last.get("ATR_PCT", 1.0), 1.0)
-        return {
-            "decision": "hold",
-            "confidence": 0,
-            "risk": {
-                "leverage": 5,
-                "risk_pct": 10,
-                "sl_gap": max(1.0, atrp * 1.2),
-                "tp_target": max(2.0, atrp * 2.5),
-                "tp1_gap": 0.5, "tp1_size": 30,
-                "tp2_gap": 2.0, "tp2_size": 30,
-                "use_trailing": True, "trail_start": 1.2, "trail_gap": 0.6,
-            },
-            "global": {
-                "max_positions": 2,
-                "cooldown_minutes": 10,
-                "max_consec_losses": 3,
-                "pause_minutes": 30,
-                "news_avoid": True,
-                "news_block_before_min": 15,
-                "news_block_after_min": 15,
-            },
-            "reason": f"AI 오류로 관망: {e}",
-            "easy": "AI 호출이 실패해서 오늘은 관망해요.",
-            "review_template": "오류/네트워크 체크"
-        }
-
-
-# =========================================================
-# AI 회고(매매일지에 후기 자동 작성)
-# =========================================================
-def ai_review_trade(trade_row: dict, state: dict):
-    if openai_client is None:
-        return "AI키 없음: 수동 회고 필요"
-    system = """
-너는 트레이딩 코치다.
-요청: 아래 거래의 결과를 바탕으로 "짧고 이해 쉬운 후기"를 작성해라.
-형식:
-- 한줄 요약
-- 잘한 점 2개
-- 아쉬운 점 2개
-- 다음엔 이렇게(행동지침 3개)
-손절이면: 왜 손절 났는지 가설 2개 + 개선 3개
-익절이면: 왜 먹혔는지 2개 + 다음에 유지할 것 3개
-"""
-    user = json.dumps(trade_row, ensure_ascii=False)
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.35
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except:
-        return "AI 회고 실패"
-
-
-# =========================================================
-# 포지션 조회 & 주문 유틸
+# 포지션/주문 유틸
 # =========================================================
 def get_active_positions(ex, symbols):
     try:
@@ -782,7 +604,6 @@ def get_active_positions(ex, symbols):
         return []
 
 def close_position_market(ex, symbol, side, contracts):
-    # side: long/short
     close_side = "sell" if side == "long" else "buy"
     try:
         ex.create_market_order(symbol, close_side, contracts, params={"reduceOnly": True})
@@ -794,48 +615,249 @@ def close_position_market(ex, symbol, side, contracts):
         except:
             return False
 
+# =========================================================
+# AI 결정(모드별: 공격+선별 / 안전)
+# =========================================================
+INDICATOR_LIST = [
+    "RSI(흐름)", "볼린저 위치", "MA 크로스", "MACD 크로스", "ADX",
+    "Stoch(K/D)", "CCI", "MFI", "Williams %R", "거래량 스파이크", "ATR%(변동성)"
+]
 
-# =========================================================
-# TradingView 차트(다크모드)
-# =========================================================
-def render_tradingview(symbol_tv: str, interval: str = "5", height: int = 520):
-    # TradingView 위젯(다크모드)
-    # interval: "1","5","15","60","240","D" 등
-    html = f"""
-<div class="tradingview-widget-container">
-  <div id="tradingview_chart"></div>
-  <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-  <script type="text/javascript">
-  new TradingView.widget(
-  {{
-    "autosize": true,
-    "symbol": "{symbol_tv}",
-    "interval": "{interval}",
-    "timezone": "Asia/Seoul",
-    "theme": "dark",
-    "style": "1",
-    "locale": "kr",
-    "toolbar_bg": "#1f1f1f",
-    "enable_publishing": false,
-    "hide_top_toolbar": false,
-    "hide_legend": false,
-    "save_image": false,
-    "container_id": "tradingview_chart"
-  }}
-  );
-  </script>
-</div>
+def ai_decide(symbol: str, pack: dict, state: dict, mode: str, cfg: dict):
+    """
+    out JSON:
+    {
+      decision buy/sell/hold,
+      confidence 0-100,
+      risk: leverage, risk_pct, sl_gap, tp_target,
+            tp1_gap,tp1_size,tp2_gap,tp2_size,
+            use_trailing, trail_start, trail_gap,
+      global: cooldown_minutes, max_consec_losses, pause_minutes, news_avoid, before/after,
+      reason, easy,
+      one_liner
+    }
+    """
+    last = pack["values"]
+    s = pack["status"]
+
+    # --- 투명성: AI 입력 저장 ---
+    ai_input = {
+        "symbol": symbol,
+        "timeframe": "5m",
+        "indicators_used": INDICATOR_LIST,
+        "indicator_values": last,
+        "indicator_status": s,
+        "mode": mode,
+        "consec_losses": int(state.get("consec_losses", 0)),
+        "open_positions": len(state.get("trades", {})),
+        "goal": "원금손실 최소화 + 짧은시간 수익 극대화",
+        "style": {
+            "prefer_short_sl": bool(cfg.get("prefer_short_sl", True)),
+            "prefer_long_tp_trend": bool(cfg.get("prefer_long_tp_trend", True)),
+            "allow_tp_extend": bool(cfg.get("allow_tp_extend", True)),
+        }
+    }
+    state.setdefault("last_ai_inputs", {})[symbol] = ai_input
+    save_runtime_state(state)
+
+    # OpenAI 없으면 관망 기본
+    if openai_client is None:
+        out = {
+            "decision": "hold",
+            "confidence": 0,
+            "risk": {
+                "leverage": 5,
+                "risk_pct": 8,
+                "sl_gap": max(0.8, float(last.get("ATR_PCT", 1.0)) * 0.8),
+                "tp_target": max(1.6, float(last.get("ATR_PCT", 1.0)) * 2.0),
+                "tp1_gap": 0.5, "tp1_size": 30,
+                "tp2_gap": 1.2, "tp2_size": 30,
+                "use_trailing": True,
+                "trail_start": 1.0, "trail_gap": 0.5,
+            },
+            "global": state.get("ai_global", default_runtime_state()["ai_global"]),
+            "reason": "AI키 없음: 관망",
+            "easy": "AI키가 없어서 자동 판단을 못해요. 지금은 관망이에요.",
+            "one_liner": f"{symbol} HOLD (AI키 없음)"
+        }
+        state.setdefault("last_ai_outputs", {})[symbol] = out
+        save_runtime_state(state)
+        return out
+
+    mistakes = summarize_recent_mistakes()
+
+    # 모드별 성향(추천)
+    if mode == "SAFE":
+        mode_rules = """
+[안전모드]
+- 애매하면 HOLD. 진입은 정말 좋은 자리만.
+- 리스크(진입금액, 레버리지)는 작게. 원금 손실 최소화 최우선.
+- 손절은 빠르게 인정하되(짧게), 휩쏘(가짜 흔들기)를 고려해서 너무 말도 안 되게 좁게 잡지 마.
+- 추세가 확실하면: TP는 길게 + 트레일링 ON(익절은 길게).
+- 연속 손실이 나오면 빨리 멈추고(pause), 쿨다운 길게.
 """
-    components.html(html, height=height, scrolling=False)
+        conf_req_hint = "확신도는 쉽게 80 넘기지 말고, 진짜 좋을 때만 85~95를 줘."
+    else:
+        mode_rules = """
+[공격모드(공격+선별)]
+- 공격적이되 선별이 핵심: 애매하면 HOLD.
+- 손절은 짧게(빠르게), 익절은 추세면 길게(트레일링/TP연장).
+- 거래량 스파이크/추세강도(ADX)/크로스(MA/MACD)가 맞을 때만 과감.
+- 연속 손실이 나오면 멈춤(pause)을 반드시 활용.
+"""
+        conf_req_hint = "확신도는 남발하지 말고, 근거가 강할 때만 80~95를 줘."
 
+    system = f"""
+너는 자동매매 트레이딩 매니저다.
+목표: 원금 손실을 최소화하면서, 짧은 시간 수익 기회를 극대화.
+중요: '공격+선별'을 기본 철학으로 두고, 애매하면 HOLD.
+{mode_rules}
+
+[최근 손실 Top5]
+{mistakes}
+
+{conf_req_hint}
+
+출력은 반드시 JSON 하나.
+스키마:
+{{
+ "decision":"buy/sell/hold",
+ "confidence":0-100,
+ "risk":{{
+   "leverage":1-50,
+   "risk_pct":1-100,
+   "sl_gap":0.3-20.0,
+   "tp_target":0.3-80.0,
+   "tp1_gap":0.1-10.0, "tp1_size":10-90,
+   "tp2_gap":0.1-30.0, "tp2_size":10-90,
+   "use_trailing":true/false,
+   "trail_start":0.1-30.0, "trail_gap":0.1-30.0
+ }},
+ "global":{{
+   "cooldown_minutes":0-240,
+   "max_consec_losses":1-10,
+   "pause_minutes":5-240,
+   "news_avoid":true/false,
+   "news_block_before_min":0-60,
+   "news_block_after_min":0-60
+ }},
+ "reason":"전문가용 근거(지표 기반, 짧게)",
+ "easy":"아주 쉬운 설명(2~4줄)",
+ "one_liner":"한줄평(텔레그램/로그용)"
+}}
+"""
+
+    user = json.dumps(ai_input, ensure_ascii=False)
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+            temperature=0.35
+        )
+        out = json.loads(resp.choices[0].message.content)
+
+        # --- 기술적 검증(오류 방지용) ---
+        out.setdefault("decision", "hold")
+        out.setdefault("confidence", 0)
+        out.setdefault("risk", {})
+        out.setdefault("global", {})
+        out.setdefault("reason", "")
+        out.setdefault("easy", "")
+        out.setdefault("one_liner", "")
+
+        r = out["risk"]
+        g = out["global"]
+
+        def minv(v, m, d):
+            v = safe_float(v, d)
+            return max(v, m)
+
+        r["leverage"] = int(minv(r.get("leverage", 5), 1, 5))
+        r["risk_pct"] = minv(r.get("risk_pct", 10), 1.0, 10.0)
+        r["sl_gap"] = minv(r.get("sl_gap", 1.0), 0.1, 1.0)
+        r["tp_target"] = minv(r.get("tp_target", 2.0), 0.1, 2.0)
+        r["tp1_gap"] = minv(r.get("tp1_gap", 0.5), 0.1, 0.5)
+        r["tp1_size"] = int(minv(r.get("tp1_size", 30), 1, 30))
+        r["tp2_gap"] = minv(r.get("tp2_gap", 1.2), 0.1, 1.2)
+        r["tp2_size"] = int(minv(r.get("tp2_size", 30), 1, 30))
+        r["use_trailing"] = bool(r.get("use_trailing", True))
+        r["trail_start"] = minv(r.get("trail_start", 1.0), 0.1, 1.0)
+        r["trail_gap"] = minv(r.get("trail_gap", 0.5), 0.1, 0.5)
+
+        g["cooldown_minutes"] = int(max(0, safe_float(g.get("cooldown_minutes", 10), 10)))
+        g["max_consec_losses"] = int(minv(g.get("max_consec_losses", 3), 1, 3))
+        g["pause_minutes"] = int(minv(g.get("pause_minutes", 30), 5, 30))
+        g["news_avoid"] = bool(g.get("news_avoid", True))
+        g["news_block_before_min"] = int(max(0, safe_float(g.get("news_block_before_min", 15), 15)))
+        g["news_block_after_min"] = int(max(0, safe_float(g.get("news_block_after_min", 15), 15)))
+
+        # --- 추천 가드레일(원금손실 최소화 목적 / 사용자가 OFF 가능) ---
+        if cfg.get("enable_hard_guardrails", True):
+            if mode == "SAFE":
+                r["leverage"] = min(r["leverage"], int(cfg.get("hard_max_leverage_safe", 10)))
+                r["risk_pct"] = min(r["risk_pct"], float(cfg.get("hard_max_risk_pct_safe", 15.0)))
+            else:
+                r["leverage"] = min(r["leverage"], int(cfg.get("hard_max_leverage_aggressive", 20)))
+                r["risk_pct"] = min(r["risk_pct"], float(cfg.get("hard_max_risk_pct_aggressive", 30.0)))
+
+        # one_liner 없으면 자동 생성
+        if not out.get("one_liner"):
+            out["one_liner"] = f"{symbol} {out.get('decision','hold').upper()} conf {out.get('confidence',0)}"
+
+        state.setdefault("last_ai_outputs", {})[symbol] = out
+        save_runtime_state(state)
+        return out
+
+    except Exception as e:
+        out = {
+            "decision": "hold", "confidence": 0,
+            "risk": {"leverage": 5, "risk_pct": 8, "sl_gap": 1.0, "tp_target": 2.0,
+                     "tp1_gap": 0.5, "tp1_size": 30, "tp2_gap": 1.2, "tp2_size": 30,
+                     "use_trailing": True, "trail_start": 1.0, "trail_gap": 0.5},
+            "global": state.get("ai_global", default_runtime_state()["ai_global"]),
+            "reason": f"AI 오류로 관망: {e}",
+            "easy": "AI 호출이 실패했어요. 지금은 관망이에요.",
+            "one_liner": f"{symbol} HOLD (AI err)"
+        }
+        state.setdefault("last_ai_outputs", {})[symbol] = out
+        save_runtime_state(state)
+        return out
 
 # =========================================================
-# 텔레그램 봇 스레드 (거래+리포트+매매일지+회고)
+# AI 회고(로그에는 자세히, UI는 한줄로)
+# =========================================================
+def ai_review_trade(trade_row: dict):
+    if openai_client is None:
+        return "AI키 없음: 수동 회고 필요"
+    system = """
+너는 트레이딩 코치다.
+요청: 아래 거래를 바탕으로 '한줄평'을 먼저 만들고, 그 다음에 짧은 회고를 써라.
+형식:
+1) 한줄평: (최대 25자 정도)
+2) 회고(짧게): 잘한 점 1개 / 아쉬운 점 1개 / 다음 행동 1개
+손절이면: 다음에 어떻게 개선할지 1개는 꼭.
+익절이면: 다음에 유지할 습관 1개는 꼭.
+"""
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": json.dumps(trade_row, ensure_ascii=False)}],
+            temperature=0.35
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except:
+        return "AI 회고 실패"
+
+# =========================================================
+# Telegram bot thread (실시간 조회/보고는 여기)
 # =========================================================
 def telegram_bot_thread():
     bot_ex = create_exchange()
     state = load_runtime_state()
-
     cal_cache = {"t": 0, "df": pd.DataFrame()}
 
     def get_calendar_cached():
@@ -847,7 +869,7 @@ def telegram_bot_thread():
     # 시작 메시지
     cfg = load_settings()
     if cfg.get("telegram_enabled", True):
-        tg_send(tg_token, tg_id, "🚀 공격모드 봇 시작!\n(자동매매 ON 시 AI가 모든 옵션을 매번 결정)", reply_markup=TG_MENU)
+        tg_send(tg_token, tg_id, "🚀 봇 시작!\n(Streamlit=제어판 / Telegram=보고&조회)", reply_markup=TG_MENU)
 
     last_manage = 0
     last_scan = 0
@@ -857,7 +879,7 @@ def telegram_bot_thread():
         try:
             cfg = load_settings()
             state = load_runtime_state()
-            aggressive = bool(cfg.get("aggressive_mode", True))
+            mode = cfg.get("trade_mode", "SAFE").upper()
 
             # 데일리 리셋
             try:
@@ -867,7 +889,7 @@ def telegram_bot_thread():
                 equity = safe_float(state.get("day_start_equity", 0))
             maybe_roll_daily_state(state, equity)
 
-            # 텔레그램 콜백 처리
+            # 텔레그램 콜백
             if cfg.get("telegram_enabled", True) and tg_token and tg_id:
                 try:
                     res = requests.get(
@@ -919,44 +941,43 @@ def telegram_bot_thread():
                                 tg_send(tg_token, cid, f"🤖 자동매매 {'ON' if cfg2['auto_trade'] else 'OFF'}", reply_markup=TG_MENU)
 
                             elif data == "log_recent":
-                                df = read_trade_log(10)
+                                df = read_trade_log(12)
                                 if df.empty:
-                                    tg_send(tg_token, cid, "🧾 매매일지 없음", reply_markup=TG_MENU)
+                                    tg_send(tg_token, cid, "🧾 로그 없음", reply_markup=TG_MENU)
                                 else:
-                                    lines = ["🧾 최근 매매일지(10개)"]
+                                    lines = ["🧾 최근 로그(한줄)"]
                                     for _, r in df.iterrows():
-                                        lines.append(
-                                            f"- {r['Time']} | {r['Symbol']} | {r['Event']} | "
-                                            f"{r['PnL_Percent']}% | 근거:{str(r.get('Reason',''))[:20]}"
-                                        )
+                                        lines.append(f"- {r.get('OneLine','')}")
                                     tg_send(tg_token, cid, "\n".join(lines), reply_markup=TG_MENU)
 
                             elif data == "log_file":
                                 if os.path.exists(TRADE_LOG_FILE):
                                     tg_send_document(tg_token, cid, TRADE_LOG_FILE, caption="📎 trade_log.csv")
                                 else:
-                                    tg_send(tg_token, cid, "CSV 파일이 아직 없어요(첫 거래 이후 생성).", reply_markup=TG_MENU)
+                                    tg_send(tg_token, cid, "CSV 파일이 아직 없어요(첫 청산 이후 생성).", reply_markup=TG_MENU)
 
-                            elif data == "brief" or data == "scan":
-                                syms = TARGET_COINS
-                                lines = ["📊 브리핑" if data == "brief" else "🌍 전체스캔(5)"]
-                                for sym in syms:
+                            elif data in ["brief", "scan"]:
+                                lines = [f"📊 브리핑 ({mode})" if data == "brief" else f"🌍 스캔(5) ({mode})"]
+                                for sym in TARGET_COINS:
                                     try:
                                         ohlcv = bot_ex.fetch_ohlcv(sym, "5m", limit=250)
-                                        df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","vol"])
-                                        df, pack = calc_indicators(df)
+                                        df_ = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","vol"])
+                                        df_, pack = calc_indicators(df_)
                                         if pack is None:
                                             continue
-                                        out = ai_decide(sym, pack, state, aggressive=aggressive)
+
+                                        out = ai_decide(sym, pack, state, mode, cfg)
+                                        # 글로벌옵션 자동 적용
+                                        if cfg.get("use_ai_global", True) and isinstance(out.get("global", {}), dict):
+                                            state["ai_global"] = out["global"]
+                                            save_runtime_state(state)
+
                                         r = out.get("risk", {})
                                         lines.append(
                                             f"\n[{sym}] {out.get('decision','hold').upper()} (conf {out.get('confidence',0)}%)\n"
-                                            f"- 레버 x{r.get('leverage')} | 진입금액 {r.get('risk_pct')}% | SL {r.get('sl_gap')}% | TP {r.get('tp_target')}%\n"
-                                            f"- 근거(쉬움): {out.get('easy','')}"
+                                            f"- x{r.get('leverage')} | 진입금액 {r.get('risk_pct')}% | SL {r.get('sl_gap')}% | TP {r.get('tp_target')}%\n"
+                                            f"- 한줄: {out.get('one_liner','')}"
                                         )
-                                        # last_ai_brief 저장
-                                        state["last_ai_brief"][sym] = out
-                                        save_runtime_state(state)
                                     except:
                                         continue
                                 tg_send(tg_token, cid, "\n".join(lines), reply_markup=TG_MENU)
@@ -979,22 +1000,25 @@ def telegram_bot_thread():
                 except:
                     pass
 
-            # 자동매매 OFF면 루프는 계속(리포트/메뉴는 가능)
+            # 자동매매 OFF면 보고/조회만
             if not cfg.get("auto_trade", False):
                 time.sleep(0.5)
                 continue
-
-            # AI 글로벌 옵션 적용(매번 브리핑/진입 시 업데이트될 수 있음)
-            ai_global = state.get("ai_global", default_runtime_state()["ai_global"])
 
             # pause 로직
             if is_paused(state):
                 time.sleep(1.0)
                 continue
 
+            ai_global = state.get("ai_global", default_runtime_state()["ai_global"])
+
+            # 뉴스 회피 체크(글로벌)
+            cal = get_calendar_cached()
+            blocked, why = is_news_block(ai_global, cal)
+
             ts = time.time()
 
-            # 1) 포지션 관리(부분익절/트레일링/SL/TP)
+            # 1) 포지션 관리(부분익절/트레일링/SL/TP + 추세면 TP 연장 1회)
             if ts - last_manage >= int(cfg.get("manage_interval_sec", 2)):
                 last_manage = ts
 
@@ -1008,27 +1032,29 @@ def telegram_bot_thread():
 
                     roi = safe_float(p.get("percentage", 0))
                     mark = safe_float(p.get("markPrice", 0)) or safe_float(p.get("last", 0))
-
                     meta = state.get("trades", {}).get(sym, {})
                     if not meta:
-                        # 혹시 state가 날아가면 최소 값으로 생성
+                        # 상태 유실 대비
                         meta = {
                             "entry_price": safe_float(p.get("entryPrice", mark)),
                             "qty": contracts,
                             "risk": {
                                 "leverage": safe_float(p.get("leverage", 1)),
                                 "risk_pct": "",
-                                "sl_gap": 5.0,
-                                "tp_target": 8.0,
+                                "sl_gap": 1.0,
+                                "tp_target": 2.0,
                                 "tp1_gap": 0.5, "tp1_size": 30,
-                                "tp2_gap": 2.0, "tp2_size": 30,
-                                "use_trailing": True, "trail_start": 1.2, "trail_gap": 0.6,
+                                "tp2_gap": 1.2, "tp2_size": 30,
+                                "use_trailing": True,
+                                "trail_start": 1.0, "trail_gap": 0.5,
                             },
                             "tp1_done": False,
                             "tp2_done": False,
+                            "tp_extended": False,
                             "best_price": mark,
                             "reason": "",
                             "easy": "",
+                            "mode": mode,
                         }
                         state.setdefault("trades", {})[sym] = meta
                         save_runtime_state(state)
@@ -1037,22 +1063,19 @@ def telegram_bot_thread():
                     r = meta.get("risk", {})
                     lev = safe_float(r.get("leverage", p.get("leverage", 1)), 1)
                     risk_pct = r.get("risk_pct", "")
-                    sl_gap = safe_float(r.get("sl_gap", 5.0), 5.0)
-                    tp_target = safe_float(r.get("tp_target", 8.0), 8.0)
+                    sl_gap = safe_float(r.get("sl_gap", 1.0), 1.0)
+                    tp_target = safe_float(r.get("tp_target", 2.0), 2.0)
 
                     tp1_gap = safe_float(r.get("tp1_gap", 0.5), 0.5)
                     tp1_size = int(safe_float(r.get("tp1_size", 30), 30))
-                    tp2_gap = safe_float(r.get("tp2_gap", 2.0), 2.0)
+                    tp2_gap = safe_float(r.get("tp2_gap", 1.2), 1.2)
                     tp2_size = int(safe_float(r.get("tp2_size", 30), 30))
 
                     use_trailing = bool(r.get("use_trailing", True))
-                    trail_start = safe_float(r.get("trail_start", 1.2), 1.2)
-                    trail_gap = safe_float(r.get("trail_gap", 0.6), 0.6)
+                    trail_start = safe_float(r.get("trail_start", 1.0), 1.0)
+                    trail_gap = safe_float(r.get("trail_gap", 0.5), 0.5)
 
-                    tp1_done = bool(meta.get("tp1_done", False))
-                    tp2_done = bool(meta.get("tp2_done", False))
-
-                    # best_price 업데이트(트레일링)
+                    # best_price 갱신
                     best_price = safe_float(meta.get("best_price", mark), mark)
                     if side == "long":
                         best_price = max(best_price, mark)
@@ -1061,262 +1084,253 @@ def telegram_bot_thread():
                     meta["best_price"] = best_price
                     save_runtime_state(state)
 
-                    # TP1 부분익절
-                    if (not tp1_done) and roi >= tp1_gap:
+                    # TP1
+                    if (not meta.get("tp1_done", False)) and roi >= tp1_gap:
                         close_qty = safe_float(contracts * (tp1_size / 100.0), 0)
                         close_qty = safe_float(bot_ex.amount_to_precision(sym, close_qty), 0)
                         if close_qty > 0:
                             close_position_market(bot_ex, sym, side, close_qty)
                             meta["tp1_done"] = True
                             save_runtime_state(state)
-                            append_trade_log({
-                                "Time": now_str(), "Symbol": sym, "Event": "TP1(부분익절)", "Side": side,
-                                "Qty": close_qty, "EntryPrice": entry_price, "ExitPrice": mark,
-                                "PnL_USDT": "", "PnL_Percent": f"{roi:.2f}",
-                                "Leverage": lev, "RiskPct": risk_pct,
-                                "TP_Target": tp_target, "SL_Target": sl_gap,
-                                "Reason": str(meta.get("reason",""))[:200], "Review": ""
-                            })
-                            if cfg.get("telegram_enabled", True):
-                                tg_send(tg_token, tg_id, f"✅ TP1 부분익절: {sym} ({roi:.2f}%)", reply_markup=TG_MENU)
 
-                    # TP2 부분익절
-                    if (not tp2_done) and roi >= tp2_gap:
+                    # TP2
+                    if (not meta.get("tp2_done", False)) and roi >= tp2_gap:
                         close_qty = safe_float(contracts * (tp2_size / 100.0), 0)
                         close_qty = safe_float(bot_ex.amount_to_precision(sym, close_qty), 0)
                         if close_qty > 0:
                             close_position_market(bot_ex, sym, side, close_qty)
                             meta["tp2_done"] = True
                             save_runtime_state(state)
-                            append_trade_log({
-                                "Time": now_str(), "Symbol": sym, "Event": "TP2(부분익절)", "Side": side,
-                                "Qty": close_qty, "EntryPrice": entry_price, "ExitPrice": mark,
-                                "PnL_USDT": "", "PnL_Percent": f"{roi:.2f}",
-                                "Leverage": lev, "RiskPct": risk_pct,
-                                "TP_Target": tp_target, "SL_Target": sl_gap,
-                                "Reason": str(meta.get("reason",""))[:200], "Review": ""
-                            })
-                            if cfg.get("telegram_enabled", True):
-                                tg_send(tg_token, tg_id, f"✅ TP2 부분익절: {sym} ({roi:.2f}%)", reply_markup=TG_MENU)
 
-                    # 트레일링
+                    # 트레일링 청산
                     if use_trailing and roi >= trail_start:
                         if side == "long":
                             dd = (best_price - mark) / best_price * 100 if best_price > 0 else 0
                         else:
                             dd = (mark - best_price) / best_price * 100 if best_price > 0 else 0
                         if dd >= trail_gap:
-                            # 전량 청산
                             ok = close_position_market(bot_ex, sym, side, contracts)
                             if ok:
                                 pnl_usdt = safe_float(p.get("unrealizedPnl", 0), 0)
-                                row = {
-                                    "Time": now_str(), "Symbol": sym, "Event": "TRAIL(청산)", "Side": side,
+                                trade_row = {
+                                    "Time": now_str(), "Mode": meta.get("mode", mode),
+                                    "Symbol": sym, "Event": "TRAIL(청산)", "Side": side,
                                     "Qty": contracts, "EntryPrice": entry_price, "ExitPrice": mark,
                                     "PnL_USDT": f"{pnl_usdt:.4f}", "PnL_Percent": f"{roi:.2f}",
                                     "Leverage": lev, "RiskPct": risk_pct,
                                     "TP_Target": tp_target, "SL_Target": sl_gap,
                                     "Reason": str(meta.get("reason",""))[:200],
                                 }
-                                review = ai_review_trade(row, state)
-                                row["Review"] = review
-                                append_trade_log(row)
+                                review = ai_review_trade(trade_row)
+                                trade_row["Review"] = review
+                                trade_row["OneLine"] = make_oneline_summary(trade_row)
+                                append_trade_log(trade_row)
 
-                                if cfg.get("telegram_enabled", True):
-                                    tg_send(
-                                        tg_token, tg_id,
-                                        f"🏁 트레일링 청산: {sym} ({roi:.2f}%)\n후기:\n{review[:600]}",
-                                        reply_markup=TG_MENU
-                                    )
-
-                                # 연속손실 reset
                                 if roi < 0:
                                     state["consec_losses"] = int(state.get("consec_losses", 0)) + 1
                                 else:
                                     state["consec_losses"] = 0
 
+                                if state["consec_losses"] >= int(ai_global.get("max_consec_losses", 3)):
+                                    state["pause_until"] = int(time.time() + int(ai_global.get("pause_minutes", 30)) * 60)
+
                                 set_cooldown(state, sym, int(ai_global.get("cooldown_minutes", 10)))
                                 state["trades"].pop(sym, None)
+                                state["last_bot_note"] = f"TRAIL 청산 {sym}"
                                 save_runtime_state(state)
-                                continue
 
-                    # SL/TP 최종 청산
+                                if cfg.get("telegram_enabled", True):
+                                    tg_send(tg_token, tg_id, f"🏁 트레일링 청산: {sym} ({roi:.2f}%)\n{trade_row['OneLine']}", reply_markup=TG_MENU)
+                            continue
+
+                    # SL 또는 TP 도달
                     if roi <= -abs(sl_gap) or roi >= tp_target:
+
+                        # --- TP 연장(추세면 익절 길게): TP 닿았을 때 1회 연장 ---
+                        if roi >= tp_target and cfg.get("allow_tp_extend", True) and cfg.get("prefer_long_tp_trend", True):
+                            if not meta.get("tp_extended", False):
+                                # 안전/공격 둘 다: 트레일링 ON이면 추세 유지 가정(간단)
+                                if bool(r.get("use_trailing", True)):
+                                    meta["tp_extended"] = True
+                                    meta["risk"]["tp_target"] = float(tp_target) * float(cfg.get("tp_extend_mult", 1.7))
+                                    save_runtime_state(state)
+                                    if cfg.get("telegram_enabled", True):
+                                        tg_send(tg_token, tg_id, f"📈 TP 도달 → 추세로 판단해 TP 1회 연장! {sym}\n새 TP: {meta['risk']['tp_target']:.2f}%", reply_markup=TG_MENU)
+                                    continue  # 지금은 청산 안 함
+
                         event = "SL(손절)" if roi <= -abs(sl_gap) else "TP(익절)"
                         ok = close_position_market(bot_ex, sym, side, contracts)
                         if ok:
                             pnl_usdt = safe_float(p.get("unrealizedPnl", 0), 0)
-                            row = {
-                                "Time": now_str(), "Symbol": sym, "Event": event, "Side": side,
+                            trade_row = {
+                                "Time": now_str(), "Mode": meta.get("mode", mode),
+                                "Symbol": sym, "Event": event, "Side": side,
                                 "Qty": contracts, "EntryPrice": entry_price, "ExitPrice": mark,
                                 "PnL_USDT": f"{pnl_usdt:.4f}", "PnL_Percent": f"{roi:.2f}",
                                 "Leverage": lev, "RiskPct": risk_pct,
                                 "TP_Target": tp_target, "SL_Target": sl_gap,
                                 "Reason": str(meta.get("reason",""))[:200],
                             }
-                            review = ai_review_trade(row, state)
-                            row["Review"] = review
-                            append_trade_log(row)
+                            review = ai_review_trade(trade_row)
+                            trade_row["Review"] = review
+                            trade_row["OneLine"] = make_oneline_summary(trade_row)
+                            append_trade_log(trade_row)
 
-                            # 연속손실 처리(여기도 AI 글로벌)
                             if roi < 0:
                                 state["consec_losses"] = int(state.get("consec_losses", 0)) + 1
-                                if state["consec_losses"] >= int(ai_global.get("max_consec_losses", 3)):
-                                    state["pause_until"] = int(time.time() + int(ai_global.get("pause_minutes", 30)) * 60)
                             else:
                                 state["consec_losses"] = 0
 
-                            if cfg.get("telegram_enabled", True):
-                                tg_send(
-                                    tg_token, tg_id,
-                                    f"{'🩸' if roi<0 else '🎉'} {event}: {sym} ({roi:.2f}%)\n"
-                                    f"근거: {str(meta.get('easy',''))}\n후기:\n{review[:600]}",
-                                    reply_markup=TG_MENU
-                                )
+                            if state["consec_losses"] >= int(ai_global.get("max_consec_losses", 3)):
+                                state["pause_until"] = int(time.time() + int(ai_global.get("pause_minutes", 30)) * 60)
 
                             set_cooldown(state, sym, int(ai_global.get("cooldown_minutes", 10)))
                             state["trades"].pop(sym, None)
-                            state["last_bot_note"] = event
+                            state["last_bot_note"] = f"{event} {sym}"
                             save_runtime_state(state)
 
-            # 2) 신규 진입 스캔
+                            if cfg.get("telegram_enabled", True):
+                                emoji = "🩸" if roi < 0 else "🎉"
+                                tg_send(tg_token, tg_id, f"{emoji} {event}: {sym} ({roi:.2f}%)\n{trade_row['OneLine']}", reply_markup=TG_MENU)
+
+            # 2) 신규 진입 스캔 (공격+선별 / 안전모드)
             if ts - last_scan >= int(cfg.get("entry_scan_interval_sec", 10)):
                 last_scan = ts
 
-                # AI global 옵션은 스캔 도중 계속 갱신 가능
-                ai_global = state.get("ai_global", default_runtime_state()["ai_global"])
-                max_pos = int(ai_global.get("max_positions", 2))
+                if blocked:
+                    state["last_bot_note"] = f"뉴스 회피: {why}"
+                    save_runtime_state(state)
+                else:
+                    # 모드별 진입 기준(추천)
+                    conf_cut = 85 if mode == "SAFE" else 80  # 공격+선별이라도 80부터
+                    for sym in TARGET_COINS:
+                        if is_paused(state) or in_cooldown(state, sym) or (sym in state.get("trades", {})):
+                            continue
+                        if get_active_positions(bot_ex, [sym]):
+                            continue
 
-                positions = get_active_positions(bot_ex, TARGET_COINS)
-                if len(positions) < max_pos and (not is_paused(state)):
-
-                    # 뉴스 회피 여부(글로벌 옵션)
-                    cal = get_calendar_cached()
-                    blocked, why = is_news_block(ai_global, cal)
-                    if blocked:
-                        state["last_bot_note"] = f"뉴스 회피: {why}"
-                        save_runtime_state(state)
-                    else:
-                        for sym in TARGET_COINS:
-                            if len(get_active_positions(bot_ex, TARGET_COINS)) >= max_pos:
-                                break
-                            if in_cooldown(state, sym):
+                        # free USDT가 너무 적으면 신규 진입 스킵(원금 방어)
+                        try:
+                            bal = bot_ex.fetch_balance({"type": "swap"})
+                            free_usdt = safe_float(bal["USDT"]["free"], 0)
+                            if free_usdt < 10:
                                 continue
-                            if sym in state.get("trades", {}):
+                        except:
+                            continue
+
+                        try:
+                            ohlcv = bot_ex.fetch_ohlcv(sym, "5m", limit=250)
+                            df_ = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","vol"])
+                            df_, pack = calc_indicators(df_)
+                            if pack is None:
                                 continue
-                            # 실제 포지션이 이미 있으면 스킵
-                            if get_active_positions(bot_ex, [sym]):
-                                continue
 
-                            try:
-                                ohlcv = bot_ex.fetch_ohlcv(sym, "5m", limit=250)
-                                df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","vol"])
-                                df, pack = calc_indicators(df)
-                                if pack is None:
+                            # "공격+선별" 필터 (모드별 강도 다르게)
+                            s = pack["status"]
+                            adx_val = safe_float(s.get("ADX", 0), 0)
+                            trend_ok = (adx_val >= (25 if mode == "SAFE" else 22)) and (s.get("MA_cross") in ["golden", "flat"]) and (s.get("MACD_cross") in ["golden", "flat"])
+                            reversal_ok = bool(s.get("VOL_SPIKE", False)) and (s.get("BB_pos") in ["above", "below"])
+                            if mode == "SAFE":
+                                # 안전모드: 추세 또는 강한 반전 둘 중 하나라도 확실해야
+                                if not (trend_ok or reversal_ok):
+                                    continue
+                            else:
+                                # 공격모드도 '선별'은 유지
+                                if not (trend_ok or reversal_ok):
                                     continue
 
-                                out = ai_decide(sym, pack, state, aggressive=aggressive)
+                            out = ai_decide(sym, pack, state, mode, cfg)
 
-                                # AI가 글로벌 옵션까지 주면 적용(매번 유동)
-                                g = out.get("global", {})
-                                if isinstance(g, dict) and g:
-                                    state["ai_global"] = g
-                                    save_runtime_state(state)
-
-                                decision = out.get("decision", "hold")
-                                conf = int(out.get("confidence", 0))
-
-                                # 공격 모드이므로 conf 기준 낮춤(원하면 여기 더 낮춰도 됨)
-                                req = 70 if aggressive else 80
-                                if decision not in ["buy", "sell"] or conf < req:
-                                    continue
-
-                                r = out.get("risk", {})
-                                lev = int(safe_float(r.get("leverage", 5), 5))
-                                risk_pct = safe_float(r.get("risk_pct", 10), 10)
-                                sl_gap = safe_float(r.get("sl_gap", 2.0), 2.0)
-                                tp_target = safe_float(r.get("tp_target", 3.0), 3.0)
-
-                                # TP/트레일링 옵션도 AI가 제공
-                                tp1_gap = safe_float(r.get("tp1_gap", 0.5), 0.5)
-                                tp1_size = int(safe_float(r.get("tp1_size", 30), 30))
-                                tp2_gap = safe_float(r.get("tp2_gap", 2.0), 2.0)
-                                tp2_size = int(safe_float(r.get("tp2_size", 30), 30))
-                                use_trailing = bool(r.get("use_trailing", True))
-                                trail_start = safe_float(r.get("trail_start", 1.2), 1.2)
-                                trail_gap = safe_float(r.get("trail_gap", 0.6), 0.6)
-
-                                # 레버 설정
-                                try:
-                                    bot_ex.set_leverage(lev, sym)
-                                except:
-                                    pass
-
-                                # 주문 수량
-                                bal = bot_ex.fetch_balance({"type": "swap"})
-                                free_usdt = safe_float(bal["USDT"]["free"], 0)
-                                use_usdt = free_usdt * (risk_pct / 100.0)
-                                price = safe_float(pack["last"]["close"], 0)
-                                if price <= 0:
-                                    continue
-                                qty = (use_usdt * lev) / price
-                                qty = safe_float(bot_ex.amount_to_precision(sym, qty), 0)
-                                if qty <= 0:
-                                    continue
-
-                                bot_ex.create_market_order(sym, decision, qty)
-
-                                side_txt = "long" if decision == "buy" else "short"
-
-                                state.setdefault("trades", {})[sym] = {
-                                    "entry_time": now_str(),
-                                    "entry_price": price,
-                                    "qty": qty,
-                                    "side": side_txt,
-                                    "risk": {
-                                        "leverage": lev,
-                                        "risk_pct": risk_pct,
-                                        "sl_gap": sl_gap,
-                                        "tp_target": tp_target,
-                                        "tp1_gap": tp1_gap, "tp1_size": tp1_size,
-                                        "tp2_gap": tp2_gap, "tp2_size": tp2_size,
-                                        "use_trailing": use_trailing,
-                                        "trail_start": trail_start,
-                                        "trail_gap": trail_gap,
-                                    },
-                                    "tp1_done": False,
-                                    "tp2_done": False,
-                                    "best_price": price,
-                                    "reason": out.get("reason", ""),
-                                    "easy": out.get("easy", ""),
-                                    "review_template": out.get("review_template", ""),
-                                }
-                                state["last_bot_note"] = f"진입 {sym} {side_txt}"
-                                state["last_ai_brief"][sym] = out
+                            # AI 글로벌옵션 자동 적용(제어판에서 ON/OFF)
+                            if cfg.get("use_ai_global", True) and isinstance(out.get("global", {}), dict):
+                                state["ai_global"] = out["global"]
                                 save_runtime_state(state)
 
-                                # 텔레그램 보고(요청한 정보: 포지션/진입금액/레버/목표수익/목표손절/근거)
-                                if cfg.get("telegram_enabled", True):
-                                    tg_send(
-                                        tg_token, tg_id,
-                                        f"🎯 진입: {sym}\n"
-                                        f"- 방향: {side_txt.upper()} (conf {conf}%)\n"
-                                        f"- 사용금액: {risk_pct:.1f}% (free USDT 기준)\n"
-                                        f"- 레버: x{lev}\n"
-                                        f"- 목표수익(TP): +{tp_target:.2f}%\n"
-                                        f"- 목표손절(SL): -{sl_gap:.2f}%\n"
-                                        f"- TP1: +{tp1_gap:.2f}%에 {tp1_size}%\n"
-                                        f"- TP2: +{tp2_gap:.2f}%에 {tp2_size}%\n"
-                                        f"- 트레일링: {('ON' if use_trailing else 'OFF')} | +{trail_start:.2f}%부터 되돌림 {trail_gap:.2f}%\n"
-                                        f"- 근거(쉬움): {out.get('easy','')}\n"
-                                        f"- 근거(상세): {out.get('reason','')[:500]}",
-                                        reply_markup=TG_MENU
-                                    )
-
-                                time.sleep(2)
-
-                            except:
+                            decision = out.get("decision", "hold")
+                            conf = int(out.get("confidence", 0))
+                            if decision not in ["buy", "sell"] or conf < conf_cut:
                                 continue
+
+                            r = out.get("risk", {})
+                            lev = int(safe_float(r.get("leverage", 5), 5))
+                            risk_pct = safe_float(r.get("risk_pct", 10), 10)
+                            sl_gap = safe_float(r.get("sl_gap", 1.0), 1.0)
+                            tp_target = safe_float(r.get("tp_target", 2.0), 2.0)
+
+                            tp1_gap = safe_float(r.get("tp1_gap", 0.5), 0.5)
+                            tp1_size = int(safe_float(r.get("tp1_size", 30), 30))
+                            tp2_gap = safe_float(r.get("tp2_gap", 1.2), 1.2)
+                            tp2_size = int(safe_float(r.get("tp2_size", 30), 30))
+                            use_trailing = bool(r.get("use_trailing", True))
+                            trail_start = safe_float(r.get("trail_start", 1.0), 1.0)
+                            trail_gap = safe_float(r.get("trail_gap", 0.5), 0.5)
+
+                            # 레버 설정
+                            try:
+                                bot_ex.set_leverage(lev, sym)
+                            except:
+                                pass
+
+                            # 주문 수량(리스크는 free 기준 %)
+                            price = safe_float(pack["values"]["close"], 0)
+                            if price <= 0:
+                                continue
+                            use_usdt = free_usdt * (risk_pct / 100.0)
+                            qty = (use_usdt * lev) / price
+                            qty = safe_float(bot_ex.amount_to_precision(sym, qty), 0)
+                            if qty <= 0:
+                                continue
+
+                            bot_ex.create_market_order(sym, decision, qty)
+
+                            side_txt = "long" if decision == "buy" else "short"
+                            state.setdefault("trades", {})[sym] = {
+                                "entry_time": now_str(),
+                                "entry_price": price,
+                                "qty": qty,
+                                "side": side_txt,
+                                "mode": mode,
+                                "risk": {
+                                    "leverage": lev,
+                                    "risk_pct": risk_pct,
+                                    "sl_gap": sl_gap,
+                                    "tp_target": tp_target,
+                                    "tp1_gap": tp1_gap, "tp1_size": tp1_size,
+                                    "tp2_gap": tp2_gap, "tp2_size": tp2_size,
+                                    "use_trailing": use_trailing,
+                                    "trail_start": trail_start,
+                                    "trail_gap": trail_gap,
+                                },
+                                "tp1_done": False,
+                                "tp2_done": False,
+                                "tp_extended": False,
+                                "best_price": price,
+                                "reason": out.get("reason", ""),
+                                "easy": out.get("easy", ""),
+                            }
+                            state["last_bot_note"] = f"진입 {sym} {side_txt} ({mode})"
+                            save_runtime_state(state)
+
+                            # 텔레그램 보고(실시간 조회/보고는 텔레그램이 메인)
+                            if cfg.get("telegram_enabled", True):
+                                tg_send(
+                                    tg_token, tg_id,
+                                    f"🎯 진입: {sym} ({mode})\n"
+                                    f"- 방향: {side_txt.upper()} (conf {conf}%)\n"
+                                    f"- 사용금액: {risk_pct:.1f}% (free 기준)\n"
+                                    f"- 레버: x{lev}\n"
+                                    f"- 목표수익(TP): +{tp_target:.2f}%\n"
+                                    f"- 목표손절(SL): -{sl_gap:.2f}%\n"
+                                    f"- 트레일링: {('ON' if use_trailing else 'OFF')} | +{trail_start:.2f}%부터 되돌림 {trail_gap:.2f}%\n"
+                                    f"- 한줄: {out.get('one_liner','')}\n"
+                                    f"- 쉬운설명: {out.get('easy','')}",
+                                    reply_markup=TG_MENU
+                                )
+
+                            time.sleep(2)
+
+                        except:
+                            continue
 
             # 3) 생존신고
             if cfg.get("telegram_enabled", True) and (time.time() - last_report > int(cfg.get("report_interval_sec", 900))):
@@ -1326,7 +1340,7 @@ def telegram_bot_thread():
                     eq = safe_float(bal["USDT"]["total"], 0)
                     tg_send(
                         tg_token, tg_id,
-                        f"💤 생존신고\n총자산: ${eq:,.2f}\n연속손실: {state.get('consec_losses',0)}\n현재포지션: {len(get_active_positions(bot_ex, TARGET_COINS))}",
+                        f"💤 생존신고 ({mode})\n총자산: ${eq:,.2f}\n연속손실: {state.get('consec_losses',0)}\npause: {'ON' if is_paused(state) else 'OFF'}",
                         reply_markup=TG_MENU
                     )
                 except:
@@ -1337,15 +1351,14 @@ def telegram_bot_thread():
         except:
             time.sleep(2)
 
-
 # =========================================================
-# Streamlit UI (차트+포지션+매매일지)
+# Streamlit UI (제어판 + 투명성 + 차트/포지션/로그)
 # =========================================================
-st.title("🧩 Bitget AI Bot (공격모드) — Streamlit 제어판 + Telegram 리포트")
+st.title("🧩 Bitget AI Bot — Streamlit 제어판 (보고/조회는 Telegram)")
 
 state = load_runtime_state()
 
-# 상단 메트릭
+# 상단 요약
 try:
     bal = exchange.fetch_balance({"type": "swap"})
     usdt_total = safe_float(bal["USDT"]["total"], 0)
@@ -1354,7 +1367,6 @@ except:
     usdt_total, usdt_free = 0.0, 0.0
 
 active_positions_ui = get_active_positions(exchange, TARGET_COINS)
-
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("총자산(USDT)", f"${usdt_total:,.2f}")
 c2.metric("주문가능(USDT)", f"${usdt_free:,.2f}")
@@ -1363,15 +1375,46 @@ c4.metric("자동매매", "🟢 ON" if config.get("auto_trade") else "🔴 OFF")
 st.caption(f"봇 메모: {state.get('last_bot_note','')}")
 st.divider()
 
-# 사이드바(사용자는 'ON/OFF' 정도만)
+# =======================
+# 사이드바 = 모든 제어판
+# =======================
 with st.sidebar:
-    st.header("🛠️ 제어판")
-    st.caption("요청대로: 옵션은 AI가 매번 결정(여기는 보고용/ONOFF 정도만)")
+    st.header("🛠️ 제어판 (모든 설정은 여기서)")
+    st.caption("Telegram은 보고/조회만, Streamlit은 설정만!")
 
-    config["auto_trade"] = st.checkbox("🤖 자동매매 ON", value=config.get("auto_trade", False))
+    config["auto_trade"] = st.checkbox("🤖 자동매매 ON/OFF", value=config.get("auto_trade", False))
     config["telegram_enabled"] = st.checkbox("📩 텔레그램 사용", value=config.get("telegram_enabled", True))
-    config["aggressive_mode"] = st.checkbox("🔥 공격 모드", value=config.get("aggressive_mode", True))
 
+    st.divider()
+    st.subheader("🎚️ 모드 선택(추천)")
+    config["trade_mode"] = st.radio("거래 모드", ["SAFE", "AGGRESSIVE"], index=0 if config.get("trade_mode","SAFE")=="SAFE" else 1)
+    st.caption("SAFE: 원금 방어 우선 / AGGRESSIVE: 공격+선별(애매하면 HOLD)")
+
+    st.divider()
+    st.subheader("🧠 AI 글로벌옵션 적용")
+    config["use_ai_global"] = st.checkbox("AI가 추천한 글로벌옵션 자동 적용", value=config.get("use_ai_global", True))
+    st.caption("ON이면 AI가 cooldown/연속손실 pause/뉴스회피 등을 자동 조절")
+
+    st.divider()
+    st.subheader("🛡️ 원금손실 최소화 가드레일(추천)")
+    config["enable_hard_guardrails"] = st.checkbox("가드레일 사용(추천)", value=config.get("enable_hard_guardrails", True))
+    st.caption("ON이면 모드별로 레버/진입금액 상한을 강제(원금 방어에 도움)")
+
+    with st.expander("가드레일 세부(원하면 조정)"):
+        config["hard_max_leverage_safe"] = st.slider("SAFE 최대 레버", 1, 50, int(config.get("hard_max_leverage_safe", 10)))
+        config["hard_max_leverage_aggressive"] = st.slider("AGGR 최대 레버", 1, 50, int(config.get("hard_max_leverage_aggressive", 20)))
+        config["hard_max_risk_pct_safe"] = st.slider("SAFE 최대 진입금액(%)", 1.0, 100.0, float(config.get("hard_max_risk_pct_safe", 15.0)))
+        config["hard_max_risk_pct_aggressive"] = st.slider("AGGR 최대 진입금액(%)", 1.0, 100.0, float(config.get("hard_max_risk_pct_aggressive", 30.0)))
+
+    st.divider()
+    st.subheader("🎯 스타일")
+    config["prefer_short_sl"] = st.checkbox("손절은 짧게", value=config.get("prefer_short_sl", True))
+    config["prefer_long_tp_trend"] = st.checkbox("추세면 익절 길게(트레일링/TP연장)", value=config.get("prefer_long_tp_trend", True))
+    config["allow_tp_extend"] = st.checkbox("TP 도달 시 1회 연장 허용", value=config.get("allow_tp_extend", True))
+    config["tp_extend_mult"] = st.slider("TP 연장 배수", 1.1, 3.0, float(config.get("tp_extend_mult", 1.7)))
+
+    st.divider()
+    st.subheader("⏱️ 루프 주기")
     config["manage_interval_sec"] = st.slider("포지션 관리 주기(초)", 1, 10, int(config.get("manage_interval_sec", 2)))
     config["entry_scan_interval_sec"] = st.slider("진입 스캔 주기(초)", 5, 60, int(config.get("entry_scan_interval_sec", 10)))
     config["report_interval_sec"] = st.slider("생존신고 주기(초)", 120, 3600, int(config.get("report_interval_sec", 900)))
@@ -1382,25 +1425,32 @@ with st.sidebar:
     config["ui_interval_tf"] = st.selectbox("차트 인터벌", ["1","5","15","60","240","D"], index=["1","5","15","60","240","D"].index(config.get("ui_interval_tf","5")))
 
     st.divider()
-    if st.button("💾 저장"):
+    if st.button("💾 설정 저장"):
         save_settings(config)
         st.success("저장됨(봇이 다음 루프부터 반영)")
 
-    st.divider()
-    st.subheader("🤖 OpenAI 키")
-    if not openai_key:
-        k = st.text_input("OPENAI_API_KEY", type="password")
-        if k:
-            config["openai_api_key"] = k
-            save_settings(config)
-            st.success("저장됨. 새로고침/재실행 시 적용")
     if st.button("📡 텔레그램 메뉴 보내기"):
         tg_send(tg_token, tg_id, "✅ 메뉴 갱신", reply_markup=TG_MENU)
 
     st.divider()
-    st.subheader("🧠 AI가 방금 추천한 글로벌 옵션")
-    ai_global = state.get("ai_global", {})
-    st.json(ai_global)
+    st.subheader("🧹 매매일지 초기화")
+    if "confirm_reset_log" not in st.session_state:
+        st.session_state["confirm_reset_log"] = False
+
+    if st.button("⚠️ 매매일지 초기화(1차)"):
+        st.session_state["confirm_reset_log"] = True
+        st.warning("한 번 더 누르면 trade_log.csv가 삭제됩니다.")
+
+    if st.session_state["confirm_reset_log"]:
+        if st.button("🗑️ 초기화 확정(2차)"):
+            try:
+                if os.path.exists(TRADE_LOG_FILE):
+                    os.remove(TRADE_LOG_FILE)
+                st.session_state["confirm_reset_log"] = False
+                st.success("trade_log.csv 초기화 완료!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"초기화 실패: {e}")
 
 # 봇 스레드 시작(중복 방지)
 if not any(t.name == "TG_Thread" for t in threading.enumerate()):
@@ -1408,14 +1458,15 @@ if not any(t.name == "TG_Thread" for t in threading.enumerate()):
     add_script_run_ctx(t)
     t.start()
 
-# --- 메인: TradingView 다크 차트 ---
+# =========================================================
+# 메인 화면: 차트 + 포지션 + 로그(한줄) + AI 투명성
+# =========================================================
 st.subheader("🕯️ TradingView 차트(다크모드)")
 tv_sym = TV_SYMBOL_MAP.get(config.get("ui_symbol"), "BINANCE:BTCUSDT")
 render_tradingview(tv_sym, interval=config.get("ui_interval_tf", "5"), height=560)
 
 st.divider()
 
-# --- 포지션 표시(제어판에서도 보여달라고 해서 유지) ---
 st.subheader("📌 현재 포지션(요약)")
 if active_positions_ui:
     rows = []
@@ -1436,34 +1487,73 @@ else:
 
 st.divider()
 
-# --- Streamlit에서도 매매일지 표시 ---
-st.subheader("🧾 매매일지(자동 회고 포함)")
-log_df = read_trade_log(200)
+st.subheader("🧾 매매일지(너가 보기 편한 한줄 + 상세는 숨김)")
+log_df = read_trade_log(int(config.get("log_rows_ui", 200)))
 if log_df.empty:
     st.caption("아직 거래 기록이 없어요. (첫 청산 이후 생성)")
 else:
-    st.dataframe(log_df, use_container_width=True, hide_index=True)
+    # 한줄 리스트
+    for i, r in log_df.iterrows():
+        st.write(f"• {r.get('OneLine','')}")
+        with st.expander("상세 보기"):
+            st.write({
+                "Time": r.get("Time",""),
+                "Mode": r.get("Mode",""),
+                "Symbol": r.get("Symbol",""),
+                "Event": r.get("Event",""),
+                "Side": r.get("Side",""),
+                "Qty": r.get("Qty",""),
+                "Entry": r.get("EntryPrice",""),
+                "Exit": r.get("ExitPrice",""),
+                "PnL%": r.get("PnL_Percent",""),
+                "Leverage": r.get("Leverage",""),
+                "RiskPct": r.get("RiskPct",""),
+                "TP": r.get("TP_Target",""),
+                "SL": r.get("SL_Target",""),
+                "Reason": r.get("Reason",""),
+                "Review": r.get("Review",""),
+            })
 
     csv = log_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button("💾 CSV 다운로드", csv, "trade_log.csv", "text/csv")
 
 st.divider()
 
-# --- 최근 AI 브리핑(요청: AI가 옵션을 매번 보고만 해주면) ---
-st.subheader("🧠 최근 AI 판단(보고용)")
-last_ai = state.get("last_ai_brief", {})
-if not last_ai:
-    st.caption("아직 AI 브리핑/진입이 없어요. 텔레그램에서 브리핑 버튼 누르거나 자동매매 ON 해보세요.")
-else:
-    # 최신 5개 정도
-    items = list(last_ai.items())[-5:]
-    for sym, out in items:
-        r = out.get("risk", {})
-        st.markdown(f"### {sym}")
-        st.write(f"- 결론: {out.get('decision','hold').upper()} (conf {out.get('confidence',0)}%)")
-        st.write(f"- 레버: x{r.get('leverage')} / 진입금액: {r.get('risk_pct')}% / SL: {r.get('sl_gap')}% / TP: {r.get('tp_target')}%")
-        st.write(f"- 쉬운설명: {out.get('easy','')}")
-        with st.expander("상세 근거"):
-            st.write(out.get("reason",""))
+st.subheader("🔎 AI가 지금 무엇을 보고 판단하는지(투명성)")
+st.caption("※ 실제 매매 판단/보고/조회는 텔레그램이 메인입니다. 여긴 확인용!")
 
-st.caption("✅ Telegram에서 매매일지(최근/CSV), 포지션, 잔고, 브리핑/스캔, ON/OFF 모두 가능합니다.")
+col_a, col_b = st.columns(2)
+with col_a:
+    st.markdown("### ✅ AI가 사용하는 지표 목록")
+    st.write(INDICATOR_LIST)
+    st.markdown("### ✅ AI가 보는 차트")
+    st.write("- timeframe: 5m (고정)")
+    st.write(f"- 감시 코인: {', '.join([c.split('/')[0] for c in TARGET_COINS])}")
+
+with col_b:
+    debug_symbol = st.selectbox("투명성 확인할 코인", TARGET_COINS, index=0)
+    last_in = state.get("last_ai_inputs", {}).get(debug_symbol, {})
+    last_out = state.get("last_ai_outputs", {}).get(debug_symbol, {})
+
+    st.markdown("### 🧾 마지막 AI 입력(요약)")
+    if last_in:
+        st.json({
+            "symbol": last_in.get("symbol"),
+            "timeframe": last_in.get("timeframe"),
+            "mode": last_in.get("mode"),
+            "indicator_status": last_in.get("indicator_status"),
+            "consec_losses": last_in.get("consec_losses"),
+            "open_positions": last_in.get("open_positions"),
+        })
+        with st.expander("지표 값 전체 보기"):
+            st.json(last_in.get("indicator_values", {}))
+    else:
+        st.caption("아직 AI가 이 코인을 판단한 기록이 없어요. (텔레그램에서 브리핑/스캔 누르거나 자동매매 ON)")
+
+    st.markdown("### 🤖 마지막 AI 출력(결정)")
+    if last_out:
+        st.json(last_out)
+    else:
+        st.caption("아직 출력 기록 없음")
+
+st.caption("⚠️ 자동매매는 손실이 발생할 수 있어요. 실전 전에는 반드시 샌드박스에서 충분히 테스트하세요.")
