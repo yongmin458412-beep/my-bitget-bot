@@ -1008,3 +1008,46 @@ if st.sidebar.button("🤖 OpenAI 연결 테스트"):
             st.sidebar.warning("💰 잔고 부족! OpenAI API 설정 페이지에서 'Credit Balance'를 충전해야 합니다. (ChatGPT Plus 결제와는 다릅니다)")
         elif "invalid_api_key" in str(e):
             st.sidebar.warning("🔑 키 오류! sk-로 시작하는 키가 맞는지, 공백은 없는지 확인하세요.")
+
+
+# =========================================================
+# 💰 [사이드바] 실시간 내 잔고 & 포지션 현황
+# =========================================================
+with st.sidebar:
+    st.divider()
+    st.header("내 지갑 현황 (Wallet)")
+    
+    try:
+        # 1. 잔고 조회
+        balance = exchange.fetch_balance({'type': 'swap'})
+        usdt_free = balance['USDT']['free']
+        usdt_total = balance['USDT']['total']
+        
+        st.metric("총 자산 (USDT)", f"${usdt_total:,.2f}")
+        st.metric("주문 가능", f"${usdt_free:,.2f}")
+        
+        # 2. 포지션 조회
+        st.divider()
+        st.subheader("보유 포지션")
+        
+        # 전체 심볼에 대해 포지션 조회는 느리므로, 주요 코인만 조회하거나 전체 조회
+        # (Bitget은 fetch_positions()에 인자가 없으면 전체를 가져옵니다)
+        positions = exchange.fetch_positions(symbols=TARGET_COINS) 
+        active_positions = [p for p in positions if float(p['contracts']) > 0]
+        
+        if active_positions:
+            for p in active_positions:
+                symbol = p['symbol'].split(':')[0]
+                side = "🟢 Long" if p['side'] == 'long' else "🔴 Short"
+                pnl = float(p['unrealizedPnl'])
+                roi = float(p['percentage'])
+                lev = p['leverage']
+                
+                # 카드 형태로 표시
+                st.info(f"**{symbol}** ({side} x{lev})\n"
+                        f"수익: **{roi:.2f}%** (${pnl:.2f})")
+        else:
+            st.caption("현재 무포지션 (관망 중)")
+            
+    except Exception as e:
+        st.error(f"데이터 조회 실패: {e}")
