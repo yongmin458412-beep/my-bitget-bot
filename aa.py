@@ -730,29 +730,41 @@ def telegram_thread(ex, main_symbol):
 # 👆 [여기까지 복사]
 
 
-# ---------------------------------------------------------
-# 📅 데이터 수집 (ForexFactory) - UI 표시용 함수 (복구)
-# ---------------------------------------------------------
-@st.cache_data(ttl=3600)
-def get_forex_events():
-    try:
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}).json()
-        events = []
-        for item in res:
-            if item['country'] == 'USD' and item['impact'] in ['High', 'Medium']:
-                events.append({"날짜": item['date'][:10], "시간": item['date'][11:], "지표": item['title'], "중요도": "🔥" if item['impact']=='High' else "⚠️"})
-        return pd.DataFrame(events)
-    except: return pd.DataFrame()
-        
+# =========================================================
+# [메인 로직] 데이터 로딩 및 처리
+# =========================================================
+# 1. 변수 초기화 (NameError 방지용 핵심 코드!)
+df = None
+status = {}
+last = None
+
+try:
+    # 2. OHLCV 데이터 가져오기
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=200)
+    
+    if not ohlcv:
+        st.error("🚨 데이터 로딩 실패: 거래소에서 차트 데이터를 가져오지 못했습니다.")
+    else:
+        # 3. 데이터프레임 변환
+        df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+        df['time'] = pd.to_datetime(df['time'], unit='ms')
+
+        # 4. 보조지표 계산
+        df, status, last = calc_indicators(df)
+
+except Exception as e:
+    st.error(f"🚨 시스템 오류 발생: {e}")
+    print(f"Main Logic Error: {e}")
+
+
 # =========================================================
 # [메인 UI 1] 시장 데이터 브리핑 (Dashboard)
 # =========================================================
 st.subheader(f"📊 {symbol} 실시간 현황")
 
-# 🔥 [핵심 수정] 데이터가 안전하게 있을 때만 화면을 그립니다.
+# 🔥 이제 last가 None이어도 에러가 나지 않습니다.
 if last is not None:
-    # 1. 추세 판단 (ADX 기준) - 여기가 에러 났던 부분!
+    # 1. 추세 판단 (ADX 기준)
     is_trend = last['ADX'] >= 25
     trend_str = "🔥 강력한 추세장" if is_trend else "💤 지루한 횡보장"
     
@@ -764,9 +776,10 @@ if last is not None:
     
     with col2:
         rsi_val = last['RSI']
+        # RSI 색상 처리
         rsi_color = "normal"
-        if rsi_val > 70: rsi_color = "inverse" # 빨강 (과매수)
-        elif rsi_val < 30: rsi_color = "off"     # 초록/회색 (과매도) -> Streamlit에선 off가 연한색 처리됨
+        if rsi_val > 70: rsi_color = "inverse" # 빨강
+        elif rsi_val < 30: rsi_color = "off"     # 초록/회색
         st.metric("RSI (강도)", f"{rsi_val:.1f}", delta=status.get('RSI'), delta_color=rsi_color)
         
     with col3:
@@ -774,7 +787,7 @@ if last is not None:
         st.metric("ADX (추세)", f"{adx_val:.1f}", delta=trend_str)
         
     with col4:
-        # 볼린저밴드 위치 퍼센트 (0~1)
+        # 볼린저밴드 위치
         bb_width = last['BB_upper'] - last['BB_lower']
         if bb_width > 0:
             bb_pos = (last['close'] - last['BB_lower']) / bb_width
@@ -783,7 +796,7 @@ if last is not None:
             st.metric("BB 위치", "계산 불가")
 
 else:
-    # 데이터가 없을 때 보여줄 안내문
+    # 데이터가 로딩되지 않았을 때
     st.warning("⚠️ 차트 데이터를 불러오는 중이거나, 데이터가 부족합니다.")
     
 # =========================================================
