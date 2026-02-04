@@ -491,35 +491,7 @@ def calc_indicators(df):
     if config.get('use_adx', True):
         status['ADX'] = "📈 강한추세" if last['ADX'] > 25 else "🦀 횡보장"
 
-    # [지표 상태판 코드 근처에 추가]
-    # === [메인 UI 3: 10종 지표 상세 대시보드] ===
-    with st.expander("📊 10종 보조지표 종합 상태판", expanded=True):
-        cols = st.columns(5)
-        idx = 0
-        
-        # 👇 [수정 1] 개수를 세기 위해 변수를 0으로 초기화합니다.
-        active_cnt_l = 0
-        active_cnt_s = 0
-        
-        for name, stat in status.items():
-            color = "off"
-            # 👇 [수정 2] 반복문을 돌면서 매수/매도 개수를 셉니다.
-            if "매수" in stat: 
-                color = "normal"
-                active_cnt_l += 1
-            elif "매도" in stat: 
-                color = "inverse"
-                active_cnt_s += 1
-                
-            cols[idx % 5].metric(name, stat, delta_color=color)
-            idx += 1
     
-        # 👇 [수정 3] 다 세어진 개수를 화면에 표시합니다.
-        st.caption("💡 **범례:** 🟢 매수신호(Buy) | 🔴 매도신호(Sell) | ⚪ 중립(Neutral)")
-        st.caption(f"🎯 **종합 집계:** 매수 신호 **{active_cnt_l}개** / 매도 신호 **{active_cnt_s}개**")
-        
-    return df, status, last
-
 def generate_wonyousi_strategy(df, status_summary):
     """
     [전략 수정: 스윙/반등 확인형]
@@ -821,36 +793,68 @@ st.caption(f"모드: {mode_str} | 현재가: ${curr_price:,.2f}")
     
 is_trend_mode = last['ADX'] >= 25 and config['use_dual_mode']
 
-# === [메인 UI 3: 10종 지표 상세 대시보드] ===
-with st.expander("📊 지표 상태판 (Indicator Dashboard)", expanded=True):
+# =========================================================
+# [메인 UI 3] 10종 지표 종합 요약 (심플 버전)
+# =========================================================
+st.divider()
+
+# 1. 매수/매도 개수 계산
+active_cnt_l = 0
+active_cnt_s = 0
+for _, stat in status.items():
+    if "매수" in stat: active_cnt_l += 1
+    elif "매도" in stat: active_cnt_s += 1
+
+# 2. 종합 점수 및 디자인 설정
+total_score = active_cnt_l - active_cnt_s
+
+if total_score >= 3:
+    sentiment = "🚀 매수 우위"
+    bg_color = "#d4edda"; text_color = "#155724"; border_color = "#c3e6cb"
+elif total_score >= 1:
+    sentiment = "📈 약한 매수"
+    bg_color = "#e2e6ea"; text_color = "#0c5460"; border_color = "#bee5eb"
+elif total_score <= -3:
+    sentiment = "📉 매도 우위"
+    bg_color = "#f8d7da"; text_color = "#721c24"; border_color = "#f5c6cb"
+elif total_score <= -1:
+    sentiment = "🔻 약한 매도"
+    bg_color = "#fff3cd"; text_color = "#856404"; border_color = "#ffeeba"
+else:
+    sentiment = "⚖️ 중립 (관망)"
+    bg_color = "#f8f9fa"; text_color = "#383d41"; border_color = "#d6d8db"
+
+# 3. [수정됨] 폰트 크기를 줄인 컴팩트 배너
+st.markdown(f"""
+<div style="
+    padding: 10px; 
+    border-radius: 8px; 
+    background-color: {bg_color}; 
+    color: {text_color}; 
+    border: 1px solid {border_color};
+    text-align: center;
+    margin-bottom: 10px;">
+    <div style="font-size: 18px; font-weight: bold; margin-bottom: 5px;">{sentiment}</div>
+    <div style="font-size: 13px;">
+        매수 시그널 <b>{active_cnt_l}</b>개 vs 매도 시그널 <b>{active_cnt_s}</b>개
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# 4. 상세 내역은 '접어두기'로 숨김 (필요할 때만 클릭)
+with st.expander("🔍 지표 상세 확인하기"):
     cols = st.columns(5)
     idx = 0
-    
-    # 개수 세기 초기화
-    active_cnt_l = 0
-    active_cnt_s = 0
-    
-    # 👇 [핵심 수정] ind_status를 status로 변경했습니다!
     for name, stat in status.items():
-        color = "off"
-        if "매수" in stat: 
-            color = "normal"
-            active_cnt_l += 1
-        elif "매도" in stat: 
-            color = "inverse"
-            active_cnt_s += 1
-            
-        cols[idx % 5].metric(name, stat, delta_color=color)
+        # 텍스트 색상 단순화
+        if "매수" in stat: color = "green"
+        elif "매도" in stat: color = "red"
+        else: color = "off"
+        
+        cols[idx % 5].caption(f"{name}") # 글씨 작게
+        cols[idx % 5].markdown(f":{color}[{stat}]")
         idx += 1
 
-    st.caption("💡 **범례:** 🟢 매수신호(Buy) | 🔴 매도신호(Sell) | ⚪ 중립(Neutral)")
-    st.caption(f"🎯 **종합 집계:** 매수 신호 **{active_cnt_l}개** / 매도 신호 **{active_cnt_s}개**")
-    
-h = 450
-tv_studies = ["RSI@tv-basicstudies", "BB@tv-basicstudies", "MASimple@tv-basicstudies"]
-studies_json = str(tv_studies).replace("'", '"')
-tv = f"""<div class="tradingview-widget-container"><div id="tradingview_chart"></div><script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script><script type="text/javascript">new TradingView.widget({{ "width": "100%", "height": {h}, "symbol": "BITGET:{symbol.replace('/','').split(':')[0]}.P", "interval": "5", "theme": "dark", "studies": {studies_json}, "container_id": "tradingview_chart" }});</script></div>"""
-components.html(tv, height=h)
 
 # 4개의 탭으로 확장 (새 기능 포함)
 t1, t2, t3, t4 = st.tabs(["🤖 자동매매 & AI분석", "⚡ 수동주문", "📅 시장정보", "📜 매매일지(DB)"])
