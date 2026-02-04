@@ -497,7 +497,7 @@ def get_forex_events():
         return df
     except Exception as e:
         print(f"Calendar Error: {e}")
-        return pd.DataFrame()a
+        return pd.DataFrame()
     
 def generate_wonyousi_strategy(df, status_summary):
     """
