@@ -745,43 +745,47 @@ def get_forex_events():
         return pd.DataFrame(events)
     except: return pd.DataFrame()
         
-# ---------------------------------------------------------
-# 📊 메인 화면 (UI 통합)
-# ---------------------------------------------------------
-# [이 코드로 덮어씌우세요]
-# [데이터 로딩 부분 수정]
-try:
-    # 1. 시세 조회
-    ticker = exchange.fetch_ticker(symbol)
-    curr_price = ticker['last']
+# =========================================================
+# [메인 UI 1] 시장 데이터 브리핑 (Dashboard)
+# =========================================================
+st.subheader(f"📊 {symbol} 실시간 현황")
+
+# 🔥 [핵심 수정] 데이터가 안전하게 있을 때만 화면을 그립니다.
+if last is not None:
+    # 1. 추세 판단 (ADX 기준) - 여기가 에러 났던 부분!
+    is_trend = last['ADX'] >= 25
+    trend_str = "🔥 강력한 추세장" if is_trend else "💤 지루한 횡보장"
     
-    # 2. 캔들 데이터 조회
-    ohlcv = exchange.fetch_ohlcv(symbol, '5m', limit=200)
+    # 2. 4단 컬럼 데이터 표시
+    col1, col2, col3, col4 = st.columns(4)
     
-    # 3. 데이터프레임 변환
-    df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
-    df['time'] = pd.to_datetime(df['time'], unit='ms')
+    with col1:
+        st.metric("현재가 (Price)", f"${last['close']:,.2f}")
     
-    # 4. 지표 계산 (변수명을 status로 통일!)
-    df, status, last = calc_indicators(df)  # 👈 여기가 핵심입니다! (ind_status -> status)
+    with col2:
+        rsi_val = last['RSI']
+        rsi_color = "normal"
+        if rsi_val > 70: rsi_color = "inverse" # 빨강 (과매수)
+        elif rsi_val < 30: rsi_color = "off"     # 초록/회색 (과매도) -> Streamlit에선 off가 연한색 처리됨
+        st.metric("RSI (강도)", f"{rsi_val:.1f}", delta=status.get('RSI'), delta_color=rsi_color)
+        
+    with col3:
+        adx_val = last['ADX']
+        st.metric("ADX (추세)", f"{adx_val:.1f}", delta=trend_str)
+        
+    with col4:
+        # 볼린저밴드 위치 퍼센트 (0~1)
+        bb_width = last['BB_upper'] - last['BB_lower']
+        if bb_width > 0:
+            bb_pos = (last['close'] - last['BB_lower']) / bb_width
+            st.metric("BB 위치", f"{bb_pos*100:.0f}%", delta=status.get('BB'))
+        else:
+            st.metric("BB 위치", "계산 불가")
 
-except Exception as e:
-    st.error(f"🚨 데이터 로딩 실패! 원인: {e}")
-    st.stop()
-
-# 1. 추세 모드 판단 로직 (이 줄이 빠져서 에러가 난 것입니다)
-# ADX가 25 이상이면 추세장, 아니면 횡보장으로 판단
-is_trend_mode = last['ADX'] >= 25 
-
-# 2. 모드 이름 설정
-mode_str = "🌊 추세장 (강한 상승/하락)" if is_trend_mode else "🦀 횡보장 (박스권)"
-
-# 3. 타이틀 출력
-st.title(f"🔥 {symbol} GPT-4o Trader")
-st.caption(f"모드: {mode_str} | 현재가: ${curr_price:,.2f}")
+else:
+    # 데이터가 없을 때 보여줄 안내문
+    st.warning("⚠️ 차트 데이터를 불러오는 중이거나, 데이터가 부족합니다.")
     
-is_trend_mode = last['ADX'] >= 25 and config['use_dual_mode']
-
 # =========================================================
 # [메인 UI 3] 10종 지표 종합 요약 (심플 버전)
 # =========================================================
