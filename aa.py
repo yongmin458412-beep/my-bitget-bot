@@ -162,38 +162,69 @@ else:
 # =========================================================
 # 1. 봇이 사용할 함수들 (봇보다 먼저 정의되어야 함!)
 # =========================================================
-
+# ---------------------------------------------------------
+# 🧮 지표 계산 함수 (수정됨: 안전장치 강화)
+# ---------------------------------------------------------
 def calc_indicators(df):
-    """지표 계산 함수"""
     try:
-        if df is None or df.empty or len(df) < 15: return df, {}, None
-        
-        # 지표 계산
+        # 1. 데이터 검증
+        if df is None or df.empty or len(df) < 15:
+            return df, {}, None
+
+        # 2. 지표 계산 (TA 라이브러리)
+        # [RSI]
         df['RSI'] = ta.momentum.rsi(df['close'], window=14)
+        
+        # [볼린저밴드]
         bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
         df['BB_upper'] = bb.bollinger_hband()
         df['BB_lower'] = bb.bollinger_lband()
+        
+        # [이동평균선 & MACD]
         df['SMA_20'] = ta.trend.sma_indicator(df['close'], window=20)
         df['SMA_60'] = ta.trend.sma_indicator(df['close'], window=60)
-        df['ADX'] = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
+        macd = ta.trend.MACD(df['close'])
+        df['MACD'] = macd.macd()
+        df['MACD_signal'] = macd.macd_signal()
         
+        # [ADX]
+        df['ADX'] = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
+
+        # 3. 중요: NaN 제거 (앞부분 데이터 정리)
         df = df.dropna()
         if df.empty: return df, {}, None
 
+        # 4. 상태 평가 (UI에 표시할 텍스트 생성)
         last = df.iloc[-1]
         status = {}
-        
+
+        # RSI 상태
         if last['RSI'] > 70: status['RSI'] = "🔴 과매수"
         elif last['RSI'] < 30: status['RSI'] = "🟢 과매도"
         else: status['RSI'] = "⚪ 중립"
-        
+
+        # 볼린저밴드 상태
         if last['close'] > last['BB_upper']: status['BB'] = "🔴 상단 돌파"
         elif last['close'] < last['BB_lower']: status['BB'] = "🟢 하단 이탈"
         else: status['BB'] = "⚪ 밴드 내"
         
+        # 이평선 추세
+        if last['close'] > last['SMA_20']: status['MA'] = "📈 상승세"
+        else: status['MA'] = "📉 하락세"
+        
+        # MACD 신호
+        if last['MACD'] > last['MACD_signal']: status['MACD'] = "Golden Cross"
+        else: status['MACD'] = "Dead Cross"
+        
+        # ADX
         status['ADX'] = "🔥 추세장" if last['ADX'] >= 25 else "💤 횡보장"
+
         return df, status, last
-    except: return df, {}, None
+
+    except Exception as e:
+        print(f"Calc Error: {e}")
+        return df, {}, None
+
 
 def generate_wonyousi_strategy(df, status_summary):
     """AI 전략 수립 함수"""
@@ -767,145 +798,91 @@ def telegram_thread(ex, main_symbol):
             
 # 👆 [여기까지 복사]
 # =========================================================
-# [메인 UI 0] 사이드바 설정 (여기가 제일 위에 있어야 함!)
-# =========================================================
-st.title("🤖 워뇨띠의 매매노트 (Bitget AI Bot)")
-
-with st.sidebar:
-    st.header("⚙️ 기본 설정")
-    # 🔥 [핵심 수정] 여기서 timeframe을 먼저 만들어야 에러가 안 납니다.
-    symbol = st.text_input("코인 심볼 (티커)", value="BTC/USDT:USDT")
-    timeframe = st.selectbox("시간봉 선택", ["1m", "3m", "5m", "15m", "1h", "4h", "1d"], index=2) 
-    
-    st.divider()
-    # (나머지 사이드바 코드들... 잔고 조회 등)
-
-# =========================================================
-# [메인 로직] 데이터 로딩 및 처리 (복구 버전)
+# [메인 로직] 데이터 로딩 및 화면 출력 (수정됨)
 # =========================================================
 df = None
 status = {}
 last = None
-data_loaded = False # 로딩 성공 여부 체크
+data_loaded = False
 
 try:
-    # 1. 사이드바 설정값 가져오기 (변수 없으면 기본값 사용)
-    target_symbol = symbol if 'symbol' in locals() else "BTC/USDT:USDT"
-    target_timeframe = timeframe if 'timeframe' in locals() else "5m"
-    
-    # 2. 데이터 요청
-    ohlcv = exchange.fetch_ohlcv(target_symbol, target_timeframe, limit=200)
+    # 1. 데이터 가져오기
+    # (사이드바에서 설정한 symbol, timeframe 변수를 사용합니다)
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
     
     if ohlcv:
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
         df['time'] = pd.to_datetime(df['time'], unit='ms')
         
-        # 3. 지표 계산
+        # 2. 지표 계산
         df, status, last = calc_indicators(df)
         
-        # 4. 계산 성공 여부 확인 ('RSI' 키가 있는지 확인)
+        # 3. 데이터 유효성 검사 ('RSI' 키가 확실히 있는지 확인)
         if last is not None and 'RSI' in last:
             data_loaded = True
 
 except Exception as e:
-    st.error(f"데이터 시스템 오류: {e}")
+    st.error(f"데이터 로딩 중 오류 발생: {e}")
 
-# =========================================================
-# [메인 UI 1] 시장 데이터 브리핑
-# =========================================================
+# ---------------------------------------------------------
+# [화면 출력] 데이터가 준비되었을 때만 그립니다.
+# ---------------------------------------------------------
 st.divider()
-st.subheader(f"📊 {target_symbol} 실시간 현황")
 
 if data_loaded:
-    # 데이터가 완벽할 때만 화면을 그립니다.
-    col1, col2, col3, col4 = st.columns(4)
+    # 1. 상단 4단 브리핑 (현재가 / RSI / ADX / BB)
+    st.subheader(f"📊 {symbol} 실시간 현황")
+    c1, c2, c3, c4 = st.columns(4)
     
-    with col1:
-        st.metric("현재가", f"${last['close']:,.2f}")
+    c1.metric("현재가", f"${last['close']:,.2f}")
     
-    with col2:
-        # RSI 색상
-        rsi = last['RSI']
-        color = "inverse" if rsi > 70 else ("off" if rsi < 30 else "normal")
-        st.metric("RSI (강도)", f"{rsi:.1f}", delta=status.get('RSI'), delta_color=color)
-        
-    with col3:
-        # ADX
-        st.metric("ADX (추세)", f"{last['ADX']:.1f}", delta=status.get('ADX'))
-        
-    with col4:
-        # 볼린저밴드
-        bw = last['BB_upper'] - last['BB_lower']
-        pos = (last['close'] - last['BB_lower']) / bw if bw > 0 else 0
-        st.metric("BB 위치", f"{pos*100:.0f}%", delta=status.get('BB'))
+    rsi = last['RSI']
+    c_rsi = "inverse" if rsi > 70 else ("off" if rsi < 30 else "normal")
+    c2.metric("RSI (강도)", f"{rsi:.1f}", delta=status.get('RSI'), delta_color=c_rsi)
+    
+    c3.metric("ADX (추세)", f"{last['ADX']:.1f}", delta=status.get('ADX'))
+    
+    bw = last['BB_upper'] - last['BB_lower']
+    pos = (last['close'] - last['BB_lower']) / bw if bw > 0 else 0.5
+    c4.metric("BB 위치", f"{pos*100:.0f}%", delta=status.get('BB'))
+
+    # 2. [복구됨] 10종 지표 종합 상태판
+    st.divider()
+    st.markdown("### 🚦 지표 종합 상태판")
+    
+    # 점수 계산 (매수 시그널 개수)
+    score = 0
+    if "과매도" in status.get('RSI', ''): score += 1
+    if "하단" in status.get('BB', ''): score += 1
+    if "상승세" in status.get('MA', ''): score += 1
+    if "Golden" in status.get('MACD', ''): score += 1
+    
+    # 상태판 디자인
+    judge = "⚖️ 중립/관망"
+    if score >= 2: judge = "🟢 매수 우위"
+    elif score <= -1: judge = "🔴 매도 우위"
+    
+    st.info(f"**종합 판단:** {judge} (매수 긍정 요인: {score}개)")
+    
+    with st.expander("🔍 지표 상세 내역 보기"):
+        ec1, ec2, ec3, ec4 = st.columns(4)
+        ec1.write(f"**RSI:** {status.get('RSI')}")
+        ec2.write(f"**BB:** {status.get('BB')}")
+        ec3.write(f"**MA:** {status.get('MA')}")
+        ec4.write(f"**MACD:** {status.get('MACD')}")
+
+    # 3. [복구됨] 메인 차트
+    st.markdown("#### 📈 가격 추세 차트")
+    st.line_chart(df.set_index('time')['close'])
 
 else:
-    # 로딩 중이거나 실패했을 때
-    st.warning("⏳ 데이터를 불러오고 계산하는 중입니다... (잠시만 기다려주세요)")
-    st.caption("팁: 이 메시지가 10초 이상 지속되면 우측 상단 'Rerun'을 눌러주세요.")
-    
-# =========================================================
-# [메인 UI 3] 10종 지표 종합 요약 (심플 버전)
-# =========================================================
-st.divider()
+    # 로딩 중 화면 (RSI 오류 대신 이 화면이 뜹니다)
+    st.warning(f"⏳ '{symbol}' 데이터를 불러오는 중입니다...")
+    st.caption("10초 이상 화면이 바뀌지 않으면 우측 상단 'Rerun'을 눌러주세요.")
+    # 데이터가 없으면 아래 코드가 실행되지 않게 여기서 멈춤
+    st.stop()
 
-# 1. 매수/매도 개수 계산
-active_cnt_l = 0
-active_cnt_s = 0
-for _, stat in status.items():
-    if "매수" in stat: active_cnt_l += 1
-    elif "매도" in stat: active_cnt_s += 1
-
-# 2. 종합 점수 및 디자인 설정
-total_score = active_cnt_l - active_cnt_s
-
-if total_score >= 3:
-    sentiment = "🚀 매수 우위"
-    bg_color = "#d4edda"; text_color = "#155724"; border_color = "#c3e6cb"
-elif total_score >= 1:
-    sentiment = "📈 약한 매수"
-    bg_color = "#e2e6ea"; text_color = "#0c5460"; border_color = "#bee5eb"
-elif total_score <= -3:
-    sentiment = "📉 매도 우위"
-    bg_color = "#f8d7da"; text_color = "#721c24"; border_color = "#f5c6cb"
-elif total_score <= -1:
-    sentiment = "🔻 약한 매도"
-    bg_color = "#fff3cd"; text_color = "#856404"; border_color = "#ffeeba"
-else:
-    sentiment = "⚖️ 중립 (관망)"
-    bg_color = "#f8f9fa"; text_color = "#383d41"; border_color = "#d6d8db"
-
-# 3. [수정됨] 폰트 크기를 줄인 컴팩트 배너
-st.markdown(f"""
-<div style="
-    padding: 10px; 
-    border-radius: 8px; 
-    background-color: {bg_color}; 
-    color: {text_color}; 
-    border: 1px solid {border_color};
-    text-align: center;
-    margin-bottom: 10px;">
-    <div style="font-size: 18px; font-weight: bold; margin-bottom: 5px;">{sentiment}</div>
-    <div style="font-size: 13px;">
-        매수 시그널 <b>{active_cnt_l}</b>개 vs 매도 시그널 <b>{active_cnt_s}</b>개
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-# 4. 상세 내역은 '접어두기'로 숨김 (필요할 때만 클릭)
-with st.expander("🔍 지표 상세 확인하기"):
-    cols = st.columns(5)
-    idx = 0
-    for name, stat in status.items():
-        # 텍스트 색상 단순화
-        if "매수" in stat: color = "green"
-        elif "매도" in stat: color = "red"
-        else: color = "off"
-        
-        cols[idx % 5].caption(f"{name}") # 글씨 작게
-        cols[idx % 5].markdown(f":{color}[{stat}]")
-        idx += 1
-
+# (이 아래에 t1, t2, t3, t4 탭 코드가 그대로 있으면 됩니다)
 
 # 4개의 탭으로 확장 (새 기능 포함)
 t1, t2, t3, t4 = st.tabs(["🤖 자동매매 & AI분석", "⚡ 수동주문", "📅 시장정보", "📜 매매일지(DB)"])
