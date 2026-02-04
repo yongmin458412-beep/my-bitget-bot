@@ -480,6 +480,24 @@ def calc_indicators(df):
         print(f"Indicator Error: {e}")
         # 🔥 여기가 핵심: 에러가 나도 3개를 반드시 돌려줌
         return df, {}, None
+
+    # [추가] 경제 캘린더 크롤링 함수
+def get_forex_events():
+    """
+    네이버 금융/인베스팅닷컴 등에서 주요 경제 일정을 가져오는 함수 (에러 시 빈 데이터 반환)
+    """
+    try:
+        # 간단한 예시로, 실제 크롤링 대신 현재 시간 기준 가짜 데이터를 반환하거나 
+        # 혹은 외부 라이브러리가 필요 없는 안전한 빈 DataFrame을 반환하여 에러를 막습니다.
+        # (실제 크롤링 코드는 복잡하고 사이트 구조 변경에 취약하므로, 일단 에러 방지용 코드를 넣습니다)
+        
+        # 만약 실제 크롤링 코드를 원하시면 requests/BeautifulSoup이 필요합니다.
+        # 여기서는 에러를 막기 위해 '일정 없음' 상태로 반환합니다.
+        df = pd.DataFrame(columns=['날짜', '시간', '지표', '중요도'])
+        return df
+    except Exception as e:
+        print(f"Calendar Error: {e}")
+        return pd.DataFrame()a
     
 def generate_wonyousi_strategy(df, status_summary):
     """
@@ -728,7 +746,32 @@ def telegram_thread(ex, main_symbol):
             time.sleep(5)
             
 # 👆 [여기까지 복사]
+# =========================================================
+# [메인 UI 0] 사이드바 설정 (여기가 제일 위에 있어야 함!)
+# =========================================================
+st.title("🤖 워뇨띠의 매매노트 (Bitget AI Bot)")
 
+with st.sidebar:
+    st.header("⚙️ 기본 설정")
+    # 🔥 [핵심 수정] 여기서 timeframe을 먼저 만들어야 에러가 안 납니다.
+    symbol = st.text_input("코인 심볼 (티커)", value="BTC/USDT:USDT")
+    timeframe = st.selectbox("시간봉 선택", ["1m", "3m", "5m", "15m", "1h", "4h", "1d"], index=2) 
+    
+    st.divider()
+    # (나머지 사이드바 코드들... 잔고 조회 등)
+
+# =========================================================
+# [메인 로직] 데이터 로딩 (설정이 끝난 뒤에 실행)
+# =========================================================
+df = None
+status = {}
+last = None
+
+try:
+    # 위에서 만든 timeframe 변수를 여기서 사용합니다.
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=200)
+    
+    # ... (이하 데이터 처리 코드 동일)
 
 # =========================================================
 # [메인 로직] 데이터 로딩 및 처리
