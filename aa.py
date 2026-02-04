@@ -400,88 +400,66 @@ if st.sidebar.button("📡 텔레그램 메뉴 전송"):
 # ---------------------------------------------------------
 def calc_indicators(df):
     """
-    보조지표 계산 함수 (에러 방지 강화판)
+    [복구용] 보조지표 계산 함수 (방탄 버전)
     """
     try:
-        # 데이터가 없으면 바로 안전하게 리턴
-        if df is None or df.empty or len(df) < 20:
+        # 1. 데이터 검증: 비어있거나 너무 짧으면 계산 불가
+        if df is None or df.empty or len(df) < 15:
             return df, {}, None
 
-        # 1. RSI (14)
+        # 2. 지표 계산 (라이브러리 사용)
+        # RSI
         df['RSI'] = ta.momentum.rsi(df['close'], window=14)
-
-        # 2. 볼린저밴드 (20, 2)
+        
+        # 볼린저밴드
         bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
         df['BB_upper'] = bb.bollinger_hband()
         df['BB_lower'] = bb.bollinger_lband()
         df['BB_mid'] = bb.bollinger_mavg()
-
-        # 3. MACD
+        
+        # MACD
         macd = ta.trend.MACD(df['close'])
         df['MACD'] = macd.macd()
         df['MACD_signal'] = macd.macd_signal()
-
-        # 4. 이동평균선 (SMA)
+        
+        # 이동평균선
         df['SMA_20'] = ta.trend.sma_indicator(df['close'], window=20)
         df['SMA_60'] = ta.trend.sma_indicator(df['close'], window=60)
-
-        # 5. 스토캐스틱
-        stoch = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close'])
-        df['Stoch_k'] = stoch.stoch()
-        df['Stoch_d'] = stoch.stoch_signal()
-
-        # 6. ADX (추세 강도)
+        
+        # ADX (추세)
         df['ADX'] = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
+        
+        # 3. 중요: 계산 후 결측치(NaN) 제거
+        # (앞부분 14개 데이터는 RSI 계산이 안되므로 NaN이 됨 -> 제거해야 안전함)
+        df = df.dropna()
+        
+        if df.empty: return df, {}, None
 
-        # 7. CCI
-        df['CCI'] = ta.trend.cci(df['high'], df['low'], df['close'], window=14)
-
-        # 8. Williams %R
-        df['Williams'] = ta.momentum.williams_r(df['high'], df['low'], df['close'], lbp=14)
-
-        # 9. 파라볼릭 SAR
-        df['SAR'] = ta.trend.psar_down(df['high'], df['low'], df['close'])
-
-        # 10. OBV (거래량)
-        df['OBV'] = ta.volume.on_balance_volume(df['close'], df['vol'])
-
-        # --- 상태 평가 ---
-        last = df.iloc[-1]
+        # 4. 상태 평가
+        last = df.iloc[-1] # 가장 최신 데이터
         status = {}
 
-        # RSI
+        # RSI 상태
         if last['RSI'] > 70: status['RSI'] = "🔴 과매수"
         elif last['RSI'] < 30: status['RSI'] = "🟢 과매도"
         else: status['RSI'] = "⚪ 중립"
 
-        # 볼린저밴드
-        if last['close'] > last['BB_upper']: status['BB'] = "🔴 상단 터치"
-        elif last['close'] < last['BB_lower']: status['BB'] = "🟢 하단 터치"
+        # 볼린저밴드 상태
+        if last['close'] > last['BB_upper']: status['BB'] = "🔴 상단 돌파"
+        elif last['close'] < last['BB_lower']: status['BB'] = "🟢 하단 이탈"
         else: status['BB'] = "⚪ 밴드 내"
-
-        # 이동평균선
-        if last['close'] > last['SMA_20'] > last['SMA_60']: status['MA'] = "🚀 정배열"
-        elif last['close'] < last['SMA_20'] < last['SMA_60']: status['MA'] = "📉 역배열"
-        else: status['MA'] = "⚠️ 혼조세"
-
-        # MACD
-        if last['MACD'] > last['MACD_signal']: status['MACD'] = "📈 골든크로스"
-        else: status['MACD'] = "📉 데드크로스"
         
-        # 거래량 (OBV) - 간단한 전일 대비
-        if len(df) > 1 and df.iloc[-1]['OBV'] > df.iloc[-2]['OBV']:
-            status['Vol'] = "🔥 매수세 유입"
-        else:
-            status['Vol'] = "💧 매도세 우위"
+        # ADX
+        status['ADX'] = "🔥 추세장" if last['ADX'] >= 25 else "💤 횡보장"
 
         return df, status, last
 
     except Exception as e:
-        print(f"Indicator Error: {e}")
-        # 🔥 여기가 핵심: 에러가 나도 3개를 반드시 돌려줌
+        # 계산 중 에러나면 터지지 말고 빈손으로 돌아갈 것
+        print(f"Calc Error: {e}")
         return df, {}, None
-
-    # [추가] 경제 캘린더 크롤링 함수
+        
+# [추가] 경제 캘린더 크롤링 함수
 def get_forex_events():
     """
     네이버 금융/인베스팅닷컴 등에서 주요 경제 일정을 가져오는 함수 (에러 시 빈 데이터 반환)
@@ -761,67 +739,69 @@ with st.sidebar:
     # (나머지 사이드바 코드들... 잔고 조회 등)
 
 # =========================================================
-# [메인 로직] 데이터 로딩 및 처리
+# [메인 로직] 데이터 로딩 및 처리 (복구 버전)
 # =========================================================
-# 1. 변수 초기화
 df = None
 status = {}
 last = None
+data_loaded = False # 로딩 성공 여부 체크
 
-# 2. 데이터 로딩 시도
 try:
-    # 사이드바에서 설정된 symbol, timeframe 사용
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=200)
+    # 1. 사이드바 설정값 가져오기 (변수 없으면 기본값 사용)
+    target_symbol = symbol if 'symbol' in locals() else "BTC/USDT:USDT"
+    target_timeframe = timeframe if 'timeframe' in locals() else "5m"
     
-    if not ohlcv:
-        st.error("🚨 데이터 로딩 실패: 거래소 응답 없음")
-    else:
-        # 데이터프레임 변환
+    # 2. 데이터 요청
+    ohlcv = exchange.fetch_ohlcv(target_symbol, target_timeframe, limit=200)
+    
+    if ohlcv:
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
         df['time'] = pd.to_datetime(df['time'], unit='ms')
         
-        # 보조지표 계산
+        # 3. 지표 계산
         df, status, last = calc_indicators(df)
+        
+        # 4. 계산 성공 여부 확인 ('RSI' 키가 있는지 확인)
+        if last is not None and 'RSI' in last:
+            data_loaded = True
 
 except Exception as e:
-    st.error(f"🚨 시스템 오류: {e}")
+    st.error(f"데이터 시스템 오류: {e}")
 
 # =========================================================
 # [메인 UI 1] 시장 데이터 브리핑
 # =========================================================
 st.divider()
-st.subheader(f"📊 {symbol} 실시간 현황")
+st.subheader(f"📊 {target_symbol} 실시간 현황")
 
-# 3. 화면 출력 (last가 있을 때만 실행)
-if last is not None:
-    # (1) 추세 상태
-    is_trend = last['ADX'] >= 25
-    trend_str = "🔥 강력한 추세장" if is_trend else "💤 지루한 횡보장"
-    
-    # (2) 4개 컬럼으로 정보 표시
+if data_loaded:
+    # 데이터가 완벽할 때만 화면을 그립니다.
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric("현재가", f"${last['close']:,.2f}")
+    
     with col2:
         # RSI 색상
-        rsi_val = last['RSI']
-        c_rsi = "inverse" if rsi_val > 70 else ("off" if rsi_val < 30 else "normal")
-        st.metric("RSI (강도)", f"{rsi_val:.1f}", delta=status.get('RSI'), delta_color=c_rsi)
+        rsi = last['RSI']
+        color = "inverse" if rsi > 70 else ("off" if rsi < 30 else "normal")
+        st.metric("RSI (강도)", f"{rsi:.1f}", delta=status.get('RSI'), delta_color=color)
+        
     with col3:
-        st.metric("ADX (추세)", f"{last['ADX']:.1f}", delta=trend_str)
+        # ADX
+        st.metric("ADX (추세)", f"{last['ADX']:.1f}", delta=status.get('ADX'))
+        
     with col4:
-        # 볼린저밴드 폭
-        bb_w = last['BB_upper'] - last['BB_lower']
-        bb_p = (last['close'] - last['BB_lower']) / bb_w if bb_w > 0 else 0
-        st.metric("BB 위치", f"{bb_p*100:.0f}%", delta=status.get('BB'))
+        # 볼린저밴드
+        bw = last['BB_upper'] - last['BB_lower']
+        pos = (last['close'] - last['BB_lower']) / bw if bw > 0 else 0
+        st.metric("BB 위치", f"{pos*100:.0f}%", delta=status.get('BB'))
 
 else:
-    # 데이터가 없을 때 표시할 내용
-    st.warning("⚠️ 데이터를 불러오는 중입니다... (잠시만 기다려주세요)")
-    st.info("💡 팁: 에러가 계속되면 우측 상단 'Rerun'을 눌러보세요.")
-
-
+    # 로딩 중이거나 실패했을 때
+    st.warning("⏳ 데이터를 불러오고 계산하는 중입니다... (잠시만 기다려주세요)")
+    st.caption("팁: 이 메시지가 10초 이상 지속되면 우측 상단 'Rerun'을 눌러주세요.")
+    
 # =========================================================
 # [메인 UI 3] 10종 지표 종합 요약 (심플 버전)
 # =========================================================
