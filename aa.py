@@ -9,7 +9,7 @@ import threading
 import os
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from openai import OpenAI
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 
@@ -21,6 +21,9 @@ SETTINGS_FILE = "bot_settings.json"
 RUNTIME_FILE = "runtime_state.json"
 TRADE_LOG_FILE = "trade_log.csv"
 DB_FILE = "wonyousi_brain.db"  # ✅ AI 회고/교훈 저장
+
+KST = timezone(timedelta(hours=9))
+
 
 st.set_page_config(layout="wide", page_title="Bitget AI 워뇨띠 봇 (제어판=Streamlit / 보고=Telegram)")
 
@@ -73,8 +76,8 @@ openai_key = st.secrets.get("OPENAI_API_KEY", "")
 # ✅ 3) 유틸
 # =========================================================
 def now_kst():
-    return datetime.utcnow() + timedelta(hours=9)
-
+    return datetime.now(KST)
+    
 def now_kst_str():
     return now_kst().strftime("%Y-%m-%d %H:%M:%S")
 
