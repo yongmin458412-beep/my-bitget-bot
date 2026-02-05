@@ -899,6 +899,10 @@ def ai_decide_trade(
 
     past_mistakes = get_past_mistakes_text(5)
 
+     # 외부시황(없어도 동작)
+        ext = read_json_safe(MONITOR_FILE, {}).get("external", {})
+        features["external"] = ext
+
     # 모델에게 “과매도 해소 타이밍”을 강제
     features = {
         "symbol": symbol,
@@ -915,10 +919,7 @@ def ai_decide_trade(
         "rsi_resolve_short": bool(status.get("_rsi_resolve_short", False)),
         "pullback_candidate": bool(status.get("_pullback_candidate", False)),
     }
-            # 외부시황(없어도 동작)
-        ext = read_json_safe(MONITOR_FILE, {}).get("external", {})
-        features["external"] = ext
-
+           
 
     sys = f"""
 너는 '워뇨띠 스타일(눌림목/해소 타이밍) + 손익비' 기반의 자동매매 트레이더 AI다.
