@@ -1298,16 +1298,18 @@ def telegram_thread(ex):
                         txt = up["message"]["text"].strip()
 
                         if txt == "상태":
+                            cfg_live = load_settings()  # ✅ 항상 최신 파일 기준
                             free, total = safe_fetch_balance(ex)
                             rt = load_runtime()
                             tg_send(
                                 f"📡 상태\n"
-                                f"- 자동매매: {'ON' if config.get('auto_trade') else 'OFF'}\n"
-                                f"- 모드: {config.get('trade_mode')}\n"
+                                f"- 자동매매: {'ON' if cfg_live.get('auto_trade') else 'OFF'}\n"
+                                f"- 모드: {cfg_live.get('trade_mode','-')}\n"
                                 f"- 잔고: {total:.2f} USDT (사용가능 {free:.2f})\n"
                                 f"- 연속손실: {rt.get('consec_losses',0)}\n"
                                 f"- 정지해제: {('정지중' if time.time() < float(rt.get('pause_until',0)) else '정상')}\n"
                             )
+
 
                         elif txt == "시야":
                             mon_now = read_json_safe(MONITOR_FILE, {})
@@ -1344,12 +1346,13 @@ def telegram_thread(ex):
                         cb_id = cb.get("id", "")
 
                         if data == "status":
+                            cfg_live = load_settings()  # ✅ 항상 최신 파일 기준
                             free, total = safe_fetch_balance(ex)
                             rt = load_runtime()
                             tg_send(
                                 f"📡 상태\n"
-                                f"- 자동매매: {'ON' if config.get('auto_trade') else 'OFF'}\n"
-                                f"- 모드: {config.get('trade_mode')}\n"
+                                f"- 자동매매: {'ON' if cfg_live.get('auto_trade') else 'OFF'}\n"
+                                f"- 모드: {cfg_live.get('trade_mode','-')}\n"
                                 f"- 잔고: {total:.2f} USDT (사용가능 {free:.2f})\n"
                                 f"- 연속손실: {rt.get('consec_losses',0)}\n"
                             )
@@ -1450,6 +1453,9 @@ if not openai_key:
         config["openai_api_key"] = k
         save_settings(config)
         st.rerun()
+
+with st.sidebar.expander("🧪 디버그: 저장된 설정(bot_settings.json) 확인"):
+    st.json(read_json_safe(SETTINGS_FILE, {}))
 
 # 모드 선택 (MODE_RULES 기반)
 mode_keys = list(MODE_RULES.keys())
