@@ -1645,6 +1645,19 @@ def telegram_thread(ex):
                             "skip_reason": ""
                         })
                         monitor_write_throttled(mon, 1.0)
+                        
+                        # ✅ 강제 방향 필터: 하락추세면 롱 금지, 상승추세면 숏 금지 (역추세 방지)
+                        trend_txt = (stt.get("추세", "") or "")
+                        is_down = ("하락" in trend_txt)
+                        is_up = ("상승" in trend_txt)
+                        
+                        if is_down and decision == "buy":
+                            cs["skip_reason"] = "하락추세라 롱 금지(역추세 방지)"
+                            continue
+                        
+                        if is_up and decision == "sell":
+                            cs["skip_reason"] = "상승추세라 숏 금지(역추세 방지)"
+                            continue
 
                         # 진입 조건
                         if decision in ["buy", "sell"] and conf >= int(rule["min_conf"]):
