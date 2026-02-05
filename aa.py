@@ -73,6 +73,21 @@ try:
     from pydantic import BaseModel, Field, ValidationError  # AI JSON 안정화
 except Exception:
     BaseModel = None
+# ---- external context pip ----
+try:
+    import feedparser  # pip: feedparser
+except Exception:
+    feedparser = None
+
+try:
+    from cachetools import TTLCache
+except Exception:
+    TTLCache = None
+
+try:
+    from tenacity import retry, stop_after_attempt, wait_fixed
+except Exception:
+    retry = None
 
 
 # =========================================================
@@ -272,6 +287,15 @@ def default_settings() -> Dict[str, Any]:
 
         # AI 출력 쉬운말(한글)
         "ai_easy_korean": True,
+
+                # 🌍 외부 시황 통합
+        "use_external_context": True,
+        "macro_blackout_minutes": 30,      # 중요 이벤트 전후 신규진입 줄이기(분)
+        "external_refresh_sec": 60,        # 외부시황 갱신 주기
+        "news_enable": True,
+        "news_refresh_sec": 300,
+        "news_max_headlines": 12,
+
 
         # ===== 추가: 지지/저항(SR) 기반 손절/익절 =====
         "use_sr_stop": True,
@@ -890,6 +914,10 @@ def ai_decide_trade(
         "rsi_resolve_long": bool(status.get("_rsi_resolve_long", False)),
         "rsi_resolve_short": bool(status.get("_rsi_resolve_short", False)),
         "pullback_candidate": bool(status.get("_pullback_candidate", False)),
+            # 외부시황(없어도 동작)
+        ext = read_json_safe(MONITOR_FILE, {}).get("external", {})
+        features["external"] = ext
+
     }
 
     sys = f"""
@@ -898,6 +926,7 @@ def ai_decide_trade(
 - 손실은 짧게(빠르게 끊기) 하지만
 - 추세가 맞으면 익절은 더 길게(수익을 키우기)
 - 그리고 같은 실수를 반복하지 않기(회고)
+
 
 [과거 실수(요약)]
 {past_mistakes}
@@ -910,6 +939,9 @@ def ai_decide_trade(
    - 최소 확신도: {rule["min_conf"]}
    - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
    - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
+4) 외부시황에서 'high_impact_events_soon'이 비어있지 않으면(중요 이벤트 임박),
+   신규 진입은 더 보수적으로(혹은 HOLD) 판단한다.
+
 
 [응답]
 반드시 JSON만 출력한다.
@@ -1083,6 +1115,149 @@ def monitor_write_throttled(mon: Dict[str, Any], min_interval_sec: float = 1.0):
         write_json_atomic(MONITOR_FILE, mon)
         mon["_last_write"] = time.time()
 
+# =========================================================
+# ✅ X) 외부 시황 통합(거시/심리/레짐/뉴스) - 데모용
+# =========================================================
+_ext_cache = TTLCache(maxsize=4, ttl=60) if TTLCache else None
+
+def _safe_get_json(url: str, timeout: int = 10):
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+def fetch_fear_greed():
+    # Alternative.me Fear & Greed (public)
+    data = _safe_get_json("https://api.alternative.me/fng/?limit=1&format=json", timeout=8)
+    if not data or "data" not in data or not data["data"]:
+        return None
+    d0 = data["data"][0]
+    try:
+        return {
+            "value": int(d0.get("value", 0)),
+            "classification": str(d0.get("value_classification", "")),
+            "timestamp": str(d0.get("timestamp", "")),
+        }
+    except Exception:
+        return None
+
+def fetch_coingecko_global():
+    # CoinGecko global (public)
+    data = _safe_get_json("https://api.coingecko.com/api/v3/global", timeout=10)
+    if not data or "data" not in data:
+        return None
+    g = data["data"]
+    mcp = g.get("market_cap_percentage", {}) or {}
+    try:
+        return {
+            "btc_dominance": float(mcp.get("btc", 0.0)),
+            "eth_dominance": float(mcp.get("eth", 0.0)),
+            "total_mcap_usd": float((g.get("total_market_cap", {}) or {}).get("usd", 0.0)),
+            "mcap_change_24h_pct": float(g.get("market_cap_change_percentage_24h_usd", 0.0)),
+        }
+    except Exception:
+        return None
+
+def fetch_upcoming_high_impact_events(within_minutes: int = 30, limit: int = 80):
+    # ForexFactory weekly JSON (네가 이미 쓰는 소스)
+    data = _safe_get_json("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10)
+    if not isinstance(data, list):
+        return []
+    now = now_kst()
+    out = []
+    for x in data[:limit]:
+        try:
+            impact = str(x.get("impact", ""))
+            if impact != "High":
+                continue
+            # date가 ISO8601(+offset)로 오는 케이스가 많음
+            dt_str = str(x.get("date", ""))
+            dt = None
+            try:
+                dt = datetime.fromisoformat(dt_str)
+                # dt가 tz-aware면 KST로 변환
+                if dt.tzinfo:
+                    dt = dt.astimezone(KST)
+                else:
+                    dt = dt.replace(tzinfo=KST)
+            except Exception:
+                continue
+
+            diff_min = (dt - now).total_seconds() / 60.0
+            if 0 <= diff_min <= within_minutes:
+                out.append({
+                    "time_kst": dt.strftime("%m-%d %H:%M"),
+                    "title": str(x.get("title","")),
+                    "country": str(x.get("country","")),
+                    "impact": "매우 중요",
+                })
+        except Exception:
+            continue
+    return out
+
+def fetch_news_headlines_rss(max_items: int = 12):
+    if feedparser is None:
+        return []
+    # 너무 많이 말고 “헤드라인만”
+    feeds = [
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cointelegraph.com/rss",
+    ]
+    items = []
+    for url in feeds:
+        try:
+            d = feedparser.parse(url)
+            for e in (d.entries or [])[:max_items]:
+                title = str(getattr(e, "title", "")).strip()
+                if title:
+                    items.append(title)
+        except Exception:
+            continue
+    # 중복 제거
+    uniq = []
+    seen = set()
+    for t in items:
+        if t not in seen:
+            uniq.append(t); seen.add(t)
+    return uniq[:max_items]
+
+def build_external_context(cfg: dict):
+    """
+    외부시황을 '요약 가능한 형태'로 묶어서 반환
+    (스레드 멈춤 방지 위해 timeout + 실패해도 None/[] 리턴)
+    """
+    if not cfg.get("use_external_context", True):
+        return {"enabled": False}
+
+    # 캐시(스레드가 계속 도는 구조라, 이거 없으면 외부요청 과다로 멈출 수 있음)
+    if _ext_cache is not None and "ext" in _ext_cache:
+        return _ext_cache["ext"]
+
+    blackout = int(cfg.get("macro_blackout_minutes", 30))
+    high_events = fetch_upcoming_high_impact_events(within_minutes=blackout)
+
+    fg = fetch_fear_greed()
+    cg = fetch_coingecko_global()
+
+    headlines = []
+    if cfg.get("news_enable", True):
+        headlines = fetch_news_headlines_rss(max_items=int(cfg.get("news_max_headlines", 12)))
+
+    ext = {
+        "enabled": True,
+        "blackout_minutes": blackout,
+        "high_impact_events_soon": high_events,  # 리스트(0개면 안전)
+        "fear_greed": fg,                        # None 가능
+        "global": cg,                            # None 가능
+        "headlines": headlines,                  # [] 가능
+        "asof_kst": now_kst_str()
+    }
+
+    if _ext_cache is not None:
+        _ext_cache["ext"] = ext
+    return ext
 
 # =========================================================
 # ✅ 16) 텔레그램 유틸 (추가: retry 있으면 적용)
@@ -1165,6 +1340,10 @@ def telegram_thread(ex):
             rt = load_runtime()
             mode = cfg.get("trade_mode", "안전모드")
             rule = MODE_RULES.get(mode, MODE_RULES["안전모드"])
+                        # 🌍 외부 시황 갱신 (AI 시야/의사결정에 반영)
+            ext = build_external_context(cfg)
+            mon["external"] = ext
+
 
             # ✅ 하트비트
             mon["last_heartbeat_epoch"] = time.time()
@@ -2017,6 +2196,26 @@ with t1:
         st_autorefresh(interval=2000, key="mon_refresh")  # 2초
     else:
         st.caption("자동 새로고침을 원하면 requirements.txt에 streamlit-autorefresh 추가하세요.")
+                st.subheader("🌍 외부 시황 요약")
+        ext = (mon.get("external") or {})
+        if not ext or not ext.get("enabled", False):
+            st.caption("외부 시황 통합 OFF")
+        else:
+            st.write({
+                "갱신시각(KST)": ext.get("asof_kst"),
+                "중요이벤트(임박)": len(ext.get("high_impact_events_soon") or []),
+                "공포탐욕": (ext.get("fear_greed") or {}),
+                "도미넌스/시총": (ext.get("global") or {}),
+            })
+            evs = ext.get("high_impact_events_soon") or []
+            if evs:
+                st.warning("⚠️ 중요 이벤트 임박(신규진입 보수적으로)")
+                st.dataframe(pd.DataFrame(evs), width="stretch", hide_index=True)
+            hd = ext.get("headlines") or []
+            if hd:
+                st.caption("뉴스 헤드라인(요약용)")
+                st.write(hd[:10])
+
         st.button("🔄 수동 새로고침")
 
     mon = read_json_safe(MONITOR_FILE, None)
