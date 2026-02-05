@@ -77,10 +77,9 @@ openai_key = st.secrets.get("OPENAI_API_KEY", "")
 
 KST = timezone(timedelta(hours=9))
 
-
 def now_kst():
     return datetime.now(KST)
-    
+
 def now_kst_str():
     return now_kst().strftime("%Y-%m-%d %H:%M:%S")
 
