@@ -22,8 +22,6 @@ RUNTIME_FILE = "runtime_state.json"
 TRADE_LOG_FILE = "trade_log.csv"
 DB_FILE = "wonyousi_brain.db"  # ✅ AI 회고/교훈 저장
 
-KST = timezone(timedelta(hours=9))
-
 
 st.set_page_config(layout="wide", page_title="Bitget AI 워뇨띠 봇 (제어판=Streamlit / 보고=Telegram)")
 
@@ -75,6 +73,11 @@ openai_key = st.secrets.get("OPENAI_API_KEY", "")
 # =========================================================
 # ✅ 3) 유틸
 # =========================================================
+
+
+KST = timezone(timedelta(hours=9))
+
+
 def now_kst():
     return datetime.now(KST)
     
