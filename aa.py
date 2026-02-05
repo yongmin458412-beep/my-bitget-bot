@@ -2196,7 +2196,7 @@ with t1:
         st_autorefresh(interval=2000, key="mon_refresh")  # 2초
     else:
         st.caption("자동 새로고침을 원하면 requirements.txt에 streamlit-autorefresh 추가하세요.")
-                st.subheader("🌍 외부 시황 요약")
+        st.subheader("🌍 외부 시황 요약")
         ext = (mon.get("external") or {})
         if not ext or not ext.get("enabled", False):
             st.caption("외부 시황 통합 OFF")
