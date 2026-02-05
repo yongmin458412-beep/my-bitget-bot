@@ -11,3 +11,18 @@ ta
 streamlit-autorefresh>=1.0.1
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
+
+# ===== 추가(추천) =====
+tenacity>=8.2.3
+loguru>=0.7.2
+pydantic>=2.6.0
+orjson>=3.10.0
+diskcache>=5.6.3
+scipy>=1.11.4
+pandas-ta>=0.3.14b0
+backtesting>=0.3.3
+
+# vectorbt/TA-Lib은 클라우드에서 설치 실패할 수 있어.
+# 실패하면 아래 2줄은 삭제하고 재배포하면 돼.
+vectorbt>=0.26.0
+TA-Lib>=0.4.28
