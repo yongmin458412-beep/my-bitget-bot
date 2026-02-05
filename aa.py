@@ -899,9 +899,8 @@ def ai_decide_trade(
 
     past_mistakes = get_past_mistakes_text(5)
 
-     # 외부시황(없어도 동작)
-        ext = read_json_safe(MONITOR_FILE, {}).get("external", {})
-        features["external"] = ext
+    ext = read_json_safe(MONITOR_FILE, {}).get("external", {})
+
 
     # 모델에게 “과매도 해소 타이밍”을 강제
     features = {
