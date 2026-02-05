@@ -700,6 +700,8 @@ def render_tradingview(symbol_ccxt: str, interval="5", height=560) -> None:
     components.html(html, height=height)
 
 
+
+
 # =========================================================
 # ✅ 11) 지표 계산 (10종 + 상태요약 + “눌림목 해소” 감지)
 # =========================================================
@@ -863,8 +865,219 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
 
 
 # =========================================================
-# ✅ 12) AI 판단 (한글 쉬운 설명 + used_indicators 포함)
+# ✅ 12) AI 판단 + 리스크 매니저(ATR/스윙 기반 SL/TP 자동보정) + 외부시황(공포탐욕/이벤트)
+# - 목표: 레버가 높을수록 SL/TP(ROI%)가 자동으로 넓어져 휩쏘 손절 반복을 줄임
+# - 외부시황: 공포/탐욕 지수 + 고중요 이벤트(이번주 캘린더에서 High만 일부)
+# - 주의: 외부 요청은 캐시로 최소화(기본 60초)
 # =========================================================
+
+_EXT_CACHE = {"ts": 0.0, "data": {}}
+
+def _fear_greed_kr(v: int) -> str:
+    # Alternative.me 기준 구간
+    if v <= 25:
+        return "극공포(패닉 구간)"
+    if v <= 45:
+        return "공포(조심 구간)"
+    if v <= 55:
+        return "중립(보통 구간)"
+    if v <= 75:
+        return "탐욕(과열 주의)"
+    return "극탐욕(과열/변동성 주의)"
+
+
+def _fetch_fear_greed() -> Dict[str, Any]:
+    """
+    공포/탐욕 지수(Alternative.me)
+    실패 시 빈 dict 반환
+    """
+    try:
+        url = "https://api.alternative.me/fng/?limit=1&format=json"
+        r = requests.get(url, timeout=8)
+        j = r.json()
+        v = int(j["data"][0]["value"])
+        cls = str(j["data"][0].get("value_classification", ""))
+        ts = str(j["data"][0].get("timestamp", ""))
+        return {
+            "value": v,
+            "label_kr": _fear_greed_kr(v),
+            "label_en": cls,
+            "timestamp": ts,
+        }
+    except Exception:
+        return {}
+
+
+def _fetch_high_impact_events(limit: int = 6) -> List[Dict[str, Any]]:
+    """
+    ForexFactory 이번주 JSON에서 impact=High만 일부 추려서 제공
+    - 시간대/포맷이 환경마다 다를 수 있어 '참고용'으로만 사용
+    """
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        r = requests.get(url, timeout=8)
+        data = r.json()
+        out = []
+        for x in data:
+            if x.get("impact") != "High":
+                continue
+            out.append({
+                "date": x.get("date", ""),
+                "time": x.get("time", ""),
+                "country": x.get("country", ""),
+                "title": x.get("title", ""),
+                "impact_kr": "매우 중요",
+            })
+            if len(out) >= limit:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def get_external_context_cached(refresh_sec: int = 60) -> Dict[str, Any]:
+    """
+    외부시황 스냅샷(캐시)
+    refresh_sec 지나면 갱신 시도
+    """
+    now = time.time()
+    if (now - float(_EXT_CACHE.get("ts", 0))) < refresh_sec and isinstance(_EXT_CACHE.get("data"), dict):
+        return _EXT_CACHE["data"]
+
+    snap = {
+        "fng": _fetch_fear_greed(),
+        "high_impact_events": _fetch_high_impact_events(limit=6),
+        "updated_kst": now_kst_str(),
+    }
+    _EXT_CACHE["ts"] = now
+    _EXT_CACHE["data"] = snap
+    return snap
+
+
+def _atr_price_pct(df: pd.DataFrame, window: int = 14) -> float:
+    """ATR을 가격 대비 %로 반환 (예: 0.45%)"""
+    try:
+        if ta is None or df is None or df.empty or len(df) < window + 5:
+            return 0.0
+        atr = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=window)
+        v = float(atr.iloc[-1])
+        c = float(df["close"].iloc[-1])
+        if c <= 0:
+            return 0.0
+        return (v / c) * 100.0
+    except Exception:
+        return 0.0
+
+
+def _swing_stop_price_pct(df: pd.DataFrame, decision: str, lookback: int = 40, buffer_atr_mul: float = 0.25) -> float:
+    """
+    최근 스윙 저점/고점 기준으로 "가격 손절폭%" 추정
+    - buy(롱): 최근 N봉 최저가 아래로 버퍼
+    - sell(숏): 최근 N봉 최고가 위로 버퍼
+    """
+    try:
+        if df is None or df.empty or len(df) < lookback + 5:
+            return 0.0
+        recent = df.tail(lookback)
+        last_close = float(df["close"].iloc[-1])
+        atr_pct = _atr_price_pct(df, 14)
+        buf_pct = atr_pct * buffer_atr_mul  # ATR의 일부를 버퍼로
+
+        if decision == "buy":
+            swing = float(recent["low"].min())
+            if last_close <= 0:
+                return 0.0
+            stop_price = swing * (1.0 - buf_pct / 100.0)
+            dist_pct = ((last_close - stop_price) / last_close) * 100.0
+            return max(0.0, dist_pct)
+
+        if decision == "sell":
+            swing = float(recent["high"].max())
+            if last_close <= 0:
+                return 0.0
+            stop_price = swing * (1.0 + buf_pct / 100.0)
+            dist_pct = ((stop_price - last_close) / last_close) * 100.0
+            return max(0.0, dist_pct)
+
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def _rr_min_by_mode(mode: str) -> float:
+    # 모드별 최소 손익비(“손절 짧게 / 익절 길게” 방향)
+    if mode == "안전모드":
+        return 1.8
+    if mode == "공격모드":
+        return 2.1
+    return 2.6  # 하이리스크/하이리턴
+
+
+def _risk_guardrail(out: Dict[str, Any], df: pd.DataFrame, decision: str, mode: str, external: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    out(sl_pct,tp_pct,leverage,rr)을 '휩쏘에 안 잘릴 정도'로 자동 보정
+    - 핵심: SL/TP는 ROI%가 아니라 "가격 변동폭%"을 기준으로 잡고 ROI로 변환
+    - 외부시황 반영(완만): 극공포면 보수적으로(손절 약간 넓게, 레버는 AI가 정한 범위 내에서만)
+    """
+    lev = max(1, int(out.get("leverage", 1)))
+    sl_roi = float(out.get("sl_pct", 1.2))
+    tp_roi = float(out.get("tp_pct", 3.0))
+    rr = float(out.get("rr", 0))
+
+    # 현재 out이 암시하는 가격 손절폭(%) = ROI손절 / 레버
+    sl_price_pct_now = sl_roi / max(lev, 1)
+
+    # 변동성 기반 최소 가격 손절폭(휩쏘 방지)
+    atr_pct = _atr_price_pct(df, 14)
+    min_price_stop = max(0.25, atr_pct * 0.9)  # 5m 기준 최소 0.25% 또는 ATR의 0.9배
+
+    # 스윙 기준 손절폭도 고려
+    swing_stop = _swing_stop_price_pct(df, decision, lookback=40, buffer_atr_mul=0.25)
+    if swing_stop > 0:
+        swing_stop = min(swing_stop, max(min_price_stop * 3.0, atr_pct * 3.0))
+    recommended_price_stop = max(min_price_stop, swing_stop)
+
+    notes = []
+
+    # ✅ 외부시황(공포탐욕)로 '약간' 보정: 극공포면 손절폭을 조금 더 여유(휩쏘 방지)
+    try:
+        fng = (external or {}).get("fng", {}) or {}
+        fng_v = int(fng.get("value", -1)) if fng.get("value") is not None else -1
+        if 0 <= fng_v <= 25:
+            recommended_price_stop = max(recommended_price_stop, min_price_stop * 1.2)
+            notes.append("외부시황: 극공포라 휩쏘 대비 손절 여유 추가")
+    except Exception:
+        pass
+
+    # ✅ 레버가 높은데 가격손절폭이 너무 작으면 SL 확장
+    if sl_price_pct_now < recommended_price_stop:
+        sl_price_pct_now = recommended_price_stop
+        sl_roi = sl_price_pct_now * lev
+        notes.append(f"손절폭(가격기준)을 변동성/스윙에 맞게 확장({recommended_price_stop:.2f}%)")
+
+    # ✅ 손익비 최소치 확보: TP가 SL*RRmin 보다 작으면 TP를 올림
+    rr_min = _rr_min_by_mode(mode)
+    if rr <= 0:
+        rr = max(rr_min, tp_roi / max(sl_roi, 0.01))
+
+    if tp_roi < sl_roi * rr_min:
+        tp_roi = sl_roi * rr_min
+        notes.append(f"손익비 최소 {rr_min:.1f} 확보하도록 익절 상향")
+
+    rr = max(rr, tp_roi / max(sl_roi, 0.01))
+
+    # 결과 저장
+    out["sl_pct"] = float(sl_roi)
+    out["tp_pct"] = float(tp_roi)
+    out["rr"] = float(rr)
+
+    # 디버그/표시용(가격 기준도 같이 기록)
+    out["sl_price_pct"] = float(sl_roi / max(lev, 1))
+    out["tp_price_pct"] = float(tp_roi / max(lev, 1))
+    out["risk_note"] = " / ".join(notes) if notes else "보정 없음"
+    return out
+
+
 def ai_decide_trade(
     df: pd.DataFrame,
     status: Dict[str, Any],
@@ -872,22 +1085,8 @@ def ai_decide_trade(
     mode: str,
     cfg: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    반환 예:
-    {
-      decision: buy/sell/hold,
-      confidence: 0~100,
-      entry_pct: 잔고 대비 진입비중(%),
-      leverage: 레버리지,
-      sl_pct: 손절(%) (ROI 기준),
-      tp_pct: 익절(%) (ROI 기준),
-      rr: 손익비,
-      used_indicators: [...],
-      reason_easy: 쉬운 한글
-    }
-    """
-    client = get_openai_client(cfg)
-    if client is None:
+
+    if openai_client is None:
         return {"decision": "hold", "confidence": 0, "reason_easy": "OpenAI 키 없음", "used_indicators": status.get("_used_indicators", [])}
 
     if df is None or df.empty or status is None:
@@ -896,13 +1095,12 @@ def ai_decide_trade(
     rule = MODE_RULES.get(mode, MODE_RULES["안전모드"])
     last = df.iloc[-1]
     prev = df.iloc[-2]
-
     past_mistakes = get_past_mistakes_text(5)
 
-    ext = read_json_safe(MONITOR_FILE, {}).get("external", {})
+    # ✅ 외부시황 스냅샷(캐시)
+    ext_refresh = int(cfg.get("ai_reco_refresh_sec", 20))  # 이미 cfg에 있는 값을 재활용
+    external = get_external_context_cached(refresh_sec=max(20, min(ext_refresh * 3, 180)))
 
-
-    # 모델에게 “과매도 해소 타이밍”을 강제
     features = {
         "symbol": symbol,
         "mode": mode,
@@ -917,35 +1115,53 @@ def ai_decide_trade(
         "rsi_resolve_long": bool(status.get("_rsi_resolve_long", False)),
         "rsi_resolve_short": bool(status.get("_rsi_resolve_short", False)),
         "pullback_candidate": bool(status.get("_pullback_candidate", False)),
+        "atr_price_pct": _atr_price_pct(df, 14),
+        "external": external,  # ✅ 여기서 외부시황을 AI에게 전달
     }
-           
+
+    # 외부시황을 시스템 프롬프트에도 명시(“참고해서 판단”하도록)
+    fng_txt = ""
+    try:
+        fng = (external or {}).get("fng", {}) or {}
+        if fng:
+            fng_txt = f"- 공포탐욕지수: {int(fng.get('value', -1))}점 / {fng.get('label_kr','')}"
+    except Exception:
+        fng_txt = ""
+
+    ev_txt = ""
+    try:
+        evs = (external or {}).get("high_impact_events", []) or []
+        if evs:
+            # 너무 길지 않게 3개만
+            top3 = evs[:3]
+            ev_txt = "- 중요 이벤트(참고): " + " | ".join([f"{e.get('country','')} {e.get('title','')}" for e in top3])
+    except Exception:
+        ev_txt = ""
 
     sys = f"""
 너는 '워뇨띠 스타일(눌림목/해소 타이밍) + 손익비' 기반의 자동매매 트레이더 AI다.
-목표:
-- 손실은 짧게(빠르게 끊기) 하지만
-- 추세가 맞으면 익절은 더 길게(수익을 키우기)
-- 그리고 같은 실수를 반복하지 않기(회고)
-
 
 [과거 실수(요약)]
 {past_mistakes}
 
+[외부 시황(참고)]
+{fng_txt}
+{ev_txt}
+
 [핵심 룰]
-1) RSI가 과매도/과매수 "상태"에 들어가자마자 진입하지 말고,
-   '해소되는 시점'(반등/반락 확인)에서만 진입 후보로 고려한다.
-2) 상승추세에서는 롱(매수) 우선, 하락추세에서는 숏(매도) 우선. (역추세는 매우 신중)
+1) RSI 과매도/과매수 "상태"에 즉시 진입하지 말고, '해소되는 시점'에서만 진입 후보.
+2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. (역추세는 매우 신중)
 3) 모드 규칙은 반드시 준수:
    - 최소 확신도: {rule["min_conf"]}
    - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
    - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
-4) 외부시황에서 'high_impact_events_soon'이 비어있지 않으면(중요 이벤트 임박),
-   신규 진입은 더 보수적으로(혹은 HOLD) 판단한다.
 
-
-[응답]
-반드시 JSON만 출력한다.
-설명은 '초보도 이해하는 쉬운 한글'로, 괄호로 뜻을 덧붙인다.
+[중요]
+- sl_pct / tp_pct는 "ROI%"(레버 반영 수익률)로 출력한다.
+- 변동성(atr_price_pct)이 작으면 손절을 너무 타이트하게 잡지 마라.
+- 외부시황이 '극공포'면 휩쏘/변동성 리스크를 고려해 신중(확신/손절/익절 설계)해라.
+- 영어 금지. 쉬운 한글(괄호로 뜻 추가).
+- 반드시 JSON만 출력.
 """
 
     user = f"""
@@ -958,22 +1174,16 @@ JSON 형식:
   "confidence": 0-100,
   "entry_pct": {rule["entry_pct_min"]}-{rule["entry_pct_max"]},
   "leverage": {rule["lev_min"]}-{rule["lev_max"]},
-  "sl_pct": 0.3-20.0,
-  "tp_pct": 0.5-50.0,
+  "sl_pct": 0.3-50.0,
+  "tp_pct": 0.5-150.0,
   "rr": 0.5-10.0,
   "used_indicators": ["..."],
   "reason_easy": "쉬운 한글(괄호로 의미 추가)"
 }}
-
-조건:
-- 확신이 낮으면 HOLD
-- pullback_candidate=True(상승추세 눌림목 반등 후보)면 가산점
-- 손절은 짧게, 익절은 추세 강하면 길게(ADX가 높을수록 tp_pct를 늘릴 수 있음)
-- 텍스트는 영어 금지, 모두 한글로.
 """
 
     try:
-        resp = client.chat.completions.create(
+        resp = openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "system", "content": sys},
                       {"role": "user", "content": user}],
@@ -982,7 +1192,6 @@ JSON 형식:
         )
         out = json.loads(resp.choices[0].message.content)
 
-        # normalize / clamp
         out["decision"] = out.get("decision", "hold")
         if out["decision"] not in ["buy", "sell", "hold"]:
             out["decision"] = "hold"
@@ -1006,9 +1215,19 @@ JSON 형식:
 
         out["reason_easy"] = str(out.get("reason_easy", ""))[:500]
 
-        # 최소 확신도 미달이면 hold
         if out["decision"] in ["buy", "sell"] and out["confidence"] < rule["min_conf"]:
             out["decision"] = "hold"
+
+        # ✅ (핵심) 리스크 매니저로 SL/TP 자동 보정 (+ 외부시황 일부 반영)
+        if out["decision"] in ["buy", "sell"]:
+            out = _risk_guardrail(out, df, out["decision"], mode, external)
+
+        # ✅ 외부시황 스냅샷도 결과에 같이 포함(디버그/표시용)
+        out["external_used"] = {
+            "fng": (external or {}).get("fng", {}),
+            "high_impact_events": (external or {}).get("high_impact_events", [])[:3],
+            "updated_kst": (external or {}).get("updated_kst", ""),
+        }
 
         return out
 
@@ -1406,9 +1625,20 @@ def telegram_thread(ex):
                         trade_id = str(tgt.get("trade_id") or "")
 
                         # ✅ 트레일링: 절반 익절 도달하면 손절을 당겨서 수익보호(기존 로직 유지)
+                        # ✅ 트레일링: "가격 변동폭 기준"으로만 조여서 휩쏘 방지
                         if cfg.get("use_trailing_stop", True):
+                            # 목표 절반 도달 시, 손절을 '너무 타이트하지 않게' 올려서 수익 보호
                             if roi >= (tp * 0.5):
-                                sl = min(sl, 0.3)
+                                lev_now = float(tgt.get("lev", p.get("leverage", 1))) or 1.0
+                                # entry 때 계산된 가격 손절폭이 있으면 그걸 기준으로, 없으면 현재 SL/레버로 추정
+                                base_price_sl = float(tgt.get("sl_price_pct", max(0.25, float(sl) / max(lev_now, 1))))
+                                # 트레일링은 원래 손절폭의 60% 정도로만 조임(너무 꽉 조이면 휩쏘)
+                                trail_price_pct = max(0.20, base_price_sl * 0.60)
+                                trail_roi = trail_price_pct * lev_now
+                        
+                                # sl은 "허용 손실폭"이므로 더 작아지면 더 타이트해짐 → min으로 조이되, 너무 작게는 금지
+                                sl = min(sl, max(1.2, float(trail_roi)))  # 최소 -1.2% ROI 이하로는 안 조임
+
 
                         # ✅ (추가) SR 기반 가격 트리거가 있으면 우선 체크
                         hit_sl_by_price = False
