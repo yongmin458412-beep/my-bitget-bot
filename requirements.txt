@@ -9,4 +9,5 @@ plotly
 openai
 ta
 streamlit-autorefresh>=1.0.1
-
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
