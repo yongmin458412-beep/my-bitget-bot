@@ -8,3 +8,5 @@ google-generativeai>=0.8.3
 plotly
 openai
 ta
+streamlit-autorefresh>=1.0.1
+
