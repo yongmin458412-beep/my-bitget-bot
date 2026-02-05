@@ -447,6 +447,26 @@ if not api_key:
     st.error("🚨 Bitget API Key가 없습니다. Secrets에 API_KEY/API_SECRET/API_PASSWORD 설정하세요.")
     st.stop()
 
+# ✅ OpenAI 클라이언트(전역) - 스레드에서도 사용
+openai_client = None
+
+def init_openai_client():
+    global openai_client
+    key = st.secrets.get("OPENAI_API_KEY") or load_settings().get("openai_api_key", "")
+    if not key:
+        openai_client = None
+        return None
+    try:
+        openai_client = OpenAI(api_key=key)
+        return openai_client
+    except Exception:
+        openai_client = None
+        return None
+
+# 최초 1회 생성
+init_openai_client()
+
+
 # =========================================================
 # ✅ (추가) OpenAI 클라이언트는 '스레드에서도 최신 키'를 쓰도록 유틸로 제공
 # =========================================================
@@ -2219,7 +2239,12 @@ if not openai_key:
     if k:
         config["openai_api_key"] = k
         save_settings(config)
+
+        # ✅ 추가: 즉시 전역 클라이언트 재생성 (스레드도 바로 사용 가능)
+        init_openai_client()
+
         st.rerun()
+
 
 with st.sidebar.expander("🧪 디버그: 저장된 설정(bot_settings.json) 확인"):
     st.json(read_json_safe(SETTINGS_FILE, {}))
