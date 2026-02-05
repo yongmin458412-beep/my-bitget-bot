@@ -1574,7 +1574,7 @@ with t1:
 
                 st.divider()
                 st.subheader("🚦 10종 보조지표 상태판(요약)")
-                st.dataframe(pd.DataFrame([status]), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame([status]), width="stretch", hide_index=True)
 
                 st.markdown("#### 📉 Bitget 실시간 종가(라인차트)")
                 st.line_chart(df.set_index("time")["close"])
@@ -1668,7 +1668,7 @@ with t3:
     if ev.empty:
         st.warning("캘린더를 불러오지 못했어요.")
     else:
-        st.dataframe(ev, use_container_width=True, hide_index=True)
+        st.dataframe(ev, width="stretch", hide_index=True)
 
 with t4:
     st.subheader("📜 매매일지(한줄평 위주 + 상세파일 저장)")
@@ -1682,7 +1682,7 @@ with t4:
         # 최신순
         if "time" in dfj.columns:
             dfj = dfj.sort_values("time", ascending=False)
-        st.dataframe(dfj, use_container_width=True, hide_index=True)
+        st.dataframe(dfj, width="stretch", hide_index=True)
 
     st.divider()
     st.subheader("📁 상세 로그(trade_log.csv)")
@@ -1690,7 +1690,7 @@ with t4:
     if log_df.empty:
         st.caption("상세 로그 없음")
     else:
-        st.dataframe(log_df.tail(300).iloc[::-1], use_container_width=True, hide_index=True)
+        st.dataframe(log_df.tail(300).iloc[::-1], width="stretch", hide_index=True)
         csv = log_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button("💾 CSV 다운로드", csv, "trade_log.csv", "text/csv")
 
