@@ -1,5 +1,5 @@
 # =========================================================
-#  Bitget AI Wonyoti Agent (Final Integrated)
+#  Bitget AI Wonyoti Agent (Final Integrated - Patched)
 #  - Streamlit: 제어판/차트/포지션/일지/AI 시야
 #  - Telegram: 실시간 보고/조회/일지 요약
 #  - AutoTrade: 데모(IS_SANDBOX=True) 기반
@@ -13,7 +13,6 @@ import time
 import uuid
 import math
 import threading
-from dataclasses import dataclass
 from typing import Dict, Any, Optional, List, Tuple
 
 import requests
@@ -38,21 +37,18 @@ try:
 except Exception:
     st_autorefresh = None
 
-# ===== 추가 PIP(있으면 사용, 없어도 기존 코드 그대로 동작) =====
 try:
     import orjson  # 빠른 JSON
 except Exception:
     orjson = None
 
+# (중요) tenacity는 한번만 import해서 이름 충돌 방지
 try:
-    from tenacity import retry, stop_after_attempt, wait_exponential_jitter
+    from tenacity import retry as tenacity_retry, stop_after_attempt, wait_exponential_jitter
 except Exception:
-    retry = None
-
-try:
-    from loguru import logger
-except Exception:
-    logger = None
+    tenacity_retry = None
+    stop_after_attempt = None
+    wait_exponential_jitter = None
 
 try:
     from diskcache import Cache
@@ -69,10 +65,6 @@ try:
 except Exception:
     argrelextrema = None
 
-try:
-    from pydantic import BaseModel, Field, ValidationError  # AI JSON 안정화
-except Exception:
-    BaseModel = None
 # ---- external context pip ----
 try:
     import feedparser  # pip: feedparser
@@ -83,12 +75,6 @@ try:
     from cachetools import TTLCache
 except Exception:
     TTLCache = None
-
-try:
-    from tenacity import retry, stop_after_attempt, wait_fixed
-except Exception:
-    retry = None
-
 
 # =========================================================
 # ✅ 0) 기본 설정
@@ -103,14 +89,11 @@ LOG_FILE = "trade_log.csv"
 MONITOR_FILE = "monitor_state.json"
 BRAIN_DB = "wonyousi_brain.db"  # (선택) 향후 확장
 
-# ===== 추가(상세 일지 저장 폴더) =====
 DETAIL_DIR = "trade_details"
 os.makedirs(DETAIL_DIR, exist_ok=True)
 
-# ===== 추가(캐시) =====
 _cache = Cache("cache") if Cache else None
 
-# 감시 대상 코인
 TARGET_COINS = [
     "BTC/USDT:USDT",
     "ETH/USDT:USDT",
@@ -120,7 +103,7 @@ TARGET_COINS = [
 ]
 
 # =========================================================
-# ✅ 1) 시간 유틸 (KST, timezone-aware) - DeprecationWarning 제거
+# ✅ 1) 시간 유틸 (KST, timezone-aware)
 # =========================================================
 from datetime import datetime, timedelta, timezone
 KST = timezone(timedelta(hours=9))
@@ -139,7 +122,7 @@ def today_kst_str() -> str:
 
 
 # =========================================================
-# ✅ 2) JSON 안전 저장/로드 (원자적)  (추가: orjson 있으면 자동 사용)
+# ✅ 2) JSON 안전 저장/로드 (원자적)
 # =========================================================
 def write_json_atomic(path: str, data: Dict[str, Any]) -> None:
     tmp = path + ".tmp"
@@ -168,7 +151,7 @@ def read_json_safe(path: str, default=None):
 
 
 # =========================================================
-# ✅ 2.5) (추가) 상세일지 저장/조회
+# ✅ 2.5) 상세일지 저장/조회
 # =========================================================
 def save_trade_detail(trade_id: str, payload: Dict[str, Any]) -> None:
     try:
@@ -196,30 +179,12 @@ def list_recent_trade_ids(limit: int = 10) -> List[str]:
 
 
 # =========================================================
-# ✅ 3) MODE_RULES (사용자 제공) - 3단계 모드
+# ✅ 3) MODE_RULES (3단계 모드)
 # =========================================================
 MODE_RULES = {
-    "안전모드": {
-        "min_conf": 85,
-        "entry_pct_min": 2,
-        "entry_pct_max": 8,
-        "lev_min": 2,
-        "lev_max": 8,
-    },
-    "공격모드": {
-        "min_conf": 80,
-        "entry_pct_min": 8,     # ✅ 공격: 최소 8% ~ 25%
-        "entry_pct_max": 25,
-        "lev_min": 2,
-        "lev_max": 10,          # ✅ 레버는 낮게
-    },
-    "하이리스크/하이리턴": {
-        "min_conf": 85,
-        "entry_pct_min": 15,
-        "entry_pct_max": 40,
-        "lev_min": 8,
-        "lev_max": 25,          # ✅ 레버도 높게
-    }
+    "안전모드": {"min_conf": 85, "entry_pct_min": 2, "entry_pct_max": 8, "lev_min": 2, "lev_max": 8},
+    "공격모드": {"min_conf": 80, "entry_pct_min": 8, "entry_pct_max": 25, "lev_min": 2, "lev_max": 10},
+    "하이리스크/하이리턴": {"min_conf": 85, "entry_pct_min": 15, "entry_pct_max": 40, "lev_min": 8, "lev_max": 25},
 }
 
 
@@ -228,7 +193,6 @@ MODE_RULES = {
 # =========================================================
 def default_settings() -> Dict[str, Any]:
     return {
-        # 공통
         "openai_api_key": "",
         "auto_trade": False,
         "trade_mode": "안전모드",
@@ -237,11 +201,9 @@ def default_settings() -> Dict[str, Any]:
 
         # 텔레그램
         "tg_enable_reports": True,
-
-        # ===== 추가: 텔레그램에 진입 근거 길게 보내지 않기(기본 False) =====
         "tg_send_entry_reason": False,
 
-        # 10종 지표 파라미터
+        # 지표 파라미터
         "rsi_period": 14,
         "rsi_buy": 30,
         "rsi_sell": 70,
@@ -252,7 +214,7 @@ def default_settings() -> Dict[str, Any]:
         "stoch_k": 14,
         "vol_mul": 2.0,
 
-        # 10종 지표 ON/OFF
+        # 지표 ON/OFF
         "use_rsi": True,
         "use_bb": True,
         "use_cci": True,
@@ -264,46 +226,43 @@ def default_settings() -> Dict[str, Any]:
         "use_willr": True,
         "use_adx": True,
 
-        # 방어/자금/전략 옵션
+        # 방어/전략 옵션
         "use_trailing_stop": True,
         "use_dca": True,
         "dca_trigger": -20.0,
         "dca_max_count": 1,
-        "dca_add_pct": 50.0,        # (기본) 추가진입은 원진입의 50% 규모
+        "dca_add_pct": 50.0,
         "use_switching": True,
-        "switch_trigger": -12.0,    # 손실이 커졌는데 반대 시그널 강하면 스위칭
+        "switch_trigger": -12.0,
 
         "no_trade_weekend": False,
 
-        # 연속손실/일시정지
+        # 연속손실 보호
         "loss_pause_enable": True,
-        "loss_pause_after": 3,        # 연속 3번 손실이면
-        "loss_pause_minutes": 30,     # 30분 정지
+        "loss_pause_after": 3,
+        "loss_pause_minutes": 30,
 
-        # AI 추천 글로벌옵션
+        # AI 추천/표시
         "ai_reco_show": True,
-        "ai_reco_apply": False,  # ✅ ON이면 AI 추천값을 자동으로 config에 반영
-        "ai_reco_refresh_sec": 20,  # 추천 갱신 주기(너무 잦으면 비용/지연)
-
-        # AI 출력 쉬운말(한글)
+        "ai_reco_apply": False,
+        "ai_reco_refresh_sec": 20,
         "ai_easy_korean": True,
 
-                # 🌍 외부 시황 통합
+        # 🌍 외부 시황 통합
         "use_external_context": True,
-        "macro_blackout_minutes": 30,      # 중요 이벤트 전후 신규진입 줄이기(분)
-        "external_refresh_sec": 60,        # 외부시황 갱신 주기
+        "macro_blackout_minutes": 30,
+        "external_refresh_sec": 60,
         "news_enable": True,
         "news_refresh_sec": 300,
         "news_max_headlines": 12,
 
-
-        # ===== 추가: 지지/저항(SR) 기반 손절/익절 =====
+        # ✅ 지지/저항(SR) 기반 손절/익절
         "use_sr_stop": True,
         "sr_timeframe": "15m",
         "sr_pivot_order": 6,
         "sr_atr_period": 14,
-        "sr_buffer_atr_mult": 0.25,   # 지지/저항 이탈 버퍼
-        "sr_rr_min": 1.5,             # SR 기반 TP 계산 시 최소 RR
+        "sr_buffer_atr_mult": 0.25,
+        "sr_rr_min": 1.5,
     }
 
 
@@ -313,7 +272,6 @@ def load_settings() -> Dict[str, Any]:
         saved = read_json_safe(SETTINGS_FILE, {})
         if isinstance(saved, dict):
             cfg.update(saved)
-    # 예전 키 이름 호환
     if "openai_key" in cfg and not cfg.get("openai_api_key"):
         cfg["openai_api_key"] = cfg["openai_key"]
     return cfg
@@ -327,7 +285,7 @@ config = load_settings()
 
 
 # =========================================================
-# ✅ 5) 런타임 상태(runtime_state.json) - 사용자 포맷 유지
+# ✅ 5) 런타임 상태(runtime_state.json)
 # =========================================================
 def default_runtime() -> Dict[str, Any]:
     return {
@@ -337,7 +295,7 @@ def default_runtime() -> Dict[str, Any]:
         "consec_losses": 0,
         "pause_until": 0,
         "cooldowns": {},
-        "trades": {}  # 심볼별 dca 횟수 등 저장
+        "trades": {}
     }
 
 
@@ -345,10 +303,8 @@ def load_runtime() -> Dict[str, Any]:
     rt = read_json_safe(RUNTIME_FILE, None)
     if not isinstance(rt, dict):
         rt = default_runtime()
-    # 날짜 rollover
     if rt.get("date") != today_kst_str():
         rt = default_runtime()
-    # 필드 보정
     for k, v in default_runtime().items():
         if k not in rt:
             rt[k] = v
@@ -360,7 +316,7 @@ def save_runtime(rt: Dict[str, Any]) -> None:
 
 
 # =========================================================
-# ✅ 6) 매매일지 CSV (상세 저장 + 한줄평 + 후기)
+# ✅ 6) 매매일지 CSV + 회고
 # =========================================================
 def log_trade(
     coin: str,
@@ -388,7 +344,6 @@ def log_trade(
             "Review": review,
             "TradeID": trade_id,
         }])
-
         if not os.path.exists(LOG_FILE):
             row.to_csv(LOG_FILE, index=False, encoding="utf-8-sig")
         else:
@@ -425,7 +380,9 @@ def get_past_mistakes_text(max_items: int = 5) -> str:
         worst = df.sort_values("PnL_Percent", ascending=True).head(max_items)
         lines = []
         for _, r in worst.iterrows():
-            lines.append(f"- {r.get('Coin','?')} {r.get('Side','?')} {float(r.get('PnL_Percent',0)):.2f}% 손실 | 이유: {str(r.get('Reason',''))[:40]}")
+            lines.append(
+                f"- {r.get('Coin','?')} {r.get('Side','?')} {float(r.get('PnL_Percent',0)):.2f}% 손실 | 이유: {str(r.get('Reason',''))[:40]}"
+            )
         return "\n".join(lines) if lines else "큰 손실 기록 없음."
     except Exception:
         return "기록 조회 실패"
@@ -447,29 +404,8 @@ if not api_key:
     st.error("🚨 Bitget API Key가 없습니다. Secrets에 API_KEY/API_SECRET/API_PASSWORD 설정하세요.")
     st.stop()
 
-# ✅ OpenAI 클라이언트(전역) - 스레드에서도 사용
-openai_client = None
 
-def init_openai_client():
-    global openai_client
-    key = st.secrets.get("OPENAI_API_KEY") or load_settings().get("openai_api_key", "")
-    if not key:
-        openai_client = None
-        return None
-    try:
-        openai_client = OpenAI(api_key=key)
-        return openai_client
-    except Exception:
-        openai_client = None
-        return None
-
-# 최초 1회 생성
-init_openai_client()
-
-
-# =========================================================
-# ✅ (추가) OpenAI 클라이언트는 '스레드에서도 최신 키'를 쓰도록 유틸로 제공
-# =========================================================
+# ✅ OpenAI 클라이언트 캐시(키별) - 스레드에서도 최신 키 사용 가능
 _OPENAI_CLIENT_CACHE: Dict[str, Any] = {}
 
 
@@ -480,7 +416,8 @@ def get_openai_client(cfg: Dict[str, Any]) -> Optional[OpenAI]:
     if key in _OPENAI_CLIENT_CACHE:
         return _OPENAI_CLIENT_CACHE[key]
     try:
-        c = OpenAI(api_key=key)
+        # timeout을 주어 "스레드 멈춤(대기)" 위험 감소
+        c = OpenAI(api_key=key, timeout=15.0)
         _OPENAI_CLIENT_CACHE[key] = c
         return c
     except Exception:
@@ -514,7 +451,7 @@ if not exchange:
 
 
 # =========================================================
-# ✅ 9) Bitget 헬퍼 (포지션/잔고/수량 정밀)
+# ✅ 9) Bitget 헬퍼 (포지션/잔고/수량)
 # =========================================================
 def safe_fetch_balance(ex) -> Tuple[float, float]:
     try:
@@ -573,7 +510,6 @@ def market_order_safe(ex, sym: str, side: str, qty: float) -> bool:
 
 
 def close_position_market(ex, sym: str, pos_side: str, contracts: float) -> bool:
-    # pos_side: long/short OR buy/sell
     if contracts <= 0:
         return False
     if pos_side in ["long", "buy"]:
@@ -582,7 +518,6 @@ def close_position_market(ex, sym: str, pos_side: str, contracts: float) -> bool
 
 
 def position_roi_percent(p: Dict[str, Any]) -> float:
-    # ccxt 포지션 dict에서 ROI% 가져오거나 계산
     try:
         if p.get("percentage") is not None:
             return float(p.get("percentage"))
@@ -592,18 +527,16 @@ def position_roi_percent(p: Dict[str, Any]) -> float:
 
 
 def position_side_normalize(p: Dict[str, Any]) -> str:
-    # bitget/ccxt는 side가 long/short 또는 buy/sell로 올 수 있음
     s = (p.get("side") or p.get("positionSide") or "").lower()
     if s in ["long", "buy"]:
         return "long"
     if s in ["short", "sell"]:
         return "short"
-    # fallback
     return "long"
 
 
 # =========================================================
-# ✅ 9.5) (추가) SR(지지/저항) 기반 손절/익절 계산
+# ✅ 9.5) SR(지지/저항) 기반 손절/익절
 # =========================================================
 def calc_atr(df: pd.DataFrame, period: int = 14) -> float:
     if df is None or df.empty or len(df) < period + 2:
@@ -618,9 +551,6 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> float:
 
 
 def pivot_levels(df: pd.DataFrame, order: int = 6, max_levels: int = 12) -> Tuple[List[float], List[float]]:
-    """
-    supports, resistances
-    """
     if df is None or df.empty or len(df) < order * 4:
         return [], []
     highs = df["high"].astype(float).values
@@ -683,10 +613,9 @@ def sr_stop_take(entry_price: float, side: str, htf_df: pd.DataFrame,
 
 
 # =========================================================
-# ✅ 10) TradingView 다크모드 차트
+# ✅ 10) TradingView 차트
 # =========================================================
 def tv_symbol_from_ccxt(sym: str) -> str:
-    # BTC/USDT:USDT -> BITGET:BTCUSDT.P (가능하면)
     base = sym.split("/")[0]
     quote = sym.split("/")[1].split(":")[0]
     return f"BITGET:{base}{quote}.P"
@@ -720,8 +649,6 @@ def render_tradingview(symbol_ccxt: str, interval="5", height=560) -> None:
     components.html(html, height=height)
 
 
-
-
 # =========================================================
 # ✅ 11) 지표 계산 (10종 + 상태요약 + “눌림목 해소” 감지)
 # =========================================================
@@ -733,7 +660,6 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
         status["_ERROR"] = "ta 모듈 없음(requirements.txt에 ta 추가 필요)"
         return df, status, None
 
-    # parameters
     rsi_period = int(cfg.get("rsi_period", 14))
     rsi_buy = float(cfg.get("rsi_buy", 30))
     rsi_sell = float(cfg.get("rsi_sell", 70))
@@ -749,59 +675,46 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
     low = df["low"]
     vol = df["vol"]
 
-    # RSI
     if cfg.get("use_rsi", True):
         df["RSI"] = ta.momentum.rsi(close, window=rsi_period)
 
-    # Bollinger
     if cfg.get("use_bb", True):
         bb = ta.volatility.BollingerBands(close, window=bb_period, window_dev=bb_std)
         df["BB_upper"] = bb.bollinger_hband()
         df["BB_lower"] = bb.bollinger_lband()
         df["BB_mid"] = bb.bollinger_mavg()
 
-    # MA
     if cfg.get("use_ma", True):
         df["MA_fast"] = ta.trend.sma_indicator(close, window=ma_fast)
         df["MA_slow"] = ta.trend.sma_indicator(close, window=ma_slow)
 
-    # MACD
     if cfg.get("use_macd", True):
         macd = ta.trend.MACD(close)
         df["MACD"] = macd.macd()
         df["MACD_signal"] = macd.macd_signal()
 
-    # Stoch
     if cfg.get("use_stoch", True):
         df["STO_K"] = ta.momentum.stoch(high, low, close, window=stoch_k, smooth_window=3)
         df["STO_D"] = ta.momentum.stoch_signal(high, low, close, window=stoch_k, smooth_window=3)
 
-    # CCI
     if cfg.get("use_cci", True):
         df["CCI"] = ta.trend.cci(high, low, close, window=20)
 
-    # MFI
     if cfg.get("use_mfi", True):
         df["MFI"] = ta.volume.money_flow_index(high, low, close, vol, window=14)
 
-    # Williams %R
     if cfg.get("use_willr", True):
         df["WILLR"] = ta.momentum.williams_r(high, low, close, lbp=14)
 
-    # ADX
     if cfg.get("use_adx", True):
         df["ADX"] = ta.trend.adx(high, low, close, window=14)
 
-    # Volume spike
     if cfg.get("use_vol", True):
         df["VOL_MA"] = vol.rolling(20).mean()
         df["VOL_SPIKE"] = (df["vol"] > (df["VOL_MA"] * vol_mul)).astype(int)
 
-    # ===== (추가) pandas-ta가 있으면 참고용 지표를 더 계산할 수 있음 (기존 기능 변경 X) =====
-    # (지표를 더 추가로 계산하되, 기존 판단 로직은 그대로 유지)
     if pta is not None:
         try:
-            # 예시: ATR(참고)
             df["ATR_ref"] = pta.atr(df["high"], df["low"], df["close"], length=14)
         except Exception:
             pass
@@ -813,10 +726,8 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # ---- status text (Korean) ----
     used = []
 
-    # RSI status
     if cfg.get("use_rsi", True):
         used.append("RSI")
         rsi_now = float(last.get("RSI", 50))
@@ -827,7 +738,6 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
         else:
             status["RSI"] = f"⚪ 중립({rsi_now:.1f})"
 
-    # Bollinger
     if cfg.get("use_bb", True):
         used.append("볼린저밴드")
         if last["close"] > last["BB_upper"]:
@@ -837,7 +747,6 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
         else:
             status["BB"] = "⚪ 밴드 내"
 
-    # MA trend
     trend = "중립"
     if cfg.get("use_ma", True):
         used.append("이동평균(MA)")
@@ -849,30 +758,24 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
             trend = "횡보/전환"
         status["추세"] = f"📈 {trend}"
 
-    # MACD
     if cfg.get("use_macd", True):
         used.append("MACD")
         status["MACD"] = "📈 상승(골든)" if last["MACD"] > last["MACD_signal"] else "📉 하락(데드)"
 
-    # ADX
     if cfg.get("use_adx", True):
         used.append("ADX(추세강도)")
         adx = float(last.get("ADX", 0))
         status["ADX"] = "🔥 추세 강함" if adx >= 25 else "💤 추세 약함"
 
-    # volume
     if cfg.get("use_vol", True):
         used.append("거래량")
         status["거래량"] = "🔥 거래량 급증" if int(last.get("VOL_SPIKE", 0)) == 1 else "⚪ 보통"
 
-    # ---- 핵심: “과매도에 바로 진입” 방지 -> “해소 시점(반등/반락 확인)” ----
     rsi_prev = float(prev.get("RSI", 50)) if cfg.get("use_rsi", True) else 50.0
     rsi_now = float(last.get("RSI", 50)) if cfg.get("use_rsi", True) else 50.0
-
     rsi_resolve_long = (rsi_prev < rsi_buy) and (rsi_now >= rsi_buy)
     rsi_resolve_short = (rsi_prev > rsi_sell) and (rsi_now <= rsi_sell)
 
-    # 눌림목 후보: 상승추세 + 과매도 해소 + (ADX 너무 약하지 않음)
     adx_now = float(last.get("ADX", 0)) if cfg.get("use_adx", True) else 0.0
     pullback_candidate = (trend == "상승추세") and rsi_resolve_long and (adx_now >= 18)
 
@@ -885,97 +788,158 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
 
 
 # =========================================================
-# ✅ 12) AI 판단 + 리스크 매니저(ATR/스윙 기반 SL/TP 자동보정) + 외부시황(공포탐욕/이벤트)
-# - 목표: 레버가 높을수록 SL/TP(ROI%)가 자동으로 넓어져 휩쏘 손절 반복을 줄임
-# - 외부시황: 공포/탐욕 지수 + 고중요 이벤트(이번주 캘린더에서 High만 일부)
-# - 주의: 외부 요청은 캐시로 최소화(기본 60초)
+# ✅ X) 외부 시황 통합(거시/심리/레짐/뉴스)
+#    - "한 버전만" 유지하도록 통합 (중복 제거)
 # =========================================================
-
-_EXT_CACHE = {"ts": 0.0, "data": {}}
-
-def _fear_greed_kr(v: int) -> str:
-    # Alternative.me 기준 구간
-    if v <= 25:
-        return "극공포(패닉 구간)"
-    if v <= 45:
-        return "공포(조심 구간)"
-    if v <= 55:
-        return "중립(보통 구간)"
-    if v <= 75:
-        return "탐욕(과열 주의)"
-    return "극탐욕(과열/변동성 주의)"
+EXT_CACHE = TTLCache(maxsize=4, ttl=60) if TTLCache else None
 
 
-def _fetch_fear_greed() -> Dict[str, Any]:
-    """
-    공포/탐욕 지수(Alternative.me)
-    실패 시 빈 dict 반환
-    """
+def _safe_get_json(url: str, timeout: int = 10):
     try:
-        url = "https://api.alternative.me/fng/?limit=1&format=json"
-        r = requests.get(url, timeout=8)
-        j = r.json()
-        v = int(j["data"][0]["value"])
-        cls = str(j["data"][0].get("value_classification", ""))
-        ts = str(j["data"][0].get("timestamp", ""))
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def fetch_fear_greed():
+    data = _safe_get_json("https://api.alternative.me/fng/?limit=1&format=json", timeout=8)
+    if not data or "data" not in data or not data["data"]:
+        return None
+    d0 = data["data"][0]
+    try:
         return {
-            "value": v,
-            "label_kr": _fear_greed_kr(v),
-            "label_en": cls,
-            "timestamp": ts,
+            "value": int(d0.get("value", 0)),
+            "classification": str(d0.get("value_classification", "")),
+            "timestamp": str(d0.get("timestamp", "")),
         }
     except Exception:
-        return {}
+        return None
 
 
-def _fetch_high_impact_events(limit: int = 6) -> List[Dict[str, Any]]:
-    """
-    ForexFactory 이번주 JSON에서 impact=High만 일부 추려서 제공
-    - 시간대/포맷이 환경마다 다를 수 있어 '참고용'으로만 사용
-    """
+def fetch_coingecko_global():
+    data = _safe_get_json("https://api.coingecko.com/api/v3/global", timeout=10)
+    if not data or "data" not in data:
+        return None
+    g = data["data"]
+    mcp = g.get("market_cap_percentage", {}) or {}
     try:
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        r = requests.get(url, timeout=8)
-        data = r.json()
-        out = []
-        for x in data:
-            if x.get("impact") != "High":
-                continue
-            out.append({
-                "date": x.get("date", ""),
-                "time": x.get("time", ""),
-                "country": x.get("country", ""),
-                "title": x.get("title", ""),
-                "impact_kr": "매우 중요",
-            })
-            if len(out) >= limit:
-                break
-        return out
+        return {
+            "btc_dominance": float(mcp.get("btc", 0.0)),
+            "eth_dominance": float(mcp.get("eth", 0.0)),
+            "total_mcap_usd": float((g.get("total_market_cap", {}) or {}).get("usd", 0.0)),
+            "mcap_change_24h_pct": float(g.get("market_cap_change_percentage_24h_usd", 0.0)),
+        }
     except Exception:
+        return None
+
+
+def fetch_upcoming_high_impact_events(within_minutes: int = 30, limit: int = 80):
+    data = _safe_get_json("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10)
+    if not isinstance(data, list):
         return []
+    now = now_kst()
+    out = []
+    for x in data[:limit]:
+        try:
+            impact = str(x.get("impact", ""))
+            if impact != "High":
+                continue
+            dt_str = str(x.get("date", ""))
+            try:
+                dt = datetime.fromisoformat(dt_str)
+                if dt.tzinfo:
+                    dt = dt.astimezone(KST)
+                else:
+                    dt = dt.replace(tzinfo=KST)
+            except Exception:
+                continue
+
+            diff_min = (dt - now).total_seconds() / 60.0
+            if 0 <= diff_min <= within_minutes:
+                out.append({
+                    "time_kst": dt.strftime("%m-%d %H:%M"),
+                    "title": str(x.get("title", "")),
+                    "country": str(x.get("country", "")),
+                    "impact": "매우 중요",
+                })
+        except Exception:
+            continue
+    return out
 
 
-def get_external_context_cached(refresh_sec: int = 60) -> Dict[str, Any]:
-    """
-    외부시황 스냅샷(캐시)
-    refresh_sec 지나면 갱신 시도
-    """
-    now = time.time()
-    if (now - float(_EXT_CACHE.get("ts", 0))) < refresh_sec and isinstance(_EXT_CACHE.get("data"), dict):
-        return _EXT_CACHE["data"]
+def fetch_news_headlines_rss(max_items: int = 12):
+    if feedparser is None:
+        return []
+    feeds = [
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cointelegraph.com/rss",
+    ]
+    items = []
+    for url in feeds:
+        try:
+            d = feedparser.parse(url)
+            for e in (d.entries or [])[:max_items]:
+                title = str(getattr(e, "title", "")).strip()
+                if title:
+                    items.append(title)
+        except Exception:
+            continue
 
-    snap = {
-        "fng": _fetch_fear_greed(),
-        "high_impact_events": _fetch_high_impact_events(limit=6),
-        "updated_kst": now_kst_str(),
+    uniq = []
+    seen = set()
+    for t in items:
+        if t not in seen:
+            uniq.append(t)
+            seen.add(t)
+    return uniq[:max_items]
+
+
+def build_external_context(cfg: dict):
+    if not cfg.get("use_external_context", True):
+        return {"enabled": False, "asof_kst": now_kst_str()}
+
+    refresh_sec = int(cfg.get("external_refresh_sec", 60))
+    if EXT_CACHE is not None and "ext" in EXT_CACHE:
+        ext = EXT_CACHE["ext"]
+        # refresh_sec보다 오래되면 갱신 시도
+        try:
+            last_ts = float(ext.get("_ts", 0))
+            if time.time() - last_ts < refresh_sec:
+                return ext
+        except Exception:
+            pass
+
+    blackout = int(cfg.get("macro_blackout_minutes", 30))
+    high_events = fetch_upcoming_high_impact_events(within_minutes=blackout)
+    fg = fetch_fear_greed()
+    cg = fetch_coingecko_global()
+
+    headlines = []
+    if cfg.get("news_enable", True):
+        headlines = fetch_news_headlines_rss(max_items=int(cfg.get("news_max_headlines", 12)))
+
+    ext = {
+        "enabled": True,
+        "blackout_minutes": blackout,
+        "high_impact_events_soon": high_events,
+        "fear_greed": fg,
+        "global": cg,
+        "headlines": headlines,
+        "asof_kst": now_kst_str(),
+        "_ts": time.time(),
     }
-    _EXT_CACHE["ts"] = now
-    _EXT_CACHE["data"] = snap
-    return snap
+
+    if EXT_CACHE is not None:
+        EXT_CACHE["ext"] = ext
+    return ext
 
 
+# =========================================================
+# ✅ 12) AI 판단 + 리스크 매니저(ATR/스윙 기반 SL/TP 자동보정) + 외부시황 반영
+# =========================================================
 def _atr_price_pct(df: pd.DataFrame, window: int = 14) -> float:
-    """ATR을 가격 대비 %로 반환 (예: 0.45%)"""
     try:
         if ta is None or df is None or df.empty or len(df) < window + 5:
             return 0.0
@@ -990,18 +954,13 @@ def _atr_price_pct(df: pd.DataFrame, window: int = 14) -> float:
 
 
 def _swing_stop_price_pct(df: pd.DataFrame, decision: str, lookback: int = 40, buffer_atr_mul: float = 0.25) -> float:
-    """
-    최근 스윙 저점/고점 기준으로 "가격 손절폭%" 추정
-    - buy(롱): 최근 N봉 최저가 아래로 버퍼
-    - sell(숏): 최근 N봉 최고가 위로 버퍼
-    """
     try:
         if df is None or df.empty or len(df) < lookback + 5:
             return 0.0
         recent = df.tail(lookback)
         last_close = float(df["close"].iloc[-1])
         atr_pct = _atr_price_pct(df, 14)
-        buf_pct = atr_pct * buffer_atr_mul  # ATR의 일부를 버퍼로
+        buf_pct = atr_pct * buffer_atr_mul
 
         if decision == "buy":
             swing = float(recent["low"].min())
@@ -1025,33 +984,24 @@ def _swing_stop_price_pct(df: pd.DataFrame, decision: str, lookback: int = 40, b
 
 
 def _rr_min_by_mode(mode: str) -> float:
-    # 모드별 최소 손익비(“손절 짧게 / 익절 길게” 방향)
     if mode == "안전모드":
         return 1.8
     if mode == "공격모드":
         return 2.1
-    return 2.6  # 하이리스크/하이리턴
+    return 2.6
 
 
 def _risk_guardrail(out: Dict[str, Any], df: pd.DataFrame, decision: str, mode: str, external: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    out(sl_pct,tp_pct,leverage,rr)을 '휩쏘에 안 잘릴 정도'로 자동 보정
-    - 핵심: SL/TP는 ROI%가 아니라 "가격 변동폭%"을 기준으로 잡고 ROI로 변환
-    - 외부시황 반영(완만): 극공포면 보수적으로(손절 약간 넓게, 레버는 AI가 정한 범위 내에서만)
-    """
     lev = max(1, int(out.get("leverage", 1)))
     sl_roi = float(out.get("sl_pct", 1.2))
     tp_roi = float(out.get("tp_pct", 3.0))
     rr = float(out.get("rr", 0))
 
-    # 현재 out이 암시하는 가격 손절폭(%) = ROI손절 / 레버
     sl_price_pct_now = sl_roi / max(lev, 1)
 
-    # 변동성 기반 최소 가격 손절폭(휩쏘 방지)
     atr_pct = _atr_price_pct(df, 14)
-    min_price_stop = max(0.25, atr_pct * 0.9)  # 5m 기준 최소 0.25% 또는 ATR의 0.9배
+    min_price_stop = max(0.25, atr_pct * 0.9)
 
-    # 스윙 기준 손절폭도 고려
     swing_stop = _swing_stop_price_pct(df, decision, lookback=40, buffer_atr_mul=0.25)
     if swing_stop > 0:
         swing_stop = min(swing_stop, max(min_price_stop * 3.0, atr_pct * 3.0))
@@ -1059,39 +1009,35 @@ def _risk_guardrail(out: Dict[str, Any], df: pd.DataFrame, decision: str, mode: 
 
     notes = []
 
-    # ✅ 외부시황(공포탐욕)로 '약간' 보정: 극공포면 손절폭을 조금 더 여유(휩쏘 방지)
+    # 외부시황: 극공포면 손절폭을 "약간" 여유
     try:
-        fng = (external or {}).get("fng", {}) or {}
-        fng_v = int(fng.get("value", -1)) if fng.get("value") is not None else -1
-        if 0 <= fng_v <= 25:
+        fg = (external or {}).get("fear_greed") or {}
+        v = int(fg.get("value", -1)) if fg else -1
+        if 0 <= v <= 25:
             recommended_price_stop = max(recommended_price_stop, min_price_stop * 1.2)
-            notes.append("외부시황: 극공포라 휩쏘 대비 손절 여유 추가")
+            notes.append("외부시황: 극공포 → 손절 여유(+)")
     except Exception:
         pass
 
-    # ✅ 레버가 높은데 가격손절폭이 너무 작으면 SL 확장
     if sl_price_pct_now < recommended_price_stop:
         sl_price_pct_now = recommended_price_stop
         sl_roi = sl_price_pct_now * lev
-        notes.append(f"손절폭(가격기준)을 변동성/스윙에 맞게 확장({recommended_price_stop:.2f}%)")
+        notes.append(f"손절폭 확장(가격 {recommended_price_stop:.2f}%)")
 
-    # ✅ 손익비 최소치 확보: TP가 SL*RRmin 보다 작으면 TP를 올림
     rr_min = _rr_min_by_mode(mode)
     if rr <= 0:
         rr = max(rr_min, tp_roi / max(sl_roi, 0.01))
 
     if tp_roi < sl_roi * rr_min:
         tp_roi = sl_roi * rr_min
-        notes.append(f"손익비 최소 {rr_min:.1f} 확보하도록 익절 상향")
+        notes.append(f"익절 상향(RR {rr_min:.1f} 확보)")
 
     rr = max(rr, tp_roi / max(sl_roi, 0.01))
 
-    # 결과 저장
     out["sl_pct"] = float(sl_roi)
     out["tp_pct"] = float(tp_roi)
     out["rr"] = float(rr)
 
-    # 디버그/표시용(가격 기준도 같이 기록)
     out["sl_price_pct"] = float(sl_roi / max(lev, 1))
     out["tp_price_pct"] = float(tp_roi / max(lev, 1))
     out["risk_note"] = " / ".join(notes) if notes else "보정 없음"
@@ -1105,8 +1051,8 @@ def ai_decide_trade(
     mode: str,
     cfg: Dict[str, Any]
 ) -> Dict[str, Any]:
-
-    if openai_client is None:
+    client = get_openai_client(cfg)
+    if client is None:
         return {"decision": "hold", "confidence": 0, "reason_easy": "OpenAI 키 없음", "used_indicators": status.get("_used_indicators", [])}
 
     if df is None or df.empty or status is None:
@@ -1117,9 +1063,7 @@ def ai_decide_trade(
     prev = df.iloc[-2]
     past_mistakes = get_past_mistakes_text(5)
 
-    # ✅ 외부시황 스냅샷(캐시)
-    ext_refresh = int(cfg.get("ai_reco_refresh_sec", 20))  # 이미 cfg에 있는 값을 재활용
-    external = get_external_context_cached(refresh_sec=max(20, min(ext_refresh * 3, 180)))
+    external = build_external_context(cfg)
 
     features = {
         "symbol": symbol,
@@ -1136,25 +1080,23 @@ def ai_decide_trade(
         "rsi_resolve_short": bool(status.get("_rsi_resolve_short", False)),
         "pullback_candidate": bool(status.get("_pullback_candidate", False)),
         "atr_price_pct": _atr_price_pct(df, 14),
-        "external": external,  # ✅ 여기서 외부시황을 AI에게 전달
+        "external": external,
     }
 
-    # 외부시황을 시스템 프롬프트에도 명시(“참고해서 판단”하도록)
     fng_txt = ""
     try:
-        fng = (external or {}).get("fng", {}) or {}
-        if fng:
-            fng_txt = f"- 공포탐욕지수: {int(fng.get('value', -1))}점 / {fng.get('label_kr','')}"
+        fg = (external or {}).get("fear_greed") or {}
+        if fg:
+            fng_txt = f"- 공포탐욕: {int(fg.get('value', -1))} / {str(fg.get('classification',''))}"
     except Exception:
         fng_txt = ""
 
     ev_txt = ""
     try:
-        evs = (external or {}).get("high_impact_events", []) or []
+        evs = (external or {}).get("high_impact_events_soon") or []
         if evs:
-            # 너무 길지 않게 3개만
             top3 = evs[:3]
-            ev_txt = "- 중요 이벤트(참고): " + " | ".join([f"{e.get('country','')} {e.get('title','')}" for e in top3])
+            ev_txt = "- 중요 이벤트(임박): " + " | ".join([f"{e.get('country','')} {e.get('title','')}" for e in top3])
     except Exception:
         ev_txt = ""
 
@@ -1171,7 +1113,7 @@ def ai_decide_trade(
 [핵심 룰]
 1) RSI 과매도/과매수 "상태"에 즉시 진입하지 말고, '해소되는 시점'에서만 진입 후보.
 2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. (역추세는 매우 신중)
-3) 모드 규칙은 반드시 준수:
+3) 모드 규칙 준수:
    - 최소 확신도: {rule["min_conf"]}
    - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
    - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
@@ -1179,8 +1121,7 @@ def ai_decide_trade(
 [중요]
 - sl_pct / tp_pct는 "ROI%"(레버 반영 수익률)로 출력한다.
 - 변동성(atr_price_pct)이 작으면 손절을 너무 타이트하게 잡지 마라.
-- 외부시황이 '극공포'면 휩쏘/변동성 리스크를 고려해 신중(확신/손절/익절 설계)해라.
-- 영어 금지. 쉬운 한글(괄호로 뜻 추가).
+- 영어 금지. 쉬운 한글.
 - 반드시 JSON만 출력.
 """
 
@@ -1198,12 +1139,11 @@ JSON 형식:
   "tp_pct": 0.5-150.0,
   "rr": 0.5-10.0,
   "used_indicators": ["..."],
-  "reason_easy": "쉬운 한글(괄호로 의미 추가)"
+  "reason_easy": "쉬운 한글"
 }}
 """
-
     try:
-        resp = openai_client.chat.completions.create(
+        resp = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "system", "content": sys},
                       {"role": "user", "content": user}],
@@ -1238,15 +1178,13 @@ JSON 형식:
         if out["decision"] in ["buy", "sell"] and out["confidence"] < rule["min_conf"]:
             out["decision"] = "hold"
 
-        # ✅ (핵심) 리스크 매니저로 SL/TP 자동 보정 (+ 외부시황 일부 반영)
         if out["decision"] in ["buy", "sell"]:
             out = _risk_guardrail(out, df, out["decision"], mode, external)
 
-        # ✅ 외부시황 스냅샷도 결과에 같이 포함(디버그/표시용)
         out["external_used"] = {
-            "fng": (external or {}).get("fng", {}),
-            "high_impact_events": (external or {}).get("high_impact_events", [])[:3],
-            "updated_kst": (external or {}).get("updated_kst", ""),
+            "fear_greed": (external or {}).get("fear_greed"),
+            "high_impact_events_soon": (external or {}).get("high_impact_events_soon", [])[:3],
+            "asof_kst": (external or {}).get("asof_kst", ""),
         }
 
         return out
@@ -1256,18 +1194,9 @@ JSON 형식:
 
 
 # =========================================================
-# ✅ 13) AI 회고(후기) 작성 (청산 시 일지에 저장)
+# ✅ 13) AI 회고(후기) 작성
 # =========================================================
-def ai_write_review(
-    symbol: str,
-    side: str,
-    pnl_percent: float,
-    reason: str,
-    cfg: Dict[str, Any]
-) -> Tuple[str, str]:
-    """
-    return: (one_line, review_long)
-    """
+def ai_write_review(symbol: str, side: str, pnl_percent: float, reason: str, cfg: Dict[str, Any]) -> Tuple[str, str]:
     client = get_openai_client(cfg)
     if client is None:
         one = "익절" if pnl_percent >= 0 else "손절"
@@ -1278,7 +1207,6 @@ def ai_write_review(
 출력은 반드시 JSON만.
 영어 금지. 초보도 이해하도록 쉬운 한글로.
 """
-
     user = f"""
 상황:
 - 코인: {symbol}
@@ -1288,8 +1216,8 @@ def ai_write_review(
 
 JSON 형식:
 {{
-  "one_line": "한줄평(아주 짧게)",
-  "review": "후기(손절이면 다음에 어떻게 개선할지 / 익절이면 다음에 무엇을 유지할지)"
+  "one_line": "한줄평",
+  "review": "후기"
 }}
 """
     try:
@@ -1310,13 +1238,9 @@ JSON 형식:
 
 
 # =========================================================
-# ✅ 14) 경제 캘린더 (한글)
+# ✅ 14) 경제 캘린더 (한글) - (참고용)
 # =========================================================
 def get_forex_events_kr(limit: int = 80) -> pd.DataFrame:
-    """
-    ForexFactory JSON(이번주) 불러와서 한글로 표기.
-    네트워크 제한/실패 시 빈 DF.
-    """
     try:
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
         r = requests.get(url, timeout=10)
@@ -1338,12 +1262,14 @@ def get_forex_events_kr(limit: int = 80) -> pd.DataFrame:
 
 
 # =========================================================
-# ✅ 15) 모니터 상태 (AI 시야/하트비트)
+# ✅ 15) 모니터 상태(하트비트/외부시황/스레드상태)
 # =========================================================
 def monitor_init():
     mon = read_json_safe(MONITOR_FILE, {"coins": {}}) or {"coins": {}}
     mon["_boot_time_kst"] = now_kst_str()
     mon["_last_write"] = 0
+    mon["thread_last_loop_epoch"] = time.time()
+    mon["thread_last_loop_kst"] = now_kst_str()
     write_json_atomic(MONITOR_FILE, mon)
     return mon
 
@@ -1354,161 +1280,20 @@ def monitor_write_throttled(mon: Dict[str, Any], min_interval_sec: float = 1.0):
         write_json_atomic(MONITOR_FILE, mon)
         mon["_last_write"] = time.time()
 
-# =========================================================
-# ✅ X) 외부 시황 통합(거시/심리/레짐/뉴스) - 데모용
-# =========================================================
-_ext_cache = TTLCache(maxsize=4, ttl=60) if TTLCache else None
-
-def _safe_get_json(url: str, timeout: int = 10):
-    try:
-        r = requests.get(url, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return None
-
-def fetch_fear_greed():
-    # Alternative.me Fear & Greed (public)
-    data = _safe_get_json("https://api.alternative.me/fng/?limit=1&format=json", timeout=8)
-    if not data or "data" not in data or not data["data"]:
-        return None
-    d0 = data["data"][0]
-    try:
-        return {
-            "value": int(d0.get("value", 0)),
-            "classification": str(d0.get("value_classification", "")),
-            "timestamp": str(d0.get("timestamp", "")),
-        }
-    except Exception:
-        return None
-
-def fetch_coingecko_global():
-    # CoinGecko global (public)
-    data = _safe_get_json("https://api.coingecko.com/api/v3/global", timeout=10)
-    if not data or "data" not in data:
-        return None
-    g = data["data"]
-    mcp = g.get("market_cap_percentage", {}) or {}
-    try:
-        return {
-            "btc_dominance": float(mcp.get("btc", 0.0)),
-            "eth_dominance": float(mcp.get("eth", 0.0)),
-            "total_mcap_usd": float((g.get("total_market_cap", {}) or {}).get("usd", 0.0)),
-            "mcap_change_24h_pct": float(g.get("market_cap_change_percentage_24h_usd", 0.0)),
-        }
-    except Exception:
-        return None
-
-def fetch_upcoming_high_impact_events(within_minutes: int = 30, limit: int = 80):
-    # ForexFactory weekly JSON (네가 이미 쓰는 소스)
-    data = _safe_get_json("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10)
-    if not isinstance(data, list):
-        return []
-    now = now_kst()
-    out = []
-    for x in data[:limit]:
-        try:
-            impact = str(x.get("impact", ""))
-            if impact != "High":
-                continue
-            # date가 ISO8601(+offset)로 오는 케이스가 많음
-            dt_str = str(x.get("date", ""))
-            dt = None
-            try:
-                dt = datetime.fromisoformat(dt_str)
-                # dt가 tz-aware면 KST로 변환
-                if dt.tzinfo:
-                    dt = dt.astimezone(KST)
-                else:
-                    dt = dt.replace(tzinfo=KST)
-            except Exception:
-                continue
-
-            diff_min = (dt - now).total_seconds() / 60.0
-            if 0 <= diff_min <= within_minutes:
-                out.append({
-                    "time_kst": dt.strftime("%m-%d %H:%M"),
-                    "title": str(x.get("title","")),
-                    "country": str(x.get("country","")),
-                    "impact": "매우 중요",
-                })
-        except Exception:
-            continue
-    return out
-
-def fetch_news_headlines_rss(max_items: int = 12):
-    if feedparser is None:
-        return []
-    # 너무 많이 말고 “헤드라인만”
-    feeds = [
-        "https://www.coindesk.com/arc/outboundfeeds/rss/",
-        "https://cointelegraph.com/rss",
-    ]
-    items = []
-    for url in feeds:
-        try:
-            d = feedparser.parse(url)
-            for e in (d.entries or [])[:max_items]:
-                title = str(getattr(e, "title", "")).strip()
-                if title:
-                    items.append(title)
-        except Exception:
-            continue
-    # 중복 제거
-    uniq = []
-    seen = set()
-    for t in items:
-        if t not in seen:
-            uniq.append(t); seen.add(t)
-    return uniq[:max_items]
-
-def build_external_context(cfg: dict):
-    """
-    외부시황을 '요약 가능한 형태'로 묶어서 반환
-    (스레드 멈춤 방지 위해 timeout + 실패해도 None/[] 리턴)
-    """
-    if not cfg.get("use_external_context", True):
-        return {"enabled": False}
-
-    # 캐시(스레드가 계속 도는 구조라, 이거 없으면 외부요청 과다로 멈출 수 있음)
-    if _ext_cache is not None and "ext" in _ext_cache:
-        return _ext_cache["ext"]
-
-    blackout = int(cfg.get("macro_blackout_minutes", 30))
-    high_events = fetch_upcoming_high_impact_events(within_minutes=blackout)
-
-    fg = fetch_fear_greed()
-    cg = fetch_coingecko_global()
-
-    headlines = []
-    if cfg.get("news_enable", True):
-        headlines = fetch_news_headlines_rss(max_items=int(cfg.get("news_max_headlines", 12)))
-
-    ext = {
-        "enabled": True,
-        "blackout_minutes": blackout,
-        "high_impact_events_soon": high_events,  # 리스트(0개면 안전)
-        "fear_greed": fg,                        # None 가능
-        "global": cg,                            # None 가능
-        "headlines": headlines,                  # [] 가능
-        "asof_kst": now_kst_str()
-    }
-
-    if _ext_cache is not None:
-        _ext_cache["ext"] = ext
-    return ext
 
 # =========================================================
-# ✅ 16) 텔레그램 유틸 (추가: retry 있으면 적용)
+# ✅ 16) 텔레그램 유틸
 # =========================================================
 def _tg_post(url: str, data: Dict[str, Any]):
-    if retry is None:
+    if tenacity_retry is None or stop_after_attempt is None or wait_exponential_jitter is None:
         return requests.post(url, data=data, timeout=10)
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(initial=0.6, max=3.0))
+
+    @tenacity_retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(initial=0.6, max=3.0))
     def _do():
         r = requests.post(url, data=data, timeout=10)
         r.raise_for_status()
         return r
+
     return _do()
 
 
@@ -1541,7 +1326,8 @@ def tg_send_menu():
     try:
         _tg_post(
             f"https://api.telegram.org/bot{tg_token}/sendMessage",
-            {"chat_id": tg_id, "text": "✅ 메뉴 갱신\n(일지상세: '일지상세 <ID>')", "reply_markup": json.dumps(kb, ensure_ascii=False)},
+            {"chat_id": tg_id, "text": "✅ 메뉴 갱신\n(일지상세: '일지상세 <ID>')",
+             "reply_markup": json.dumps(kb, ensure_ascii=False)},
         )
     except Exception:
         pass
@@ -1560,7 +1346,7 @@ def tg_answer_callback(cb_id: str):
 
 
 # =========================================================
-# ✅ 17) 자동매매 핵심 스레드 (24시간 모니터 + 매매 + 일지 + 시야)
+# ✅ 17) 자동매매 핵심 스레드
 # =========================================================
 def telegram_thread(ex):
     offset = 0
@@ -1569,8 +1355,6 @@ def telegram_thread(ex):
     tg_send("🚀 AI 봇 가동 시작! (모의투자)\n명령: 상태 / 시야 / 일지 / 일지상세 <ID>")
     tg_send_menu()
 
-    # active_targets: 심볼별 목표/정보 저장
-    # (추가: trade_id / SR가격 기반 sl_price,tp_price 저장)
     active_targets: Dict[str, Dict[str, Any]] = {}
 
     while True:
@@ -1579,18 +1363,21 @@ def telegram_thread(ex):
             rt = load_runtime()
             mode = cfg.get("trade_mode", "안전모드")
             rule = MODE_RULES.get(mode, MODE_RULES["안전모드"])
-                        # 🌍 외부 시황 갱신 (AI 시야/의사결정에 반영)
-            ext = build_external_context(cfg)
-            mon["external"] = ext
 
-
-            # ✅ 하트비트
+            # ✅ 하트비트/루프 상태를 "가장 먼저" 갱신 (멈춤의심 감소)
+            mon["thread_last_loop_epoch"] = time.time()
+            mon["thread_last_loop_kst"] = now_kst_str()
             mon["last_heartbeat_epoch"] = time.time()
             mon["last_heartbeat_kst"] = now_kst_str()
             mon["auto_trade"] = bool(cfg.get("auto_trade", False))
             mon["trade_mode"] = mode
             mon["pause_until"] = rt.get("pause_until", 0)
             mon["consec_losses"] = rt.get("consec_losses", 0)
+            monitor_write_throttled(mon, 0.8)
+
+            # 🌍 외부시황 갱신(캐시)
+            ext = build_external_context(cfg)
+            mon["external"] = ext
 
             # ✅ 자동매매 ON일 때만 스캔/매매
             if cfg.get("auto_trade", False):
@@ -1599,19 +1386,19 @@ def telegram_thread(ex):
                     wd = now_kst().weekday()  # 0=월 ... 5=토 6=일
                     if wd in [5, 6]:
                         mon["global_state"] = "주말 거래 OFF"
-                        monitor_write_throttled(mon, 2.0)
+                        monitor_write_throttled(mon, 1.5)
                         time.sleep(2.0)
                         continue
 
                 # 일시정지(연속손실)
                 if cfg.get("loss_pause_enable", True) and time.time() < float(rt.get("pause_until", 0)):
                     mon["global_state"] = "일시정지 중(연속손실/보호)"
-                    monitor_write_throttled(mon, 2.0)
+                    monitor_write_throttled(mon, 1.5)
                     time.sleep(1.0)
                 else:
                     mon["global_state"] = "스캔/매매 중"
 
-                    # 1) 포지션 관리 (손절/익절/트레일링/DCA/스위칭)
+                    # 1) 포지션 관리(손절/익절/트레일링/DCA)
                     for sym in TARGET_COINS:
                         ps = safe_fetch_positions(ex, [sym])
                         act = [p for p in ps if float(p.get("contracts") or 0) > 0]
@@ -1619,16 +1406,15 @@ def telegram_thread(ex):
                             continue
 
                         p = act[0]
-                        side = position_side_normalize(p)  # long/short
+                        side = position_side_normalize(p)
                         contracts = float(p.get("contracts") or 0)
                         entry = float(p.get("entryPrice") or 0)
                         roi = float(position_roi_percent(p))
                         cur_px = get_last_price(ex, sym) or entry
 
-                        # 목표가: active_targets에 없으면 fallback
                         tgt = active_targets.get(sym, {
-                            "sl": 2.0,     # 손절(%) 기준
-                            "tp": 5.0,     # 익절(%) 기준
+                            "sl": 2.0,
+                            "tp": 5.0,
                             "entry_usdt": 0.0,
                             "entry_pct": 0.0,
                             "lev": p.get("leverage", "?"),
@@ -1636,31 +1422,28 @@ def telegram_thread(ex):
                             "trade_id": "",
                             "sl_price": None,
                             "tp_price": None,
+                            "sl_price_pct": None,
+                            "tp_price_pct": None,
                         })
                         sl = float(tgt.get("sl", 2.0))
                         tp = float(tgt.get("tp", 5.0))
-
                         sl_price = tgt.get("sl_price")
                         tp_price = tgt.get("tp_price")
                         trade_id = str(tgt.get("trade_id") or "")
 
-                        # ✅ 트레일링: 절반 익절 도달하면 손절을 당겨서 수익보호(기존 로직 유지)
-                        # ✅ 트레일링: "가격 변동폭 기준"으로만 조여서 휩쏘 방지
+                        # ✅ 트레일링(가격 변동폭 기준으로만 조임 → 휩쏘 방지)
                         if cfg.get("use_trailing_stop", True):
-                            # 목표 절반 도달 시, 손절을 '너무 타이트하지 않게' 올려서 수익 보호
                             if roi >= (tp * 0.5):
                                 lev_now = float(tgt.get("lev", p.get("leverage", 1))) or 1.0
-                                # entry 때 계산된 가격 손절폭이 있으면 그걸 기준으로, 없으면 현재 SL/레버로 추정
-                                base_price_sl = float(tgt.get("sl_price_pct", max(0.25, float(sl) / max(lev_now, 1))))
-                                # 트레일링은 원래 손절폭의 60% 정도로만 조임(너무 꽉 조이면 휩쏘)
+                                base_price_sl = tgt.get("sl_price_pct")
+                                if base_price_sl is None:
+                                    base_price_sl = max(0.25, float(sl) / max(lev_now, 1))
+                                base_price_sl = float(base_price_sl)
                                 trail_price_pct = max(0.20, base_price_sl * 0.60)
                                 trail_roi = trail_price_pct * lev_now
-                        
-                                # sl은 "허용 손실폭"이므로 더 작아지면 더 타이트해짐 → min으로 조이되, 너무 작게는 금지
-                                sl = min(sl, max(1.2, float(trail_roi)))  # 최소 -1.2% ROI 이하로는 안 조임
+                                sl = min(sl, max(1.2, float(trail_roi)))
 
-
-                        # ✅ (추가) SR 기반 가격 트리거가 있으면 우선 체크
+                        # ✅ SR 가격 트리거 우선 체크
                         hit_sl_by_price = False
                         hit_tp_by_price = False
                         if cfg.get("use_sr_stop", True):
@@ -1675,7 +1458,7 @@ def telegram_thread(ex):
                                 if side == "short" and cur_px <= float(tp_price):
                                     hit_tp_by_price = True
 
-                        # ✅ DCA (물타기): 손실이 일정 수준 이하일 때 1회 추가 진입 (기존 유지)
+                        # ✅ DCA
                         if cfg.get("use_dca", True):
                             dca_trig = float(cfg.get("dca_trigger", -20.0))
                             dca_max = int(cfg.get("dca_max_count", 1))
@@ -1704,11 +1487,9 @@ def telegram_thread(ex):
                                         mon["last_action"] = {"time_kst": now_kst_str(), "type": "DCA", "symbol": sym, "roi": roi}
                                         monitor_write_throttled(mon, 0.2)
 
-                        # ===== 손절 조건: (추가) SR 가격 트리거 OR (기존) ROI 손절 =====
                         do_stop = hit_sl_by_price or (roi <= -abs(sl))
                         do_take = hit_tp_by_price or (roi >= tp)
 
-                        # ✅ 손절
                         if do_stop:
                             pnl_usdt_snapshot = float(p.get("unrealizedPnl") or 0.0)
                             ok = close_position_market(ex, sym, side, contracts)
@@ -1717,9 +1498,9 @@ def telegram_thread(ex):
                                 free_after, total_after = safe_fetch_balance(ex)
 
                                 one, review = ai_write_review(sym, side, roi, "자동 손절(지지/저항 이탈 또는 목표 손절)", cfg)
-                                log_trade(sym, side, entry, exit_px, pnl_usdt_snapshot, roi, "자동 손절", one_line=one, review=review, trade_id=trade_id)
+                                log_trade(sym, side, entry, exit_px, pnl_usdt_snapshot, roi, "자동 손절",
+                                          one_line=one, review=review, trade_id=trade_id)
 
-                                # (추가) 상세일지 업데이트
                                 if trade_id:
                                     d = load_trade_detail(trade_id) or {}
                                     d.update({
@@ -1732,14 +1513,12 @@ def telegram_thread(ex):
                                     })
                                     save_trade_detail(trade_id, d)
 
-                                # 연속손실 증가 및 일시정지 조건
                                 rt["consec_losses"] = int(rt.get("consec_losses", 0)) + 1
                                 if cfg.get("loss_pause_enable", True) and rt["consec_losses"] >= int(cfg.get("loss_pause_after", 3)):
                                     rt["pause_until"] = time.time() + int(cfg.get("loss_pause_minutes", 30)) * 60
                                     tg_send(f"🛑 연속손실 보호\n- 연속손실: {rt['consec_losses']}회\n- {int(cfg.get('loss_pause_minutes',30))}분 자동 정지")
                                 save_runtime(rt)
 
-                                # (추가) 텔레그램: USDT 손익/현재잔고까지 표시
                                 tg_send(
                                     f"🩸 손절\n"
                                     f"- 코인: {sym}\n"
@@ -1759,7 +1538,6 @@ def telegram_thread(ex):
                                 mon["last_action"] = {"time_kst": now_kst_str(), "type": "STOP", "symbol": sym, "roi": roi}
                                 monitor_write_throttled(mon, 0.2)
 
-                        # ✅ 익절
                         elif do_take:
                             pnl_usdt_snapshot = float(p.get("unrealizedPnl") or 0.0)
                             ok = close_position_market(ex, sym, side, contracts)
@@ -1768,9 +1546,9 @@ def telegram_thread(ex):
                                 free_after, total_after = safe_fetch_balance(ex)
 
                                 one, review = ai_write_review(sym, side, roi, "자동 익절(지지/저항 목표 또는 목표 익절)", cfg)
-                                log_trade(sym, side, entry, exit_px, pnl_usdt_snapshot, roi, "자동 익절", one_line=one, review=review, trade_id=trade_id)
+                                log_trade(sym, side, entry, exit_px, pnl_usdt_snapshot, roi, "자동 익절",
+                                          one_line=one, review=review, trade_id=trade_id)
 
-                                # (추가) 상세일지 업데이트
                                 if trade_id:
                                     d = load_trade_detail(trade_id) or {}
                                     d.update({
@@ -1808,21 +1586,28 @@ def telegram_thread(ex):
                     # 2) 신규 진입 스캔
                     free_usdt, total_usdt = safe_fetch_balance(ex)
 
+                    # ✅ 중요 이벤트 임박이면 신규진입 억제(블랙아웃)
+                    blackout_events = (ext or {}).get("high_impact_events_soon") or []
+                    is_blackout = len(blackout_events) > 0
+
                     for sym in TARGET_COINS:
-                        # 이미 포지션 있으면 스킵
                         ps = safe_fetch_positions(ex, [sym])
                         act = [p for p in ps if float(p.get("contracts") or 0) > 0]
                         if act:
                             continue
 
-                        # 쿨다운
                         cd = float(rt.get("cooldowns", {}).get(sym, 0))
                         if time.time() < cd:
                             mon.setdefault("coins", {}).setdefault(sym, {})
                             mon["coins"][sym]["skip_reason"] = "쿨다운(잠깐 쉬는중)"
                             continue
 
-                        # 데이터 로드
+                        # 블랙아웃이면 신규진입 스킵 (원하는대로 “전후 진입 줄이기” 구현)
+                        if is_blackout:
+                            mon.setdefault("coins", {}).setdefault(sym, {})
+                            mon["coins"][sym]["skip_reason"] = "중요 이벤트 임박(블랙아웃) → 신규진입 보류"
+                            continue
+
                         try:
                             ohlcv = ex.fetch_ohlcv(sym, cfg.get("timeframe", "5m"), limit=220)
                             df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
@@ -1844,7 +1629,6 @@ def telegram_thread(ex):
                             })
                             continue
 
-                        # 모니터 기록(지표/상태)
                         cs.update({
                             "last_scan_epoch": time.time(),
                             "last_scan_kst": now_kst_str(),
@@ -1858,7 +1642,7 @@ def telegram_thread(ex):
                             "pullback_candidate": bool(stt.get("_pullback_candidate", False)),
                         })
 
-                        # ✅ AI 호출 필터 (기존 유지)
+                        # ✅ AI 호출 필터
                         call_ai = False
                         if bool(stt.get("_pullback_candidate", False)):
                             call_ai = True
@@ -1872,10 +1656,9 @@ def telegram_thread(ex):
                         if not call_ai:
                             cs["ai_called"] = False
                             cs["skip_reason"] = "횡보/해소 신호 없음(휩쏘 위험)"
-                            monitor_write_throttled(mon, 1.0)
+                            monitor_write_throttled(mon, 0.8)
                             continue
 
-                        # AI 판단
                         ai = ai_decide_trade(df, stt, sym, mode, cfg)
                         decision = ai.get("decision", "hold")
                         conf = int(ai.get("confidence", 0))
@@ -1894,22 +1677,21 @@ def telegram_thread(ex):
                             "min_conf_required": int(rule["min_conf"]),
                             "skip_reason": ""
                         })
-                        monitor_write_throttled(mon, 1.0)
-                        
-                        # ✅ 강제 방향 필터: 하락추세면 롱 금지, 상승추세면 숏 금지 (역추세 방지)
+                        monitor_write_throttled(mon, 0.8)
+
+                        # ✅ 강제 방향 필터(역추세 방지)
                         trend_txt = (stt.get("추세", "") or "")
                         is_down = ("하락" in trend_txt)
                         is_up = ("상승" in trend_txt)
-                        
+
                         if is_down and decision == "buy":
                             cs["skip_reason"] = "하락추세라 롱 금지(역추세 방지)"
                             continue
-                        
+
                         if is_up and decision == "sell":
                             cs["skip_reason"] = "상승추세라 숏 금지(역추세 방지)"
                             continue
 
-                        # 진입 조건
                         if decision in ["buy", "sell"] and conf >= int(rule["min_conf"]):
                             entry_pct = float(ai.get("entry_pct", rule["entry_pct_min"]))
                             lev = int(ai.get("leverage", rule["lev_min"]))
@@ -1932,14 +1714,14 @@ def telegram_thread(ex):
                             if ok:
                                 trade_id = uuid.uuid4().hex[:10]
 
-                                # ===== (추가) SR 기반 SL/TP 가격도 함께 계산해서 저장 =====
+                                # SR 기반 SL/TP 가격 계산
                                 sl_price = None
                                 tp_price = None
                                 if cfg.get("use_sr_stop", True):
                                     try:
                                         sr_tf = cfg.get("sr_timeframe", "15m")
                                         htf = ex.fetch_ohlcv(sym, sr_tf, limit=220)
-                                        hdf = pd.DataFrame(htf, columns=["time","open","high","low","close","vol"])
+                                        hdf = pd.DataFrame(htf, columns=["time", "open", "high", "low", "close", "vol"])
                                         hdf["time"] = pd.to_datetime(hdf["time"], unit="ms")
                                         sr = sr_stop_take(
                                             entry_price=px,
@@ -1956,9 +1738,13 @@ def telegram_thread(ex):
                                     except Exception:
                                         pass
 
-                                # 목표 저장(기존 + 추가)
+                                # ✅ (중요) ai 리스크 보정값의 "가격기준 손절폭"도 저장 → 트레일링이 휩쏘 줄임
+                                sl_price_pct = ai.get("sl_price_pct")
+                                tp_price_pct = ai.get("tp_price_pct")
+
                                 active_targets[sym] = {
-                                    "sl": slp, "tp": tpp,
+                                    "sl": slp,
+                                    "tp": tpp,
                                     "entry_usdt": entry_usdt,
                                     "entry_pct": entry_pct,
                                     "lev": lev,
@@ -1966,9 +1752,10 @@ def telegram_thread(ex):
                                     "trade_id": trade_id,
                                     "sl_price": sl_price,
                                     "tp_price": tp_price,
+                                    "sl_price_pct": sl_price_pct,
+                                    "tp_price_pct": tp_price_pct,
                                 }
 
-                                # (추가) 상세일지 저장(진입 근거는 여기로)
                                 save_trade_detail(trade_id, {
                                     "trade_id": trade_id,
                                     "time": now_kst_str(),
@@ -1981,18 +1768,19 @@ def telegram_thread(ex):
                                     "lev": lev,
                                     "sl_pct_roi": slp,
                                     "tp_pct_roi": tpp,
+                                    "sl_price_pct": sl_price_pct,
+                                    "tp_price_pct": tp_price_pct,
                                     "sl_price_sr": sl_price,
                                     "tp_price_sr": tp_price,
                                     "used_indicators": ai.get("used_indicators", []),
                                     "reason_easy": ai.get("reason_easy", ""),
                                     "raw_status": stt,
+                                    "external_used": ai.get("external_used", {}),
                                 })
 
-                                # 쿨다운 60초
                                 rt.setdefault("cooldowns", {})[sym] = time.time() + 60
                                 save_runtime(rt)
 
-                                # 텔레그램 보고(기존 + 추가: 잔고/일지ID / 근거는 옵션)
                                 if cfg.get("tg_enable_reports", True):
                                     direction = "롱(상승에 베팅)" if decision == "buy" else "숏(하락에 베팅)"
                                     msg = (
@@ -2009,11 +1797,10 @@ def telegram_thread(ex):
                                         f"- 확신도: {conf}% (기준 {rule['min_conf']}%)\n"
                                         f"- 일지ID: {trade_id}\n"
                                     )
-                                    # 근거 길게 전송 여부
                                     if cfg.get("tg_send_entry_reason", False):
                                         msg += (
-                                            f"- 근거(쉬운말): {ai.get('reason_easy','')[:220]}\n"
-                                            f"- AI가 본 지표: {', '.join(ai.get('used_indicators', []))}\n"
+                                            f"- 근거: {ai.get('reason_easy','')[:220]}\n"
+                                            f"- AI 지표: {', '.join(ai.get('used_indicators', []))}\n"
                                         )
                                     tg_send(msg)
 
@@ -2037,7 +1824,7 @@ def telegram_thread(ex):
                         time.sleep(0.4)
 
             # =================================================
-            # 텔레그램 수신 처리 (텍스트 명령 / 콜백 버튼)
+            # 텔레그램 수신 처리
             # =================================================
             try:
                 res = requests.get(
@@ -2051,21 +1838,20 @@ def telegram_thread(ex):
                 for up in res.get("result", []):
                     offset = up.get("update_id", offset)
 
-                    # 텍스트 명령
                     if "message" in up and "text" in up["message"]:
                         txt = up["message"]["text"].strip()
 
                         if txt == "상태":
                             cfg_live = load_settings()
                             free, total = safe_fetch_balance(ex)
-                            rt = load_runtime()
+                            rt2 = load_runtime()
                             tg_send(
                                 f"📡 상태\n"
                                 f"- 자동매매: {'ON' if cfg_live.get('auto_trade') else 'OFF'}\n"
                                 f"- 모드: {cfg_live.get('trade_mode','-')}\n"
                                 f"- 잔고: {total:.2f} USDT (사용가능 {free:.2f})\n"
-                                f"- 연속손실: {rt.get('consec_losses',0)}\n"
-                                f"- 정지해제: {('정지중' if time.time() < float(rt.get('pause_until',0)) else '정상')}\n"
+                                f"- 연속손실: {rt2.get('consec_losses',0)}\n"
+                                f"- 정지상태: {('정지중' if time.time() < float(rt2.get('pause_until',0)) else '정상')}\n"
                             )
 
                         elif txt == "시야":
@@ -2077,11 +1863,11 @@ def telegram_thread(ex):
                                 f"- 모드: {mon_now.get('trade_mode','-')}",
                                 f"- 마지막 하트비트: {mon_now.get('last_heartbeat_kst','-')}",
                             ]
-                            for sym, cs in list(coins.items())[:10]:
+                            for sym2, cs2 in list(coins.items())[:10]:
                                 lines.append(
-                                    f"- {sym}: {str(cs.get('ai_decision','-')).upper()}({cs.get('ai_confidence','-')}%) "
-                                    f"/ RSI {cs.get('rsi','-')} / ADX {cs.get('adx','-')} "
-                                    f"/ {str(cs.get('ai_reason_easy') or cs.get('skip_reason') or '')[:30]}"
+                                    f"- {sym2}: {str(cs2.get('ai_decision','-')).upper()}({cs2.get('ai_confidence','-')}%) "
+                                    f"/ RSI {cs2.get('rsi','-')} / ADX {cs2.get('adx','-')} "
+                                    f"/ {str(cs2.get('ai_reason_easy') or cs2.get('skip_reason') or '')[:30]}"
                                 )
                             tg_send("\n".join(lines))
 
@@ -2093,11 +1879,13 @@ def telegram_thread(ex):
                                 top = df_log.head(8)
                                 msg = ["📜 최근 매매일지(요약)"]
                                 for _, r in top.iterrows():
-                                    tid = str(r.get("TradeID","") or "")
-                                    msg.append(f"- {r['Time']} {r['Coin']} {r['Side']} {float(r['PnL_Percent']):.2f}% | {str(r.get('OneLine',''))[:40]} | ID:{tid}")
+                                    tid = str(r.get("TradeID", "") or "")
+                                    msg.append(
+                                        f"- {r['Time']} {r['Coin']} {r['Side']} {float(r['PnL_Percent']):.2f}% | "
+                                        f"{str(r.get('OneLine',''))[:40]} | ID:{tid}"
+                                    )
                                 tg_send("\n".join(msg))
 
-                        # ===== (추가) 상세일지 조회 =====
                         elif txt.startswith("일지상세"):
                             parts = txt.split()
                             if len(parts) < 2:
@@ -2121,7 +1909,6 @@ def telegram_thread(ex):
                                         f"- 사용지표: {', '.join(d.get('used_indicators', []))[:200]}\n"
                                     )
 
-                    # 콜백 버튼
                     if "callback_query" in up:
                         cb = up["callback_query"]
                         data = cb.get("data", "")
@@ -2130,13 +1917,13 @@ def telegram_thread(ex):
                         if data == "status":
                             cfg_live = load_settings()
                             free, total = safe_fetch_balance(ex)
-                            rt = load_runtime()
+                            rt2 = load_runtime()
                             tg_send(
                                 f"📡 상태\n"
                                 f"- 자동매매: {'ON' if cfg_live.get('auto_trade') else 'OFF'}\n"
                                 f"- 모드: {cfg_live.get('trade_mode','-')}\n"
                                 f"- 잔고: {total:.2f} USDT (사용가능 {free:.2f})\n"
-                                f"- 연속손실: {rt.get('consec_losses',0)}\n"
+                                f"- 연속손실: {rt2.get('consec_losses',0)}\n"
                             )
 
                         elif data == "vision":
@@ -2146,10 +1933,10 @@ def telegram_thread(ex):
                                 "👁️ AI 시야(요약)",
                                 f"- 마지막 하트비트: {mon_now.get('last_heartbeat_kst','-')}",
                             ]
-                            for sym, cs in list(coins.items())[:10]:
+                            for sym2, cs2 in list(coins.items())[:10]:
                                 lines.append(
-                                    f"- {sym}: {str(cs.get('ai_decision','-')).upper()}({cs.get('ai_confidence','-')}%) "
-                                    f"/ {str(cs.get('ai_reason_easy') or cs.get('skip_reason') or '')[:35]}"
+                                    f"- {sym2}: {str(cs2.get('ai_decision','-')).upper()}({cs2.get('ai_confidence','-')}%) "
+                                    f"/ {str(cs2.get('ai_reason_easy') or cs2.get('skip_reason') or '')[:35]}"
                                 )
                             tg_send("\n".join(lines))
 
@@ -2160,16 +1947,17 @@ def telegram_thread(ex):
                         elif data == "position":
                             msg = ["📊 포지션"]
                             has = False
-                            for sym in TARGET_COINS:
-                                ps = safe_fetch_positions(ex, [sym])
+                            for sym2 in TARGET_COINS:
+                                ps = safe_fetch_positions(ex, [sym2])
                                 act = [p for p in ps if float(p.get("contracts") or 0) > 0]
                                 if act:
                                     p = act[0]
                                     has = True
-                                    side = position_side_normalize(p)
-                                    roi = float(position_roi_percent(p))
+                                    side2 = position_side_normalize(p)
+                                    roi2 = float(position_roi_percent(p))
                                     upnl = float(p.get("unrealizedPnl") or 0.0)
-                                    msg.append(f"- {sym}: {('롱' if side=='long' else '숏')} (수익률 {roi:.2f}%, 손익 {upnl:.2f} USDT)")
+                                    lev2 = p.get("leverage", "?")
+                                    msg.append(f"- {sym2}: {('롱' if side2=='long' else '숏')} (x{lev2}, 수익률 {roi2:.2f}%, 손익 {upnl:.2f} USDT)")
                             if not has:
                                 msg.append("- 없음(관망)")
                             tg_send("\n".join(msg))
@@ -2182,7 +1970,7 @@ def telegram_thread(ex):
                                 top = df_log.head(8)
                                 msg = ["📜 최근 매매일지(요약)"]
                                 for _, r in top.iterrows():
-                                    tid = str(r.get("TradeID","") or "")
+                                    tid = str(r.get("TradeID", "") or "")
                                     msg.append(f"- {r['Time']} {r['Coin']} {r['Side']} {float(r['PnL_Percent']):.2f}% | {str(r.get('OneLine',''))[:40]} | ID:{tid}")
                                 tg_send("\n".join(msg))
 
@@ -2191,20 +1979,20 @@ def telegram_thread(ex):
 
                         elif data == "close_all":
                             tg_send("🛑 전량 청산 시도")
-                            for sym in TARGET_COINS:
-                                ps = safe_fetch_positions(ex, [sym])
+                            for sym2 in TARGET_COINS:
+                                ps = safe_fetch_positions(ex, [sym2])
                                 act = [p for p in ps if float(p.get("contracts") or 0) > 0]
                                 if not act:
                                     continue
                                 p = act[0]
-                                side = position_side_normalize(p)
+                                side2 = position_side_normalize(p)
                                 contracts = float(p.get("contracts") or 0)
-                                close_position_market(ex, sym, side, contracts)
+                                close_position_market(ex, sym2, side2, contracts)
                             tg_send("✅ 전량 청산 요청 완료")
 
                         tg_answer_callback(cb_id)
 
-            monitor_write_throttled(mon, 2.0)
+            monitor_write_throttled(mon, 1.5)
             time.sleep(0.8)
 
         except Exception as e:
@@ -2216,6 +2004,7 @@ def telegram_thread(ex):
 # ✅ 18) 스레드 시작 (중복 방지)
 # =========================================================
 def ensure_thread_started():
+    # 살아있는 TG_THREAD가 없으면 시작
     for t in threading.enumerate():
         if t.name == "TG_THREAD":
             return
@@ -2239,45 +2028,49 @@ if not openai_key:
     if k:
         config["openai_api_key"] = k
         save_settings(config)
-
-        # ✅ 추가: 즉시 전역 클라이언트 재생성 (스레드도 바로 사용 가능)
-        init_openai_client()
-
         st.rerun()
-
 
 with st.sidebar.expander("🧪 디버그: 저장된 설정(bot_settings.json) 확인"):
     st.json(read_json_safe(SETTINGS_FILE, {}))
 
-
-# 모드 선택 (MODE_RULES 기반)
 mode_keys = list(MODE_RULES.keys())
 safe_mode = config.get("trade_mode", "안전모드")
 if safe_mode not in mode_keys:
     safe_mode = "안전모드"
 config["trade_mode"] = st.sidebar.selectbox("매매 모드", mode_keys, index=mode_keys.index(safe_mode))
 
-# 자동매매 ON/OFF
 auto_on = st.sidebar.checkbox("🤖 자동매매 (텔레그램 연동)", value=bool(config.get("auto_trade", False)))
 if auto_on != bool(config.get("auto_trade", False)):
     config["auto_trade"] = auto_on
     save_settings(config)
     st.rerun()
 
-# 기본 옵션
 st.sidebar.divider()
-config["timeframe"] = st.sidebar.selectbox("타임프레임", ["1m", "3m", "5m", "15m", "1h"], index=["1m","3m","5m","15m","1h"].index(config.get("timeframe","5m")))
+config["timeframe"] = st.sidebar.selectbox(
+    "타임프레임", ["1m", "3m", "5m", "15m", "1h"],
+    index=["1m", "3m", "5m", "15m", "1h"].index(config.get("timeframe", "5m"))
+)
 config["tg_enable_reports"] = st.sidebar.checkbox("📨 텔레그램 보고 활성화", value=bool(config.get("tg_enable_reports", True)))
 config["use_trailing_stop"] = st.sidebar.checkbox("🚀 트레일링 스탑(수익보호)", value=bool(config.get("use_trailing_stop", True)))
-
-# ===== (추가) 텔레그램 근거 전송 토글 =====
 config["tg_send_entry_reason"] = st.sidebar.checkbox("📌 텔레그램에 진입근거(긴글)도 보내기", value=bool(config.get("tg_send_entry_reason", False)))
 
 st.sidebar.divider()
-st.sidebar.subheader("🧱 지지/저항(SR) 손절/익절(추가)")
+st.sidebar.subheader("🌍 외부 시황 통합")
+config["use_external_context"] = st.sidebar.checkbox("외부시황 사용", value=bool(config.get("use_external_context", True)))
+c_ext1, c_ext2 = st.sidebar.columns(2)
+config["macro_blackout_minutes"] = c_ext1.number_input("블랙아웃(분)", 0, 240, int(config.get("macro_blackout_minutes", 30)))
+config["external_refresh_sec"] = c_ext2.number_input("갱신(초)", 10, 600, int(config.get("external_refresh_sec", 60)))
+config["news_enable"] = st.sidebar.checkbox("뉴스 헤드라인 사용(RSS)", value=bool(config.get("news_enable", True)))
+c_n1, c_n2 = st.sidebar.columns(2)
+config["news_refresh_sec"] = c_n1.number_input("뉴스 갱신(초)", 30, 3600, int(config.get("news_refresh_sec", 300)))
+config["news_max_headlines"] = c_n2.number_input("헤드라인 수", 3, 30, int(config.get("news_max_headlines", 12)))
+
+st.sidebar.divider()
+st.sidebar.subheader("🧱 지지/저항(SR) 손절/익절")
 config["use_sr_stop"] = st.sidebar.checkbox("SR 기반 가격 손절/익절 사용", value=bool(config.get("use_sr_stop", True)))
 c_sr1, c_sr2 = st.sidebar.columns(2)
-config["sr_timeframe"] = c_sr1.selectbox("SR 타임프레임", ["5m","15m","1h","4h"], index=["5m","15m","1h","4h"].index(config.get("sr_timeframe","15m")))
+config["sr_timeframe"] = c_sr1.selectbox("SR 타임프레임", ["5m", "15m", "1h", "4h"],
+                                         index=["5m", "15m", "1h", "4h"].index(config.get("sr_timeframe", "15m")))
 config["sr_pivot_order"] = c_sr2.number_input("피벗 민감도", 3, 10, int(config.get("sr_pivot_order", 6)))
 c_sr3, c_sr4 = st.sidebar.columns(2)
 config["sr_atr_period"] = c_sr3.number_input("ATR 기간", 7, 30, int(config.get("sr_atr_period", 14)))
@@ -2346,12 +2139,9 @@ if st.sidebar.button("🤖 OpenAI 연결 테스트"):
         except Exception as e:
             st.sidebar.error(f"❌ 실패: {e}")
 
-# 설정 저장
 save_settings(config)
 
-# =========================================================
-# ✅ Sidebar: 잔고/포지션 현황
-# =========================================================
+# Sidebar: 잔고/포지션
 with st.sidebar:
     st.divider()
     st.header("내 지갑 현황")
@@ -2378,13 +2168,10 @@ with st.sidebar:
         st.error(f"포지션 조회 실패: {e}")
 
 
-# =========================================================
-# ✅ Main UI: 차트/지표/탭
-# =========================================================
+# Main UI
 st.title("📈 비트겟 AI 워뇨띠 에이전트 (Final)")
 st.caption("Streamlit=제어판/모니터링, Telegram=실시간 보고/조회. (모의투자 IS_SANDBOX=True)")
 
-# 코인 선택
 markets = exchange.markets or {}
 if markets:
     symbol_list = [s for s in markets if markets[s].get("linear") and markets[s].get("swap")]
@@ -2395,7 +2182,6 @@ else:
 
 symbol = st.selectbox("코인 선택", symbol_list, index=0)
 
-# 상단 레이아웃
 left, right = st.columns([2, 1], gap="large")
 
 with left:
@@ -2418,7 +2204,7 @@ with right:
                 st.warning("지표 계산 실패(데이터 부족)")
             else:
                 st.metric("현재가", f"{float(last['close']):,.4f}")
-                show = {
+                st.write({
                     "RSI": stt.get("RSI", "-"),
                     "BB": stt.get("BB", "-"),
                     "MACD": stt.get("MACD", "-"),
@@ -2426,24 +2212,22 @@ with right:
                     "추세": stt.get("추세", "-"),
                     "거래량": stt.get("거래량", "-"),
                     "눌림목후보(해소)": "✅" if stt.get("_pullback_candidate") else "—",
-                }
-                st.write(show)
+                })
 
-                # ===== (추가) SR 기준 TP/SL 미리보기 =====
                 if config.get("use_sr_stop", True):
                     try:
-                        sr_tf = config.get("sr_timeframe","15m")
+                        sr_tf = config.get("sr_timeframe", "15m")
                         htf = exchange.fetch_ohlcv(symbol, sr_tf, limit=220)
-                        hdf = pd.DataFrame(htf, columns=["time","open","high","low","close","vol"])
+                        hdf = pd.DataFrame(htf, columns=["time", "open", "high", "low", "close", "vol"])
                         hdf["time"] = pd.to_datetime(hdf["time"], unit="ms")
                         sr = sr_stop_take(
                             entry_price=float(last["close"]),
                             side="buy",
                             htf_df=hdf,
-                            atr_period=int(config.get("sr_atr_period",14)),
-                            pivot_order=int(config.get("sr_pivot_order",6)),
-                            buffer_atr_mult=float(config.get("sr_buffer_atr_mult",0.25)),
-                            rr_min=float(config.get("sr_rr_min",1.5)),
+                            atr_period=int(config.get("sr_atr_period", 14)),
+                            pivot_order=int(config.get("sr_pivot_order", 6)),
+                            buffer_atr_mult=float(config.get("sr_buffer_atr_mult", 0.25)),
+                            rr_min=float(config.get("sr_rr_min", 1.5)),
                         )
                         if sr:
                             st.caption(f"SR(참고): 롱 기준 TP {sr['tp_price']:.6g} / SL {sr['sl_price']:.6g}")
@@ -2455,36 +2239,14 @@ with right:
 
 st.divider()
 
-# 탭
 t1, t2, t3, t4 = st.tabs(["🤖 자동매매 & AI시야", "⚡ 수동주문", "📅 시장정보", "📜 매매일지"])
 
 with t1:
     st.subheader("👁️ 실시간 AI 모니터링(봇 시야)")
     if st_autorefresh is not None:
-        st_autorefresh(interval=2000, key="mon_refresh")  # 2초
+        st_autorefresh(interval=2000, key="mon_refresh")
     else:
         st.caption("자동 새로고침을 원하면 requirements.txt에 streamlit-autorefresh 추가하세요.")
-        st.subheader("🌍 외부 시황 요약")
-        ext = (mon.get("external") or {})
-        if not ext or not ext.get("enabled", False):
-            st.caption("외부 시황 통합 OFF")
-        else:
-            st.write({
-                "갱신시각(KST)": ext.get("asof_kst"),
-                "중요이벤트(임박)": len(ext.get("high_impact_events_soon") or []),
-                "공포탐욕": (ext.get("fear_greed") or {}),
-                "도미넌스/시총": (ext.get("global") or {}),
-            })
-            evs = ext.get("high_impact_events_soon") or []
-            if evs:
-                st.warning("⚠️ 중요 이벤트 임박(신규진입 보수적으로)")
-                st.dataframe(pd.DataFrame(evs), width="stretch", hide_index=True)
-            hd = ext.get("headlines") or []
-            if hd:
-                st.caption("뉴스 헤드라인(요약용)")
-                st.write(hd[:10])
-
-        st.button("🔄 수동 새로고침")
 
     mon = read_json_safe(MONITOR_FILE, None)
     if not mon:
@@ -2493,24 +2255,50 @@ with t1:
         hb = float(mon.get("last_heartbeat_epoch", 0))
         age = (time.time() - hb) if hb else 9999
 
+        # 좀 더 현실적으로: 10초 이내 OK, 10~30 주의, 30초↑ 멈춤 의심
+        status_txt = "🟢 작동중" if age < 10 else ("🟡 지연" if age < 30 else "🔴 멈춤 의심")
+
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("자동매매", "ON" if mon.get("auto_trade") else "OFF")
         c2.metric("모드", mon.get("trade_mode", "-"))
-        c3.metric("하트비트", f"{age:.1f}초 전", "🟢 작동중" if age < 6 else "🔴 멈춤 의심")
+        c3.metric("하트비트", f"{age:.1f}초 전", status_txt)
         c4.metric("연속손실", str(mon.get("consec_losses", 0)))
 
-        if age >= 6:
-            st.error("⚠️ 봇 스레드가 멈췄거나(크래시) 갱신이 안될 수 있어요.")
+        if age >= 30:
+            st.error("⚠️ 봇 스레드가 오래 멈췄거나(크래시/네트워크 대기) 갱신이 안될 수 있어요.")
+            st.caption("팁: Streamlit을 새로고침(F5)하거나 배포환경이면 재시작하면 대부분 복구됩니다.")
 
         st.caption(f"봇 상태: {mon.get('global_state','-')} | 마지막 액션: {mon.get('last_action',{})}")
 
+        # 외부 시황 요약
+        st.subheader("🌍 외부 시황 요약")
+        ext = mon.get("external") or {}
+        if not ext or not ext.get("enabled", False):
+            st.caption("외부 시황 통합 OFF")
+        else:
+            st.write({
+                "갱신시각(KST)": ext.get("asof_kst"),
+                "블랙아웃(분)": ext.get("blackout_minutes"),
+                "중요이벤트(임박)": len(ext.get("high_impact_events_soon") or []),
+                "공포탐욕": (ext.get("fear_greed") or {}),
+                "도미넌스/시총": (ext.get("global") or {}),
+            })
+            evs = ext.get("high_impact_events_soon") or []
+            if evs:
+                st.warning("⚠️ 중요 이벤트 임박(신규진입 보수적으로/보류)")
+                st.dataframe(pd.DataFrame(evs), width="stretch", hide_index=True)
+            hd = ext.get("headlines") or []
+            if hd:
+                st.caption("뉴스 헤드라인(요약용)")
+                st.write(hd[:10])
+
         rows = []
         coins = mon.get("coins", {}) or {}
-        for sym, cs in coins.items():
+        for sym2, cs in coins.items():
             last_scan = float(cs.get("last_scan_epoch", 0) or 0)
             scan_age = (time.time() - last_scan) if last_scan else 9999
             rows.append({
-                "코인": sym,
+                "코인": sym2,
                 "스캔(초전)": f"{scan_age:.1f}",
                 "가격": cs.get("price", ""),
                 "추세": cs.get("trend", ""),
@@ -2595,10 +2383,10 @@ with t2:
         ps = safe_fetch_positions(exchange, TARGET_COINS)
         act = [p for p in ps if float(p.get("contracts") or 0) > 0]
         for p in act:
-            sym = p.get("symbol", "")
-            side = position_side_normalize(p)
+            sym2 = p.get("symbol", "")
+            side2 = position_side_normalize(p)
             contracts = float(p.get("contracts") or 0)
-            close_position_market(exchange, sym, side, contracts)
+            close_position_market(exchange, sym2, side2, contracts)
         st.success("전량 청산 요청 완료(데모)")
 
 with t3:
@@ -2629,7 +2417,6 @@ with t4:
         csv_bytes = df_log.to_csv(index=False).encode("utf-8-sig")
         st.download_button("💾 CSV 다운로드", data=csv_bytes, file_name="trade_log.csv", mime="text/csv")
 
-    # ===== (추가) 상세일지 조회 UI =====
     st.divider()
     st.subheader("🧾 상세일지 조회(TradeID)")
     tid = st.text_input("TradeID 입력 (텔레그램 '일지'에 ID가 나옵니다)")
