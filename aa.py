@@ -115,7 +115,6 @@ os.makedirs(DETAIL_DIR, exist_ok=True)
 _cache = Cache("cache") if Cache else None  # 선택
 _ext_cache = TTLCache(maxsize=4, ttl=60) if TTLCache else None
 _ohlcv_cache = TTLCache(maxsize=256, ttl=10) if TTLCache else None
-_style_cache = TTLCache(maxsize=8, ttl=30) if TTLCache else None
 
 REQUEST_TIMEOUT = 10
 OPENAI_TIMEOUT = 20
@@ -176,6 +175,17 @@ def tf_to_minutes(tf: str) -> int:
     if tf.endswith("d"):
         return int(tf[:-1]) * 60 * 24
     return 5
+
+def df_for_display(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    try:
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+        for c in df.columns:
+            df[c] = df[c].apply(lambda x: "" if x is None else str(x))
+        return df
+    except Exception:
+        return pd.DataFrame(rows)
 
 
 # =========================================================
@@ -270,7 +280,7 @@ def default_settings() -> Dict[str, Any]:
         # 방어/전략
         "use_trailing_stop": True,
         "use_dca": True, "dca_trigger": -20.0, "dca_max_count": 1, "dca_add_pct": 50.0,
-        "use_switching": True, "switch_trigger": -12.0,  # (옵션만 유지)
+        "use_switching": True, "switch_trigger": -12.0,
         "no_trade_weekend": False,
 
         # 연속손실 보호
@@ -300,7 +310,7 @@ def default_settings() -> Dict[str, Any]:
 
         # ✅ 역추세 금지 필터
         "trend_filter_enabled": True,
-        "trend_filter_timeframe": "1h",  # 기존 유지(백업)
+        "trend_filter_timeframe": "1h",  # 백업
         "trend_filter_cache_sec": 60,
         "trend_filter_tf_scalp": "5m",
         "trend_filter_tf_swing": "1h",
@@ -322,8 +332,8 @@ def default_settings() -> Dict[str, Any]:
 
         # ✅ 스윙 분할익절/순환매도
         "swing_partial_tp_enable": True,
-        "swing_partial_tp_levels": "0.35,0.60,0.90",  # 목표TP 대비 비율
-        "swing_partial_tp_sizes": "0.30,0.30,0.40",  # 청산 비중(합<=1)
+        "swing_partial_tp_levels": "0.35,0.60,0.90",
+        "swing_partial_tp_sizes": "0.30,0.30,0.40",
         "swing_recycle_enable": False,
         "swing_recycle_trigger_roi": 4.0,
         "swing_recycle_add_pct": 20.0,
@@ -1251,7 +1261,7 @@ def ai_decide_trade(df: pd.DataFrame, status: Dict[str, Any], symbol: str, mode:
         "rsi_prev": float(prev.get("RSI", 50)) if "RSI" in df.columns else None,
         "rsi_now": float(last.get("RSI", 50)) if "RSI" in df.columns else None,
         "adx": float(last.get("ADX", 0)) if "ADX" in df.columns else None,
-        "trend_short": status.get("추세", ""),  # 단기추세(timeframe)
+        "trend_short": status.get("추세", ""),
         "bb": status.get("BB", ""),
         "macd": status.get("MACD", ""),
         "vol": status.get("거래량", ""),
@@ -1521,17 +1531,13 @@ def get_trade_style(ex, cfg: Dict[str, Any], rt: Dict[str, Any]) -> Tuple[str, i
     if now < lock_until:
         return cur, int(rt.get("style_confidence", 0)), rt.get("style_reason", "잠금 유지")
 
-    # 캐시 사용
-    if _style_cache is not None and "style" in _style_cache:
-        cached = _style_cache["style"]
-        return cached.get("style", cur), int(cached.get("conf", 50)), cached.get("reason", "캐시")
-
+    # 룰 기반 1차 판단
     style, conf, reason, ambiguous = decide_style_rule(ex, cfg)
 
+    # 애매할 때만 AI 보조(비용/지연 최소화)
     if ambiguous and cfg.get("style_ai_fallback", True):
         min_ai_gap = int(cfg.get("style_ai_min_interval_min", 10)) * 60
         if now - float(rt.get("style_last_ai_epoch", 0)) >= min_ai_gap:
-            # AI 보조
             features = {
                 "trend_1h": reason,
                 "timeframe": cfg.get("timeframe", "5m"),
@@ -1553,10 +1559,6 @@ def get_trade_style(ex, cfg: Dict[str, Any], rt: Dict[str, Any]) -> Tuple[str, i
         rt["style_reason"] = reason
 
     save_runtime(rt)
-
-    if _style_cache is not None:
-        _style_cache["style"] = {"style": style, "conf": conf, "reason": reason}
-
     return style, conf, reason
 
 def get_trend_filter_tf(cfg: Dict[str, Any], style: str) -> str:
@@ -1768,7 +1770,7 @@ def telegram_thread(ex):
             mode = cfg.get("trade_mode", "안전모드")
             rule = MODE_RULES.get(mode, MODE_RULES["안전모드"])
 
-            # 스타일 결정
+            # 스타일 결정(시장상황 기반)
             style, style_conf, style_reason = get_trade_style(ex, cfg, rt)
             trend_filter_tf = get_trend_filter_tf(cfg, style)
 
@@ -2110,7 +2112,7 @@ def telegram_thread(ex):
                             "last_scan_epoch": time.time(),
                             "last_scan_kst": now_kst_str(),
                             "price": float(last["close"]),
-                            "trend_short": stt.get("추세", ""),      # 단기추세(timeframe)
+                            "trend_short": stt.get("추세", ""),
                             "trend_filter": cs.get("trend_filter", ""),
                             "trend_filter_tf": htf_tf,
                             "rsi": float(last.get("RSI", 0)) if "RSI" in df.columns else None,
@@ -2487,7 +2489,7 @@ def telegram_thread(ex):
 
             monitor_write_throttled(mon, 2.0)
             time.sleep(0.8)
-            backoff_sec = 1  # 정상 루프면 백오프 초기화
+            backoff_sec = 1
 
         except Exception as e:
             tg_send(f"⚠️ 스레드 오류: {e}")
@@ -2597,7 +2599,7 @@ st.sidebar.subheader("🧭 자동 스타일(스캘핑/스윙)")
 config["auto_style"] = st.sidebar.checkbox("자동 스타일 선택", value=bool(config.get("auto_style", True)))
 if not config["auto_style"]:
     config["fixed_style"] = st.sidebar.selectbox("고정 스타일", ["스캘핑","스윙"], index=["스캘핑","스윙"].index(config.get("fixed_style","스캘핑")))
-config["style_lock_minutes"] = st.sidebar.number_input("스타일 유지(분)", 5, 240, int(config.get("style_lock_minutes", 30)))
+config["style_lock_minutes"] = st.sidebar.number_input("최소 유지(플리핑 방지, 분)", 5, 240, int(config.get("style_lock_minutes", 30)))
 
 mon_view = read_json_safe(MONITOR_FILE, {}) or {}
 st.sidebar.caption(f"현재 스타일: {mon_view.get('trade_style','-')} ({mon_view.get('style_confidence','-')}%)")
@@ -2844,7 +2846,7 @@ with t1:
             evs = ext.get("high_impact_events_soon") or []
             if evs:
                 st.warning("⚠️ 중요 이벤트 임박(신규진입 보수적으로)")
-                st.dataframe(pd.DataFrame(evs), width="stretch", hide_index=True)
+                st.dataframe(df_for_display(evs), width="stretch", hide_index=True)
             hd = ext.get("headlines") or []
             if hd:
                 st.caption("뉴스 헤드라인(요약용)")
@@ -2897,7 +2899,7 @@ with t1:
                 "스킵/근거": (cs.get("skip_reason") or cs.get("ai_reason_easy") or "")[:160],
             })
         if rows:
-            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            st.dataframe(df_for_display(rows), width="stretch", hide_index=True)
         else:
             st.info("아직 스캔 데이터가 없습니다.")
 
