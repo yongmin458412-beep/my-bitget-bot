@@ -634,6 +634,31 @@ def log_trade(
     except Exception:
         pass
 
+    # ✅ Google Sheets 매매일지(요구사항: TRADE 이벤트) - CSV와 동일한 정보를 payload로 남김
+    try:
+        if gsheet_is_enabled():
+            gsheet_log_trade(
+                stage="JOURNAL",
+                symbol=str(coin or ""),
+                trade_id=str(trade_id or ""),
+                message=str(reason or "")[:160],
+                payload={
+                    "time_kst": row_dict.get("Time"),
+                    "coin": row_dict.get("Coin"),
+                    "side": row_dict.get("Side"),
+                    "entry": row_dict.get("Entry"),
+                    "exit": row_dict.get("Exit"),
+                    "pnl_usdt": row_dict.get("PnL_USDT"),
+                    "pnl_pct": row_dict.get("PnL_Percent"),
+                    "reason": row_dict.get("Reason"),
+                    "one_line": row_dict.get("OneLine"),
+                    "review": str(row_dict.get("Review", ""))[:800],
+                    "trade_id": row_dict.get("TradeID"),
+                },
+            )
+    except Exception:
+        pass
+
 
 def read_trade_log() -> pd.DataFrame:
     if not os.path.exists(LOG_FILE):
@@ -791,15 +816,12 @@ def _get_gsheet_client_from_secrets() -> Optional[Any]:
     if gspread is None or GoogleCredentials is None:
         return None
     try:
+        # ✅ 요구사항: GSHEET_SERVICE_ACCOUNT_JSON (멀티라인 포함) 지원
         info = None
-        # ✅ 요구사항 규격 우선
-        if st.secrets.get("GSHEET_SERVICE_ACCOUNT_JSON"):
-            info = json.loads(st.secrets.get("GSHEET_SERVICE_ACCOUNT_JSON"))
-        # (호환) 기존 규격
-        elif "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], dict):
-            info = dict(st.secrets["gcp_service_account"])
-        elif st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
-            info = json.loads(st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON"))
+        try:
+            info = _gsheet_service_account_info()  # type: ignore[name-defined]
+        except Exception:
+            info = None
         if not info:
             return None
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -851,11 +873,21 @@ def export_trade_log_to_gsheet(date_str: str, df_day: pd.DataFrame, summary: Dic
 # =========================================================
 # ✅ 7) Secrets (Bitget / Telegram / OpenAI)
 # =========================================================
+try:
+    # 일부 환경/스레드에서 st.secrets 접근이 예외가 날 수 있어 fallback 스냅샷 유지
+    _SECRETS_SNAPSHOT = dict(st.secrets)
+except Exception:
+    _SECRETS_SNAPSHOT = {}
+
+
 def _sget(key: str, default: Any = "") -> Any:
     try:
         return st.secrets.get(key, default)
     except Exception:
-        return default
+        try:
+            return _SECRETS_SNAPSHOT.get(key, default)
+        except Exception:
+            return default
 
 
 def _sget_str(key: str, default: str = "") -> str:
@@ -1198,7 +1230,23 @@ _GSHEET_QUEUE_HIGH = deque()  # TRADE/EVENT
 _GSHEET_QUEUE_SCAN = deque()  # SCAN
 _GSHEET_QUEUE_LOCK = threading.RLock()
 _GSHEET_CACHE_LOCK = threading.RLock()
-_GSHEET_CACHE: Dict[str, Any] = {"ws": None, "header_ok": False, "last_init_epoch": 0.0, "last_err": ""}
+_GSHEET_CACHE: Dict[str, Any] = {
+    "ws": None,
+    "header_ok": False,
+    "last_init_epoch": 0.0,
+    "last_err": "",
+    "service_account_email": "",
+    "worksheet": "",
+    "spreadsheet_id": "",
+    "last_append_epoch": 0.0,
+    "last_append_kst": "",
+    "last_append_type": "",
+    "last_append_stage": "",
+}
+
+_GSHEET_NOTIFY_LOCK = threading.RLock()
+_GSHEET_LAST_NOTIFY_EPOCH = 0.0
+_GSHEET_LAST_NOTIFY_MSG = ""
 
 
 def gsheet_is_enabled() -> bool:
@@ -1213,6 +1261,108 @@ def _gsheet_get_settings() -> Dict[str, str]:
     return {"spreadsheet_id": sid, "worksheet": ws_name, "service_account_json": sa_json}
 
 
+def _gsheet_service_account_info() -> Optional[Dict[str, Any]]:
+    """
+    secrets 형태 다양성 흡수:
+    - GSHEET_SERVICE_ACCOUNT_JSON: JSON 문자열(요구사항)
+    - 혹시 dict로 넣은 경우도 방어적으로 지원
+    - (호환) [gcp_service_account] dict
+    """
+    try:
+        raw = _sget("GSHEET_SERVICE_ACCOUNT_JSON", None)
+        if raw is None or raw == "":
+            raw = _sget("GOOGLE_SERVICE_ACCOUNT_JSON", None)
+        if (raw is None or raw == "") and ("gcp_service_account" in st.secrets) and isinstance(st.secrets.get("gcp_service_account"), dict):
+            return dict(st.secrets.get("gcp_service_account") or {})
+        if isinstance(raw, dict):
+            return dict(raw)
+        s = str(raw or "").strip()
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except Exception as je:
+            # 스트림릿 secrets(TOML)에서 "\n" escape가 실제 개행으로 풀리면 JSON이 깨질 수 있음
+            # → 사용자에게 원인을 알려주기 위해 last_err를 남긴다.
+            try:
+                _GSHEET_CACHE["last_err"] = f"GSHEET_SERVICE_ACCOUNT_JSON 파싱 실패: {je}"
+            except Exception:
+                pass
+            # ✅ Streamlit secrets(TOML) 멀티라인 문자열에서 private_key의 개행이 실제 개행으로 들어오면 JSON이 깨짐
+            #    → private_key 값 내부의 개행만 \\n으로 이스케이프해서 1회 복구 시도
+            try:
+                if s.startswith("{") and '"private_key"' in s and ("\n" in s or "\r" in s):
+                    m = re.search(r'"private_key"\s*:\s*"(.*?)"', s, flags=re.S)
+                    if m:
+                        pk = m.group(1)
+                        if "\n" in pk or "\r" in pk:
+                            pk_fixed = pk.replace("\r\n", "\n").replace("\n", "\\n")
+                            s2 = s[: m.start(1)] + pk_fixed + s[m.end(1) :]
+                            v2 = json.loads(s2)
+                            if isinstance(v2, dict):
+                                try:
+                                    _GSHEET_CACHE["last_err"] = ""
+                                except Exception:
+                                    pass
+                                return dict(v2)
+            except Exception:
+                pass
+            try:
+                import ast as _ast
+
+                # 혹시 dict가 str()로 변환돼 들어온 경우(단, 안전한 literal_eval만 사용)
+                if s.startswith("{") and ("'client_email'" in s or "'private_key'" in s):
+                    v = _ast.literal_eval(s)
+                    if isinstance(v, dict):
+                        return dict(v)
+            except Exception:
+                pass
+            return None
+    except Exception:
+        return None
+
+
+def _gsheet_service_account_email() -> str:
+    try:
+        info = _gsheet_service_account_info() or {}
+        return str(info.get("client_email") or "").strip()
+    except Exception:
+        return ""
+
+
+def _gsheet_notify_connect_issue(where: str, msg: str, min_interval_sec: float = 300.0) -> None:
+    """
+    Google Sheets 연결/권한 문제를 관리자 DM으로 안내(과다 스팸 방지).
+    """
+    try:
+        if not TG_ADMIN_IDS:
+            return
+        now = time.time()
+        with _GSHEET_NOTIFY_LOCK:
+            global _GSHEET_LAST_NOTIFY_EPOCH, _GSHEET_LAST_NOTIFY_MSG
+            if (now - float(_GSHEET_LAST_NOTIFY_EPOCH or 0.0)) < float(min_interval_sec):
+                return
+            if msg and msg == _GSHEET_LAST_NOTIFY_MSG and (now - float(_GSHEET_LAST_NOTIFY_EPOCH or 0.0)) < float(min_interval_sec) * 2:
+                return
+            _GSHEET_LAST_NOTIFY_EPOCH = now
+            _GSHEET_LAST_NOTIFY_MSG = msg
+        stg = _gsheet_get_settings()
+        email = _gsheet_service_account_email()
+        hint = ""
+        if email and stg.get("spreadsheet_id"):
+            hint = f"\n- 서비스계정 이메일: {email}\n- 공유: 시트에 위 이메일을 '편집자'로 공유해야 합니다."
+        notify_admin_error(
+            where,
+            RuntimeError(msg),
+            context={"spreadsheet_id": stg.get("spreadsheet_id", ""), "worksheet": stg.get("worksheet", ""), "service_account_email": email, "code": CODE_VERSION},
+            min_interval_sec=min_interval_sec,
+        )
+        if hint:
+            tg_send(hint, target="admin")
+    except Exception:
+        pass
+
+
 def _gsheet_connect_ws() -> Optional[Any]:
     if not gsheet_is_enabled():
         return None
@@ -1223,13 +1373,22 @@ def _gsheet_connect_ws() -> Optional[Any]:
     stg = _gsheet_get_settings()
     sid = stg.get("spreadsheet_id", "").strip()
     ws_name = stg.get("worksheet", "BOT_LOG").strip() or "BOT_LOG"
-    sa_json = stg.get("service_account_json", "").strip()
-    if not sid or not sa_json:
-        _GSHEET_CACHE["last_err"] = "GSHEET_SPREADSHEET_ID 또는 GSHEET_SERVICE_ACCOUNT_JSON 누락"
+    info = _gsheet_service_account_info()
+    if not sid:
+        _GSHEET_CACHE["last_err"] = "GSHEET_SPREADSHEET_ID 누락"
+        return None
+    if not info:
+        cur = str(_GSHEET_CACHE.get("last_err", "") or "").strip()
+        _GSHEET_CACHE["last_err"] = cur or "GSHEET_SERVICE_ACCOUNT_JSON 누락/파싱 실패"
         return None
 
     try:
-        info = json.loads(sa_json)
+        try:
+            _GSHEET_CACHE["service_account_email"] = str((info or {}).get("client_email") or "").strip()
+        except Exception:
+            _GSHEET_CACHE["service_account_email"] = ""
+        _GSHEET_CACHE["worksheet"] = ws_name
+        _GSHEET_CACHE["spreadsheet_id"] = sid
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = GoogleCredentials.from_service_account_info(info, scopes=scopes)
         client = gspread.authorize(creds)
@@ -1243,6 +1402,91 @@ def _gsheet_connect_ws() -> Optional[Any]:
     except Exception as e:
         _GSHEET_CACHE["last_err"] = f"GSHEET 연결 실패: {e}"
         return None
+
+
+def gsheet_status_snapshot() -> Dict[str, Any]:
+    try:
+        stg = _gsheet_get_settings()
+        with _GSHEET_QUEUE_LOCK:
+            qh = len(_GSHEET_QUEUE_HIGH)
+            qs = len(_GSHEET_QUEUE_SCAN)
+        with _GSHEET_CACHE_LOCK:
+            last_init = float(_GSHEET_CACHE.get("last_init_epoch", 0) or 0)
+            return {
+                "enabled": bool(gsheet_is_enabled()),
+                "spreadsheet_id": stg.get("spreadsheet_id", ""),
+                "worksheet": stg.get("worksheet", ""),
+                "service_account_email": _gsheet_service_account_email(),
+                "connected": bool(_GSHEET_CACHE.get("ws", None) is not None),
+                "header_ok": bool(_GSHEET_CACHE.get("header_ok", False)),
+                "queue_high": qh,
+                "queue_scan": qs,
+                "last_init_kst": _epoch_to_kst_str(last_init) if last_init else "",
+                "last_append_kst": str(_GSHEET_CACHE.get("last_append_kst", "") or ""),
+                "last_append_type": str(_GSHEET_CACHE.get("last_append_type", "") or ""),
+                "last_append_stage": str(_GSHEET_CACHE.get("last_append_stage", "") or ""),
+                "last_err": str(_GSHEET_CACHE.get("last_err", "") or ""),
+            }
+    except Exception:
+        return {"enabled": bool(gsheet_is_enabled()), "last_err": str(_GSHEET_CACHE.get("last_err", "") if isinstance(_GSHEET_CACHE, dict) else "")}
+
+
+def gsheet_test_append_row(timeout_sec: int = 20) -> Dict[str, Any]:
+    """
+    수동 진단용:
+    - 연결 + 헤더 + append_row를 즉시 수행해서 권한/설정 문제를 바로 확인.
+    """
+    if not gsheet_is_enabled():
+        return {"ok": False, "error": "GSHEET_ENABLED=false"}
+    if gspread is None or GoogleCredentials is None:
+        return {"ok": False, "error": "gspread/google-auth 미설치(requirements.txt 확인)"}
+
+    def _do():
+        ws = _gsheet_connect_ws()
+        if ws is None:
+            err = str(_GSHEET_CACHE.get("last_err", "") or "unknown_error")
+            raise RuntimeError(err)
+        _gsheet_ensure_header(ws)
+        rec = {
+            "time_kst": now_kst_str(),
+            "type": "EVENT",
+            "stage": "GSHEET_TEST",
+            "symbol": "",
+            "tf": "",
+            "signal": "",
+            "score": "",
+            "trade_id": "",
+            "message": f"manual_test code={CODE_VERSION}",
+            "payload_json": {"code": CODE_VERSION},
+        }
+        row = [
+            rec["time_kst"],
+            rec["type"],
+            rec["stage"],
+            rec["symbol"],
+            rec["tf"],
+            rec["signal"],
+            rec["score"],
+            rec["trade_id"],
+            rec["message"],
+            safe_json_dumps(rec["payload_json"], limit=1800),
+        ]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        with _GSHEET_CACHE_LOCK:
+            _GSHEET_CACHE["last_append_epoch"] = time.time()
+            _GSHEET_CACHE["last_append_kst"] = now_kst_str()
+            _GSHEET_CACHE["last_append_type"] = "EVENT"
+            _GSHEET_CACHE["last_append_stage"] = "GSHEET_TEST"
+        return True
+
+    try:
+        _call_with_timeout(_do, timeout_sec)
+        return {"ok": True}
+    except Exception as e:
+        with _GSHEET_CACHE_LOCK:
+            _GSHEET_CACHE["last_err"] = f"GSHEET 테스트 실패: {e}"
+        _gsheet_notify_connect_issue("GSHEET_TEST", f"GSHEET 테스트 실패: {e}", min_interval_sec=120.0)
+        return {"ok": False, "error": str(e)}
 
 
 def _gsheet_ensure_header(ws: Any) -> None:
@@ -1341,6 +1585,22 @@ def gsheet_worker_thread():
                 time.sleep(2.0)
                 continue
 
+            # ✅ secrets 변경(시트/워크시트) 감지 시 즉시 재연결
+            try:
+                stg_now = _gsheet_get_settings()
+                with _GSHEET_CACHE_LOCK:
+                    sid_now = str(stg_now.get("spreadsheet_id", "") or "").strip()
+                    ws_now = str(stg_now.get("worksheet", "") or "").strip()
+                    sid_old = str(_GSHEET_CACHE.get("spreadsheet_id", "") or "").strip()
+                    ws_old = str(_GSHEET_CACHE.get("worksheet", "") or "").strip()
+                    if (sid_now and sid_old and sid_now != sid_old) or (ws_now and ws_old and ws_now != ws_old):
+                        _GSHEET_CACHE["ws"] = None
+                        _GSHEET_CACHE["header_ok"] = False
+                        _GSHEET_CACHE["last_init_epoch"] = 0.0
+                        _GSHEET_CACHE["last_err"] = ""
+            except Exception:
+                pass
+
             rec = None
             with _GSHEET_QUEUE_LOCK:
                 if _GSHEET_QUEUE_HIGH:
@@ -1365,6 +1625,11 @@ def gsheet_worker_thread():
 
             if ws is None:
                 # 연결 실패면 재시도 위해 되돌려놓고 backoff
+                try:
+                    msg = str(_GSHEET_CACHE.get("last_err", "") or "GSHEET 연결 실패")
+                    _gsheet_notify_connect_issue("GSHEET_CONNECT", msg, min_interval_sec=300.0)
+                except Exception:
+                    pass
                 with _GSHEET_QUEUE_LOCK:
                     typ = str(rec.get("type", "EVENT")).strip().upper()
                     if typ in ["TRADE", "EVENT"]:
@@ -1402,9 +1667,23 @@ def gsheet_worker_thread():
             else:
                 _append()
 
+            try:
+                with _GSHEET_CACHE_LOCK:
+                    _GSHEET_CACHE["last_append_epoch"] = time.time()
+                    _GSHEET_CACHE["last_append_kst"] = now_kst_str()
+                    _GSHEET_CACHE["last_append_type"] = str(rec.get("type", "") or "")
+                    _GSHEET_CACHE["last_append_stage"] = str(rec.get("stage", "") or "")
+                    _GSHEET_CACHE["last_err"] = ""
+            except Exception:
+                pass
             backoff = 1.0
         except Exception as e:
             # 실패해도 봇은 살아야 함(오류는 관리자에게 알림)
+            try:
+                with _GSHEET_CACHE_LOCK:
+                    _GSHEET_CACHE["last_err"] = f"GSHEET append 실패: {e}"
+            except Exception:
+                pass
             notify_admin_error("GSHEET_THREAD", e, min_interval_sec=120.0)
             time.sleep(backoff)
             backoff = float(clamp(backoff * 1.5, 1.0, 12.0))
@@ -3021,6 +3300,7 @@ def mon_add_scan(mon: Dict[str, Any], stage: str, symbol: str, tf: str = "", sig
     - monitor_state.json에 저장되어 UI/Telegram이 항상 최신을 볼 수 있게 함
     """
     try:
+        ts = time.time()
         rec = {
             "time_kst": now_kst_str(),
             "stage": stage,
@@ -3034,11 +3314,22 @@ def mon_add_scan(mon: Dict[str, Any], stage: str, symbol: str, tf: str = "", sig
         mon.setdefault("scan_process", [])
         mon["scan_process"].append(rec)
         mon["scan_process"] = mon["scan_process"][-400:]
-        mon["last_scan_epoch"] = time.time()
-        mon["last_scan_kst"] = now_kst_str()
+        mon["last_scan_epoch"] = ts
+        mon["last_scan_kst"] = rec.get("time_kst", "")
+        # 코인별 진행상황(요구사항: "어떤 단계로 분석중인지" 직관적으로)
+        try:
+            sym0 = str(symbol or "").strip()
+            if sym0 and sym0 != "*":
+                mon.setdefault("coins", {}).setdefault(sym0, {})
+                mon["coins"][sym0]["scan_stage"] = stage
+                mon["coins"][sym0]["scan_stage_kst"] = rec.get("time_kst", "")
+                mon["coins"][sym0]["last_scan_epoch"] = ts
+                mon["coins"][sym0]["last_scan_kst"] = rec.get("time_kst", "")
+        except Exception:
+            pass
         # ✅ 스캔이 길어져도 UI에서 "멈춤 의심"이 과도하게 뜨지 않게, 스캔 단계도 heartbeat로 간주
-        mon["last_heartbeat_epoch"] = time.time()
-        mon["last_heartbeat_kst"] = now_kst_str()
+        mon["last_heartbeat_epoch"] = ts
+        mon["last_heartbeat_kst"] = rec.get("time_kst", "")
         # Google Sheets에도 SCAN 누적(비동기 큐)
         try:
             gsheet_log_scan(stage=stage, symbol=symbol, tf=tf, signal=signal, score=score, message=message, payload=extra or {})
@@ -3166,7 +3457,7 @@ def tg_send_menu(cfg: Optional[Dict[str, Any]] = None):
             [{"text": "📊 포지션", "callback_data": "position"}, {"text": "💰 잔고", "callback_data": "balance"}],
             [{"text": "📜 일지(최근)", "callback_data": "log"}, {"text": "🧾 일지상세", "callback_data": "log_detail_help"}],
             [{"text": "🔎 강제스캔", "callback_data": "scan"}, {"text": "🎚️ /mode", "callback_data": "mode_help"}],
-            [{"text": "🛑 전량청산", "callback_data": "close_all"}],
+            [{"text": "📎 시트", "callback_data": "gsheet"}, {"text": "🛑 전량청산", "callback_data": "close_all"}],
         ]
     }
     # ✅ 사용자의 요구: TG_TARGET_CHAT_ID는 채널로(알림/결과),
@@ -3181,10 +3472,10 @@ def tg_send_menu(cfg: Optional[Dict[str, Any]] = None):
                 f"https://api.telegram.org/bot{tg_token}/sendMessage",
                 {
                     "chat_id": cid,
-                    "text": "✅ /menu\n/status /positions /scan /mode auto|scalping|swing /log <id>\n(일지상세: '일지상세 <ID>')",
-                    "reply_markup": json.dumps(kb, ensure_ascii=False),
-                },
-            )
+                "text": "✅ /menu\n/status /positions /scan /mode auto|scalping|swing /log <id> /gsheet\n(일지상세: '일지상세 <ID>')",
+                "reply_markup": json.dumps(kb, ensure_ascii=False),
+            },
+        )
     except Exception:
         pass
 
@@ -3274,7 +3565,9 @@ def notify_admin_error(where: str, err: BaseException, context: Optional[Dict[st
         tg_send(text, target="admin", cfg=load_settings())
         try:
             # Google Sheets에도 ERROR 이벤트 남김(가능할 때만)
-            gsheet_log_event("ERROR", message=f"{where_s}: {type(err).__name__}", payload={"msg": msg_s, "ctx": context or {}})
+            # ✅ Google Sheets 자체 장애일 때는 무한 루프/스팸을 막기 위해 시트로 ERROR를 다시 쓰지 않는다.
+            if not str(where_s).upper().startswith("GSHEET"):
+                gsheet_log_event("ERROR", message=f"{where_s}: {type(err).__name__}", payload={"msg": msg_s, "ctx": context or {}})
         except Exception:
             pass
     except Exception:
@@ -3689,7 +3982,7 @@ def telegram_thread(ex):
 
     # 부팅 메시지(그룹: 메뉴, 채널: 시작 알림)
     cfg_boot = load_settings()
-    boot_msg = f"🚀 AI 봇 가동 시작! (모의투자)\n- code: {CODE_VERSION}\n명령: /menu /status /positions /scan /mode /log"
+    boot_msg = f"🚀 AI 봇 가동 시작! (모의투자)\n- code: {CODE_VERSION}\n명령: /menu /status /positions /scan /mode /log /gsheet"
     tg_send(boot_msg, target="channel", cfg=cfg_boot)
     # ✅ 요구: TG_TARGET_CHAT_ID는 채널(브로드캐스트), 관리는 관리자 DM으로(중복/스팸 방지)
     if TG_ADMIN_IDS:
@@ -4004,45 +4297,62 @@ def telegram_thread(ex):
                 force_scan_ts = 0.0
             force_scan_pending = bool(force_scan_id) and (not force_scan_done) and (time.time() - force_scan_ts < 60 * 10)
 
-            # 자동매매 ON 또는 강제스캔(/scan)일 때 스캔 루프 실행
-            if cfg.get("auto_trade", False) or force_scan_pending:
+            # ✅ 스캔 루프는 항상 실행(시야/스캔 갱신)
+            # - 신규 진입(주문)만 auto_trade/paused/weekend 정책으로 제어
+            if True:
                 trade_enabled = bool(cfg.get("auto_trade", False))
                 force_scan_syms_set = set(force_scan_symbols or [])
                 force_scan_summary_lines: List[str] = []
 
-                # 주말 거래 금지
-                if cfg.get("no_trade_weekend", False):
-                    wd = now_kst().weekday()
-                    if wd in [5, 6]:
-                        mon["global_state"] = "주말 거래 OFF"
-                        monitor_write_throttled(mon, 2.0)
-                        time.sleep(2.0)
-                        # 강제스캔이 있으면 스캔은 수행(주문은 하지 않음)
-                        if trade_enabled and not force_scan_pending:
-                            continue
+                # 주말 거래 금지: 신규진입만 제한(스캔/시야는 계속)
+                # - weekend_block_now는 entry_allowed_global에 반영
 
                 # 일시정지(연속손실)
                 paused_now = cfg.get("loss_pause_enable", True) and time.time() < float(rt.get("pause_until", 0))
-                if paused_now and trade_enabled and not force_scan_pending:
+                if False and paused_now and trade_enabled and not force_scan_pending:
                     mon["global_state"] = "일시정지 중(연속손실/보호)"
                     monitor_write_throttled(mon, 2.0)
                     time.sleep(1.0)
                 else:
-                    mon["global_state"] = "스캔/매매 중" if trade_enabled else "강제 스캔 중(/scan)"
-
                     # 신규 진입 허용 여부(강제스캔 scan_only면 '강제로 추가 호출된 AI'로는 진입 금지)
                     weekend_block_now = cfg.get("no_trade_weekend", False) and (now_kst().weekday() in [5, 6])
                     entry_allowed_global = trade_enabled and (not paused_now) and (not weekend_block_now)
 
+                    # 상태 표시(사용자 체감 개선)
+                    if force_scan_pending:
+                        mon["global_state"] = "강제 스캔 중(/scan)"
+                    elif not trade_enabled:
+                        mon["global_state"] = "스캔 중(자동매매 OFF)"
+                    elif paused_now:
+                        mon["global_state"] = "스캔 중(정지: 연속손실 보호)"
+                    elif weekend_block_now:
+                        mon["global_state"] = "스캔 중(주말: 신규진입 OFF)"
+                    else:
+                        mon["global_state"] = "스캔/매매 중"
+
                     # 1) 포지션 관리
                     open_pos_snapshot = []
-                    for sym in (TARGET_COINS if trade_enabled else []):
-                        ps = safe_fetch_positions(ex, [sym])
-                        act = [p for p in ps if float(p.get("contracts") or 0) > 0]
-                        if not act:
-                            continue
 
-                        p = act[0]
+                    # ✅ 포지션은 1회 스냅샷으로 사용(API 호출 최소화)
+                    pos_by_sym: Dict[str, Dict[str, Any]] = {}
+                    try:
+                        ps_all = safe_fetch_positions(ex, TARGET_COINS)
+                        for p0 in (ps_all or []):
+                            try:
+                                sym0 = str(p0.get("symbol") or "").strip()
+                                if not sym0:
+                                    continue
+                                if float(p0.get("contracts") or 0) > 0:
+                                    pos_by_sym[sym0] = p0
+                            except Exception:
+                                continue
+                    except Exception:
+                        pos_by_sym = {}
+
+                    for sym in (TARGET_COINS if entry_allowed_global else []):
+                        p = pos_by_sym.get(sym)
+                        if not p:
+                            continue
                         side = position_side_normalize(p)
                         contracts = float(p.get("contracts") or 0)
                         entry = float(p.get("entryPrice") or 0)
@@ -4451,19 +4761,52 @@ def telegram_thread(ex):
                             }
                         )
 
+                    # ✅ 자동매매가 OFF/정지/주말이어도 포지션 스냅샷은 UI에 표시
+                    if (not open_pos_snapshot) and (not entry_allowed_global) and pos_by_sym:
+                        try:
+                            for sym in TARGET_COINS:
+                                p = pos_by_sym.get(sym)
+                                if not p:
+                                    continue
+                                side = position_side_normalize(p)
+                                roi = float(position_roi_percent(p))
+                                upnl = float(p.get("unrealizedPnl") or 0.0)
+                                lev_live = _pos_leverage(p)
+                                tgt0 = (active_targets.get(sym, {}) or {})
+                                style_now = str(tgt0.get("style", "") or "")
+                                tp = float(tgt0.get("tp", 0.0) or 0.0)
+                                sl = float(tgt0.get("sl", 0.0) or 0.0)
+                                trade_id = str(tgt0.get("trade_id") or "")
+                                open_pos_snapshot.append(
+                                    {
+                                        "symbol": sym,
+                                        "side": side,
+                                        "roi": roi,
+                                        "upnl": upnl,
+                                        "lev": lev_live,
+                                        "style": style_now,
+                                        "tp": tp,
+                                        "sl": sl,
+                                        "trade_id": trade_id,
+                                    }
+                                )
+                        except Exception:
+                            pass
+
                     mon["open_positions"] = open_pos_snapshot
 
                     # 2) 신규 진입 스캔
-                    free_usdt, _ = safe_fetch_balance(ex)
                     risk_mul = external_risk_multiplier(ext, cfg)
                     mon["entry_risk_multiplier"] = risk_mul
+                    free_usdt = 0.0
+                    if entry_allowed_global:
+                        free_usdt, _ = safe_fetch_balance(ex)
+                    active_syms = set(pos_by_sym.keys())
 
                     scan_cycle_start = time.time()
                     for sym in TARGET_COINS:
                         # 포지션 있으면 스킵
-                        ps = safe_fetch_positions(ex, [sym])
-                        act = [p for p in ps if float(p.get("contracts") or 0) > 0]
-                        if act:
+                        if sym in active_syms:
                             mon_add_scan(mon, stage="in_position", symbol=sym, tf=str(cfg.get("timeframe", "")), message="이미 포지션 보유")
                             continue
 
@@ -5003,6 +5346,37 @@ def telegram_thread(ex):
                             )
                             _reply_to_chat(msg)
 
+                        # /gsheet (관리자) - 상태/연결 테스트
+                        elif low.startswith("/gsheet") or txt in ["시트", "구글시트", "gsheet"]:
+                            if not is_admin:
+                                _deny()
+                            else:
+                                parts = txt.split()
+                                do_test = False
+                                if len(parts) >= 2:
+                                    arg = str(parts[1]).lower().strip()
+                                    do_test = arg in ["test", "t", "ping", "check"]
+                                if do_test:
+                                    res = gsheet_test_append_row(timeout_sec=25)
+                                    if res.get("ok"):
+                                        _reply_admin_dm("✅ Google Sheets TEST 성공(GSHEET_TEST)")
+                                    else:
+                                        _reply_admin_dm(f"❌ Google Sheets TEST 실패: {res.get('error','')}")
+                                stg = gsheet_status_snapshot()
+                                msg = (
+                                    "📎 Google Sheets 상태\n"
+                                    f"- enabled: {stg.get('enabled')}\n"
+                                    f"- connected: {stg.get('connected')}\n"
+                                    f"- spreadsheet_id: {stg.get('spreadsheet_id')}\n"
+                                    f"- worksheet: {stg.get('worksheet')}\n"
+                                    f"- service_account_email: {stg.get('service_account_email')}\n"
+                                    f"- queue_high/scan: {stg.get('queue_high')}/{stg.get('queue_scan')}\n"
+                                    f"- last_append: {stg.get('last_append_kst')} ({stg.get('last_append_type')}:{stg.get('last_append_stage')})\n"
+                                    f"- last_err: {stg.get('last_err')}\n"
+                                    "사용법: /gsheet test"
+                                )
+                                _reply_admin_dm(msg[:3500])
+
                         # /positions (관리자)
                         elif low.startswith("/positions") or txt == "포지션":
                             if not is_admin:
@@ -5338,6 +5712,25 @@ def telegram_thread(ex):
                                 _cb_reply("⛔️ 관리자만 사용할 수 있는 버튼입니다.")
                             else:
                                 _cb_reply("🎚️ /mode 사용법\n- /mode auto\n- /mode scalping\n- /mode swing")
+
+                        elif data == "gsheet":
+                            if not is_admin:
+                                _cb_reply("⛔️ 관리자만 사용할 수 있는 버튼입니다.")
+                            else:
+                                stg = gsheet_status_snapshot()
+                                msg = (
+                                    "📎 Google Sheets 상태\n"
+                                    f"- enabled: {stg.get('enabled')}\n"
+                                    f"- connected: {stg.get('connected')}\n"
+                                    f"- spreadsheet_id: {stg.get('spreadsheet_id')}\n"
+                                    f"- worksheet: {stg.get('worksheet')}\n"
+                                    f"- service_account_email: {stg.get('service_account_email')}\n"
+                                    f"- queue_high/scan: {stg.get('queue_high')}/{stg.get('queue_scan')}\n"
+                                    f"- last_append: {stg.get('last_append_kst')} ({stg.get('last_append_type')}:{stg.get('last_append_stage')})\n"
+                                    f"- last_err: {stg.get('last_err')}\n"
+                                    "테스트: /gsheet test"
+                                )
+                                _cb_reply(msg[:3500])
 
                         elif data == "close_all":
                             if not is_admin:
@@ -5707,6 +6100,26 @@ if st.sidebar.button("🤖 OpenAI 연결 테스트"):
             st.sidebar.error(f"❌ 실패: {last_err}")
             notify_admin_error("UI:OPENAI_TEST", last_err, context={"models_tried": tried})
 
+# ✅ Google Sheets 연결 테스트(요구사항)
+if st.sidebar.button("📎 Google Sheets 연결 테스트"):
+    try:
+        res = gsheet_test_append_row(timeout_sec=25)
+        if res.get("ok"):
+            st.sidebar.success("✅ Google Sheets append_row 성공(GSHEET_TEST)")
+        else:
+            st.sidebar.error(f"❌ Google Sheets 실패: {res.get('error','')}")
+        stg = gsheet_status_snapshot()
+        email = str(stg.get("service_account_email", "")).strip()
+        if email:
+            st.sidebar.caption(f"서비스계정 이메일(시트 공유 필요): {email}")
+        else:
+            st.sidebar.caption("서비스계정 이메일을 읽지 못했어요(GSHEET_SERVICE_ACCOUNT_JSON 확인).")
+        with st.sidebar.expander("Google Sheets 상태(디버그)"):
+            st.json(stg)
+    except Exception as e:
+        st.sidebar.error(f"❌ 테스트 오류: {e}")
+        notify_admin_error("UI:GSHEET_TEST", e, context={"code": CODE_VERSION})
+
 save_settings(config)
 
 with st.sidebar:
@@ -5851,6 +6264,13 @@ with t1:
     if not mon:
         st.warning("monitor_state.json이 아직 없습니다. (스레드 시작 확인)")
     else:
+        # ✅ Google Sheets 상태(요구사항)
+        try:
+            st.subheader("📎 Google Sheets 상태")
+            st.write(gsheet_status_snapshot())
+            st.caption("※ 서비스계정 이메일로 스프레드시트를 '편집자'로 공유해야 append 됩니다.")
+        except Exception:
+            pass
         # 외부 시황 요약(항상 보이게)
         st.subheader("🌍 외부 시황 요약(한글/이모티콘)")
         ext = (mon.get("external") or {})
@@ -5947,6 +6367,8 @@ with t1:
                 {
                     "코인": sym,
                     "스캔(초전)": f"{scan_age:.1f}",
+                    "스캔단계": cs.get("scan_stage", ""),
+                    "단계시각": cs.get("scan_stage_kst", ""),
                     "가격": cs.get("price", ""),
                     "단기추세": cs.get("trend_short", ""),
                     "장기추세(1h)": cs.get("trend_long", ""),
@@ -6115,7 +6537,12 @@ with t4:
             return ""
 
         try:
-            sty = df_show[show_cols].style.applymap(_color_pnl, subset=["PnL_Percent", "PnL_USDT"])
+            # pandas 2.2+: Styler.applymap deprecate → map 사용
+            sty0 = df_show[show_cols].style
+            if hasattr(sty0, "map"):
+                sty = sty0.map(_color_pnl, subset=["PnL_Percent", "PnL_USDT"])  # type: ignore[attr-defined]
+            else:
+                sty = sty0.applymap(_color_pnl, subset=["PnL_Percent", "PnL_USDT"])
             st_dataframe_safe(sty, hide_index=True)
         except Exception:
             st_dataframe_safe(df_for_display(df_show[show_cols]), hide_index=True)
