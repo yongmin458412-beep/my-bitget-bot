@@ -27,7 +27,10 @@ backtesting>=0.3.3
 vectorbt>=0.26.0
 TA-Lib>=0.4.28
 
-
 feedparser>=6.0.11
 cachetools>=5.3.3
-tenacity>=8.2.3
+
+# ✅ Google Sheets
+gspread
+google-auth
+gspread-formatting
