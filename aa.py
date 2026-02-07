@@ -131,6 +131,25 @@ except Exception:
 
 
 # =========================================================
+# ✅ 빌드/버전 토큰(운영 디버깅용)
+# - Streamlit은 rerun 시에도 daemon thread가 남을 수 있어, "지금 어떤 코드가 돌아가고 있는지"
+#   확인하기 쉽게 토큰을 만든다.
+# =========================================================
+def _code_version_token() -> str:
+    try:
+        p = str(__file__ or "").strip()
+        if not p:
+            return "unknown"
+        mtime = int(os.path.getmtime(p))
+        return f"{os.path.basename(p)}@{mtime}"
+    except Exception:
+        return "unknown"
+
+
+CODE_VERSION = _code_version_token()
+
+
+# =========================================================
 # ✅ 0) 기본 설정
 # =========================================================
 st.set_page_config(layout="wide", page_title="비트겟 AI 워뇨띠 에이전트 (Final Integrated)")
@@ -923,14 +942,14 @@ def openai_chat_create_with_fallback(
             continue
         tried.append(m2)
         try:
-            def _do():
+            def _do(use_response_format: bool = True):
                 kwargs: Dict[str, Any] = {
                     "model": m2,
                     "messages": messages,
                     "temperature": float(temperature),
                     "max_tokens": int(max_tokens),
                 }
-                if response_format is not None:
+                if response_format is not None and use_response_format:
                     kwargs["response_format"] = response_format
                 return client.chat.completions.create(**kwargs)
 
@@ -939,7 +958,29 @@ def openai_chat_create_with_fallback(
         except FuturesTimeoutError as e:
             last_err = e
             continue
+        except TypeError as e:
+            # 일부 openai 라이브러리/환경에서 response_format 파라미터가 지원되지 않을 수 있음
+            # (예: "got an unexpected keyword argument 'response_format'")
+            msg = str(e or "")
+            if response_format is not None and ("response_format" in msg):
+                try:
+                    resp = _call_with_timeout(lambda: _do(use_response_format=False), timeout_sec)
+                    return m2, resp
+                except Exception as e2:
+                    last_err = e2
+                    continue
+            last_err = e
+            continue
         except Exception as e:
+            # 모델 자체가 response_format을 지원하지 않는 경우도 있어, 1회는 response_format 없이 재시도
+            msg = str(e or "")
+            if response_format is not None and ("response_format" in msg.lower()):
+                try:
+                    resp = _call_with_timeout(lambda: _do(use_response_format=False), timeout_sec)
+                    return m2, resp
+                except Exception as e2:
+                    last_err = e2
+                    continue
             last_err = e
             continue
     if last_err is not None:
@@ -2969,6 +3010,7 @@ def notify_admin_error(where: str, err: BaseException, context: Optional[Dict[st
             f"🧨 오류 알림\n"
             f"- where: {where_s}\n"
             f"- time_kst: {now_kst_str()}\n"
+            f"- code: {CODE_VERSION}\n"
             f"- error: {type(err).__name__}: {msg_s}\n"
         )
         if ctx_txt:
@@ -3399,7 +3441,7 @@ def telegram_thread(ex):
 
     # 부팅 메시지(그룹: 메뉴, 채널: 시작 알림)
     cfg_boot = load_settings()
-    boot_msg = "🚀 AI 봇 가동 시작! (모의투자)\n명령: /menu /status /positions /scan /mode /log"
+    boot_msg = f"🚀 AI 봇 가동 시작! (모의투자)\n- code: {CODE_VERSION}\n명령: /menu /status /positions /scan /mode /log"
     tg_send(boot_msg, target="channel", cfg=cfg_boot)
     # ✅ 요구: TG_TARGET_CHAT_ID는 채널(브로드캐스트), 관리는 관리자 DM으로(중복/스팸 방지)
     if TG_ADMIN_IDS:
@@ -3718,40 +3760,39 @@ def telegram_thread(ex):
 
                     # 1) 포지션 관리
                     open_pos_snapshot = []
-                    if trade_enabled:
-                        for sym in TARGET_COINS:
-                            ps = safe_fetch_positions(ex, [sym])
-                            act = [p for p in ps if float(p.get("contracts") or 0) > 0]
-                            if not act:
-                                continue
+                    for sym in (TARGET_COINS if trade_enabled else []):
+                        ps = safe_fetch_positions(ex, [sym])
+                        act = [p for p in ps if float(p.get("contracts") or 0) > 0]
+                        if not act:
+                            continue
 
-                            p = act[0]
-                            side = position_side_normalize(p)
-                            contracts = float(p.get("contracts") or 0)
-                            entry = float(p.get("entryPrice") or 0)
-                            roi = float(position_roi_percent(p))
-                            cur_px = get_last_price(ex, sym) or entry
-                            lev_live = _pos_leverage(p)
-                            upnl = float(p.get("unrealizedPnl") or 0.0)
+                        p = act[0]
+                        side = position_side_normalize(p)
+                        contracts = float(p.get("contracts") or 0)
+                        entry = float(p.get("entryPrice") or 0)
+                        roi = float(position_roi_percent(p))
+                        cur_px = get_last_price(ex, sym) or entry
+                        lev_live = _pos_leverage(p)
+                        upnl = float(p.get("unrealizedPnl") or 0.0)
 
-                            tgt = active_targets.get(
-                                sym,
-                                {
-                                    "sl": 2.0,
-                                    "tp": 5.0,
-                                    "entry_usdt": 0.0,
-                                    "entry_pct": 0.0,
-                                    "lev": p.get("leverage", "?"),
-                                    "reason": "",
-                                    "trade_id": "",
-                                    "sl_price": None,
-                                    "tp_price": None,
-                                    "sl_price_pct": None,
-                                    "style": "스캘핑",
-                                    "entry_epoch": time.time(),
-                                    "style_last_switch_epoch": time.time(),
-                                },
-                            )
+                        tgt = active_targets.get(
+                            sym,
+                            {
+                                "sl": 2.0,
+                                "tp": 5.0,
+                                "entry_usdt": 0.0,
+                                "entry_pct": 0.0,
+                                "lev": p.get("leverage", "?"),
+                                "reason": "",
+                                "trade_id": "",
+                                "sl_price": None,
+                                "tp_price": None,
+                                "sl_price_pct": None,
+                                "style": "스캘핑",
+                                "entry_epoch": time.time(),
+                                "style_last_switch_epoch": time.time(),
+                            },
+                        )
 
                         # ✅ 스타일 자동 전환(포지션 보유 중)
                         tgt = _maybe_switch_style_for_open_position(ex, sym, side, tgt, cfg, mon)
@@ -4120,19 +4161,19 @@ def telegram_thread(ex):
                                 mon_add_event(mon, "TAKE", sym, f"ROI +{roi:.2f}%", {"trade_id": trade_id})
                                 monitor_write_throttled(mon, 0.2)
 
-                            open_pos_snapshot.append(
-                                {
-                                    "symbol": sym,
-                                    "side": side,
-                                    "roi": roi,
-                                    "upnl": upnl,
-                                    "lev": lev_live,
-                                    "style": style_now,
-                                    "tp": tp,
-                                    "sl": sl,
-                                    "trade_id": trade_id,
-                                }
-                            )
+                        open_pos_snapshot.append(
+                            {
+                                "symbol": sym,
+                                "side": side,
+                                "roi": roi,
+                                "upnl": upnl,
+                                "lev": lev_live,
+                                "style": style_now,
+                                "tp": tp,
+                                "sl": sl,
+                                "trade_id": trade_id,
+                            }
+                        )
 
                     mon["open_positions"] = open_pos_snapshot
 
@@ -5157,7 +5198,7 @@ ensure_threads_started()
 st.sidebar.title("🛠️ 제어판")
 st.sidebar.caption("Streamlit=제어/상태 확인용, Telegram=실시간 보고/조회용")
 
-openai_key_secret = st.secrets.get("OPENAI_API_KEY", "")
+openai_key_secret = _sget_str("OPENAI_API_KEY")
 if not openai_key_secret and not config.get("openai_api_key"):
     k = st.sidebar.text_input("OpenAI API Key 입력(선택)", type="password")
     if k:
