@@ -300,6 +300,34 @@ def df_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================================================
+# ✅ 2.7) Streamlit DataFrame 표시 호환(버전 차이 대응)
+# - 일부 Streamlit 버전에서 st.dataframe(width="stretch") / hide_index / use_container_width 호환 문제
+# - UI 기능이 "작동 안 함"처럼 보이는 런타임 오류를 줄인다.
+# =========================================================
+def st_dataframe_safe(data, **kwargs):
+    """
+    Streamlit 버전 차이로 인한 파라미터 TypeError를 흡수하면서 최대한 표시.
+    - 기존 코드의 width="stretch" 사용을 호환 처리
+    """
+    try:
+        if kwargs.get("width") == "stretch":
+            kwargs.pop("width", None)
+            kwargs.setdefault("use_container_width", True)
+        kwargs.setdefault("use_container_width", True)
+        return st.dataframe(data, **kwargs)
+    except TypeError:
+        # 구버전 Streamlit: 지원하지 않는 kwargs 제거 후 재시도
+        for k in ["use_container_width", "hide_index", "column_config", "column_order", "width"]:
+            kwargs.pop(k, None)
+        try:
+            return st.dataframe(data, **kwargs)
+        except Exception:
+            return st.dataframe(data)
+    except Exception:
+        return st.dataframe(data)
+
+
+# =========================================================
 # ✅ 3) MODE_RULES (기존 유지)
 # =========================================================
 MODE_RULES = {
@@ -851,7 +879,9 @@ _OPENAI_CLIENT_LOCK = threading.RLock()
 
 
 def get_openai_client(cfg: Dict[str, Any]) -> Optional[OpenAI]:
-    key = st.secrets.get("OPENAI_API_KEY") or cfg.get("openai_api_key", "")
+    # ✅ secrets 규격(요구사항): OPENAI_API_KEY
+    # - 일부 환경에서 st.secrets.get 호환 이슈를 피하기 위해 _sget_str 사용
+    key = _sget_str("OPENAI_API_KEY") or str(cfg.get("openai_api_key", "") or "").strip()
     if not key:
         return None
     with _OPENAI_CLIENT_LOCK:
@@ -1089,8 +1119,9 @@ def gsheet_worker_thread():
                 _append()
 
             backoff = 1.0
-        except Exception:
-            # 실패해도 봇은 살아야 함
+        except Exception as e:
+            # 실패해도 봇은 살아야 함(오류는 관리자에게 알림)
+            notify_admin_error("GSHEET_THREAD", e, min_interval_sec=120.0)
             time.sleep(backoff)
             backoff = float(clamp(backoff * 1.5, 1.0, 12.0))
 
@@ -1431,9 +1462,17 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
     status: Dict[str, Any] = {}
     if df is None or df.empty or len(df) < 120:
         return df, status, None
-    if ta is None:
-        status["_ERROR"] = "ta 모듈 없음(requirements.txt에 ta 추가 필요)"
+    # ✅ 지표 라이브러리 호환:
+    # - 1순위: ta (기존)
+    # - 2순위: pandas_ta (ta 미설치 환경에서 기능 복구)
+    use_ta = ta is not None
+    use_pta = (not use_ta) and (pta is not None)
+    if not use_ta and not use_pta:
+        status["_ERROR"] = "ta/pandas_ta 모듈 없음(requirements.txt에 ta 또는 pandas_ta 추가 필요)"
         return df, status, None
+    status["_backend"] = "ta" if use_ta else "pandas_ta"
+    if use_pta:
+        status["_INFO"] = "ta 미설치 → pandas_ta로 지표 계산"
 
     rsi_period = int(cfg.get("rsi_period", 14))
     rsi_buy = float(cfg.get("rsi_buy", 30))
@@ -1449,44 +1488,131 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
     high = df["high"]
     low = df["low"]
     vol = df["vol"]
+    orig_cols = set(df.columns)
 
     if cfg.get("use_rsi", True):
-        df["RSI"] = ta.momentum.rsi(close, window=rsi_period)
+        try:
+            if use_ta:
+                df["RSI"] = ta.momentum.rsi(close, window=rsi_period)
+            else:
+                df["RSI"] = pta.rsi(close, length=rsi_period)
+        except Exception as e:
+            status["_RSI_ERROR"] = str(e)[:160]
 
     if cfg.get("use_bb", True):
-        bb = ta.volatility.BollingerBands(close, window=bb_period, window_dev=bb_std)
-        df["BB_upper"] = bb.bollinger_hband()
-        df["BB_lower"] = bb.bollinger_lband()
-        df["BB_mid"] = bb.bollinger_mavg()
+        try:
+            if use_ta:
+                bb = ta.volatility.BollingerBands(close, window=bb_period, window_dev=bb_std)
+                df["BB_upper"] = bb.bollinger_hband()
+                df["BB_lower"] = bb.bollinger_lband()
+                df["BB_mid"] = bb.bollinger_mavg()
+            else:
+                bb = pta.bbands(close, length=bb_period, std=bb_std)
+                if isinstance(bb, pd.DataFrame) and not bb.empty:
+                    col_u = next((c for c in bb.columns if str(c).startswith("BBU_")), "")
+                    col_l = next((c for c in bb.columns if str(c).startswith("BBL_")), "")
+                    col_m = next((c for c in bb.columns if str(c).startswith("BBM_")), "")
+                    if col_u:
+                        df["BB_upper"] = bb[col_u]
+                    if col_l:
+                        df["BB_lower"] = bb[col_l]
+                    if col_m:
+                        df["BB_mid"] = bb[col_m]
+        except Exception as e:
+            status["_BB_ERROR"] = str(e)[:160]
 
     if cfg.get("use_ma", True):
-        df["MA_fast"] = ta.trend.sma_indicator(close, window=ma_fast)
-        df["MA_slow"] = ta.trend.sma_indicator(close, window=ma_slow)
+        try:
+            if use_ta:
+                df["MA_fast"] = ta.trend.sma_indicator(close, window=ma_fast)
+                df["MA_slow"] = ta.trend.sma_indicator(close, window=ma_slow)
+            else:
+                df["MA_fast"] = pta.sma(close, length=ma_fast)
+                df["MA_slow"] = pta.sma(close, length=ma_slow)
+        except Exception as e:
+            status["_MA_ERROR"] = str(e)[:160]
 
     if cfg.get("use_macd", True):
-        macd = ta.trend.MACD(close)
-        df["MACD"] = macd.macd()
-        df["MACD_signal"] = macd.macd_signal()
+        try:
+            if use_ta:
+                macd = ta.trend.MACD(close)
+                df["MACD"] = macd.macd()
+                df["MACD_signal"] = macd.macd_signal()
+            else:
+                macd = pta.macd(close)
+                if isinstance(macd, pd.DataFrame) and not macd.empty:
+                    col_macd = next((c for c in macd.columns if str(c).startswith("MACD_") and not str(c).startswith("MACDh_") and not str(c).startswith("MACDs_")), "")
+                    col_sig = next((c for c in macd.columns if str(c).startswith("MACDs_")), "")
+                    if col_macd:
+                        df["MACD"] = macd[col_macd]
+                    if col_sig:
+                        df["MACD_signal"] = macd[col_sig]
+        except Exception as e:
+            status["_MACD_ERROR"] = str(e)[:160]
 
     if cfg.get("use_stoch", True):
-        df["STO_K"] = ta.momentum.stoch(high, low, close, window=stoch_k, smooth_window=3)
-        df["STO_D"] = ta.momentum.stoch_signal(high, low, close, window=stoch_k, smooth_window=3)
+        try:
+            if use_ta:
+                df["STO_K"] = ta.momentum.stoch(high, low, close, window=stoch_k, smooth_window=3)
+                df["STO_D"] = ta.momentum.stoch_signal(high, low, close, window=stoch_k, smooth_window=3)
+            else:
+                stoch = pta.stoch(high, low, close, k=stoch_k, d=3, smooth_k=3)
+                if isinstance(stoch, pd.DataFrame) and not stoch.empty:
+                    col_k = next((c for c in stoch.columns if str(c).startswith("STOCHk_")), "")
+                    col_d = next((c for c in stoch.columns if str(c).startswith("STOCHd_")), "")
+                    if col_k:
+                        df["STO_K"] = stoch[col_k]
+                    if col_d:
+                        df["STO_D"] = stoch[col_d]
+        except Exception as e:
+            status["_STOCH_ERROR"] = str(e)[:160]
 
     if cfg.get("use_cci", True):
-        df["CCI"] = ta.trend.cci(high, low, close, window=20)
+        try:
+            if use_ta:
+                df["CCI"] = ta.trend.cci(high, low, close, window=20)
+            else:
+                df["CCI"] = pta.cci(high, low, close, length=20)
+        except Exception as e:
+            status["_CCI_ERROR"] = str(e)[:160]
 
     if cfg.get("use_mfi", True):
-        df["MFI"] = ta.volume.money_flow_index(high, low, close, vol, window=14)
+        try:
+            if use_ta:
+                df["MFI"] = ta.volume.money_flow_index(high, low, close, vol, window=14)
+            else:
+                df["MFI"] = pta.mfi(high, low, close, vol, length=14)
+        except Exception as e:
+            status["_MFI_ERROR"] = str(e)[:160]
 
     if cfg.get("use_willr", True):
-        df["WILLR"] = ta.momentum.williams_r(high, low, close, lbp=14)
+        try:
+            if use_ta:
+                df["WILLR"] = ta.momentum.williams_r(high, low, close, lbp=14)
+            else:
+                df["WILLR"] = pta.willr(high, low, close, length=14)
+        except Exception as e:
+            status["_WILLR_ERROR"] = str(e)[:160]
 
     if cfg.get("use_adx", True):
-        df["ADX"] = ta.trend.adx(high, low, close, window=14)
+        try:
+            if use_ta:
+                df["ADX"] = ta.trend.adx(high, low, close, window=14)
+            else:
+                adx = pta.adx(high, low, close, length=14)
+                if isinstance(adx, pd.DataFrame) and not adx.empty:
+                    col_adx = next((c for c in adx.columns if str(c).startswith("ADX_")), "")
+                    if col_adx:
+                        df["ADX"] = adx[col_adx]
+        except Exception as e:
+            status["_ADX_ERROR"] = str(e)[:160]
 
     if cfg.get("use_vol", True):
-        df["VOL_MA"] = vol.rolling(20).mean()
-        df["VOL_SPIKE"] = (df["vol"] > (df["VOL_MA"] * vol_mul)).astype(int)
+        try:
+            df["VOL_MA"] = vol.rolling(20).mean()
+            df["VOL_SPIKE"] = (df["vol"] > (df["VOL_MA"] * vol_mul)).astype(int)
+        except Exception as e:
+            status["_VOL_ERROR"] = str(e)[:160]
 
     if pta is not None:
         try:
@@ -1494,17 +1620,39 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
         except Exception:
             pass
 
-    df = df.dropna()
-    if df.empty or len(df) < 5:
-        return df, status, None
+    # ✅ 일부 지표가 전부 NaN이면 dropna()가 전체를 비울 수 있으므로, all-NaN 컬럼은 제거
+    try:
+        new_cols = [c for c in df.columns if c not in orig_cols]
+        dropped = []
+        for c in new_cols:
+            try:
+                if df[c].isna().all():
+                    df.drop(columns=[c], inplace=True)
+                    dropped.append(c)
+            except Exception:
+                continue
+        if dropped:
+            status["_DROP_ALL_NAN_COLS"] = dropped[:25]
+    except Exception:
+        pass
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    # dropna는 유지(기존 동작)하되, 전부 비어버리면 close 기준으로라도 복구 시도
+    df2 = df.dropna()
+    if df2.empty or len(df2) < 5:
+        try:
+            df2 = df.dropna(subset=["close"])
+        except Exception:
+            df2 = df2
+    if df2.empty or len(df2) < 5:
+        return df2, status, None
+
+    last = df2.iloc[-1]
+    prev = df2.iloc[-2] if len(df2) >= 2 else last
 
     used = []
 
     # RSI
-    if cfg.get("use_rsi", True):
+    if cfg.get("use_rsi", True) and "RSI" in df2.columns:
         used.append("RSI")
         rsi_now = float(last.get("RSI", 50))
         if rsi_now < rsi_buy:
@@ -1515,7 +1663,7 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
             status["RSI"] = f"⚪ 중립({rsi_now:.1f})"
 
     # BB
-    if cfg.get("use_bb", True):
+    if cfg.get("use_bb", True) and all(c in df2.columns for c in ["BB_upper", "BB_lower"]):
         used.append("볼린저밴드")
         if last["close"] > last["BB_upper"]:
             status["BB"] = "🔴 상단 돌파"
@@ -1528,37 +1676,44 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
     trend = "중립"
     if cfg.get("use_ma", True):
         used.append("이동평균(MA)")
-        if last["MA_fast"] > last["MA_slow"] and last["close"] > last["MA_slow"]:
-            trend = "상승추세"
-        elif last["MA_fast"] < last["MA_slow"] and last["close"] < last["MA_slow"]:
-            trend = "하락추세"
-        else:
-            trend = "횡보/전환"
+        try:
+            if all(c in df2.columns for c in ["MA_fast", "MA_slow"]):
+                if last["MA_fast"] > last["MA_slow"] and last["close"] > last["MA_slow"]:
+                    trend = "상승추세"
+                elif last["MA_fast"] < last["MA_slow"] and last["close"] < last["MA_slow"]:
+                    trend = "하락추세"
+                else:
+                    trend = "횡보/전환"
+            else:
+                # 최소 기능: close만으로도 추세 산출(표시용)
+                trend = compute_ma_trend_from_df(df2, fast=ma_fast, slow=ma_slow)
+        except Exception:
+            trend = "중립"
         status["추세"] = f"📈 {trend}"
 
     # MACD
-    if cfg.get("use_macd", True):
+    if cfg.get("use_macd", True) and all(c in df2.columns for c in ["MACD", "MACD_signal"]):
         used.append("MACD")
         status["MACD"] = "📈 상승(골든)" if last["MACD"] > last["MACD_signal"] else "📉 하락(데드)"
 
     # ADX
-    if cfg.get("use_adx", True):
+    if cfg.get("use_adx", True) and "ADX" in df2.columns:
         used.append("ADX(추세강도)")
         adx = float(last.get("ADX", 0))
         status["ADX"] = "🔥 추세 강함" if adx >= 25 else "💤 추세 약함"
 
     # Volume
-    if cfg.get("use_vol", True):
+    if cfg.get("use_vol", True) and "VOL_SPIKE" in df2.columns:
         used.append("거래량")
         status["거래량"] = "🔥 거래량 급증" if int(last.get("VOL_SPIKE", 0)) == 1 else "⚪ 보통"
 
     # RSI 해소
-    rsi_prev = float(prev.get("RSI", 50)) if cfg.get("use_rsi", True) else 50.0
-    rsi_now = float(last.get("RSI", 50)) if cfg.get("use_rsi", True) else 50.0
+    rsi_prev = float(prev.get("RSI", 50)) if (cfg.get("use_rsi", True) and "RSI" in df2.columns) else 50.0
+    rsi_now = float(last.get("RSI", 50)) if (cfg.get("use_rsi", True) and "RSI" in df2.columns) else 50.0
     rsi_resolve_long = (rsi_prev < rsi_buy) and (rsi_now >= rsi_buy)
     rsi_resolve_short = (rsi_prev > rsi_sell) and (rsi_now <= rsi_sell)
 
-    adx_now = float(last.get("ADX", 0)) if cfg.get("use_adx", True) else 0.0
+    adx_now = float(last.get("ADX", 0)) if (cfg.get("use_adx", True) and "ADX" in df2.columns) else 0.0
     pullback_candidate = (trend == "상승추세") and rsi_resolve_long and (adx_now >= 18)
 
     status["_used_indicators"] = used
@@ -1566,7 +1721,7 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
     status["_rsi_resolve_short"] = bool(rsi_resolve_short)
     status["_pullback_candidate"] = bool(pullback_candidate)
 
-    return df, status, last
+    return df2, status, last
 
 
 # =========================================================
@@ -2027,10 +2182,14 @@ def external_risk_multiplier(ext: Dict[str, Any], cfg: Dict[str, Any]) -> float:
 # =========================================================
 def _atr_price_pct(df: pd.DataFrame, window: int = 14) -> float:
     try:
-        if ta is None or df is None or df.empty or len(df) < window + 5:
+        if df is None or df.empty or len(df) < window + 5:
             return 0.0
-        atr = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=window)
-        v = float(atr.iloc[-1])
+        if ta is not None:
+            atr = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=window)
+            v = float(atr.iloc[-1])
+        else:
+            # ta 미설치 환경에서도 최소 기능 유지(수동 ATR)
+            v = float(calc_atr(df, period=window))
         c = float(df["close"].iloc[-1])
         if c <= 0:
             return 0.0
@@ -2540,12 +2699,54 @@ def _tg_post(url: str, data: Dict[str, Any]):
     return _do()
 
 
+def tg_admin_chat_ids() -> List[str]:
+    """
+    Telegram Bot API에서 개인 DM의 chat_id는 보통 user_id와 동일합니다.
+    - 단, 봇이 해당 사용자에게 DM을 보내려면 사용자가 먼저 봇을 시작(/start)해야 합니다.
+    """
+    try:
+        if not TG_ADMIN_IDS:
+            return []
+        ids = []
+        for x in sorted(list(TG_ADMIN_IDS)):
+            try:
+                ids.append(str(int(x)))
+            except Exception:
+                continue
+        return ids
+    except Exception:
+        return []
+
+
+def tg_send_chat(chat_id: Any, text: str):
+    """특정 chat_id(채널/그룹/개인)로 직접 전송."""
+    if not tg_token:
+        return
+    if chat_id is None:
+        return
+    cid = str(chat_id).strip()
+    if not cid:
+        return
+    try:
+        _tg_post(f"https://api.telegram.org/bot{tg_token}/sendMessage", {"chat_id": cid, "text": text})
+    except Exception:
+        pass
+
+
 def _tg_chat_id_by_target(target: str, cfg: Dict[str, Any]) -> List[str]:
     target = (target or "default").lower()
     if target == "channel":
         return [tg_id_channel] if tg_id_channel else []
     if target == "group":
         return [tg_id_group] if tg_id_group else []
+    if target == "admin":
+        ids = tg_admin_chat_ids()
+        if ids:
+            return ids
+        # fallback: 기존 동작(그룹/디폴트)
+        if tg_id_group:
+            return [tg_id_group]
+        return [tg_id_default] if tg_id_default else []
     if target == "both":
         ids = []
         if tg_id_channel:
@@ -2573,7 +2774,7 @@ def tg_send(text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = 
 
 
 def tg_send_menu(cfg: Optional[Dict[str, Any]] = None):
-    if not tg_token or not tg_id_group:
+    if not tg_token:
         return
     cfg = cfg or load_settings()
     kb = {
@@ -2585,15 +2786,22 @@ def tg_send_menu(cfg: Optional[Dict[str, Any]] = None):
             [{"text": "🛑 전량청산", "callback_data": "close_all"}],
         ]
     }
+    # ✅ 사용자의 요구: TG_TARGET_CHAT_ID는 채널로(알림/결과),
+    #    관리/버튼은 TG_ADMIN_USER_IDS(관리자 DM)로 보내기.
+    # - admin ids가 있으면 admin에게, 없으면 group(default)에게.
+    to_ids = tg_admin_chat_ids() or ([tg_id_group] if tg_id_group else ([tg_id_default] if tg_id_default else []))
+    if not to_ids:
+        return
     try:
-        _tg_post(
-            f"https://api.telegram.org/bot{tg_token}/sendMessage",
-            {
-                "chat_id": tg_id_group,
-                "text": "✅ /menu\n/status /positions /scan /mode auto|scalping|swing /log <id>\n(일지상세: '일지상세 <ID>')",
-                "reply_markup": json.dumps(kb, ensure_ascii=False),
-            },
-        )
+        for cid in to_ids:
+            _tg_post(
+                f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                {
+                    "chat_id": cid,
+                    "text": "✅ /menu\n/status /positions /scan /mode auto|scalping|swing /log <id>\n(일지상세: '일지상세 <ID>')",
+                    "reply_markup": json.dumps(kb, ensure_ascii=False),
+                },
+            )
     except Exception:
         pass
 
@@ -2603,6 +2811,88 @@ def tg_answer_callback(cb_id: str):
         return
     try:
         _tg_post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", {"callback_query_id": cb_id})
+    except Exception:
+        pass
+
+
+# =========================================================
+# ✅ 16.2) 오류 알림(관리자 DM) - 요구사항
+# - "코드에서 나오는 모든 오류"를 TG_ADMIN_USER_IDS로 전송(스팸 방지용 dedup/쿨다운 포함)
+# =========================================================
+_ERR_NOTIFY_LOCK = threading.RLock()
+_ERR_NOTIFY_LAST: Dict[str, float] = {}
+
+
+def notify_admin_error(where: str, err: BaseException, context: Optional[Dict[str, Any]] = None, tb: str = "", min_interval_sec: float = 60.0):
+    """
+    안전한 오류 알림:
+    - Telegram 전송 실패가 또 다른 예외를 만들지 않게 100% swallow
+    - 동일 오류는 min_interval_sec 동안 중복 전송 방지
+    """
+    try:
+        if not tg_token:
+            return
+        if not TG_ADMIN_IDS:
+            return
+        where_s = str(where or "unknown")[:120]
+        msg_s = str(err)[:300]
+        sig = f"{where_s}|{type(err).__name__}|{msg_s}"
+
+        now = time.time()
+        with _ERR_NOTIFY_LOCK:
+            last = float(_ERR_NOTIFY_LAST.get(sig, 0) or 0)
+            if (now - last) < float(min_interval_sec):
+                return
+            _ERR_NOTIFY_LAST[sig] = now
+            # 메모리 누수 방지(최대 300개 유지)
+            if len(_ERR_NOTIFY_LAST) > 300:
+                # 오래된 것부터 제거
+                for k in sorted(_ERR_NOTIFY_LAST, key=_ERR_NOTIFY_LAST.get)[:80]:
+                    _ERR_NOTIFY_LAST.pop(k, None)
+
+        tb_text = tb or ""
+        if not tb_text:
+            try:
+                tb_text = traceback.format_exc()
+            except Exception:
+                tb_text = ""
+        tb_short = ""
+        if tb_text:
+            try:
+                tb_lines = tb_text.strip().splitlines()
+                tb_short = "\n".join(tb_lines[-8:])
+            except Exception:
+                tb_short = ""
+
+        ctx_txt = ""
+        if context:
+            try:
+                ctx_txt = safe_json_dumps(context, limit=900)
+            except Exception:
+                ctx_txt = str(context)[:900]
+
+        text = (
+            f"🧨 오류 알림\n"
+            f"- where: {where_s}\n"
+            f"- time_kst: {now_kst_str()}\n"
+            f"- error: {type(err).__name__}: {msg_s}\n"
+        )
+        if ctx_txt:
+            text += f"- ctx: {ctx_txt}\n"
+        if tb_short:
+            text += f"- tb(last):\n{tb_short}\n"
+
+        # Telegram 길이 제한 보호
+        if len(text) > 3500:
+            text = text[:3500] + "..."
+
+        # 관리자 DM으로만 전송
+        tg_send(text, target="admin", cfg=load_settings())
+        try:
+            # Google Sheets에도 ERROR 이벤트 남김(가능할 때만)
+            gsheet_log_event("ERROR", message=f"{where_s}: {type(err).__name__}", payload={"msg": msg_s, "ctx": context or {}})
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -2669,7 +2959,9 @@ def telegram_polling_thread():
                     tg_updates_push(up)
             else:
                 time.sleep(0.4)
-        except Exception:
+        except Exception as e:
+            # 폴링 오류도 관리자에게 알림(과다 스팸 방지: 120s dedup)
+            notify_admin_error("TG_POLL_THREAD", e, context={"offset": offset}, min_interval_sec=120.0)
             time.sleep(backoff)
             backoff = float(clamp(backoff * 1.5, 1.0, 15.0))
 
@@ -2960,8 +3252,13 @@ def telegram_thread(ex):
 
     # 부팅 메시지(그룹: 메뉴, 채널: 시작 알림)
     cfg_boot = load_settings()
-    tg_send("🚀 AI 봇 가동 시작! (모의투자)\n명령: /menu /status /positions /scan /mode /log", target="channel", cfg=cfg_boot)
-    tg_send("🚀 AI 봇 가동 시작! (모의투자)\n명령: /menu /status /positions /scan /mode /log", target="group", cfg=cfg_boot)
+    boot_msg = "🚀 AI 봇 가동 시작! (모의투자)\n명령: /menu /status /positions /scan /mode /log"
+    tg_send(boot_msg, target="channel", cfg=cfg_boot)
+    # ✅ 요구: TG_TARGET_CHAT_ID는 채널(브로드캐스트), 관리는 관리자 DM으로(중복/스팸 방지)
+    if TG_ADMIN_IDS:
+        tg_send(boot_msg, target="admin", cfg=cfg_boot)
+    elif tg_id_group and tg_id_group != tg_id_channel:
+        tg_send(boot_msg, target="group", cfg=cfg_boot)
     tg_send_menu(cfg=cfg_boot)
 
     # 주기 작업 스케줄러 상태
@@ -4153,7 +4450,17 @@ def telegram_thread(ex):
                             lines += force_scan_summary_lines[:12]
                         else:
                             lines.append("- (수집된 결과 없음)")
-                        tg_send("\n".join(lines), target=cfg.get("tg_route_queries_to", "group"), cfg=cfg)
+                        # ✅ 요구: TG_TARGET_CHAT_ID는 채널(브로드캐스트), 관리/버튼/강제스캔 결과는 관리자 DM으로
+                        try:
+                            force_by = int(force_scan_req.get("requested_by", 0) or 0)
+                        except Exception:
+                            force_by = 0
+                        if TG_ADMIN_IDS and force_by:
+                            tg_send_chat(force_by, "\n".join(lines))
+                        elif TG_ADMIN_IDS:
+                            tg_send("\n".join(lines), target="admin", cfg=cfg)
+                        else:
+                            tg_send("\n".join(lines), target=cfg.get("tg_route_queries_to", "group"), cfg=cfg)
                         mon_add_event(mon, "SCAN_DONE", "", f"id={force_scan_id}", {"symbols": list(force_scan_syms_set)[:50], "scan_only": force_scan_only})
                         gsheet_log_event("SCAN_DONE", message=f"id={force_scan_id}", payload={"symbols": list(force_scan_syms_set)[:50], "scan_only": force_scan_only})
                     except Exception:
@@ -4172,21 +4479,39 @@ def telegram_thread(ex):
                     if "message" in up and "text" in (up.get("message") or {}):
                         msg0 = up.get("message") or {}
                         txt = str(msg0.get("text") or "").strip()
+                        chat_id = ((msg0.get("chat") or {}) if isinstance(msg0.get("chat"), dict) else {}).get("id", None)
                         from0 = msg0.get("from") or {}
                         uid = from0.get("id", None)
                         is_admin = tg_is_admin(uid)
 
-                        def _reply(m: str):
-                            tg_send(m, target=cfg.get("tg_route_queries_to", "group"), cfg=cfg)
+                        def _reply_to_chat(m: str):
+                            # /status처럼 누구나 허용되는 응답은 "요청이 온 채팅"으로 답장
+                            if chat_id is not None:
+                                tg_send_chat(chat_id, m)
+                            else:
+                                tg_send(m, target=cfg.get("tg_route_queries_to", "group"), cfg=cfg)
+
+                        def _reply_admin_dm(m: str):
+                            # ✅ 요구: 관리/버튼 결과는 TG_ADMIN_USER_IDS(관리자 DM)로
+                            if TG_ADMIN_IDS:
+                                if uid is not None:
+                                    tg_send_chat(uid, m)
+                                else:
+                                    tg_send(m, target="admin", cfg=cfg)
+                            else:
+                                _reply_to_chat(m)
 
                         def _deny():
-                            _reply("⛔️ 관리자만 사용할 수 있는 명령입니다.")
+                            _reply_to_chat("⛔️ 관리자만 사용할 수 있는 명령입니다.")
 
                         low = txt.lower().strip()
 
-                        # /menu (누구나 허용)
+                        # /menu (관리자) - TG_ADMIN_USER_IDS 설정 시, /status 외에는 관리자만 허용
                         if low.startswith("/menu") or low in ["menu", "메뉴"]:
-                            tg_send_menu(cfg=cfg)
+                            if TG_ADMIN_IDS and not is_admin:
+                                _deny()
+                            else:
+                                tg_send_menu(cfg=cfg)
 
                         # /status (누구나 허용)
                         elif low.startswith("/status") or txt == "상태":
@@ -4206,7 +4531,7 @@ def telegram_thread(ex):
                                 f"- 마지막 스캔: {mon_now.get('last_scan_kst','-')}\n"
                                 f"- 마지막 하트비트: {mon_now.get('last_heartbeat_kst','-')}\n"
                             )
-                            _reply(msg)
+                            _reply_to_chat(msg)
 
                         # /positions (관리자)
                         elif low.startswith("/positions") or txt == "포지션":
@@ -4227,7 +4552,7 @@ def telegram_thread(ex):
                                         lev = p.get("leverage", "?")
                                         style = str((active_targets.get(sym, {}) or {}).get("style", ""))
                                         msg.append(_fmt_pos_line(sym, side, lev, roi, upnl, style=style))
-                                _reply("\n".join(msg))
+                                _reply_admin_dm("\n".join(msg))
 
                         # /scan (관리자) - 강제스캔(스캔만, 주문X)
                         elif low.startswith("/scan") or txt == "스캔":
@@ -4244,7 +4569,7 @@ def telegram_thread(ex):
                                     else:
                                         syms = [s for s in TARGET_COINS if s.upper().startswith(f"{sym_arg}/")]
                                 if not syms:
-                                    _reply("대상 심볼이 없습니다. 예) /scan BTC 또는 /scan BTC/USDT:USDT")
+                                    _reply_admin_dm("대상 심볼이 없습니다. 예) /scan BTC 또는 /scan BTC/USDT:USDT")
                                 else:
                                     rid = uuid.uuid4().hex[:8]
                                     rt2 = load_runtime()
@@ -4263,7 +4588,7 @@ def telegram_thread(ex):
                                         gsheet_log_event("SCAN_REQUEST", message=f"id={rid}", payload={"symbols": syms, "by": uid})
                                     except Exception:
                                         pass
-                                    _reply(f"🔎 강제스캔 요청 완료: {rid}\n- 대상: {', '.join(syms)}\n- 주의: 강제스캔은 '스캔만' 수행(주문X)")
+                                    _reply_admin_dm(f"🔎 강제스캔 요청 완료: {rid}\n- 대상: {', '.join(syms)}\n- 주의: 강제스캔은 '스캔만' 수행(주문X)")
 
                         # /mode auto|scalping|swing (관리자)
                         elif low.startswith("/mode") or low.startswith("모드"):
@@ -4272,7 +4597,7 @@ def telegram_thread(ex):
                             else:
                                 parts = txt.split()
                                 if len(parts) < 2:
-                                    _reply("사용법: /mode auto|scalping|swing")
+                                    _reply_admin_dm("사용법: /mode auto|scalping|swing")
                                 else:
                                     arg = str(parts[1]).lower().strip()
                                     if arg in ["auto", "a"]:
@@ -4284,7 +4609,7 @@ def telegram_thread(ex):
                                     else:
                                         m = ""
                                     if not m:
-                                        _reply("사용법: /mode auto|scalping|swing")
+                                        _reply_admin_dm("사용법: /mode auto|scalping|swing")
                                     else:
                                         cfg2 = load_settings()
                                         cfg2["regime_mode"] = m
@@ -4294,7 +4619,7 @@ def telegram_thread(ex):
                                             gsheet_log_event("MODE_CHANGE", message=f"regime_mode={m}", payload={"by": uid})
                                         except Exception:
                                             pass
-                                        _reply(f"✅ 레짐 변경: {m}")
+                                        _reply_admin_dm(f"✅ 레짐 변경: {m}")
 
                         # /vision (관리자)
                         elif low.startswith("/vision") or txt == "시야":
@@ -4317,7 +4642,7 @@ def telegram_thread(ex):
                                         f"/ 단기 {cs.get('trend_short','-')} / 장기 {cs.get('trend_long','-')} "
                                         f"/ {str(cs.get('ai_reason_easy') or cs.get('skip_reason') or '')[:30]}"
                                     )
-                                _reply("\n".join(lines))
+                                _reply_admin_dm("\n".join(lines))
 
                         # /log 또는 /log <id> (관리자)
                         elif low.startswith("/log") or txt == "일지":
@@ -4329,7 +4654,7 @@ def telegram_thread(ex):
                                     tid = parts[1].strip()
                                     d = load_trade_detail(tid)
                                     if not d:
-                                        _reply("해당 ID를 찾지 못했어요.")
+                                        _reply_admin_dm("해당 ID를 찾지 못했어요.")
                                     else:
                                         evs = d.get("events", []) or []
                                         ev_short = []
@@ -4359,11 +4684,11 @@ def telegram_thread(ex):
                                         if ev_short:
                                             msg += "최근 이벤트:\n" + "\n".join(ev_short)
                                         # 텔레그램 길이 제한 보호
-                                        _reply(msg[:3500])
+                                        _reply_admin_dm(msg[:3500])
                                 else:
                                     df_log = read_trade_log()
                                     if df_log.empty:
-                                        _reply("📜 일지 없음(아직 기록된 매매가 없어요)")
+                                        _reply_admin_dm("📜 일지 없음(아직 기록된 매매가 없어요)")
                                     else:
                                         top = df_log.head(8)
                                         msg = ["📜 최근 매매일지(요약)"]
@@ -4374,7 +4699,7 @@ def telegram_thread(ex):
                                             msg.append(
                                                 f"- {emo} {r['Time']} {r['Coin']} {r['Side']} {pnl:.2f}% | {str(r.get('OneLine',''))[:40]} | ID:{tid}"
                                             )
-                                        _reply("\n".join(msg))
+                                        _reply_admin_dm("\n".join(msg))
 
                         # (호환) 일지상세 /detail (관리자)
                         elif txt.startswith("일지상세") or low.startswith("/detail"):
@@ -4383,14 +4708,14 @@ def telegram_thread(ex):
                             else:
                                 parts = txt.split()
                                 if len(parts) < 2:
-                                    _reply("사용법: 일지상세 <ID>\n(예: 일지상세 a1b2c3d4e5)")
+                                    _reply_admin_dm("사용법: 일지상세 <ID>\n(예: 일지상세 a1b2c3d4e5)")
                                 else:
                                     tid = parts[1].strip()
                                     d = load_trade_detail(tid)
                                     if not d:
-                                        _reply("해당 ID를 찾지 못했어요.")
+                                        _reply_admin_dm("해당 ID를 찾지 못했어요.")
                                     else:
-                                        _reply(
+                                        _reply_admin_dm(
                                             (
                                                 f"🧾 일지상세 {tid}\n"
                                                 f"- 코인: {d.get('coin')}\n"
@@ -4415,9 +4740,21 @@ def telegram_thread(ex):
                         cb_id = str(cb.get("id", "") or "")
                         uid = (cb.get("from") or {}).get("id", None)
                         is_admin = tg_is_admin(uid)
+                        cb_chat_id = (((cb.get("message") or {}).get("chat") or {}) if isinstance((cb.get("message") or {}).get("chat"), dict) else {}).get("id", None)
 
                         def _cb_reply(m: str):
-                            tg_send(m, target=cfg.get("tg_route_queries_to", "group"), cfg=cfg)
+                            # ✅ 요구: 버튼 응답은 관리자 DM(TG_ADMIN_USER_IDS) 우선
+                            if TG_ADMIN_IDS:
+                                if uid is not None:
+                                    tg_send_chat(uid, m)
+                                else:
+                                    tg_send(m, target="admin", cfg=cfg)
+                            else:
+                                # fallback: 버튼이 있던 채팅으로 답장
+                                if cb_chat_id is not None:
+                                    tg_send_chat(cb_chat_id, m)
+                                else:
+                                    tg_send(m, target=cfg.get("tg_route_queries_to", "group"), cfg=cfg)
 
                         if data == "status":
                             # 누구나
@@ -4527,7 +4864,10 @@ def telegram_thread(ex):
                                 _cb_reply(f"🔎 강제스캔 요청 완료: {rid}\n- 주의: 스캔만 수행(주문X)")
 
                         elif data == "mode_help":
-                            _cb_reply("🎚️ /mode 사용법\n- /mode auto\n- /mode scalping\n- /mode swing")
+                            if not is_admin:
+                                _cb_reply("⛔️ 관리자만 사용할 수 있는 버튼입니다.")
+                            else:
+                                _cb_reply("🎚️ /mode 사용법\n- /mode auto\n- /mode scalping\n- /mode swing")
 
                         elif data == "close_all":
                             if not is_admin:
@@ -4834,21 +5174,35 @@ if st.sidebar.button("📡 텔레그램 메뉴 전송(/menu)"):
     tg_send_menu(cfg=config)
 
 if st.sidebar.button("🤖 OpenAI 연결 테스트"):
-    if get_openai_client(config) is None:
+    client = get_openai_client(config)
+    if client is None:
         st.sidebar.error("OpenAI 연결 실패(키/설정 확인)")
     else:
-        try:
-            def _do():
-                return get_openai_client(config).chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": "테스트입니다. 1+1은?"}],
-                    max_tokens=10,
-                )
+        models_to_try = ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"]
+        last_err: Optional[BaseException] = None
+        tried = []
+        for m in models_to_try:
+            tried.append(m)
+            try:
+                def _do():
+                    return client.chat.completions.create(
+                        model=m,
+                        messages=[{"role": "user", "content": "테스트입니다. 1+1은?"}],
+                        temperature=0.0,
+                        max_tokens=16,
+                    )
 
-            resp = _call_with_timeout(_do, OPENAI_TIMEOUT_SEC)
-            st.sidebar.success("✅ 연결 성공: " + resp.choices[0].message.content)
-        except Exception as e:
-            st.sidebar.error(f"❌ 실패: {e}")
+                resp = _call_with_timeout(_do, max(OPENAI_TIMEOUT_SEC, 30))
+                out = (resp.choices[0].message.content or "").strip()
+                st.sidebar.success(f"✅ 연결 성공({m}): {out}")
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if last_err is not None:
+            st.sidebar.error(f"❌ 실패: {last_err}")
+            notify_admin_error("UI:OPENAI_TEST", last_err, context={"models_tried": tried})
 
 save_settings(config)
 
@@ -4904,8 +5258,8 @@ with left:
 
 with right:
     st.subheader("🧾 실시간 지표 요약")
-    if ta is None:
-        st.error("ta 모듈이 없습니다. requirements.txt에 `ta` 추가 후 재배포하세요.")
+    if ta is None and pta is None:
+        st.error("ta/pandas_ta 모듈이 없습니다. requirements.txt에 `ta` 또는 `pandas_ta` 추가 후 재배포하세요.")
     else:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, config.get("timeframe", "5m"), limit=220)
@@ -4925,7 +5279,16 @@ with right:
             )
 
             if last is None:
-                st.warning("지표 계산 실패(데이터 부족)")
+                # 지표가 부족해도 장기추세/스타일은 표시(사용자 체감 개선)
+                st.warning("지표 계산 실패(데이터 부족/지표 계산 오류)")
+                style_hint = _style_for_entry(symbol, "buy", "", htf_trend, config)
+                st.write(
+                    {
+                        "장기추세(1h)": f"🧭 {htf_trend}",
+                        "추천 스타일(롱 관점)": f"{style_hint.get('style','-')} ({style_hint.get('confidence','-')}%)",
+                        "상태": stt.get("_ERROR") or stt.get("_INFO") or "-",
+                    }
+                )
             else:
                 st.metric("현재가", f"{float(last['close']):,.4f}")
                 # 스타일 추천(현재 차트 기준)
@@ -4940,6 +5303,7 @@ with right:
                     "ADX": stt.get("ADX", "-"),
                     "거래량": stt.get("거래량", "-"),
                     "눌림목후보(해소)": "✅" if stt.get("_pullback_candidate") else "—",
+                    "지표엔진": stt.get("_backend", "-"),
                 }
                 st.write(show)
 
@@ -4961,11 +5325,12 @@ with right:
                         )
                         if sr:
                             st.caption(f"SR(참고): 롱 기준 TP {sr['tp_price']:.6g} / SL {sr['sl_price']:.6g}")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        notify_admin_error("UI:SR_CALC", e, context={"symbol": symbol, "tf": str(config.get("sr_timeframe", ""))}, min_interval_sec=120.0)
 
         except Exception as e:
             st.error(f"데이터 로딩 오류: {e}")
+            notify_admin_error("UI:INDICATOR_SUMMARY", e, context={"symbol": symbol, "tf": str(config.get("timeframe", ""))})
 
 st.divider()
 
@@ -5002,7 +5367,7 @@ with t1:
             evs = ext.get("high_impact_events_soon") or []
             if evs:
                 st.warning("⚠️ 중요 이벤트 임박(신규진입 보수적으로)")
-                st.dataframe(df_for_display(pd.DataFrame(evs)), width="stretch", hide_index=True)
+                st_dataframe_safe(df_for_display(pd.DataFrame(evs)), hide_index=True)
             hd = ext.get("headlines") or []
             if hd:
                 st.caption("뉴스 헤드라인(요약용)")
@@ -5033,7 +5398,7 @@ with t1:
         ops = mon.get("open_positions") or []
         if ops:
             st.caption(f"현재 포지션 수: {len(ops)}")
-            st.dataframe(df_for_display(pd.DataFrame(ops)), width="stretch", hide_index=True)
+            st_dataframe_safe(df_for_display(pd.DataFrame(ops)), hide_index=True)
         else:
             st.caption("⚪ 포지션 없음(관망)")
 
@@ -5041,7 +5406,7 @@ with t1:
         st.subheader("🧾 최근 이벤트(봇 로그)")
         evs = (mon.get("events") or [])[-30:]
         if evs:
-            st.dataframe(df_for_display(pd.DataFrame(evs[::-1])), width="stretch", hide_index=True)
+            st_dataframe_safe(df_for_display(pd.DataFrame(evs[::-1])), hide_index=True)
         else:
             st.caption("이벤트 없음")
 
@@ -5053,9 +5418,9 @@ with t1:
             try:
                 df_scan = pd.DataFrame(scan_logs[-int(max_show):])
                 df_scan = df_scan.iloc[::-1].reset_index(drop=True)
-                st.dataframe(df_for_display(df_scan), width="stretch", hide_index=True)
+                st_dataframe_safe(df_for_display(df_scan), hide_index=True)
             except Exception:
-                st.dataframe(df_for_display(pd.DataFrame(scan_logs[-int(max_show):][::-1])), width="stretch", hide_index=True)
+                st_dataframe_safe(df_for_display(pd.DataFrame(scan_logs[-int(max_show):][::-1])), hide_index=True)
         else:
             st.caption("SCAN 로그 없음")
 
@@ -5092,34 +5457,35 @@ with t1:
                 }
             )
         if rows:
-            st.dataframe(df_for_display(pd.DataFrame(rows)), width="stretch", hide_index=True)
+            st_dataframe_safe(df_for_display(pd.DataFrame(rows)), hide_index=True)
         else:
             st.info("아직 스캔 데이터가 없습니다.")
 
     st.divider()
-    st.subheader("🔍 현재 코인 AI 분석(수동 버튼)")
-    if st.button("현재 코인 AI 분석 실행"):
-        if get_openai_client(config) is None:
-            st.error("OpenAI 키 없음")
-        elif ta is None:
-            st.error("ta 모듈 없음")
-        else:
-            try:
-                ext_now = build_external_context(config, rt=load_runtime())
-                ohlcv = exchange.fetch_ohlcv(symbol, config.get("timeframe", "5m"), limit=220)
-                df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
-                df["time"] = pd.to_datetime(df["time"], unit="ms")
-                df2, stt, last = calc_indicators(df, config)
-                if last is None:
-                    st.warning("지표 계산 실패")
-                else:
-                    ai = ai_decide_trade(df2, stt, symbol, config.get("trade_mode", "안전모드"), config, external=ext_now)
-                    # 스타일 힌트
-                    htf_trend = get_htf_trend_cached(exchange, symbol, "1h", int(config.get("ma_fast", 7)), int(config.get("ma_slow", 99)), int(config.get("trend_filter_cache_sec", 60)))
-                    style_info = _style_for_entry(symbol, ai.get("decision", "hold"), stt.get("추세", ""), htf_trend, config)
-                    st.json({"ai": ai, "style": style_info, "htf_trend": htf_trend})
-            except Exception as e:
-                st.error(f"분석 오류: {e}")
+	    st.subheader("🔍 현재 코인 AI 분석(수동 버튼)")
+	    if st.button("현재 코인 AI 분석 실행"):
+	        if get_openai_client(config) is None:
+	            st.error("OpenAI 키 없음")
+	        elif ta is None and pta is None:
+	            st.error("ta/pandas_ta 모듈 없음")
+	        else:
+	            try:
+	                ext_now = build_external_context(config, rt=load_runtime())
+	                ohlcv = exchange.fetch_ohlcv(symbol, config.get("timeframe", "5m"), limit=220)
+	                df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
+	                df["time"] = pd.to_datetime(df["time"], unit="ms")
+	                df2, stt, last = calc_indicators(df, config)
+	                if last is None:
+	                    st.warning("지표 계산 실패")
+	                else:
+	                    ai = ai_decide_trade(df2, stt, symbol, config.get("trade_mode", "안전모드"), config, external=ext_now)
+	                    # 스타일 힌트
+	                    htf_trend = get_htf_trend_cached(exchange, symbol, "1h", int(config.get("ma_fast", 7)), int(config.get("ma_slow", 99)), int(config.get("trend_filter_cache_sec", 60)))
+	                    style_info = _style_for_entry(symbol, ai.get("decision", "hold"), stt.get("추세", ""), htf_trend, config)
+	                    st.json({"ai": ai, "style": style_info, "htf_trend": htf_trend})
+	            except Exception as e:
+	                st.error(f"분석 오류: {e}")
+	                notify_admin_error("UI:MANUAL_AI_ANALYSIS", e, context={"symbol": symbol, "tf": str(config.get("timeframe", ""))})
 
 with t2:
     st.subheader("⚡ 수동 주문(데모용)")
@@ -5221,9 +5587,9 @@ with t4:
 
         try:
             sty = df_show[show_cols].style.applymap(_color_pnl, subset=["PnL_Percent", "PnL_USDT"])
-            st.dataframe(sty, width="stretch", hide_index=True)
+            st_dataframe_safe(sty, hide_index=True)
         except Exception:
-            st.dataframe(df_for_display(df_show[show_cols]), width="stretch", hide_index=True)
+            st_dataframe_safe(df_for_display(df_show[show_cols]), hide_index=True)
 
         csv_bytes = df_log.to_csv(index=False).encode("utf-8-sig")
         st.download_button("💾 CSV 다운로드", data=csv_bytes, file_name="trade_log.csv", mime="text/csv")
