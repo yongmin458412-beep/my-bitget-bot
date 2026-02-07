@@ -966,6 +966,7 @@ def openai_health_info(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     fpr = _openai_key_fingerprint(key)
     now = time.time()
     with _OPENAI_HEALTH_LOCK:
+        global _OPENAI_SUSPENDED_UNTIL_EPOCH, _OPENAI_SUSPENDED_REASON, _OPENAI_SUSPENDED_KEY_FPR
         # 키가 바뀌면 suspend 해제
         if _OPENAI_SUSPENDED_KEY_FPR and _OPENAI_SUSPENDED_KEY_FPR != fpr:
             _OPENAI_SUSPENDED_UNTIL_EPOCH = 0.0
