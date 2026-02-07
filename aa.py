@@ -901,6 +901,52 @@ def _call_with_timeout(fn, timeout_sec: int):
     return fut.result(timeout=timeout_sec)
 
 
+def openai_chat_create_with_fallback(
+    client: OpenAI,
+    models: List[str],
+    messages: List[Dict[str, Any]],
+    temperature: float,
+    max_tokens: int,
+    response_format: Optional[Dict[str, Any]] = None,
+    timeout_sec: int = OPENAI_TIMEOUT_SEC,
+) -> Tuple[str, Any]:
+    """
+    OpenAI 호출 모델 fallback:
+    - 일부 계정/환경에서 특정 모델이 없을 수 있어(예: gpt-4o 미지원) 순차 시도
+    - 성공 시 (model_used, response) 반환
+    """
+    last_err: Optional[BaseException] = None
+    tried: List[str] = []
+    for m in models:
+        m2 = str(m or "").strip()
+        if not m2:
+            continue
+        tried.append(m2)
+        try:
+            def _do():
+                kwargs: Dict[str, Any] = {
+                    "model": m2,
+                    "messages": messages,
+                    "temperature": float(temperature),
+                    "max_tokens": int(max_tokens),
+                }
+                if response_format is not None:
+                    kwargs["response_format"] = response_format
+                return client.chat.completions.create(**kwargs)
+
+            resp = _call_with_timeout(_do, timeout_sec)
+            return m2, resp
+        except FuturesTimeoutError as e:
+            last_err = e
+            continue
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"OpenAI call failed (models_tried={tried})")
+
+
 # =========================================================
 # ✅ 7.5) Google Sheets Logger (TRADE/EVENT/SCAN) - 요구사항 필수
 # - GSHEET_ENABLED == "true" 일 때만 동작
@@ -2409,17 +2455,34 @@ JSON 형식:
 }}
 """
     try:
-        def _do():
-            return client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-                max_tokens=900,
-            )
+        # 모델 fallback (gpt-4o 미지원 계정/환경 대응)
+        models = [
+            str(cfg.get("openai_model_trade", "") or "").strip(),
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1-mini",
+            "gpt-4.1",
+        ]
+        # 중복 제거(순서 유지)
+        models2: List[str] = []
+        for m in models:
+            m = str(m or "").strip()
+            if not m:
+                continue
+            if m not in models2:
+                models2.append(m)
 
-        resp = _call_with_timeout(_do, OPENAI_TIMEOUT_SEC)
+        model_used, resp = openai_chat_create_with_fallback(
+            client=client,
+            models=models2,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=900,
+            timeout_sec=OPENAI_TIMEOUT_SEC,
+        )
         out = json.loads(resp.choices[0].message.content)
+        out["_openai_model"] = model_used
 
         out["decision"] = out.get("decision", "hold")
         if out["decision"] not in ["buy", "sell", "hold"]:
@@ -2452,6 +2515,7 @@ JSON 형식:
     except FuturesTimeoutError:
         return {"decision": "hold", "confidence": 0, "reason_easy": "AI 타임아웃(대기 너무 김)", "used_indicators": status.get("_used_indicators", [])}
     except Exception as e:
+        notify_admin_error("AI:DECIDE_TRADE", e, context={"symbol": symbol, "mode": mode}, tb=traceback.format_exc(), min_interval_sec=120.0)
         return {"decision": "hold", "confidence": 0, "reason_easy": f"AI 오류: {e}", "used_indicators": status.get("_used_indicators", [])}
 
 
@@ -2477,16 +2541,30 @@ def ai_decide_style(symbol: str, decision: str, trend_short: str, trend_long: st
         '형식: {"style":"스캘핑"|"스윙","confidence":0-100,"reason":"쉬운 한글"}'
     )
     try:
-        def _do():
-            return client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "system", "content": sys}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-                max_tokens=250,
-            )
+        models = [
+            str(cfg.get("openai_model_style", "") or "").strip(),
+            "gpt-4o-mini",
+            "gpt-4o",
+            "gpt-4.1-mini",
+            "gpt-4.1",
+        ]
+        models2: List[str] = []
+        for m in models:
+            m = str(m or "").strip()
+            if not m:
+                continue
+            if m not in models2:
+                models2.append(m)
 
-        resp = _call_with_timeout(_do, OPENAI_TIMEOUT_SEC)
+        _model_used, resp = openai_chat_create_with_fallback(
+            client=client,
+            models=models2,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=250,
+            timeout_sec=OPENAI_TIMEOUT_SEC,
+        )
         out = json.loads(resp.choices[0].message.content)
         style = str(out.get("style", "스캘핑"))
         if style not in ["스캘핑", "스윙"]:
@@ -2494,7 +2572,8 @@ def ai_decide_style(symbol: str, decision: str, trend_short: str, trend_long: st
         conf = int(clamp(int(out.get("confidence", 55)), 0, 100))
         reason = str(out.get("reason", ""))[:240]
         return {"style": style, "confidence": conf, "reason": reason}
-    except Exception:
+    except Exception as e:
+        notify_admin_error("AI:DECIDE_STYLE", e, context={"symbol": symbol}, tb=traceback.format_exc(), min_interval_sec=180.0)
         return {"style": "스캘핑", "confidence": 55, "reason": "스타일 AI 판단 실패 → 스캘핑"}
 
 
@@ -2582,21 +2661,36 @@ JSON 형식:
   "one_line": "한줄평(아주 짧게)",
   "review": "후기(손절이면 다음에 개선 / 익절이면 유지할 점)"
 }}
-"""
+    """
     try:
-        def _do():
-            return client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
-                response_format={"type": "json_object"},
-                temperature=0.3,
-                max_tokens=500,
-            )
+        models = [
+            str(cfg.get("openai_model_review", "") or "").strip(),
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1-mini",
+            "gpt-4.1",
+        ]
+        models2: List[str] = []
+        for m in models:
+            m = str(m or "").strip()
+            if not m:
+                continue
+            if m not in models2:
+                models2.append(m)
 
-        resp = _call_with_timeout(_do, OPENAI_TIMEOUT_SEC)
+        _model_used, resp = openai_chat_create_with_fallback(
+            client=client,
+            models=models2,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+            max_tokens=500,
+            timeout_sec=OPENAI_TIMEOUT_SEC,
+        )
         out = json.loads(resp.choices[0].message.content)
         return str(out.get("one_line", ""))[:120], str(out.get("review", ""))[:800]
-    except Exception:
+    except Exception as e:
+        notify_admin_error("AI:WRITE_REVIEW", e, context={"symbol": symbol}, tb=traceback.format_exc(), min_interval_sec=180.0)
         one = "익절" if pnl_percent >= 0 else "손절"
         return (f"{one}({pnl_percent:.2f}%)", "후기 작성 실패")
 
@@ -2893,6 +2987,59 @@ def notify_admin_error(where: str, err: BaseException, context: Optional[Dict[st
             gsheet_log_event("ERROR", message=f"{where_s}: {type(err).__name__}", payload={"msg": msg_s, "ctx": context or {}})
         except Exception:
             pass
+    except Exception:
+        pass
+
+
+# =========================================================
+# ✅ 16.3) Global excepthook (best-effort)
+# - 잡히지 않은 예외(특히 스레드)도 관리자 DM으로 전달
+# =========================================================
+def install_global_error_hooks():
+    try:
+        import sys as _sys
+        import threading as _threading
+
+        def _fmt_tb(exc_type, exc, tb_obj) -> str:
+            try:
+                return "".join(traceback.format_exception(exc_type, exc, tb_obj))
+            except Exception:
+                try:
+                    return traceback.format_exc()
+                except Exception:
+                    return ""
+
+        # sys.excepthook (메인 스레드 unhandled)
+        def _sys_hook(exc_type, exc, tb_obj):  # type: ignore
+            try:
+                notify_admin_error("SYS_EXCEPTHOOK", exc, tb=_fmt_tb(exc_type, exc, tb_obj), min_interval_sec=10.0)
+            except Exception:
+                pass
+            # 기본 훅도 호출(가능하면)
+            try:
+                _sys.__excepthook__(exc_type, exc, tb_obj)
+            except Exception:
+                pass
+
+        _sys.excepthook = _sys_hook
+
+        # threading.excepthook (Python 3.8+)
+        if hasattr(_threading, "excepthook"):
+            _orig_thread_hook = _threading.excepthook
+
+            def _th_hook(args):  # type: ignore
+                try:
+                    where = f"THREAD_EXCEPTHOOK:{getattr(args.thread, 'name', '')}"
+                    notify_admin_error(where, args.exc_value, tb=_fmt_tb(args.exc_type, args.exc_value, args.exc_traceback), min_interval_sec=10.0)
+                except Exception:
+                    pass
+                try:
+                    _orig_thread_hook(args)
+                except Exception:
+                    pass
+
+            _threading.excepthook = _th_hook
+
     except Exception:
         pass
 
@@ -4900,6 +5047,7 @@ def telegram_thread(ex):
                         gsheet_log_event("TG_UPDATE_ERROR", message=str(_e)[:240])
                     except Exception:
                         pass
+                    notify_admin_error("TG_UPDATE_HANDLER", _e, tb=traceback.format_exc(), min_interval_sec=60.0)
 
             monitor_write_throttled(mon, 2.0)
             backoff_sec = 1.0
@@ -4908,9 +5056,11 @@ def telegram_thread(ex):
         except Exception as e:
             # 스레드가 죽지 않도록 backoff
             try:
+                notify_admin_error("TG_THREAD_LOOP", e, tb=traceback.format_exc(), min_interval_sec=45.0)
                 err = f"{e}"
                 if len(err) > 500:
                     err = err[:500] + "..."
+                # 브로드캐스트 채널에도 짧게(선택): 운영자가 채널을 모니터링 중일 수 있음
                 tg_send(f"⚠️ 스레드 오류: {err}", target="channel", cfg=load_settings())
             except Exception:
                 pass
@@ -4931,7 +5081,9 @@ def watchdog_thread():
             cfg = load_settings()
             if age >= 60 and not warned:
                 warned = True
-                tg_send(f"🧯 워치독 경고: 하트비트 {age:.0f}초 정체(스레드 멈춤 의심)", target="channel", cfg=cfg)
+                msg = f"🧯 워치독 경고: 하트비트 {age:.0f}초 정체(스레드 멈춤 의심)"
+                tg_send(msg, target="channel", cfg=cfg)
+                tg_send(msg, target="admin", cfg=cfg)
             if age < 30:
                 warned = False
 
@@ -4946,7 +5098,9 @@ def watchdog_thread():
                     th = threading.Thread(target=telegram_thread, args=(exchange,), daemon=True, name="TG_THREAD")
                     add_script_run_ctx(th)
                     th.start()
-                    tg_send("🧯 워치독: TG_THREAD 재시작 시도", target="channel", cfg=cfg)
+                    msg2 = "🧯 워치독: TG_THREAD 재시작 시도"
+                    tg_send(msg2, target="channel", cfg=cfg)
+                    tg_send(msg2, target="admin", cfg=cfg)
                 except Exception:
                     pass
 
@@ -4992,6 +5146,8 @@ def ensure_threads_started():
         wd.start()
 
 
+# 전역 예외 훅 설치(가능한 경우): 스레드/런타임에서 잡히지 않은 오류를 관리자 DM으로
+install_global_error_hooks()
 ensure_threads_started()
 
 
@@ -5462,30 +5618,30 @@ with t1:
             st.info("아직 스캔 데이터가 없습니다.")
 
     st.divider()
-	    st.subheader("🔍 현재 코인 AI 분석(수동 버튼)")
-	    if st.button("현재 코인 AI 분석 실행"):
-	        if get_openai_client(config) is None:
-	            st.error("OpenAI 키 없음")
-	        elif ta is None and pta is None:
-	            st.error("ta/pandas_ta 모듈 없음")
-	        else:
-	            try:
-	                ext_now = build_external_context(config, rt=load_runtime())
-	                ohlcv = exchange.fetch_ohlcv(symbol, config.get("timeframe", "5m"), limit=220)
-	                df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
-	                df["time"] = pd.to_datetime(df["time"], unit="ms")
-	                df2, stt, last = calc_indicators(df, config)
-	                if last is None:
-	                    st.warning("지표 계산 실패")
-	                else:
-	                    ai = ai_decide_trade(df2, stt, symbol, config.get("trade_mode", "안전모드"), config, external=ext_now)
-	                    # 스타일 힌트
-	                    htf_trend = get_htf_trend_cached(exchange, symbol, "1h", int(config.get("ma_fast", 7)), int(config.get("ma_slow", 99)), int(config.get("trend_filter_cache_sec", 60)))
-	                    style_info = _style_for_entry(symbol, ai.get("decision", "hold"), stt.get("추세", ""), htf_trend, config)
-	                    st.json({"ai": ai, "style": style_info, "htf_trend": htf_trend})
-	            except Exception as e:
-	                st.error(f"분석 오류: {e}")
-	                notify_admin_error("UI:MANUAL_AI_ANALYSIS", e, context={"symbol": symbol, "tf": str(config.get("timeframe", ""))})
+    st.subheader("🔍 현재 코인 AI 분석(수동 버튼)")
+    if st.button("현재 코인 AI 분석 실행"):
+        if get_openai_client(config) is None:
+            st.error("OpenAI 키 없음")
+        elif ta is None and pta is None:
+            st.error("ta/pandas_ta 모듈 없음")
+        else:
+            try:
+                ext_now = build_external_context(config, rt=load_runtime())
+                ohlcv = exchange.fetch_ohlcv(symbol, config.get("timeframe", "5m"), limit=220)
+                df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
+                df["time"] = pd.to_datetime(df["time"], unit="ms")
+                df2, stt, last = calc_indicators(df, config)
+                if last is None:
+                    st.warning("지표 계산 실패")
+                else:
+                    ai = ai_decide_trade(df2, stt, symbol, config.get("trade_mode", "안전모드"), config, external=ext_now)
+                    # 스타일 힌트
+                    htf_trend = get_htf_trend_cached(exchange, symbol, "1h", int(config.get("ma_fast", 7)), int(config.get("ma_slow", 99)), int(config.get("trend_filter_cache_sec", 60)))
+                    style_info = _style_for_entry(symbol, ai.get("decision", "hold"), stt.get("추세", ""), htf_trend, config)
+                    st.json({"ai": ai, "style": style_info, "htf_trend": htf_trend})
+            except Exception as e:
+                st.error(f"분석 오류: {e}")
+                notify_admin_error("UI:MANUAL_AI_ANALYSIS", e, context={"symbol": symbol, "tf": str(config.get("timeframe", ""))})
 
 with t2:
     st.subheader("⚡ 수동 주문(데모용)")
@@ -5533,11 +5689,15 @@ with t2:
 
 with t3:
     st.subheader("📅 시장정보(외부 시황)")
-    ext = build_external_context(config, rt=load_runtime())
-    if not ext.get("enabled"):
-        st.info("외부 시황 통합 OFF")
-    else:
-        st.json(ext)
+    try:
+        ext = build_external_context(config, rt=load_runtime())
+        if not ext.get("enabled"):
+            st.info("외부 시황 통합 OFF")
+        else:
+            st.json(ext)
+    except Exception as e:
+        st.error(f"시장정보 로딩 오류: {e}")
+        notify_admin_error("UI:MARKET_INFO", e, min_interval_sec=120.0)
 
 with t4:
     st.subheader("📜 매매일지 (이모티콘/색상 + 일별 내보내기)")
@@ -5549,11 +5709,15 @@ with t4:
         st.success("매매일지 초기화 완료")
         st.rerun()
     if c3.button("📤 오늘 일지 내보내기"):
-        res = export_trade_log_daily(today_kst_str(), config)
-        if res.get("ok"):
-            st.success(f"내보내기 완료: rows={res.get('rows')} | xlsx={res.get('excel_path','')} | csv={res.get('csv_path','')}")
-        else:
-            st.error(f"내보내기 실패: {res.get('error','')}")
+        try:
+            res = export_trade_log_daily(today_kst_str(), config)
+            if res.get("ok"):
+                st.success(f"내보내기 완료: rows={res.get('rows')} | xlsx={res.get('excel_path','')} | csv={res.get('csv_path','')}")
+            else:
+                st.error(f"내보내기 실패: {res.get('error','')}")
+        except Exception as e:
+            st.error(f"내보내기 오류: {e}")
+            notify_admin_error("UI:EXPORT_TODAY", e, min_interval_sec=120.0)
 
     df_log = read_trade_log()
     if df_log.empty:
@@ -5629,8 +5793,8 @@ with t5:
     run_bt = st.button("▶️ 백테스트 실행")
 
     if run_bt:
-        if ta is None:
-            st.error("ta 모듈 없음")
+        if ta is None and pta is None:
+            st.error("ta/pandas_ta 모듈 없음")
         else:
             try:
                 ohlcv = exchange.fetch_ohlcv(bt_symbol, bt_tf, limit=int(bt_n))
@@ -5723,6 +5887,7 @@ with t5:
                         st.warning("조건에 맞는 거래가 없었습니다.")
             except Exception as e:
                 st.error(f"백테스트 오류: {e}")
+                notify_admin_error("UI:BACKTEST", e, context={"symbol": bt_symbol, "tf": bt_tf, "n": int(bt_n)}, min_interval_sec=120.0)
 
 
 st.caption("⚠️ 이 봇은 모의투자(IS_SANDBOX=True)에서 충분히 검증 후 사용하세요.")
