@@ -326,20 +326,40 @@ def df_for_display(df: pd.DataFrame) -> pd.DataFrame:
 def st_dataframe_safe(data, **kwargs):
     """
     Streamlit 버전 차이로 인한 파라미터 TypeError를 흡수하면서 최대한 표시.
-    - 기존 코드의 width="stretch" 사용을 호환 처리
+    - 최신 Streamlit(2025+): `use_container_width`가 deprecate → `width="stretch"` 우선 사용
+    - 구버전 Streamlit: `width` 미지원이면 `use_container_width=True/False`로 폴백
     """
     try:
-        if kwargs.get("width") == "stretch":
-            kwargs.pop("width", None)
-            kwargs.setdefault("use_container_width", True)
-        kwargs.setdefault("use_container_width", True)
+        # ✅ 최신 Streamlit 권장: width="stretch"/"content"
+        # - 호출자가 use_container_width를 줬다면(레거시), 가능한 경우 width로 변환해 경고를 없앤다.
+        if "use_container_width" in kwargs and "width" not in kwargs:
+            try:
+                kwargs["width"] = "stretch" if bool(kwargs.get("use_container_width")) else "content"
+            except Exception:
+                kwargs["width"] = "stretch"
+            kwargs.pop("use_container_width", None)
+        kwargs.setdefault("width", "stretch")
         return st.dataframe(data, **kwargs)
     except TypeError:
-        # 구버전 Streamlit: 지원하지 않는 kwargs 제거 후 재시도
-        for k in ["use_container_width", "hide_index", "column_config", "column_order", "width"]:
-            kwargs.pop(k, None)
+        # 구버전 Streamlit: width 미지원 → use_container_width로 폴백
         try:
+            w = kwargs.pop("width", None)
+            if "use_container_width" not in kwargs:
+                if w == "content":
+                    kwargs["use_container_width"] = False
+                else:
+                    kwargs["use_container_width"] = True
             return st.dataframe(data, **kwargs)
+        except TypeError:
+            # 지원하지 않는 kwargs 제거 후 재시도
+            for k in ["use_container_width", "hide_index", "column_config", "column_order", "width"]:
+                kwargs.pop(k, None)
+            try:
+                return st.dataframe(data, **kwargs)
+            except Exception:
+                return st.dataframe(data)
+        try:
+            return st.dataframe(data)
         except Exception:
             return st.dataframe(data)
     except Exception:
