@@ -434,6 +434,9 @@ def default_settings() -> Dict[str, Any]:
         "news_enable": True,
         "news_refresh_sec": 300,
         "news_max_headlines": 12,
+        # 뉴스 한글화는 외부 네트워크(번역기) 사용 시 느려질 수 있어 시간 예산을 둔다.
+        # - 예산 초과 시 남은 헤드라인은 룰 기반 보정(_translate_ko_rule)만 적용
+        "news_translate_budget_sec": 10,
         "external_koreanize_enable": True,
         "external_ai_translate_enable": False,  # 외부시황 번역에 AI 사용(비용↑, 기본 OFF)
 
@@ -2012,9 +2015,14 @@ _ext_cache = TTLCache(maxsize=12, ttl=60) if TTLCache else None
 _translate_cache = TTLCache(maxsize=256, ttl=60 * 60 * 24) if TTLCache else None  # 24h
 
 
-def _http_get_json(url: str, timeout: int = HTTP_TIMEOUT_SEC):
+def _http_get_json(url: str, timeout: int = HTTP_TIMEOUT_SEC, attempts: int = 3):
     headers = {"User-Agent": "Mozilla/5.0 (WonyotiAgent/1.0)"}
-    if retry is None:
+    try:
+        attempts_i = max(1, int(attempts or 1))
+    except Exception:
+        attempts_i = 1
+
+    if retry is None or stop_after_attempt is None or wait_exponential_jitter is None:
         try:
             r = requests.get(url, timeout=timeout, headers=headers)
             r.raise_for_status()
@@ -2022,7 +2030,7 @@ def _http_get_json(url: str, timeout: int = HTTP_TIMEOUT_SEC):
         except Exception:
             return None
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(initial=0.7, max=4.0))
+    @retry(stop=stop_after_attempt(attempts_i), wait=wait_exponential_jitter(initial=0.5, max=2.0))
     def _do():
         r = requests.get(url, timeout=timeout, headers=headers)
         r.raise_for_status()
@@ -2141,7 +2149,8 @@ def translate_to_korean(text: str, cfg: Dict[str, Any], use_cache: bool = True) 
 
 
 def fetch_fear_greed(cfg: Dict[str, Any]):
-    data = _http_get_json("https://api.alternative.me/fng/?limit=1&format=json", timeout=8)
+    # 외부시황은 "참고"용 → 과도한 재시도는 봇 루프를 멈추게 할 수 있어 attempts를 낮춘다.
+    data = _http_get_json("https://api.alternative.me/fng/?limit=1&format=json", timeout=6, attempts=2)
     if not data or "data" not in data or not data["data"]:
         return None
     d0 = data["data"][0]
@@ -2157,7 +2166,7 @@ def fetch_fear_greed(cfg: Dict[str, Any]):
 
 
 def fetch_coingecko_global():
-    data = _http_get_json("https://api.coingecko.com/api/v3/global", timeout=10)
+    data = _http_get_json("https://api.coingecko.com/api/v3/global", timeout=8, attempts=2)
     if not data or "data" not in data:
         return None
     g = data["data"]
@@ -2197,7 +2206,7 @@ def _country_to_ko(country: str, cfg: Dict[str, Any]) -> str:
 
 
 def fetch_upcoming_high_impact_events(cfg: Dict[str, Any], within_minutes: int = 30, limit: int = 80):
-    data = _http_get_json("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10)
+    data = _http_get_json("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=8, attempts=2)
     if not isinstance(data, list):
         return []
     now = now_kst()
@@ -2242,9 +2251,13 @@ def fetch_news_headlines_rss(cfg: Dict[str, Any], max_items: int = 12):
         "https://cointelegraph.com/rss",
     ]
     items = []
+    headers = {"User-Agent": "Mozilla/5.0 (WonyotiAgent/1.0)"}
     for url in feeds:
         try:
-            d = feedparser.parse(url)
+            # feedparser.parse(url)은 내부 네트워크 fetch가 hang될 수 있음 → requests로 timeout 보장 후 parse
+            r = requests.get(url, timeout=8, headers=headers)
+            r.raise_for_status()
+            d = feedparser.parse(r.content)
             for e in (d.entries or [])[: max_items * 2]:
                 title = str(getattr(e, "title", "")).strip()
                 if not title:
@@ -2260,7 +2273,24 @@ def fetch_news_headlines_rss(cfg: Dict[str, Any], max_items: int = 12):
     uniq = uniq[:max_items]
     # 한글화(옵션)
     if cfg.get("external_koreanize_enable", True):
-        uniq = [translate_to_korean(t, cfg) for t in uniq]
+        # ✅ 번역기는 느릴 수 있음(특히 deep-translator) → 시간 예산 초과 시 룰 기반만 적용
+        try:
+            raw = cfg.get("news_translate_budget_sec", 10)
+            budget = float(10.0 if raw is None else raw)
+        except Exception:
+            budget = 10.0
+        budget = max(0.0, budget)
+        if budget <= 0:
+            uniq = [_translate_ko_rule(t) for t in uniq]
+        else:
+            t0 = time.time()
+            out_titles = []
+            for t in uniq:
+                if (time.time() - t0) > budget:
+                    out_titles.append(_translate_ko_rule(t))
+                    continue
+                out_titles.append(translate_to_korean(t, cfg))
+            uniq = out_titles
     return uniq
 
 
@@ -2304,9 +2334,12 @@ def fetch_daily_btc_brief(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ]
 
     raw_titles: List[str] = []
+    headers = {"User-Agent": "Mozilla/5.0 (WonyotiAgent/1.0)"}
     for url in feeds:
         try:
-            d = feedparser.parse(url)
+            r = requests.get(url, timeout=8, headers=headers)
+            r.raise_for_status()
+            d = feedparser.parse(r.content)
             for e in (d.entries or [])[:60]:
                 title = str(getattr(e, "title", "")).strip()
                 if not title:
@@ -3003,6 +3036,9 @@ def mon_add_scan(mon: Dict[str, Any], stage: str, symbol: str, tf: str = "", sig
         mon["scan_process"] = mon["scan_process"][-400:]
         mon["last_scan_epoch"] = time.time()
         mon["last_scan_kst"] = now_kst_str()
+        # ✅ 스캔이 길어져도 UI에서 "멈춤 의심"이 과도하게 뜨지 않게, 스캔 단계도 heartbeat로 간주
+        mon["last_heartbeat_epoch"] = time.time()
+        mon["last_heartbeat_kst"] = now_kst_str()
         # Google Sheets에도 SCAN 누적(비동기 큐)
         try:
             gsheet_log_scan(stage=stage, symbol=symbol, tf=tf, signal=signal, score=score, message=message, payload=extra or {})
@@ -3677,6 +3713,27 @@ def telegram_thread(ex):
             mode = cfg.get("trade_mode", "안전모드")
             rule = MODE_RULES.get(mode, MODE_RULES["안전모드"])
 
+            # =========================================================
+            # ✅ 루프 하트비트(즉시 기록)
+            # - 외부시황/거래소 호출이 느리거나 일시 장애여도 UI에서 "멈춤 의심"이 과도하게 뜨지 않게
+            # - (중요) trade heartbeat(텔레그램 15분 리포트)와 별개로, '스레드 생존' 신호다.
+            # =========================================================
+            try:
+                now_str0 = now_kst_str()
+                mon["loop_stage"] = "LOOP_START"
+                mon["loop_stage_kst"] = now_str0
+                mon["last_heartbeat_epoch"] = time.time()
+                mon["last_heartbeat_kst"] = now_str0
+                mon["auto_trade"] = bool(cfg.get("auto_trade", False))
+                mon["trade_mode"] = mode
+                mon["pause_until"] = rt.get("pause_until", 0)
+                mon["consec_losses"] = rt.get("consec_losses", 0)
+                mon["trend_filter_policy"] = cfg.get("trend_filter_policy", "ALLOW_SCALP")
+                mon["code_version"] = CODE_VERSION
+                monitor_write_throttled(mon, 0.5)
+            except Exception:
+                pass
+
             # ✅ 매일 아침 브리핑(한 번만)
             try:
                 if cfg.get("daily_btc_brief_enable", True):
@@ -3711,7 +3768,14 @@ def telegram_thread(ex):
                 pass
 
             # 외부 시황 갱신(캐시 포함) + daily brief 포함
-            ext = build_external_context(cfg, rt=rt)
+            try:
+                mon["loop_stage"] = "EXTERNAL_CONTEXT"
+                mon["loop_stage_kst"] = now_kst_str()
+                ext = build_external_context(cfg, rt=rt)
+            except Exception as e:
+                ext = {"enabled": False, "error": str(e)[:240], "asof_kst": now_kst_str()}
+                notify_admin_error("EXTERNAL_CONTEXT", e, tb=traceback.format_exc(), min_interval_sec=180.0)
+                mon_add_event(mon, "EXTERNAL_FAIL", "", f"{e}"[:140], {})
             mon["external"] = ext
 
             # ✅ 일별 내보내기 자동(새벽 00시대, 전일 기준)
@@ -5541,6 +5605,13 @@ st.sidebar.subheader("🪙 외부 시황")
 config["use_external_context"] = st.sidebar.checkbox("외부 시황 통합", value=bool(config.get("use_external_context", True)))
 config["external_koreanize_enable"] = st.sidebar.checkbox("외부시황 한글화(가능한 범위)", value=bool(config.get("external_koreanize_enable", True)))
 config["external_ai_translate_enable"] = st.sidebar.checkbox("외부시황 AI 번역(비용↑)", value=bool(config.get("external_ai_translate_enable", False)))
+config["news_translate_budget_sec"] = st.sidebar.number_input(
+    "뉴스 번역 시간예산(초, 0=룰기반만)",
+    0,
+    60,
+    int(config.get("news_translate_budget_sec", 10)),
+    step=1,
+)
 
 st.sidebar.divider()
 st.sidebar.subheader("🌅 아침 브리핑")
@@ -5823,7 +5894,18 @@ with t1:
         if age >= stale_thresh:
             st.error(f"⚠️ 봇 스레드가 멈췄거나(크래시) 갱신이 안될 수 있어요. ({stale_thresh:.0f}초 이상)")
 
-        st.caption(f"봇 상태: {mon.get('global_state','-')}")
+        st.caption(
+            f"봇 상태: {mon.get('global_state','-')} | stage: {mon.get('loop_stage','-')}@{mon.get('loop_stage_kst','-')} | code: {mon.get('code_version','-')}"
+        )
+        try:
+            h = openai_health_info(load_settings())
+            ai_txt = "OK" if bool(h.get("available", False)) else str(h.get("message", "OFF"))
+            until = str(h.get("until_kst", "")).strip()
+            if until and (not bool(h.get("available", False))):
+                ai_txt = f"{ai_txt} (~{until} KST)"
+            st.caption(f"OpenAI: {ai_txt}")
+        except Exception:
+            pass
 
         # ✅ 포지션/진입 정보(직관적 표시)
         st.subheader("📊 현재 포지션(스타일/목표 포함)")
