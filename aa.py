@@ -897,12 +897,177 @@ _OPENAI_CLIENT_CACHE: Dict[str, Any] = {}
 _OPENAI_CLIENT_LOCK = threading.RLock()
 
 
+# =========================================================
+# ✅ OpenAI Health/Suspension (쿼터/레이트리밋 대응)
+# - 429(insufficient_quota) 같은 오류가 반복되면 스캔/스레드가 "계속 오류"처럼 보일 수 있어
+#   일정 시간 OpenAI 호출을 자동 중지(suspend)해서 스팸/부하를 줄인다.
+# - 키를 바꾸면(suffix/len 변화) 자동으로 suspend를 해제한다.
+# =========================================================
+_OPENAI_HEALTH_LOCK = threading.RLock()
+_OPENAI_SUSPENDED_UNTIL_EPOCH = 0.0
+_OPENAI_SUSPENDED_REASON = ""
+_OPENAI_SUSPENDED_KEY_FPR = ""
+_OPENAI_LAST_ERROR_SUMMARY = ""
+_OPENAI_LAST_ERROR_EPOCH = 0.0
+
+
+def _openai_key_fingerprint(key: str) -> str:
+    try:
+        k = str(key or "")
+        if not k:
+            return ""
+        suf = k[-4:] if len(k) >= 4 else k
+        return f"len{len(k)}..{suf}"
+    except Exception:
+        return ""
+
+
+def _openai_err_kind(err: BaseException) -> str:
+    """
+    OpenAI 오류를 대략 분류(라이브러리 버전 차이/에러 형태 차이를 흡수).
+    """
+    try:
+        name = str(type(err).__name__ or "").lower()
+    except Exception:
+        name = ""
+    try:
+        s = str(err or "").lower()
+    except Exception:
+        s = ""
+
+    # quota/결제 부족
+    if "insufficient_quota" in s or "exceeded your current quota" in s or "plan and billing" in s:
+        return "insufficient_quota"
+    # 잘못된 키
+    if "invalid_api_key" in s or "incorrect api key" in s or "api key" in s and "invalid" in s:
+        return "invalid_api_key"
+    # rate limit
+    if "ratelimit" in name or ("rate limit" in s and "insufficient_quota" not in s):
+        return "rate_limit"
+    # timeout
+    if "timeout" in s or "timed out" in s:
+        return "timeout"
+    return "other"
+
+
+def openai_health_info(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    returns:
+      - available: bool
+      - status: OK|NO_KEY|SUSPENDED
+      - message: human readable(KO)
+      - until_kst: str (when suspended)
+    """
+    cfg = cfg or {}
+    key = _sget_str("OPENAI_API_KEY") or str(cfg.get("openai_api_key", "") or "").strip()
+    if not key:
+        return {"available": False, "status": "NO_KEY", "message": "OpenAI 키 없음", "until_kst": ""}
+
+    fpr = _openai_key_fingerprint(key)
+    now = time.time()
+    with _OPENAI_HEALTH_LOCK:
+        # 키가 바뀌면 suspend 해제
+        if _OPENAI_SUSPENDED_KEY_FPR and _OPENAI_SUSPENDED_KEY_FPR != fpr:
+            _OPENAI_SUSPENDED_UNTIL_EPOCH = 0.0
+            _OPENAI_SUSPENDED_REASON = ""
+            _OPENAI_SUSPENDED_KEY_FPR = ""
+
+        if now < float(_OPENAI_SUSPENDED_UNTIL_EPOCH or 0.0) and _OPENAI_SUSPENDED_KEY_FPR == fpr:
+            until_kst = _epoch_to_kst_str(float(_OPENAI_SUSPENDED_UNTIL_EPOCH))
+            reason = str(_OPENAI_SUSPENDED_REASON or "").strip() or "일시 중지"
+            return {"available": False, "status": "SUSPENDED", "message": f"OpenAI 일시중지: {reason}", "until_kst": until_kst}
+
+    return {"available": True, "status": "OK", "message": "OpenAI OK", "until_kst": ""}
+
+
+def openai_suspend(cfg: Optional[Dict[str, Any]], reason: str, duration_sec: int, err: Optional[BaseException] = None) -> None:
+    cfg = cfg or {}
+    key = _sget_str("OPENAI_API_KEY") or str(cfg.get("openai_api_key", "") or "").strip()
+    fpr = _openai_key_fingerprint(key)
+    until = time.time() + float(max(5, int(duration_sec)))
+    msg_err = ""
+    try:
+        msg_err = str(err)[:240] if err is not None else ""
+    except Exception:
+        msg_err = ""
+
+    with _OPENAI_HEALTH_LOCK:
+        global _OPENAI_SUSPENDED_UNTIL_EPOCH, _OPENAI_SUSPENDED_REASON, _OPENAI_SUSPENDED_KEY_FPR
+        global _OPENAI_LAST_ERROR_SUMMARY, _OPENAI_LAST_ERROR_EPOCH
+        _OPENAI_SUSPENDED_UNTIL_EPOCH = float(until)
+        _OPENAI_SUSPENDED_REASON = str(reason or "").strip()[:120]
+        _OPENAI_SUSPENDED_KEY_FPR = str(fpr or "")
+        _OPENAI_LAST_ERROR_SUMMARY = msg_err
+        _OPENAI_LAST_ERROR_EPOCH = time.time()
+
+    try:
+        gsheet_log_event(
+            "OPENAI_SUSPEND",
+            message=str(reason or "suspend"),
+            payload={"until_kst": _epoch_to_kst_str(float(until)), "duration_sec": int(duration_sec), "err": msg_err},
+        )
+    except Exception:
+        pass
+
+
+def openai_handle_failure(err: BaseException, cfg: Optional[Dict[str, Any]], where: str = "") -> str:
+    """
+    OpenAI 실패를 분류하고, 필요 시 suspend 설정.
+    returns: kind string
+    """
+    kind = _openai_err_kind(err)
+    # quota 부족은 모델을 바꿔도 해결되지 않으므로 길게 suspend
+    if kind == "insufficient_quota":
+        openai_suspend(cfg, reason="insufficient_quota(쿼터/결제)", duration_sec=6 * 60 * 60, err=err)
+    elif kind == "invalid_api_key":
+        openai_suspend(cfg, reason="invalid_api_key(키 오류)", duration_sec=10 * 60, err=err)
+    elif kind == "rate_limit":
+        openai_suspend(cfg, reason="rate_limit(잠시 대기)", duration_sec=120, err=err)
+    elif kind == "timeout":
+        openai_suspend(cfg, reason="timeout(잠시 대기)", duration_sec=60, err=err)
+    else:
+        # 기타 오류도 짧게 suspend 해서 스팸/부하 완화
+        openai_suspend(cfg, reason="openai_error(잠시 대기)", duration_sec=45, err=err)
+    return kind
+
+
+def openai_clear_suspension(cfg: Optional[Dict[str, Any]] = None) -> None:
+    """
+    수동 테스트/운영자가 결제/쿼터를 복구한 직후 즉시 재시도할 수 있게 suspend를 해제.
+    - 자동매매/스캔 루프에서는 사용하지 않는 것이 안전.
+    """
+    cfg = cfg or {}
+    key = _sget_str("OPENAI_API_KEY") or str(cfg.get("openai_api_key", "") or "").strip()
+    fpr = _openai_key_fingerprint(key)
+    with _OPENAI_HEALTH_LOCK:
+        global _OPENAI_SUSPENDED_UNTIL_EPOCH, _OPENAI_SUSPENDED_REASON, _OPENAI_SUSPENDED_KEY_FPR
+        if not _OPENAI_SUSPENDED_KEY_FPR:
+            return
+        if fpr and _OPENAI_SUSPENDED_KEY_FPR != fpr:
+            # 다른 키면 이미 openai_health_info()에서 자동 해제되지만, 안전하게 클리어
+            pass
+        _OPENAI_SUSPENDED_UNTIL_EPOCH = 0.0
+        _OPENAI_SUSPENDED_REASON = ""
+        _OPENAI_SUSPENDED_KEY_FPR = ""
+    try:
+        gsheet_log_event("OPENAI_UNSUSPEND", message="manual_clear", payload={"code": CODE_VERSION})
+    except Exception:
+        pass
+
+
 def get_openai_client(cfg: Dict[str, Any]) -> Optional[OpenAI]:
     # ✅ secrets 규격(요구사항): OPENAI_API_KEY
     # - 일부 환경에서 st.secrets.get 호환 이슈를 피하기 위해 _sget_str 사용
     key = _sget_str("OPENAI_API_KEY") or str(cfg.get("openai_api_key", "") or "").strip()
     if not key:
         return None
+    # suspend 상태면 호출하지 않음(스팸/부하 방지)
+    try:
+        h = openai_health_info(cfg)
+        if not bool(h.get("available", False)):
+            return None
+    except Exception:
+        pass
     with _OPENAI_CLIENT_LOCK:
         if key in _OPENAI_CLIENT_CACHE:
             return _OPENAI_CLIENT_CACHE[key]
@@ -981,6 +1146,14 @@ def openai_chat_create_with_fallback(
                 except Exception as e2:
                     last_err = e2
                     continue
+            # quota/키오류 등은 모델 바꿔도 해결되지 않으므로 즉시 중단
+            kind = ""
+            try:
+                kind = _openai_err_kind(e)
+            except Exception:
+                kind = ""
+            if kind in ["insufficient_quota", "invalid_api_key"]:
+                raise e
             last_err = e
             continue
     if last_err is not None:
@@ -2390,9 +2563,14 @@ def ai_decide_trade(df: pd.DataFrame, status: Dict[str, Any], symbol: str, mode:
     ✅ 기존 기능 유지: AI가 buy/sell/hold + entry/leverage/sl/tp/rr/근거(JSON)
     ✅ 안정성 강화: timeout + 예외 처리
     """
+    h = openai_health_info(cfg)
     client = get_openai_client(cfg)
     if client is None:
-        return {"decision": "hold", "confidence": 0, "reason_easy": "OpenAI 키 없음", "used_indicators": status.get("_used_indicators", [])}
+        msg = str(h.get("message", "OpenAI 사용 불가"))
+        until = str(h.get("until_kst", "")).strip()
+        if until:
+            msg = f"{msg} (~{until} KST)"
+        return {"decision": "hold", "confidence": 0, "reason_easy": msg, "used_indicators": status.get("_used_indicators", [])}
     if df is None or df.empty or status is None:
         return {"decision": "hold", "confidence": 0, "reason_easy": "데이터 부족", "used_indicators": status.get("_used_indicators", [])}
 
@@ -2556,6 +2734,7 @@ JSON 형식:
     except FuturesTimeoutError:
         return {"decision": "hold", "confidence": 0, "reason_easy": "AI 타임아웃(대기 너무 김)", "used_indicators": status.get("_used_indicators", [])}
     except Exception as e:
+        openai_handle_failure(e, cfg, where="DECIDE_TRADE")
         notify_admin_error("AI:DECIDE_TRADE", e, context={"symbol": symbol, "mode": mode}, tb=traceback.format_exc(), min_interval_sec=120.0)
         return {"decision": "hold", "confidence": 0, "reason_easy": f"AI 오류: {e}", "used_indicators": status.get("_used_indicators", [])}
 
@@ -2565,9 +2744,14 @@ def ai_decide_style(symbol: str, decision: str, trend_short: str, trend_long: st
     룰 기반으로 애매할 때만 AI로 스캘핑/스윙 판단.
     비용/지연 최소화를 위해 기본은 룰 기반.
     """
+    h = openai_health_info(cfg)
     client = get_openai_client(cfg)
     if client is None:
-        return {"style": "스캘핑", "confidence": 55, "reason": "AI 키 없음 → 룰 기반(보수적으로 스캘핑)"}
+        msg = str(h.get("message", "OpenAI 사용 불가")).strip()
+        until = str(h.get("until_kst", "")).strip()
+        if until:
+            msg = f"{msg} (~{until} KST)"
+        return {"style": "스캘핑", "confidence": 55, "reason": f"{msg} → 룰 기반(보수적으로 스캘핑)"}
 
     payload = {
         "symbol": symbol,
@@ -2614,6 +2798,7 @@ def ai_decide_style(symbol: str, decision: str, trend_short: str, trend_long: st
         reason = str(out.get("reason", ""))[:240]
         return {"style": style, "confidence": conf, "reason": reason}
     except Exception as e:
+        openai_handle_failure(e, cfg, where="DECIDE_STYLE")
         notify_admin_error("AI:DECIDE_STYLE", e, context={"symbol": symbol}, tb=traceback.format_exc(), min_interval_sec=180.0)
         return {"style": "스캘핑", "confidence": 55, "reason": "스타일 AI 판단 실패 → 스캘핑"}
 
@@ -2684,10 +2869,15 @@ def apply_style_envelope(ai: Dict[str, Any], style: str, cfg: Dict[str, Any], ru
 # ✅ 14) AI 회고(후기) (기존 유지 + 안정성)
 # =========================================================
 def ai_write_review(symbol: str, side: str, pnl_percent: float, reason: str, cfg: Dict[str, Any]) -> Tuple[str, str]:
+    h = openai_health_info(cfg)
     client = get_openai_client(cfg)
     if client is None:
         one = "익절" if pnl_percent >= 0 else "손절"
-        return (f"{one}({pnl_percent:.2f}%)", "OpenAI 키 없음 - 후기 자동작성 불가")
+        msg = str(h.get("message", "OpenAI 사용 불가")).strip()
+        until = str(h.get("until_kst", "")).strip()
+        if until:
+            msg = f"{msg} (~{until} KST)"
+        return (f"{one}({pnl_percent:.2f}%)", f"{msg} - 후기 자동작성 불가")
 
     sys = "너는 매매 회고를 아주 쉽게 써주는 코치다. 출력은 반드시 JSON만. 영어 금지."
     user = f"""
@@ -2731,6 +2921,7 @@ JSON 형식:
         out = json.loads(resp.choices[0].message.content)
         return str(out.get("one_line", ""))[:120], str(out.get("review", ""))[:800]
     except Exception as e:
+        openai_handle_failure(e, cfg, where="WRITE_REVIEW")
         notify_admin_error("AI:WRITE_REVIEW", e, context={"symbol": symbol}, tb=traceback.format_exc(), min_interval_sec=180.0)
         one = "익절" if pnl_percent >= 0 else "손절"
         return (f"{one}({pnl_percent:.2f}%)", "후기 작성 실패")
@@ -4709,10 +4900,16 @@ def telegram_thread(ex):
                             mon_now = read_json_safe(MONITOR_FILE, {}) or {}
                             regime_mode = str(cfg_live.get("regime_mode", "auto")).lower().strip()
                             regime_txt = "AUTO" if regime_mode == "auto" else ("SCALPING" if regime_mode.startswith("scal") else "SWING")
+                            h = openai_health_info(cfg_live)
+                            ai_txt = "OK" if bool(h.get("available", False)) else str(h.get("message", "OFF"))
+                            until = str(h.get("until_kst", "")).strip()
+                            if until and (not bool(h.get("available", False))):
+                                ai_txt = f"{ai_txt} (~{until} KST)"
                             msg = (
                                 f"📡 상태\n- 자동매매: {'ON' if cfg_live.get('auto_trade') else 'OFF'}\n"
                                 f"- 모드: {cfg_live.get('trade_mode','-')}\n"
                                 f"- 레짐: {regime_txt}\n"
+                                f"- OpenAI: {ai_txt}\n"
                                 f"- 잔고: {total:.2f} USDT (가용 {free:.2f})\n"
                                 f"- 연속손실: {rt2.get('consec_losses',0)}\n"
                                 f"- 정지해제: {('정지중' if time.time() < float(rt2.get('pause_until',0)) else '정상')}\n"
@@ -5101,8 +5298,9 @@ def telegram_thread(ex):
                 err = f"{e}"
                 if len(err) > 500:
                     err = err[:500] + "..."
-                # 브로드캐스트 채널에도 짧게(선택): 운영자가 채널을 모니터링 중일 수 있음
-                tg_send(f"⚠️ 스레드 오류: {err}", target="channel", cfg=load_settings())
+                # ✅ 요구: 오류는 관리자 DM으로(채널 스팸 방지)
+                if not TG_ADMIN_IDS:
+                    tg_send(f"⚠️ 스레드 오류: {err}", target="channel", cfg=load_settings())
             except Exception:
                 pass
             time.sleep(backoff_sec)
@@ -5371,9 +5569,20 @@ if st.sidebar.button("📡 텔레그램 메뉴 전송(/menu)"):
     tg_send_menu(cfg=config)
 
 if st.sidebar.button("🤖 OpenAI 연결 테스트"):
+    # 운영자가 결제/쿼터를 복구한 직후 즉시 재시도할 수 있게 수동 clear
+    openai_clear_suspension(config)
+    h = openai_health_info(config)
     client = get_openai_client(config)
     if client is None:
-        st.sidebar.error("OpenAI 연결 실패(키/설정 확인)")
+        msg = str(h.get("message", "OpenAI 사용 불가")).strip()
+        until = str(h.get("until_kst", "")).strip()
+        if until:
+            msg = f"{msg} (~{until} KST)"
+        st.sidebar.error(f"❌ OpenAI 사용 불가: {msg}")
+        if "insufficient_quota" in msg:
+            st.sidebar.caption("OpenAI 결제/크레딧(Quota) 부족입니다. OpenAI 콘솔에서 Billing/크레딧을 확인하세요.")
+        elif str(h.get("status")) == "NO_KEY":
+            st.sidebar.caption("Streamlit secrets에 OPENAI_API_KEY를 설정하세요.")
     else:
         models_to_try = ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"]
         last_err: Optional[BaseException] = None
@@ -5396,6 +5605,11 @@ if st.sidebar.button("🤖 OpenAI 연결 테스트"):
                 break
             except Exception as e:
                 last_err = e
+                # quota/키오류면 더 시도해도 의미 없음
+                kind = _openai_err_kind(e)
+                openai_handle_failure(e, config, where="UI_OPENAI_TEST")
+                if kind in ["insufficient_quota", "invalid_api_key"]:
+                    break
                 continue
         if last_err is not None:
             st.sidebar.error(f"❌ 실패: {last_err}")
@@ -5661,8 +5875,15 @@ with t1:
     st.divider()
     st.subheader("🔍 현재 코인 AI 분석(수동 버튼)")
     if st.button("현재 코인 AI 분석 실행"):
+        # 수동 실행은 운영자가 즉시 재시도할 수 있게 suspend를 클리어
+        openai_clear_suspension(config)
         if get_openai_client(config) is None:
-            st.error("OpenAI 키 없음")
+            h = openai_health_info(config)
+            msg = str(h.get("message", "OpenAI 사용 불가")).strip()
+            until = str(h.get("until_kst", "")).strip()
+            if until:
+                msg = f"{msg} (~{until} KST)"
+            st.error(msg)
         elif ta is None and pta is None:
             st.error("ta/pandas_ta 모듈 없음")
         else:
