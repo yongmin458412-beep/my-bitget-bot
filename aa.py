@@ -1235,6 +1235,7 @@ _GSHEET_CACHE: Dict[str, Any] = {
     "header_ok": False,
     "last_init_epoch": 0.0,
     "last_err": "",
+    "last_tb": "",
     "service_account_email": "",
     "worksheet": "",
     "spreadsheet_id": "",
@@ -1351,10 +1352,16 @@ def _gsheet_notify_connect_issue(where: str, msg: str, min_interval_sec: float =
         hint = ""
         if email and stg.get("spreadsheet_id"):
             hint = f"\n- 서비스계정 이메일: {email}\n- 공유: 시트에 위 이메일을 '편집자'로 공유해야 합니다."
+        tb_txt = ""
+        try:
+            tb_txt = str(_GSHEET_CACHE.get("last_tb", "") or "")
+        except Exception:
+            tb_txt = ""
         notify_admin_error(
             where,
             RuntimeError(msg),
             context={"spreadsheet_id": stg.get("spreadsheet_id", ""), "worksheet": stg.get("worksheet", ""), "service_account_email": email, "code": CODE_VERSION},
+            tb=tb_txt,
             min_interval_sec=min_interval_sec,
         )
         if hint:
@@ -1400,7 +1407,28 @@ def _gsheet_connect_ws() -> Optional[Any]:
             ws = sh.add_worksheet(title=ws_name, rows=5000, cols=len(GSHEET_HEADER) + 5)
         return ws
     except Exception as e:
-        _GSHEET_CACHE["last_err"] = f"GSHEET 연결 실패: {e}"
+        try:
+            err_name = str(type(e).__name__ or "Exception")
+        except Exception:
+            err_name = "Exception"
+        try:
+            err_msg = str(e or "").strip()
+        except Exception:
+            err_msg = ""
+        detail = err_msg if err_msg else err_name
+        low = f"{err_name} {err_msg}".lower()
+        # 가장 흔한 케이스: 시트 미공유/ID 오타 → SpreadsheetNotFound(메시지 비어있을 수 있음)
+        if "spreadsheetnotfound" in low:
+            detail = "SpreadsheetNotFound (시트를 서비스계정 이메일에 '편집자'로 공유 + GSHEET_SPREADSHEET_ID 확인)"
+        elif "permission" in low or "forbidden" in low:
+            detail = f"{err_name} (권한 문제: 공유/드라이브 권한/스코프 확인) {err_msg}".strip()
+        elif ("api" in low and "enable" in low) or "has not been used" in low:
+            detail = f"{err_name} (Google Sheets/Drive API 활성화 필요) {err_msg}".strip()
+        _GSHEET_CACHE["last_err"] = f"GSHEET 연결 실패: {detail}".strip()
+        try:
+            _GSHEET_CACHE["last_tb"] = traceback.format_exc()
+        except Exception:
+            _GSHEET_CACHE["last_tb"] = ""
         return None
 
 
