@@ -34,3 +34,10 @@ cachetools>=5.3.3
 gspread
 google-auth
 gspread-formatting
+
+# gspread-formatting  # optional (only if you need formatting)
+
+# Optional translation/logging
+deep-translator
+loguru
+
