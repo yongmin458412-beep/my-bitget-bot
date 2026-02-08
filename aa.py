@@ -588,7 +588,14 @@ def default_settings() -> Dict[str, Any]:
 
         # 방어/전략
         "use_trailing_stop": True,
-        "use_dca": True, "dca_trigger": -20.0, "dca_max_count": 1, "dca_add_pct": 50.0,
+        "use_dca": True,
+        "dca_trigger": -20.0,
+        "dca_max_count": 1,
+        # ✅ 추매 규모(기본=기존 % 방식 유지)
+        # - dca_add_usdt > 0 이면 "USDT(마진)" 기준으로 추매 금액을 고정(사용자 요구)
+        # - 0이면 기존처럼 원진입 대비 %로 계산
+        "dca_add_pct": 50.0,
+        "dca_add_usdt": 0.0,
         "use_switching": True, "switch_trigger": -12.0,  # (옵션만 유지: 기존 코드도 로직 미구현)
         "no_trade_weekend": False,
 
@@ -667,6 +674,12 @@ def default_settings() -> Dict[str, Any]:
         "swing_partial_tp1_at_tp_frac": 0.35, "swing_partial_tp1_close_pct": 33,
         "swing_partial_tp2_at_tp_frac": 0.60, "swing_partial_tp2_close_pct": 33,
         "swing_partial_tp3_at_tp_frac": 0.85, "swing_partial_tp3_close_pct": 34,
+        # ✅ (추가) 부분익절 "청산수량"을 USDT(마진)로 지정(사용자 요구)
+        # - 0이면 기존 % 청산을 사용
+        # - 값이 있으면 해당 USDT(마진)만큼의 포지션을 청산(레버 반영: qty = (usdt*lev)/price)
+        "swing_partial_tp1_close_usdt": 0.0,
+        "swing_partial_tp2_close_usdt": 0.0,
+        "swing_partial_tp3_close_usdt": 0.0,
 
         "swing_recycle_enable": False,
         "swing_recycle_cooldown_min": 20,
@@ -4155,9 +4168,13 @@ def get_htf_trend_cached(ex, sym: str, tf: str, fast: int, slow: int, cache_sec:
         ohlcv = safe_fetch_ohlcv(ex, sym, tf, limit=max(220, slow + 50))
         if not ohlcv:
             return "중립"
+        try:
+            last_bar_ms = int((ohlcv[-1] or [0])[0] or 0)
+        except Exception:
+            last_bar_ms = 0
         hdf = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
         trend = compute_ma_trend_from_df(hdf, fast=fast, slow=slow)
-        _TREND_CACHE[key] = {"ts": now, "trend": trend}
+        _TREND_CACHE[key] = {"ts": now, "trend": trend, "last_bar_ms": last_bar_ms}
         return trend
     except Exception:
         return "중립"
@@ -6657,6 +6674,20 @@ def _maybe_switch_style_for_open_position(
         elif regime_mode in ["swing", "long"]:
             rec_style = "스윙"
 
+        # ✅ confirm2/hysteresis가 "같은 데이터 스냅샷"으로 몇 초 만에 누적되어
+        #    레짐이 빠르게 바뀌는 현상을 방지:
+        # - get_htf_trend_cached는 cache_sec 동안 같은 값을 반환할 수 있으므로,
+        #   카운트/바이어스는 "새 스냅샷(캐시 갱신/새 봉)"에서만 갱신한다.
+        try:
+            sm = _TREND_CACHE.get(f"{sym}|{short_tf}", {}) or {}
+            lm = _TREND_CACHE.get(f"{sym}|{long_tf}", {}) or {}
+            trend_snap_token = (
+                f"{short_tf}|{int(float(sm.get('ts', 0) or 0))}|{int(sm.get('last_bar_ms', 0) or 0)}|{short_trend}|"
+                f"{long_tf}|{int(float(lm.get('ts', 0) or 0))}|{int(lm.get('last_bar_ms', 0) or 0)}|{long_trend}"
+            )
+        except Exception:
+            trend_snap_token = ""
+
         # ✅ 플립플롭 방지(시간락 없이):
         # - 장기추세가 계속 같은 방향인데, 단기추세가 "횡보/전환"처럼 중립으로 흔들리는 것만으로
         #   스윙→스캘핑으로 급전환하지 않게 한다.
@@ -6706,6 +6737,7 @@ def _maybe_switch_style_for_open_position(
             try:
                 tgt["_pending_style"] = ""
                 tgt["_pending_style_count"] = 0
+                tgt["_pending_style_snap_token"] = ""
             except Exception:
                 pass
         if regime_mode == "auto" and rec_style != cur_style:
@@ -6734,11 +6766,18 @@ def _maybe_switch_style_for_open_position(
                     pass
                 pending = str(tgt.get("_pending_style", ""))
                 cnt = int(tgt.get("_pending_style_count", 0) or 0)
+                snap_prev = str(tgt.get("_pending_style_snap_token", "") or "")
                 if pending == rec_style:
-                    cnt += 1
+                    # 같은 스냅샷(캐시 갱신 전)에서는 카운트를 올리지 않는다
+                    if trend_snap_token and trend_snap_token == snap_prev:
+                        cnt = cnt
+                    else:
+                        cnt += 1
+                        tgt["_pending_style_snap_token"] = trend_snap_token
                 else:
                     pending = rec_style
                     cnt = 1
+                    tgt["_pending_style_snap_token"] = trend_snap_token
                 tgt["_pending_style"] = pending
                 tgt["_pending_style_count"] = cnt
                 if cnt < int(required_n):
@@ -6750,16 +6789,20 @@ def _maybe_switch_style_for_open_position(
                 # 전환 확정
                 tgt["_pending_style"] = ""
                 tgt["_pending_style_count"] = 0
+                tgt["_pending_style_snap_token"] = ""
             elif switch_ctl == "hysteresis":
                 bias = float(tgt.get("_regime_bias", 0.5) or 0.5)  # 0=스캘핑, 1=스윙
                 step = float(cfg.get("regime_hysteresis_step", 0.55))
                 enter_swing = float(cfg.get("regime_hysteresis_enter_swing", 0.75))
                 enter_scalp = float(cfg.get("regime_hysteresis_enter_scalp", 0.25))
-                if rec_style == "스윙":
-                    bias = min(1.0, bias + step)
-                else:
-                    bias = max(0.0, bias - step)
-                tgt["_regime_bias"] = bias
+                snap_prev = str(tgt.get("_regime_bias_snap_token", "") or "")
+                if (not trend_snap_token) or trend_snap_token != snap_prev:
+                    if rec_style == "스윙":
+                        bias = min(1.0, bias + step)
+                    else:
+                        bias = max(0.0, bias - step)
+                    tgt["_regime_bias"] = bias
+                    tgt["_regime_bias_snap_token"] = trend_snap_token
                 # 임계값을 넘을 때만 전환
                 if cur_style == "스캘핑" and bias < enter_swing:
                     tgt["style_reco"] = rec_style
@@ -6966,7 +7009,13 @@ def _try_scalp_to_swing_dca(ex, sym: str, side: str, cur_px: float, tgt: Dict[st
         free, _ = safe_fetch_balance(ex)
         base_entry = float(tgt.get("entry_usdt", 0.0))
         dca_add_pct = float(cfg.get("dca_add_pct", 50.0))
-        add_usdt = base_entry * (dca_add_pct / 100.0)
+        dca_add_usdt_cfg = 0.0
+        try:
+            dca_add_usdt_cfg = float(cfg.get("dca_add_usdt", 0.0) or 0.0)
+        except Exception:
+            dca_add_usdt_cfg = 0.0
+        # ✅ (추가) USDT 기준 추매(마진) 우선, 없으면 기존 % 방식 유지
+        add_usdt = float(dca_add_usdt_cfg) if float(dca_add_usdt_cfg) > 0 else (base_entry * (dca_add_pct / 100.0))
         if add_usdt > free:
             add_usdt = free * 0.5
         if add_usdt < 5:
@@ -6983,6 +7032,19 @@ def _try_scalp_to_swing_dca(ex, sym: str, side: str, cur_px: float, tgt: Dict[st
             save_runtime(rt)
             mon_add_event(mon, "DCA_CONVERT", sym, f"스캘핑→스윙 전환 추매 {add_usdt:.2f} USDT", {"add_usdt": add_usdt})
             try:
+                # 실제 마진 추정(근사): notional/lev
+                try:
+                    margin_est = (float(qty) * float(cur_px)) / max(float(lev), 1.0)
+                except Exception:
+                    margin_est = float(add_usdt)
+                try:
+                    tg_send(
+                        f"💧 전환추매(DCA)\n- 코인: {sym}\n- 스타일: 스캘핑→스윙\n- 추가금(마진): {float(add_usdt):.2f} USDT (추정 {float(margin_est):.2f})\n- 추가수량: {qty}\n- 레버: x{lev}\n- 일지ID: {str(tgt.get('trade_id','') or '-')}",
+                        target=cfg.get("tg_route_events_to", "channel"),
+                        cfg=cfg,
+                    )
+                except Exception:
+                    pass
                 gsheet_log_trade(
                     stage="DCA_CONVERT",
                     symbol=sym,
@@ -7743,7 +7805,33 @@ def telegram_thread(ex):
                                 if label in done:
                                     continue
                                 if roi >= float(trig_roi) and contracts_left > 0:
-                                    close_qty = to_precision_qty(ex, sym, contracts_left * close_frac)
+                                    # ✅ (추가) 부분익절 청산수량을 USDT(마진)로 지정 가능
+                                    close_usdt_cfg = 0.0
+                                    try:
+                                        if label == "TP1":
+                                            close_usdt_cfg = float(cfg.get("swing_partial_tp1_close_usdt", 0.0) or 0.0)
+                                        elif label == "TP2":
+                                            close_usdt_cfg = float(cfg.get("swing_partial_tp2_close_usdt", 0.0) or 0.0)
+                                        elif label == "TP3":
+                                            close_usdt_cfg = float(cfg.get("swing_partial_tp3_close_usdt", 0.0) or 0.0)
+                                    except Exception:
+                                        close_usdt_cfg = 0.0
+                                    try:
+                                        lev_for_calc = float(lev_live or 0.0)
+                                    except Exception:
+                                        lev_for_calc = 0.0
+                                    if lev_for_calc <= 0:
+                                        try:
+                                            lev_for_calc = float(tgt.get("lev", 1) or 1)
+                                        except Exception:
+                                            lev_for_calc = 1.0
+                                    close_mode = "pct"
+                                    if float(close_usdt_cfg) > 0 and float(cur_px) > 0:
+                                        close_mode = "usdt"
+                                        close_qty_raw = (float(close_usdt_cfg) * float(lev_for_calc)) / max(float(cur_px), 1e-9)
+                                        close_qty = to_precision_qty(ex, sym, min(float(contracts_left), float(close_qty_raw)))
+                                    else:
+                                        close_qty = to_precision_qty(ex, sym, contracts_left * close_frac)
                                     # 너무 작은 수량은 스킵
                                     if close_qty <= 0:
                                         done.add(label)
@@ -7751,6 +7839,11 @@ def telegram_thread(ex):
                                     ok = close_position_market(ex, sym, side, close_qty)
                                     if ok:
                                         done.add(label)
+                                        # 청산 마진(추정): notional/lev
+                                        try:
+                                            close_margin_est = (float(close_qty) * float(cur_px)) / max(float(lev_for_calc), 1.0)
+                                        except Exception:
+                                            close_margin_est = 0.0
                                         # 순환매도(재진입)용 메모리: 부분익절 수량 누적 + 타임스탬프
                                         try:
                                             trade_state["last_partial_tp_epoch"] = time.time()
@@ -7760,20 +7853,21 @@ def telegram_thread(ex):
                                         trade_state["partial_tp_done"] = list(done)
                                         save_runtime(rt)
                                         contracts_left = max(0.0, contracts_left - close_qty)
-                                        mon_add_event(mon, "PARTIAL_TP", sym, f"{label} 부분익절({close_frac*100:.0f}%)", {"roi": roi, "qty": close_qty})
+                                        close_txt = f"{float(close_usdt_cfg):.2f}USDT" if close_mode == "usdt" else f"{close_frac*100:.0f}%"
+                                        mon_add_event(mon, "PARTIAL_TP", sym, f"{label} 부분익절({close_txt})", {"roi": roi, "qty": close_qty, "margin_usdt_est": close_margin_est, "mode": close_mode})
                                         try:
                                             gsheet_log_trade(
                                                 stage="PARTIAL_TP",
                                                 symbol=sym,
                                                 trade_id=trade_id,
                                                 message=f"{label} close_qty={close_qty}",
-                                                payload={"label": label, "roi": roi, "qty": close_qty, "contracts_left": contracts_left},
+                                                payload={"label": label, "roi": roi, "qty": close_qty, "contracts_left": contracts_left, "margin_usdt_est": close_margin_est, "mode": close_mode},
                                             )
                                         except Exception:
                                             pass
                                         # 텔레그램 채널 보고
                                         tg_send(
-                                            f"🧩 부분익절({label})\n- 코인: {sym}\n- 스타일: 스윙\n- ROI: +{roi:.2f}%\n- 청산수량: {close_qty}\n- 남은수량: {contracts_left}\n- 일지ID: {trade_id or '-'}",
+                                            f"🧩 부분익절({label})\n- 코인: {sym}\n- 스타일: 스윙\n- ROI: +{roi:.2f}%\n- 청산수량: {close_qty}\n- 청산마진(추정): {close_margin_est:.2f} USDT\n- 남은수량: {contracts_left}\n- 일지ID: {trade_id or '-'}",
                                             target=cfg.get("tg_route_events_to", "channel"),
                                             cfg=cfg,
                                         )
@@ -7781,7 +7875,7 @@ def telegram_thread(ex):
                                         if trade_id:
                                             d = load_trade_detail(trade_id) or {}
                                             evs = d.get("events", []) or []
-                                            evs.append({"time": now_kst_str(), "type": "PARTIAL_TP", "label": label, "roi": roi, "qty": close_qty})
+                                            evs.append({"time": now_kst_str(), "type": "PARTIAL_TP", "label": label, "roi": roi, "qty": close_qty, "margin_usdt_est": close_margin_est, "mode": close_mode})
                                             d["events"] = evs
                                             save_trade_detail(trade_id, d)
 
@@ -7964,6 +8058,11 @@ def telegram_thread(ex):
                             dca_trig = float(cfg.get("dca_trigger", -20.0))
                             dca_max = int(cfg.get("dca_max_count", 1))
                             dca_add_pct = float(cfg.get("dca_add_pct", 50.0))
+                            dca_add_usdt_cfg = 0.0
+                            try:
+                                dca_add_usdt_cfg = float(cfg.get("dca_add_usdt", 0.0) or 0.0)
+                            except Exception:
+                                dca_add_usdt_cfg = 0.0
 
                             trade_state = rt.setdefault("trades", {}).setdefault(sym, {"dca_count": 0, "partial_tp_done": [], "recycle_count": 0})
                             dca_count = int(trade_state.get("dca_count", 0))
@@ -7971,7 +8070,8 @@ def telegram_thread(ex):
                             if roi <= dca_trig and dca_count < dca_max:
                                 free, _ = safe_fetch_balance(ex)
                                 base_entry = float(tgt.get("entry_usdt", 0.0))
-                                add_usdt = base_entry * (dca_add_pct / 100.0)
+                                # ✅ (추가) USDT 기준 추매(마진) 우선, 없으면 기존 % 방식 유지
+                                add_usdt = float(dca_add_usdt_cfg) if float(dca_add_usdt_cfg) > 0 else (base_entry * (dca_add_pct / 100.0))
                                 if add_usdt > free:
                                     add_usdt = free * 0.5
 
@@ -7983,8 +8083,13 @@ def telegram_thread(ex):
                                     if ok:
                                         trade_state["dca_count"] = dca_count + 1
                                         save_runtime(rt)
+                                        # 실제 마진 추정(근사): notional/lev
+                                        try:
+                                            margin_est = (float(qty) * float(cur_px)) / max(float(lev), 1.0)
+                                        except Exception:
+                                            margin_est = float(add_usdt)
                                         tg_send(
-                                            f"💧 물타기(DCA)\n- 코인: {sym}\n- 스타일: {style_now}\n- 추가금: {add_usdt:.2f} USDT\n- 이유: 손실 {roi:.2f}% (기준 {dca_trig}%)\n- 일지ID: {trade_id or '-'}",
+                                            f"💧 물타기(DCA)\n- 코인: {sym}\n- 스타일: {style_now}\n- 추가금(마진): {float(add_usdt):.2f} USDT (추정 {float(margin_est):.2f})\n- 추가수량: {qty}\n- 레버: x{lev}\n- 이유: 손실 {roi:.2f}% (기준 {dca_trig}%)\n- 일지ID: {trade_id or '-'}",
                                             target=cfg.get("tg_route_events_to", "channel"),
                                             cfg=cfg,
                                         )
@@ -8090,11 +8195,21 @@ def telegram_thread(ex):
                                 save_runtime(rt)
 
                                 emo = "🟢" if roi >= 0 else "🔴"
+                                try:
+                                    bb_total_s = f"{float(bb_total):.2f}" if bb_total is not None else "-"
+                                except Exception:
+                                    bb_total_s = "-"
+                                try:
+                                    bb_free_s = f"{float(bb_free):.2f}" if bb_free is not None else "-"
+                                except Exception:
+                                    bb_free_s = "-"
                                 tg_send(
-                                    f"{emo} 손절\n- 코인: {sym}\n- 스타일: {style_now}\n- 수익률: {roi:.2f}% (손익 {pnl_usdt_snapshot:.2f} USDT)\n"
+                                    f"{emo} 손절\n- 코인: {sym}\n- 스타일: {style_now}\n- 수익률: {roi:+.2f}% (손익 {pnl_usdt_snapshot:+.2f} USDT)\n"
+                                    f"- 진입가→청산가: {float(entry):.6g} → {float(exit_px):.6g}\n"
+                                    f"- 청산수량(contracts): {contracts}\n"
                                     f"- 진입금: {float(tgt.get('entry_usdt',0)):.2f} USDT (잔고 {float(tgt.get('entry_pct',0)):.1f}%)\n"
                                     f"- 레버: x{tgt.get('lev','?')}\n"
-                                    f"- 현재잔고: {total_after:.2f} USDT (가용 {free_after:.2f})\n"
+                                    f"- 잔고(총/가용): {bb_total_s}→{total_after:.2f} / {bb_free_s}→{free_after:.2f} USDT\n"
                                     f"- 이유: {'지지/저항 이탈' if hit_sl_by_price else '목표 손절 도달'}\n"
                                     f"- 한줄평: {one}\n- 일지ID: {trade_id or '없음'}",
                                     target=cfg.get("tg_route_events_to", "channel"),
@@ -8177,11 +8292,21 @@ def telegram_thread(ex):
                                 rt["consec_losses"] = 0
                                 save_runtime(rt)
 
+                                try:
+                                    bb_total_s = f"{float(bb_total):.2f}" if bb_total is not None else "-"
+                                except Exception:
+                                    bb_total_s = "-"
+                                try:
+                                    bb_free_s = f"{float(bb_free):.2f}" if bb_free is not None else "-"
+                                except Exception:
+                                    bb_free_s = "-"
                                 tg_send(
-                                    f"🎉 익절\n- 코인: {sym}\n- 스타일: {style_now}\n- 수익률: +{roi:.2f}% (손익 {pnl_usdt_snapshot:.2f} USDT)\n"
+                                    f"🎉 익절\n- 코인: {sym}\n- 스타일: {style_now}\n- 수익률: {roi:+.2f}% (손익 {pnl_usdt_snapshot:+.2f} USDT)\n"
+                                    f"- 진입가→청산가: {float(entry):.6g} → {float(exit_px):.6g}\n"
+                                    f"- 청산수량(contracts): {contracts}\n"
                                     f"- 진입금: {float(tgt.get('entry_usdt',0)):.2f} USDT (잔고 {float(tgt.get('entry_pct',0)):.1f}%)\n"
                                     f"- 레버: x{tgt.get('lev','?')}\n"
-                                    f"- 현재잔고: {total_after:.2f} USDT (가용 {free_after:.2f})\n"
+                                    f"- 잔고(총/가용): {bb_total_s}→{total_after:.2f} / {bb_free_s}→{free_after:.2f} USDT\n"
                                     f"- 이유: {'지지/저항 목표 도달' if hit_tp_by_price else '목표 익절 도달'}\n"
                                     f"- 한줄평: {one}\n- 일지ID: {trade_id or '없음'}",
                                     target=cfg.get("tg_route_events_to", "channel"),
@@ -8820,12 +8945,30 @@ def telegram_thread(ex):
                                 # 텔레그램 보고
                                 if cfg.get("tg_enable_reports", True):
                                     direction = "롱(상승에 베팅)" if decision == "buy" else "숏(하락에 베팅)"
+                                    try:
+                                        rr0 = float(ai2.get("rr", 0.0) or 0.0)
+                                    except Exception:
+                                        rr0 = 0.0
+                                    if rr0 <= 0:
+                                        try:
+                                            rr0 = float(tpp) / max(abs(float(slp)), 0.01)
+                                        except Exception:
+                                            rr0 = 0.0
+                                    try:
+                                        sl_price_pct0 = float(ai2.get("sl_price_pct", float(slp) / max(int(lev), 1)) or 0.0)
+                                    except Exception:
+                                        sl_price_pct0 = float(slp) / max(int(lev), 1)
+                                    try:
+                                        tp_price_pct0 = float(ai2.get("tp_price_pct", float(tpp) / max(int(lev), 1)) or 0.0)
+                                    except Exception:
+                                        tp_price_pct0 = float(tpp) / max(int(lev), 1)
                                     msg = (
                                         f"🎯 진입\n- 코인: {sym}\n- 스타일: {style}\n- 방향: {direction}\n"
                                         f"- 스타일이유: {str(cs.get('style_reason','') or '').strip()[:180]}\n"
                                         f"- 진입금: {entry_usdt:.2f} USDT (잔고 {entry_pct:.1f}%)\n"
                                         f"- 레버리지: x{lev}\n"
-                                        f"- 목표익절: +{tpp:.2f}% / 목표손절: -{slp:.2f}%\n"
+                                        f"- 목표익절/손절(ROI): +{tpp:.2f}% / -{slp:.2f}% | RR {rr0:.2f}\n"
+                                        f"- 가격기준(TP/SL): +{tp_price_pct0:.2f}% / -{sl_price_pct0:.2f}%\n"
                                         f"- 단기추세({cfg.get('timeframe','5m')}): {stt.get('추세','-')}\n"
                                         f"- 장기추세({htf_tf}): 🧭 {htf_trend}\n"
                                         f"- 외부리스크 감산: x{entry_risk_mul:.2f} ({'스윙만 적용' if str(style)=='스윙' else '스캘핑=미적용'})\n"
@@ -9710,6 +9853,11 @@ with st.sidebar.expander("분할익절 상세 설정"):
     p3a, p3b = st.columns(2)
     config["swing_partial_tp3_at_tp_frac"] = p3a.number_input("3차: TP비율", 0.05, 0.99, float(config.get("swing_partial_tp3_at_tp_frac", 0.85)), step=0.05)
     config["swing_partial_tp3_close_pct"] = p3b.number_input("3차: 청산%", 1, 95, int(config.get("swing_partial_tp3_close_pct", 34)))
+    st.caption("※ (선택) 아래 USDT(마진) 값을 0보다 크게 설정하면, 해당 단계는 '청산%' 대신 USDT 기준으로 청산합니다.")
+    u1, u2, u3 = st.columns(3)
+    config["swing_partial_tp1_close_usdt"] = u1.number_input("1차: 청산 USDT", 0.0, 1000000.0, float(config.get("swing_partial_tp1_close_usdt", 0.0) or 0.0), step=5.0)
+    config["swing_partial_tp2_close_usdt"] = u2.number_input("2차: 청산 USDT", 0.0, 1000000.0, float(config.get("swing_partial_tp2_close_usdt", 0.0) or 0.0), step=5.0)
+    config["swing_partial_tp3_close_usdt"] = u3.number_input("3차: 청산 USDT", 0.0, 1000000.0, float(config.get("swing_partial_tp3_close_usdt", 0.0) or 0.0), step=5.0)
 
 config["swing_recycle_enable"] = st.sidebar.checkbox("스윙: 순환매도(부분익절 후 재진입)", value=bool(config.get("swing_recycle_enable", False)))
 with st.sidebar.expander("순환매도 상세 설정"):
@@ -9758,6 +9906,14 @@ c3, c4 = st.sidebar.columns(2)
 config["dca_trigger"] = c3.number_input("DCA 발동(%)", -90.0, -1.0, float(config.get("dca_trigger", -20.0)), step=0.5)
 config["dca_max_count"] = c4.number_input("최대 횟수", 0, 10, int(config.get("dca_max_count", 1)))
 config["dca_add_pct"] = st.sidebar.slider("추가 규모(원진입 대비 %)", 10, 200, int(config.get("dca_add_pct", 50)))
+config["dca_add_usdt"] = st.sidebar.number_input(
+    "추가 규모(USDT, 마진) [우선]",
+    0.0,
+    1000000.0,
+    float(config.get("dca_add_usdt", 0.0) or 0.0),
+    step=5.0,
+    help="0보다 크면, DCA는 % 대신 이 USDT(마진) 금액을 사용합니다. (선물: qty≈(usdt*레버)/가격)",
+)
 
 st.sidebar.divider()
 st.sidebar.subheader("🪙 외부 시황")
