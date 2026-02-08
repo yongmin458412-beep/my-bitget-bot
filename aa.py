@@ -544,9 +544,13 @@ def st_dataframe_safe(data, **kwargs):
 # ✅ 3) MODE_RULES (기존 유지)
 # =========================================================
 MODE_RULES = {
-    "안전모드": {"min_conf": 85, "entry_pct_min": 2, "entry_pct_max": 8, "lev_min": 2, "lev_max": 8},
-    "공격모드": {"min_conf": 80, "entry_pct_min": 8, "entry_pct_max": 25, "lev_min": 2, "lev_max": 10},
-    "하이리스크/하이리턴": {"min_conf": 85, "entry_pct_min": 15, "entry_pct_max": 40, "lev_min": 8, "lev_max": 25},
+    # ✅ 사용자 요구 반영:
+    # - 안전모드: 진입비중↓, 레버↓, 확신도↑일 때만 진입
+    # - 공격모드: 진입비중/레버 "중간", 확신도 "중간"이어도 진입
+    # - 하이리스크/하이리턴: 진입비중↑, 레버↑, 확신도↑일 때만 진입
+    "안전모드": {"min_conf": 88, "entry_pct_min": 2, "entry_pct_max": 7, "lev_min": 2, "lev_max": 6},
+    "공격모드": {"min_conf": 80, "entry_pct_min": 7, "entry_pct_max": 22, "lev_min": 4, "lev_max": 12},
+    "하이리스크/하이리턴": {"min_conf": 88, "entry_pct_min": 18, "entry_pct_max": 40, "lev_min": 12, "lev_max": 25},
 }
 
 
@@ -555,6 +559,8 @@ MODE_RULES = {
 # =========================================================
 def default_settings() -> Dict[str, Any]:
     return {
+        # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
+        "settings_schema_version": 2,
         "openai_api_key": "",
         "auto_trade": False,
         "trade_mode": "안전모드",
@@ -681,7 +687,8 @@ def default_settings() -> Dict[str, Any]:
         "swing_partial_tp2_close_usdt": 0.0,
         "swing_partial_tp3_close_usdt": 0.0,
 
-        "swing_recycle_enable": False,
+        # ✅ 사용자 요구: 스윙 순환매 기본 ON
+        "swing_recycle_enable": True,
         "swing_recycle_cooldown_min": 20,
         "swing_recycle_max_count": 2,
         "swing_recycle_reentry_roi": 0.8,
@@ -715,8 +722,9 @@ def default_settings() -> Dict[str, Any]:
 
         # ✅ 내보내기(일별 엑셀/구글시트)
         "export_daily_enable": True,
-        "export_excel_enable": True,
-        "export_gsheet_enable": False,  # secrets 설정 필요
+        # ✅ 사용자 요구: Excel 저장 기본 OFF, Google Sheets 저장 기본 ON
+        "export_excel_enable": False,
+        "export_gsheet_enable": True,  # secrets(GSHEET_ENABLED/...) 설정 필요
         "export_gsheet_spreadsheet_id": "",  # 비워두면 secrets의 GSHEET_ID 사용
         # ✅ Google Sheets 원본 로그(TRADE/EVENT/SCAN) 레거시 모드 허용 여부(기본 OFF)
         # - 사용자 요구: 구글시트에는 "매매일지 + 시간대/일별 총합"만(=trades_only)
@@ -731,19 +739,66 @@ def default_settings() -> Dict[str, Any]:
 
 
 def load_settings() -> Dict[str, Any]:
-    cfg = default_settings()
+    base = default_settings()
+    saved = {}
+    saved_ver = 0
     if os.path.exists(SETTINGS_FILE):
-        saved = read_json_safe(SETTINGS_FILE, {})
+        saved = read_json_safe(SETTINGS_FILE, {}) or {}
         if isinstance(saved, dict):
-            cfg.update(saved)
+            try:
+                saved_ver = int(saved.get("settings_schema_version", 0) or 0)
+            except Exception:
+                saved_ver = 0
+    cfg = dict(base)
+    if isinstance(saved, dict):
+        cfg.update(saved)
     # 이전 키 호환
     if "openai_key" in cfg and not cfg.get("openai_api_key"):
         cfg["openai_api_key"] = cfg["openai_key"]
     # 누락 키 보정
-    base = default_settings()
     for k, v in base.items():
         if k not in cfg:
             cfg[k] = v
+    # ✅ 기본값 마이그레이션(사용자 요구 반영)
+    try:
+        base_ver = int(base.get("settings_schema_version", 0) or 0)
+    except Exception:
+        base_ver = 0
+    if saved_ver < base_ver:
+        changed = False
+        # v2: Google Sheets 기본/순환매 기본/스윙 손절 기본 확장
+        if saved_ver < 2:
+            try:
+                if bool(cfg.get("export_excel_enable", True)) is True:
+                    cfg["export_excel_enable"] = False
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if bool(cfg.get("export_gsheet_enable", False)) is False:
+                    cfg["export_gsheet_enable"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if bool(cfg.get("swing_recycle_enable", False)) is False:
+                    cfg["swing_recycle_enable"] = True
+                    changed = True
+            except Exception:
+                pass
+            # 스윙은 스캘핑처럼 -2~-3%에 잘리는 문제를 줄이기 위해 기본 손절 하한을 넓게 유지
+            try:
+                if float(cfg.get("swing_sl_roi_min", 0.0) or 0.0) < 12.0:
+                    cfg["swing_sl_roi_min"] = 12.0
+                    changed = True
+            except Exception:
+                pass
+        cfg["settings_schema_version"] = base_ver
+        if changed:
+            try:
+                save_settings(cfg)
+            except Exception:
+                pass
     return cfg
 
 
@@ -5519,7 +5574,8 @@ def _rr_min_by_style(style: str) -> float:
     if style == "스캘핑":
         return 1.2
     if style == "스윙":
-        return 1.8
+        # ✅ 스윙은 스캘핑보다 "훨씬 길게" 가져가는 전략이므로 RR 하한을 더 높게
+        return 2.4
     return 1.5
 
 
@@ -6850,6 +6906,19 @@ def _maybe_switch_style_for_open_position(
                 tgt["tp"] = float(clamp(float(tgt.get("tp", 6.0)), float(cfg.get("swing_tp_roi_min", 3.0)), float(cfg.get("swing_tp_roi_max", 50.0))))
                 tgt["sl"] = float(clamp(float(tgt.get("sl", 3.0)), float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 30.0))))
                 tgt["scalp_exit_mode"] = False
+                # ✅ 스윙은 스캘핑보다 RR/목표폭이 "확연히" 커야 하므로,
+                #    전환 시점에도 RR 하한을 강제해 TP를 충분히 늘린다.
+                try:
+                    mode_now = str(cfg.get("trade_mode", "안전모드") or "안전모드")
+                    rr_min_now = max(float(_rr_min_by_mode(mode_now)), float(_rr_min_by_style("스윙")))
+                    sl_now = float(tgt.get("sl", 0) or 0.0)
+                    tp_now = float(tgt.get("tp", 0) or 0.0)
+                    tp_need = abs(sl_now) * float(rr_min_now)
+                    if tp_now < tp_need:
+                        tp_cap = float(cfg.get("swing_tp_roi_max", 50.0))
+                        tgt["tp"] = float(clamp(tp_need, float(cfg.get("swing_tp_roi_min", 3.0)), tp_cap))
+                except Exception:
+                    pass
 
             # ✅ 스타일 전환 시 SR 가격 라인도 함께 재계산(스윙인데 -2~-3%에 잘리는 문제 완화)
             try:
@@ -8741,6 +8810,26 @@ def telegram_thread(ex):
                                 cs["style_reason"] = r0[:240]
                             except Exception:
                                 pass
+
+                            # ✅ 하이리스크/하이리턴 모드 정책:
+                            # - 레버/진입비중이 큰 모드이므로, 자동(auto)에서는 "스윙(단기+장기 정렬)"에서만 신규 진입.
+                            # - (레짐 강제 scalping/swing을 사용자가 명시한 경우는 예외)
+                            if str(mode) == "하이리스크/하이리턴" and str(regime_mode) == "auto" and str(style) != "스윙":
+                                cs["skip_reason"] = "하이리스크 모드: 스윙(단기+장기 추세 정렬)에서만 진입"
+                                try:
+                                    mon_add_scan(
+                                        mon,
+                                        stage="trade_skipped",
+                                        symbol=sym,
+                                        tf=str(cfg.get("timeframe", "5m")),
+                                        signal=str(decision),
+                                        score=conf,
+                                        message="highrisk_requires_swing",
+                                        extra={"mode": str(mode), "style": str(style), "trend_short": str(stt.get("추세", "")), "trend_long": str(htf_trend)},
+                                    )
+                                except Exception:
+                                    pass
+                                continue
 
                             # 스타일별 envelope + 리스크가드레일
                             ai2 = apply_style_envelope(ai, style, cfg, rule)
