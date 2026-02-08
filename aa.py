@@ -615,7 +615,8 @@ def default_settings() -> Dict[str, Any]:
         "external_ai_translate_enable": False,  # 외부시황 번역에 AI 사용(비용↑, 기본 OFF)
 
         # ✅ 매일 아침 BTC 경제뉴스 5개 브리핑
-        "daily_btc_brief_enable": True,
+        # ✅ 아침 브리핑(기본 OFF): 사용자 요구
+        "daily_btc_brief_enable": False,
         "daily_btc_brief_hour_kst": 9,
         "daily_btc_brief_minute_kst": 0,
         "daily_btc_brief_max_items": 5,
@@ -628,9 +629,10 @@ def default_settings() -> Dict[str, Any]:
         "regime_switch_control": "confirm2",   # "confirm2"|"hysteresis"|"off"
         # confirm2 상세: n회 연속 동일 레짐일 때만 전환(기본 2)
         # - 플립백(바로 되돌림) 방지: 직전 전환의 반대방향으로는 더 많은 확인(기본 3)
-        "regime_confirm_n": 2,
-        "regime_confirm_n_flipback": 3,
-        "regime_hysteresis_step": 0.55,
+        # ✅ 기본값 튜닝: 너무 잦은 전환(플립플롭) 방지
+        "regime_confirm_n": 3,
+        "regime_confirm_n_flipback": 5,
+        "regime_hysteresis_step": 0.2,
         "regime_hysteresis_enter_swing": 0.75,
         "regime_hysteresis_enter_scalp": 0.25,
         # ✅ 스타일 AI 보조(선택): 레짐 전환/표시에서 불필요한 OpenAI 호출을 줄이기 위해 분리 옵션 제공
@@ -653,7 +655,8 @@ def default_settings() -> Dict[str, Any]:
 
         "swing_tp_roi_min": 3.0,
         "swing_tp_roi_max": 50.0,
-        "swing_sl_roi_min": 1.5,
+        # ✅ 스윙 손절(ROI%)은 너무 짧으면 휩쏘로 잘리는 문제가 커서 기본을 더 넓게(요구사항)
+        "swing_sl_roi_min": 12.0,
         "swing_sl_roi_max": 30.0,
         "swing_entry_pct_mult": 1.0,
         "swing_lev_cap": 25,
@@ -683,6 +686,12 @@ def default_settings() -> Dict[str, Any]:
         "sr_buffer_atr_mult": 0.25,
         "sr_rr_min": 1.5,
         "sr_levels_cache_sec": 60,
+        # ✅ 스윙 전용 SR 파라미터(더 큰 매물대/완만한 SL/TP)
+        "sr_timeframe_swing": "1h",
+        "sr_lookback_swing": 320,
+        "sr_pivot_order_swing": 8,
+        "sr_buffer_atr_mult_swing": 0.45,
+        "sr_rr_min_swing": 2.0,
 
         # ✅ 추세 필터 정책(기능 유지/확장)
         "trend_filter_enabled": True,
@@ -701,6 +710,10 @@ def default_settings() -> Dict[str, Any]:
         "gsheet_allow_legacy_logs": False,
         # ✅ Google Sheets 표(서식) 자동 적용(권장): 1회만 적용되며, UI에서 강제 재적용 가능
         "gsheet_auto_format_enable": True,
+        # ✅ 관리자(명령/버튼) 응답 출력 위치
+        # - 요구: "관리자가 봇을 작동하면, 답변은 채널로"
+        # - 옵션: "channel"|"admin"|"both"
+        "tg_admin_replies_to": "channel",
     }
 
 
@@ -1716,7 +1729,7 @@ def gsheet_mode() -> str:
 def _gsheet_trade_ws_names() -> Dict[str, str]:
     stg = _gsheet_get_settings()
     base = str(stg.get("worksheet", "") or "").strip() or "TRADES"
-    return {"trade": base, "hourly": f"{base}_HOURLY", "daily": f"{base}_DAILY"}
+    return {"trade": base, "hourly": f"{base}_HOURLY", "daily": f"{base}_DAILY", "calendar": f"{base}_CALENDAR"}
 
 
 def _gsheet_get_settings() -> Dict[str, str]:
@@ -2091,6 +2104,7 @@ def _gsheet_prepare_trades_only_sheets(sh: Any) -> Optional[Dict[str, Any]]:
     base = names["trade"]
     hourly = names["hourly"]
     daily = names["daily"]
+    calendar_ws = names["calendar"]
 
     try:
         ws_trade = None
@@ -2203,7 +2217,18 @@ def _gsheet_prepare_trades_only_sheets(sh: Any) -> Optional[Dict[str, Any]]:
 
         ws_hourly = _gsheet_get_or_create_worksheet(sh, hourly, rows=2000, cols=len(GSHEET_HOURLY_SUMMARY_HEADER) + 2)
         ws_daily = _gsheet_get_or_create_worksheet(sh, daily, rows=2000, cols=len(GSHEET_DAILY_SUMMARY_HEADER) + 2)
-        return {"ws_trade": ws_trade, "ws_hourly": ws_hourly, "ws_daily": ws_daily, "trade_title": base, "hourly_title": hourly, "daily_title": daily}
+        # ✅ 달력형 일별 요약(요구사항)
+        ws_calendar = _gsheet_get_or_create_worksheet(sh, calendar_ws, rows=140, cols=10)
+        return {
+            "ws_trade": ws_trade,
+            "ws_hourly": ws_hourly,
+            "ws_daily": ws_daily,
+            "ws_calendar": ws_calendar,
+            "trade_title": base,
+            "hourly_title": hourly,
+            "daily_title": daily,
+            "calendar_title": calendar_ws,
+        }
     except Exception as e:
         notify_admin_error("GSHEET_PREPARE", e, min_interval_sec=180.0)
         return None
@@ -2216,7 +2241,7 @@ def _gsheet_prepare_trades_only_sheets(sh: Any) -> Optional[Dict[str, Any]]:
 # - 레이트리밋 방지: sync state에 "버전+시트명"을 저장해 1회만 적용
 # =========================================================
 
-GSHEET_FORMAT_VERSION = 2
+GSHEET_FORMAT_VERSION = 3
 
 
 def _gsheet_auto_format_enabled() -> bool:
@@ -2238,7 +2263,7 @@ def _gsheet_auto_format_enabled() -> bool:
         return True
 
 
-def _gsheet_format_is_already_applied(st0: Dict[str, Any], trade_title: str, hourly_title: str, daily_title: str) -> bool:
+def _gsheet_format_is_already_applied(st0: Dict[str, Any], trade_title: str, hourly_title: str, daily_title: str, calendar_title: str = "") -> bool:
     try:
         ver = int(st0.get("format_version_applied", 0) or 0)
         if ver != int(GSHEET_FORMAT_VERSION):
@@ -2248,6 +2273,8 @@ def _gsheet_format_is_already_applied(st0: Dict[str, Any], trade_title: str, hou
         if str(st0.get("format_hourly_title", "") or "") != str(hourly_title or ""):
             return False
         if str(st0.get("format_daily_title", "") or "") != str(daily_title or ""):
+            return False
+        if str(st0.get("format_calendar_title", "") or "") != str(calendar_title or ""):
             return False
         return True
     except Exception:
@@ -2581,16 +2608,18 @@ def _gsheet_apply_trades_only_format_internal(
         trade_title = str(sheets.get("trade_title", "") or "")
         hourly_title = str(sheets.get("hourly_title", "") or "")
         daily_title = str(sheets.get("daily_title", "") or "")
+        calendar_title = str(sheets.get("calendar_title", "") or "")
         ws_trade = sheets.get("ws_trade")
         ws_hourly = sheets.get("ws_hourly")
         ws_daily = sheets.get("ws_daily")
-        if ws_trade is None or ws_hourly is None or ws_daily is None:
+        ws_calendar = sheets.get("ws_calendar")
+        if ws_trade is None or ws_hourly is None or ws_daily is None or ws_calendar is None:
             return {"ok": False, "error": "missing_worksheets"}
 
         if not _gsheet_auto_format_enabled():
             return {"ok": True, "skipped": True, "reason": "auto_format_disabled"}
 
-        if (not force) and _gsheet_format_is_already_applied(st0, trade_title, hourly_title, daily_title):
+        if (not force) and _gsheet_format_is_already_applied(st0, trade_title, hourly_title, daily_title, calendar_title):
             return {"ok": True, "skipped": True, "reason": "already_applied"}
 
         md = _gsheet_fetch_metadata_safe(sh)
@@ -2697,6 +2726,142 @@ def _gsheet_apply_trades_only_format_internal(
         except Exception:
             pass
 
+        # ---- Calendar ----
+        try:
+            sid = int(getattr(ws_calendar, "id", -1))
+            rc = int(getattr(ws_calendar, "row_count", 140) or 140)
+            cc = int(getattr(ws_calendar, "col_count", 8) or 8)
+            cc = max(cc, 8)
+            sm = by_id.get(sid, {})
+            reqs += _gsheet_build_cleanup_requests(sid, sm)
+
+            # Freeze top 2 rows + left 1 column
+            reqs.append(
+                {
+                    "updateSheetProperties": {
+                        "properties": {"sheetId": sid, "gridProperties": {"frozenRowCount": 2, "frozenColumnCount": 1}},
+                        "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
+                    }
+                }
+            )
+
+            # Column widths: A(label)=140, B~H=120
+            col_widths = {0: 140, 1: 120, 2: 120, 3: 120, 4: 120, 5: 120, 6: 120, 7: 120}
+            for c0, w in col_widths.items():
+                reqs.append(
+                    {
+                        "updateDimensionProperties": {
+                            "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": int(c0), "endIndex": int(c0) + 1},
+                            "properties": {"pixelSize": int(w)},
+                            "fields": "pixelSize",
+                        }
+                    }
+                )
+
+            # Header row 1 (A1:H1)
+            reqs.append(
+                {
+                    "repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 8},
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": _gsheet_color("#202124"),
+                                "horizontalAlignment": "LEFT",
+                                "textFormat": {"foregroundColor": _gsheet_color("#ffffff"), "bold": True, "fontSize": 12},
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)",
+                    }
+                }
+            )
+
+            # Header row 2 (A2:H2) day names
+            reqs.append(
+                {
+                    "repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 8},
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": _gsheet_color("#303134"),
+                                "horizontalAlignment": "CENTER",
+                                "textFormat": {"foregroundColor": _gsheet_color("#ffffff"), "bold": True},
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)",
+                    }
+                }
+            )
+
+            # Label column A (body rows only; A3:A22 정도면 충분)
+            reqs.append(
+                {
+                    "repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 2, "endRowIndex": 20, "startColumnIndex": 0, "endColumnIndex": 1},
+                        "cell": {"userEnteredFormat": {"backgroundColor": _gsheet_color("#f1f3f4"), "textFormat": {"bold": True}}},
+                        "fields": "userEnteredFormat(backgroundColor,textFormat)",
+                    }
+                }
+            )
+
+            # Center align calendar grid (B3:H20)
+            reqs.append(
+                {
+                    "repeatCell": {
+                        "range": {"sheetId": sid, "startRowIndex": 2, "endRowIndex": 20, "startColumnIndex": 1, "endColumnIndex": 8},
+                        "cell": {"userEnteredFormat": {"horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE"}},
+                        "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment)",
+                    }
+                }
+            )
+
+            # Number formats for PnL rows / Trades rows
+            pnl_rows = [3, 6, 9, 12, 15, 18]  # 0-based row indices for "손익(USDT)" rows
+            trade_rows = [4, 7, 10, 13, 16, 19]  # "거래수" rows
+            for r0 in pnl_rows:
+                reqs.append(
+                    {
+                        "repeatCell": {
+                            "range": {"sheetId": sid, "startRowIndex": int(r0), "endRowIndex": int(r0) + 1, "startColumnIndex": 1, "endColumnIndex": 8},
+                            "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "0.00"}}},
+                            "fields": "userEnteredFormat.numberFormat",
+                        }
+                    }
+                )
+            for r0 in trade_rows:
+                reqs.append(
+                    {
+                        "repeatCell": {
+                            "range": {"sheetId": sid, "startRowIndex": int(r0), "endRowIndex": int(r0) + 1, "startColumnIndex": 1, "endColumnIndex": 8},
+                            "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "0"}}},
+                            "fields": "userEnteredFormat.numberFormat",
+                        }
+                    }
+                )
+
+            # Conditional formats (PnL rows only)
+            rngs = [
+                {"sheetId": sid, "startRowIndex": int(r0), "endRowIndex": int(r0) + 1, "startColumnIndex": 1, "endColumnIndex": 8}
+                for r0 in pnl_rows
+            ]
+            green_rule = {
+                "ranges": rngs,
+                "booleanRule": {
+                    "condition": {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "0"}]},
+                    "format": {"backgroundColor": _gsheet_color("#e6f4ea"), "textFormat": {"foregroundColor": _gsheet_color("#137333"), "bold": True}},
+                },
+            }
+            red_rule = {
+                "ranges": rngs,
+                "booleanRule": {
+                    "condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]},
+                    "format": {"backgroundColor": _gsheet_color("#fce8e6"), "textFormat": {"foregroundColor": _gsheet_color("#a50e0e"), "bold": True}},
+                },
+            }
+            reqs.append({"addConditionalFormatRule": {"rule": green_rule, "index": 0}})
+            reqs.append({"addConditionalFormatRule": {"rule": red_rule, "index": 1}})
+        except Exception:
+            pass
+
         if not reqs:
             return {"ok": True, "skipped": True, "reason": "no_requests"}
 
@@ -2711,6 +2876,7 @@ def _gsheet_apply_trades_only_format_internal(
             st0["format_trade_title"] = trade_title
             st0["format_hourly_title"] = hourly_title
             st0["format_daily_title"] = daily_title
+            st0["format_calendar_title"] = calendar_title
         except Exception:
             pass
         return {"ok": True, "applied": True, "requests": int(len(reqs))}
@@ -2895,6 +3061,92 @@ def _trade_log_to_hourly_daily(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     return df_h, df_d
 
 
+def _daily_summary_to_calendar_values(df_d: pd.DataFrame, year: int, month: int) -> List[List[Any]]:
+    """
+    일별 요약(df_d)을 "달력 형태"의 값 테이블로 변환한다.
+    - 시트 레이아웃: A=라벨, B~H=월~일
+    - 각 주마다 3행 블록: 날짜 / 손익(USDT) / 거래수
+    """
+    import calendar as _cal
+
+    y = int(year)
+    m = int(month)
+    asof = now_kst_str()
+
+    # map: YYYY-MM-DD -> {pnl, trades}
+    pnl_map: Dict[str, float] = {}
+    trades_map: Dict[str, int] = {}
+    try:
+        if df_d is not None and (not df_d.empty) and ("날짜(KST)" in df_d.columns):
+            for _, r in df_d.iterrows():
+                ds = str(r.get("날짜(KST)", "") or "").strip()
+                if not ds:
+                    continue
+                try:
+                    pnl_map[ds] = float(pd.to_numeric(r.get("총손익(USDT)"), errors="coerce") or 0.0)
+                except Exception:
+                    pnl_map[ds] = float(r.get("총손익(USDT)", 0.0) or 0.0)
+                try:
+                    trades_map[ds] = int(pd.to_numeric(r.get("거래수"), errors="coerce") or 0)
+                except Exception:
+                    try:
+                        trades_map[ds] = int(r.get("거래수", 0) or 0)
+                    except Exception:
+                        trades_map[ds] = 0
+    except Exception:
+        pnl_map = {}
+        trades_map = {}
+
+    cal = _cal.Calendar(firstweekday=0)  # 0=월
+    weeks = cal.monthdatescalendar(y, m) or []
+    # 6주 고정(표 크기 일정)
+    while len(weeks) < 6:
+        if weeks:
+            last = weeks[-1][-1]
+            nxt = [last + timedelta(days=i) for i in range(1, 8)]
+            weeks.append(nxt)
+        else:
+            # fallback: 빈 6주
+            base = datetime(y, m, 1).date()
+            weeks = [[base + timedelta(days=i) for i in range(7)] for _ in range(6)]
+            break
+    weeks = weeks[:6]
+
+    # Header rows (8 cols: A..H)
+    values: List[List[Any]] = []
+    values.append([f"📅 {y:04d}-{m:02d} 매매 달력(KST)", f"업데이트: {asof}", "", "", "", "", "", ""])
+    values.append(["", "월", "화", "수", "목", "금", "토", "일"])
+
+    for wk in weeks:
+        # 날짜(일자)
+        row_day = ["날짜"]
+        row_pnl = ["손익(USDT)"]
+        row_tr = ["거래수"]
+        for d in wk[:7]:
+            try:
+                in_month = (d.year == y and d.month == m)
+            except Exception:
+                in_month = False
+            if not in_month:
+                row_day.append("")
+                row_pnl.append("")
+                row_tr.append("")
+                continue
+            ds = f"{d.year:04d}-{d.month:02d}-{d.day:02d}"
+            row_day.append(str(d.day))
+            row_pnl.append(float(pnl_map.get(ds, 0.0)))
+            row_tr.append(int(trades_map.get(ds, 0)))
+        values.append(row_day)
+        values.append(row_pnl)
+        values.append(row_tr)
+
+    # 20 rows fixed: 2 + 6*3
+    if len(values) < 20:
+        for _ in range(20 - len(values)):
+            values.append([""] * 8)
+    return values[:20]
+
+
 def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) -> Dict[str, Any]:
     """
     ✅ 사용자 요구 반영:
@@ -2920,6 +3172,7 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
         ws_trade = sheets["ws_trade"]
         ws_hourly = sheets["ws_hourly"]
         ws_daily = sheets["ws_daily"]
+        ws_calendar = sheets.get("ws_calendar")
         # 상태 캐시(진단용)
         try:
             with _GSHEET_CACHE_LOCK:
@@ -2936,6 +3189,7 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
             st0["trade_ws_title"] = str(sheets.get("trade_title", "") or "")
             st0["hourly_ws_title"] = str(sheets.get("hourly_title", "") or "")
             st0["daily_ws_title"] = str(sheets.get("daily_title", "") or "")
+            st0["calendar_ws_title"] = str(sheets.get("calendar_title", "") or "")
         except Exception:
             pass
 
@@ -3064,6 +3318,7 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
         last_sum = float(st0.get("last_summary_sync_epoch", 0) or 0)
         summary_due = force_summary or (appended > 0) or ((now_ts - last_sum) >= 60 * 30)
         did_summary = False
+        did_calendar = False
         if summary_due:
             df_h, df_d = _trade_log_to_hourly_daily(df)
             # update (clear+update: 표가 짧아질 때 잔여행 방지)
@@ -3083,6 +3338,17 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
                 ws_daily.update("A1", vals_d)
             except Exception:
                 pass
+            # ✅ 달력형 일별 요약(요구사항): 현재 월 기준
+            try:
+                if ws_calendar is not None:
+                    n0 = now_kst()
+                    cal_vals = _daily_summary_to_calendar_values(df_d, int(n0.year), int(n0.month))
+                    ws_calendar.update("A1", cal_vals)
+                    did_calendar = True
+                    st0["last_calendar_sync_epoch"] = now_ts
+                    st0["last_calendar_sync_kst"] = now_kst_str()
+            except Exception:
+                pass
             did_summary = True
             st0["last_summary_sync_epoch"] = now_ts
             st0["last_summary_sync_kst"] = now_kst_str()
@@ -3098,7 +3364,7 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
             _GSHEET_CACHE["last_append_stage"] = "TRADES_ONLY_SYNC"
             _GSHEET_CACHE["last_err"] = ""
             _GSHEET_CACHE["last_tb"] = ""
-        return {"ok": True, "appended": appended, "summary": did_summary}
+        return {"ok": True, "appended": appended, "summary": did_summary, "calendar": did_calendar}
 
     try:
         res = _call_with_timeout(_do, timeout_sec)
@@ -3156,8 +3422,10 @@ def gsheet_status_snapshot() -> Dict[str, Any]:
                             "trade_sheet": str(st0.get("trade_ws_title") or names.get("trade", "")),
                             "hourly_sheet": str(st0.get("hourly_ws_title") or names.get("hourly", "")),
                             "daily_sheet": str(st0.get("daily_ws_title") or names.get("daily", "")),
+                            "calendar_sheet": str(st0.get("calendar_ws_title") or names.get("calendar", "")),
                             "last_trade_sync_kst": str(st0.get("last_trade_sync_kst", "") or ""),
                             "last_summary_sync_kst": str(st0.get("last_summary_sync_kst", "") or ""),
+                            "last_calendar_sync_kst": str(st0.get("last_calendar_sync_kst", "") or ""),
                             "synced_trade_ids": int(len(st0.get("synced_trade_ids", []) or [])),
                             "format_version_applied": int(st0.get("format_version_applied", 0) or 0),
                             "format_applied_kst": str(st0.get("format_applied_kst", "") or ""),
@@ -3978,6 +4246,250 @@ def sr_stop_take(
     }
 
 
+def _sr_params_for_style(style: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    스타일별 SR 파라미터를 반환한다.
+    - 스윙: 더 큰 매물대/완만한 버퍼(손절/익절이 너무 타이트해지는 문제 완화)
+    - 스캘핑: 기존(기본) SR
+    """
+    st = str(style or "").strip()
+    if st == "스윙":
+        return {
+            "tf": str(cfg.get("sr_timeframe_swing", "1h") or "1h"),
+            "lookback": int(cfg.get("sr_lookback_swing", 320) or 320),
+            "pivot_order": int(cfg.get("sr_pivot_order_swing", 8) or 8),
+            "buffer_atr_mult": float(cfg.get("sr_buffer_atr_mult_swing", 0.45) or 0.45),
+            "rr_min": float(cfg.get("sr_rr_min_swing", 2.0) or 2.0),
+        }
+    return {
+        "tf": str(cfg.get("sr_timeframe", "15m") or "15m"),
+        "lookback": int(cfg.get("sr_lookback", 220) or 220),
+        "pivot_order": int(cfg.get("sr_pivot_order", 6) or 6),
+        "buffer_atr_mult": float(cfg.get("sr_buffer_atr_mult", 0.25) or 0.25),
+        "rr_min": float(cfg.get("sr_rr_min", 1.5) or 1.5),
+    }
+
+
+def _sr_price_bounds_from_price_pct(entry_price: float, side: str, sl_price_pct: float, tp_price_pct: float) -> Tuple[float, float]:
+    """
+    ROI%가 아니라 "가격 변동폭%" 기준으로 SL/TP 최소 기준가를 계산한다.
+    - buy(롱): sl_bound = entry*(1 - sl_pct), tp_bound = entry*(1 + tp_pct)
+    - sell(숏): sl_bound = entry*(1 + sl_pct), tp_bound = entry*(1 - tp_pct)
+    """
+    px = float(entry_price or 0.0)
+    slp = float(max(0.0, sl_price_pct))
+    tpp = float(max(0.0, tp_price_pct))
+    if str(side or "").lower().strip() == "buy":
+        return px * (1.0 - slp / 100.0), px * (1.0 + tpp / 100.0)
+    return px * (1.0 + slp / 100.0), px * (1.0 - tpp / 100.0)
+
+
+def _sr_pick_sl_tp_price(
+    *,
+    entry_price: float,
+    side: str,
+    sl_bound: float,
+    tp_bound: float,
+    supports: List[float],
+    resistances: List[float],
+    buf: float,
+    ai_sl_price: Optional[float] = None,
+    ai_tp_price: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    SR 후보 + AI 후보를 섞어서 최종 SL/TP 가격을 선택한다.
+    목표:
+    - SR 기반(지지/저항) 원칙 유지
+    - 하지만 ROI/리스크 가드레일이 만든 "최소 가격 손절폭"보다 더 타이트한 SR/AI 라인은 채택하지 않음
+      (요구사항: 스윙인데 -2~-3%에서 잘리는 문제 완화)
+    """
+    px = float(entry_price or 0.0)
+    s = str(side or "").lower().strip()
+    out = {"sl_price": None, "tp_price": None, "sl_source": "", "tp_source": ""}
+
+    def _f(x) -> Optional[float]:
+        try:
+            if x is None:
+                return None
+            if isinstance(x, str) and not x.strip():
+                return None
+            v = float(x)
+            if not math.isfinite(v):
+                return None
+            return v
+        except Exception:
+            return None
+
+    ai_sl = _f(ai_sl_price)
+    ai_tp = _f(ai_tp_price)
+    buf2 = float(buf or 0.0)
+
+    if s == "buy":
+        # SL candidates: AI or supports-buf (must be below entry and <= sl_bound)
+        sl_cands: List[Tuple[float, str]] = []
+        if ai_sl is not None and ai_sl < px:
+            sl_cands.append((ai_sl, "AI"))
+        for lv in (supports or []):
+            try:
+                sp = float(lv) - buf2
+                if sp < px:
+                    sl_cands.append((sp, "SR"))
+            except Exception:
+                continue
+        sl_ok = [(p, src) for (p, src) in sl_cands if p <= float(sl_bound)]
+        if sl_ok:
+            # 가장 덜 타이트(=entry에 가장 가까운) 기준으로 선택
+            p_sel, src_sel = max(sl_ok, key=lambda x: x[0])
+            out["sl_price"] = float(p_sel)
+            out["sl_source"] = str(src_sel)
+        else:
+            out["sl_price"] = float(sl_bound)
+            out["sl_source"] = "ROI"
+
+        # TP candidates: AI or resistances (must be above entry and >= tp_bound)
+        tp_cands: List[Tuple[float, str]] = []
+        if ai_tp is not None and ai_tp > px:
+            tp_cands.append((ai_tp, "AI"))
+        for lv in (resistances or []):
+            try:
+                rp = float(lv)
+                if rp > px:
+                    tp_cands.append((rp, "SR"))
+            except Exception:
+                continue
+        tp_ok = [(p, src) for (p, src) in tp_cands if p >= float(tp_bound)]
+        if tp_ok:
+            p_sel, src_sel = min(tp_ok, key=lambda x: x[0])
+            out["tp_price"] = float(p_sel)
+            out["tp_source"] = str(src_sel)
+        else:
+            out["tp_price"] = float(tp_bound)
+            out["tp_source"] = "ROI"
+
+    else:
+        # sell(숏)
+        # SL candidates: AI or resistances+buf (must be above entry and >= sl_bound)
+        sl_cands2: List[Tuple[float, str]] = []
+        if ai_sl is not None and ai_sl > px:
+            sl_cands2.append((ai_sl, "AI"))
+        for lv in (resistances or []):
+            try:
+                rp = float(lv) + buf2
+                if rp > px:
+                    sl_cands2.append((rp, "SR"))
+            except Exception:
+                continue
+        sl_ok2 = [(p, src) for (p, src) in sl_cands2 if p >= float(sl_bound)]
+        if sl_ok2:
+            # 가장 덜 타이트(=entry에 가장 가까운) 기준으로 선택
+            p_sel, src_sel = min(sl_ok2, key=lambda x: x[0])
+            out["sl_price"] = float(p_sel)
+            out["sl_source"] = str(src_sel)
+        else:
+            out["sl_price"] = float(sl_bound)
+            out["sl_source"] = "ROI"
+
+        # TP candidates: AI or supports (must be below entry and <= tp_bound)
+        tp_cands2: List[Tuple[float, str]] = []
+        if ai_tp is not None and ai_tp < px:
+            tp_cands2.append((ai_tp, "AI"))
+        for lv in (supports or []):
+            try:
+                sp = float(lv)
+                if sp < px:
+                    tp_cands2.append((sp, "SR"))
+            except Exception:
+                continue
+        tp_ok2 = [(p, src) for (p, src) in tp_cands2 if p <= float(tp_bound)]
+        if tp_ok2:
+            p_sel, src_sel = max(tp_ok2, key=lambda x: x[0])
+            out["tp_price"] = float(p_sel)
+            out["tp_source"] = str(src_sel)
+        else:
+            out["tp_price"] = float(tp_bound)
+            out["tp_source"] = "ROI"
+
+    return out
+
+
+def sr_prices_for_style(
+    ex,
+    sym: str,
+    *,
+    entry_price: float,
+    side: str,
+    style: str,
+    cfg: Dict[str, Any],
+    sl_price_pct: float,
+    tp_price_pct: float,
+    ai_sl_price: Optional[float] = None,
+    ai_tp_price: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    최종 SL/TP 가격을 계산(SR 기반 + AI 후보 + ROI 바운드 보정).
+    - 네트워크/계산 실패 시에도 None을 반환하고 상위에서 fallback 하도록 한다.
+    """
+    out = {
+        "ok": False,
+        "sl_price": None,
+        "tp_price": None,
+        "sl_source": "",
+        "tp_source": "",
+        "tf": "",
+        "lookback": 0,
+        "pivot_order": 0,
+        "buffer_atr_mult": 0.0,
+        "rr_min": 0.0,
+        "atr": 0.0,
+    }
+    if not sym:
+        return out
+    try:
+        params = _sr_params_for_style(style, cfg)
+        sr_tf = str(params.get("tf") or "")
+        sr_lb = int(params.get("lookback") or 0)
+        piv = int(params.get("pivot_order") or 0)
+        buf_mul = float(params.get("buffer_atr_mult") or 0.0)
+        rr_min = float(params.get("rr_min") or 0.0)
+
+        out.update({"tf": sr_tf, "lookback": sr_lb, "pivot_order": piv, "buffer_atr_mult": buf_mul, "rr_min": rr_min})
+
+        htf = safe_fetch_ohlcv(ex, sym, sr_tf, limit=max(120, sr_lb))
+        if not htf:
+            return out
+        hdf = pd.DataFrame(htf, columns=["time", "open", "high", "low", "close", "vol"])
+        try:
+            hdf["time"] = pd.to_datetime(hdf["time"], unit="ms")
+        except Exception:
+            pass
+
+        atr = calc_atr(hdf, int(cfg.get("sr_atr_period", 14)))
+        out["atr"] = float(atr)
+        supports, resistances = pivot_levels(hdf, order=max(3, piv))
+        buf = (atr * buf_mul) if atr > 0 else float(entry_price) * 0.0015
+
+        sl_bound, tp_bound = _sr_price_bounds_from_price_pct(float(entry_price), str(side), float(sl_price_pct), float(tp_price_pct))
+        picked = _sr_pick_sl_tp_price(
+            entry_price=float(entry_price),
+            side=str(side),
+            sl_bound=float(sl_bound),
+            tp_bound=float(tp_bound),
+            supports=list(supports or []),
+            resistances=list(resistances or []),
+            buf=float(buf),
+            ai_sl_price=ai_sl_price,
+            ai_tp_price=ai_tp_price,
+        )
+        out["sl_price"] = picked.get("sl_price", None)
+        out["tp_price"] = picked.get("tp_price", None)
+        out["sl_source"] = str(picked.get("sl_source", "") or "")
+        out["tp_source"] = str(picked.get("tp_source", "") or "")
+        out["ok"] = bool(out["sl_price"] is not None and out["tp_price"] is not None)
+        return out
+    except Exception:
+        return out
+
+
 # ✅ SR 레벨 캐시(스캔 과정 표시/안정성/요청 과다 방지)
 _SR_CACHE: Dict[str, Dict[str, Any]] = {}
 
@@ -4684,7 +5196,8 @@ def fetch_daily_btc_brief(cfg: Dict[str, Any]) -> Dict[str, Any]:
         client = get_openai_client(cfg)
         if client is not None:
             try:
-                payload = {"date": date_str, "titles": items_ko}
+                # 예측 대상(거래 대상 코인)도 같이 전달
+                payload = {"date": date_str, "titles": items_ko, "targets": TARGET_COINS}
 
                 def _do():
                     return client.chat.completions.create(
@@ -4696,8 +5209,10 @@ def fetch_daily_btc_brief(cfg: Dict[str, Any]) -> Dict[str, Any]:
                                     "너는 암호화폐 트레이딩용 아침 브리핑 에디터다.\n"
                                     "입력된 제목 리스트에서 '비트코인/거시경제' 관점으로 중요한 5개를 골라,"
                                     "각 항목을 아주 짧고 쉬운 한국어 한줄로 정리해라.\n"
+                                    "추가로, targets(코인 리스트)에 대해 오늘 하루의 방향성(롱/숏/관망)을 아주 보수적으로 '예측'해라.\n"
+                                    "- 예측은 참고용이며, 과장 금지.\n"
                                     "출력은 반드시 JSON만.\n"
-                                    '형식: {"items":[{"emoji":"📰","title":"...","note":"한줄 요약"}], "bias":"중립|보수|공격", "risk":"낮음|보통|높음"}'
+                                    '형식: {"items":[{"emoji":"📰","title":"...","note":"한줄 요약"}], "bias":"중립|보수|공격", "risk":"낮음|보통|높음", "outlook":[{"symbol":"BTC/USDT:USDT","dir":"롱|숏|관망","confidence":0-100,"note":"아주 짧게"}]}'
                                 ),
                             },
                             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -4714,6 +5229,13 @@ def fetch_daily_btc_brief(cfg: Dict[str, Any]) -> Dict[str, Any]:
                     out["items"] = items[: int(cfg.get("daily_btc_brief_max_items", 5))]
                     out["bias"] = str(jj.get("bias", "중립"))
                     out["risk"] = str(jj.get("risk", "보통"))
+                    # 코인/방향 예측(선택)
+                    try:
+                        outlk = jj.get("outlook", []) or jj.get("signals", [])
+                        if isinstance(outlk, list):
+                            out["outlook"] = outlk[: min(10, len(outlk))]
+                    except Exception:
+                        pass
                     out["source"] = "openai"
                 else:
                     out["items"] = [{"emoji": "📰", "title": t, "note": ""} for t in items_ko]
@@ -5039,7 +5561,17 @@ def _risk_guardrail(out: Dict[str, Any], df: pd.DataFrame, decision: str, mode: 
     return out
 
 
-def ai_decide_trade(df: pd.DataFrame, status: Dict[str, Any], symbol: str, mode: str, cfg: Dict[str, Any], external: Dict[str, Any]) -> Dict[str, Any]:
+def ai_decide_trade(
+    df: pd.DataFrame,
+    status: Dict[str, Any],
+    symbol: str,
+    mode: str,
+    cfg: Dict[str, Any],
+    external: Dict[str, Any],
+    trend_long: str = "",
+    sr_context: Optional[Dict[str, Any]] = None,
+    chart_style_hint: str = "",
+) -> Dict[str, Any]:
     """
     ✅ 기존 기능 유지: AI가 buy/sell/hold + entry/leverage/sl/tp/rr/근거(JSON)
     ✅ 안정성 강화: timeout + 예외 처리
@@ -5062,7 +5594,13 @@ def ai_decide_trade(df: pd.DataFrame, status: Dict[str, Any], symbol: str, mode:
 
     # daily brief를 포함한 외부시황(이미 thread에서 build했으면 그걸 쓰게 external 파라미터로 전달)
     ext = external or {}
-    daily_brief = (ext.get("daily_btc_brief") or {}) if isinstance(ext, dict) else {}
+    ext_enabled = False
+    try:
+        if isinstance(ext, dict) and ext:
+            ext_enabled = bool(ext.get("enabled", True))
+    except Exception:
+        ext_enabled = False
+    daily_brief = (ext.get("daily_btc_brief") or {}) if (ext_enabled and isinstance(ext, dict)) else {}
 
     features = {
         "symbol": symbol,
@@ -5072,6 +5610,7 @@ def ai_decide_trade(df: pd.DataFrame, status: Dict[str, Any], symbol: str, mode:
         "rsi_now": float(last.get("RSI", 50)) if "RSI" in df.columns else None,
         "adx": float(last.get("ADX", 0)) if "ADX" in df.columns else None,
         "trend_short": status.get("추세", ""),  # 단기추세(timeframe)
+        "trend_long": str(trend_long or ""),
         "bb": status.get("BB", ""),
         "macd": status.get("MACD", ""),
         "vol": status.get("거래량", ""),
@@ -5079,17 +5618,23 @@ def ai_decide_trade(df: pd.DataFrame, status: Dict[str, Any], symbol: str, mode:
         "rsi_resolve_short": bool(status.get("_rsi_resolve_short", False)),
         "pullback_candidate": bool(status.get("_pullback_candidate", False)),
         "atr_price_pct": _atr_price_pct(df, 14),
-        "external": {
-            "fear_greed": ext.get("fear_greed"),
-            "high_impact_events_soon": (ext.get("high_impact_events_soon") or [])[:3],
-            "global": ext.get("global"),
-            "daily_btc_brief": daily_brief,
-        },
+        "sr_context": sr_context or {},
+        "chart_style_hint": str(chart_style_hint or ""),
+        "external": (
+            {
+                "fear_greed": ext.get("fear_greed"),
+                "high_impact_events_soon": (ext.get("high_impact_events_soon") or [])[:3],
+                "global": ext.get("global"),
+                "daily_btc_brief": daily_brief,
+            }
+            if ext_enabled
+            else {}
+        ),
     }
 
     fg_txt = ""
     try:
-        fg = (ext or {}).get("fear_greed") or {}
+        fg = (ext or {}).get("fear_greed") or {} if ext_enabled else {}
         if fg:
             fg_txt = f"- 공포탐욕지수: {fg.get('emoji','')} {int(fg.get('value', 0))} / {fg.get('classification','')}"
     except Exception:
@@ -5097,7 +5642,7 @@ def ai_decide_trade(df: pd.DataFrame, status: Dict[str, Any], symbol: str, mode:
 
     ev_txt = ""
     try:
-        evs = (ext or {}).get("high_impact_events_soon") or []
+        evs = (ext or {}).get("high_impact_events_soon") or [] if ext_enabled else []
         if evs:
             ev_txt = "- 중요 이벤트(임박): " + " | ".join([f"{e.get('country','')} {e.get('title','')}" for e in evs[:3]])
     except Exception:
@@ -5111,16 +5656,15 @@ def ai_decide_trade(df: pd.DataFrame, status: Dict[str, Any], symbol: str, mode:
     except Exception:
         brief_txt = ""
 
+    ext_hdr = "[외부 시황(참고)]\n" + "\n".join([x for x in [fg_txt, ev_txt, brief_txt] if x]) if ext_enabled else "[외부 시황] (스캘핑/단기 판단: 적용하지 않음)"
+
     sys = f"""
 너는 '워뇨띠 스타일(눌림목/해소 타이밍) + 손익비' 기반의 자동매매 트레이더 AI다.
 
 [과거 실수(요약)]
 {past_mistakes}
 
-[외부 시황(참고)]
-{fg_txt}
-{ev_txt}
-{brief_txt}
+{ext_hdr}
 
 [핵심 룰]
 1) RSI 과매도/과매수 '상태'에 즉시 진입하지 말고, '해소되는 시점'에서만 진입 후보.
@@ -5133,6 +5677,9 @@ def ai_decide_trade(df: pd.DataFrame, status: Dict[str, Any], symbol: str, mode:
 [중요]
 - sl_pct / tp_pct는 ROI%(레버 반영 수익률)로 출력한다.
 - 변동성(atr_price_pct)이 작으면 손절을 너무 타이트하게 잡지 마라.
+- sr_context(지지/저항) 정보를 참고해, 가능하면 sl_price/tp_price(가격)를 함께 지정해라.
+  - buy(롱): sl_price는 price보다 낮게, tp_price는 price보다 높게
+  - sell(숏): sl_price는 price보다 높게, tp_price는 price보다 낮게
 - 영어 금지. 쉬운 한글.
 - 반드시 JSON만 출력.
 """
@@ -5150,6 +5697,8 @@ JSON 형식:
   "sl_pct": 0.3-50.0,
   "tp_pct": 0.5-150.0,
   "rr": 0.5-10.0,
+  "sl_price": number|null,
+  "tp_price": number|null,
   "used_indicators": ["..."],
   "reason_easy": "쉬운 한글"
 }}
@@ -5199,6 +5748,33 @@ JSON 형식:
         out["sl_pct"] = float(out.get("sl_pct", 1.2))
         out["tp_pct"] = float(out.get("tp_pct", 3.0))
         out["rr"] = float(out.get("rr", max(0.5, out["tp_pct"] / max(out["sl_pct"], 0.01))))
+
+        # (선택) 가격 기반 SL/TP (SR 기반)
+        try:
+            sp = out.get("sl_price", None)
+            tp = out.get("tp_price", None)
+            sp_f = float(sp) if sp is not None and str(sp).strip() != "" else None
+            tp_f = float(tp) if tp is not None and str(tp).strip() != "" else None
+            px_now = float(last["close"])
+            dec0 = str(out.get("decision", "hold"))
+            if dec0 == "buy":
+                if sp_f is not None and (sp_f <= 0 or sp_f >= px_now):
+                    sp_f = None
+                if tp_f is not None and (tp_f <= px_now):
+                    tp_f = None
+            elif dec0 == "sell":
+                if sp_f is not None and (sp_f <= px_now):
+                    sp_f = None
+                if tp_f is not None and (tp_f <= 0 or tp_f >= px_now):
+                    tp_f = None
+            else:
+                sp_f = None
+                tp_f = None
+            out["sl_price"] = sp_f
+            out["tp_price"] = tp_f
+        except Exception:
+            out["sl_price"] = None
+            out["tp_price"] = None
 
         used = out.get("used_indicators", status.get("_used_indicators", []))
         if not isinstance(used, list):
@@ -5367,7 +5943,7 @@ def apply_style_envelope(ai: Dict[str, Any], style: str, cfg: Dict[str, Any], ru
         elif style == "스윙":
             entry_pct = float(clamp(entry_pct * float(cfg.get("swing_entry_pct_mult", 1.0)), rule["entry_pct_min"], rule["entry_pct_max"]))
             lev = int(min(lev, int(cfg.get("swing_lev_cap", rule["lev_max"]))))
-            sl = float(clamp(sl, float(cfg.get("swing_sl_roi_min", 1.5)), float(cfg.get("swing_sl_roi_max", 30.0))))
+            sl = float(clamp(sl, float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 30.0))))
             tp = float(clamp(tp, float(cfg.get("swing_tp_roi_min", 3.0)), float(cfg.get("swing_tp_roi_max", 50.0))))
 
         out["entry_pct"] = entry_pct
@@ -6081,6 +6657,49 @@ def _maybe_switch_style_for_open_position(
         elif regime_mode in ["swing", "long"]:
             rec_style = "스윙"
 
+        # ✅ 플립플롭 방지(시간락 없이):
+        # - 장기추세가 계속 같은 방향인데, 단기추세가 "횡보/전환"처럼 중립으로 흔들리는 것만으로
+        #   스윙→스캘핑으로 급전환하지 않게 한다.
+        # - (중요) 레짐 강제 모드에서는 이 가드를 적용하지 않는다.
+        try:
+            if regime_mode == "auto" and cur_style == "스윙" and rec_style == "스캘핑":
+                def _trend_state(t: str) -> str:
+                    tt = str(t or "")
+                    if "상승" in tt:
+                        return "up"
+                    if "하락" in tt:
+                        return "down"
+                    if ("횡보" in tt) or ("전환" in tt):
+                        return "side"
+                    return "neutral"
+
+                def _align_state(state: str, side: str) -> bool:
+                    if side == "long":
+                        return state == "up"
+                    if side == "short":
+                        return state == "down"
+                    return False
+
+                def _opp_state(state: str, side: str) -> bool:
+                    if side == "long":
+                        return state == "down"
+                    if side == "short":
+                        return state == "up"
+                    return False
+
+                st_short = _trend_state(short_trend)
+                st_long = _trend_state(long_trend)
+                long_align = _align_state(st_long, str(pos_side or ""))
+                short_opp = _opp_state(st_short, str(pos_side or ""))
+                if long_align and (not short_opp) and st_short in ["side", "neutral"]:
+                    tgt["style_reco"] = "스윙"
+                    tgt["style_reco_note"] = "장기추세 유지 + 단기 중립 흔들림 → 스윙 유지"
+                    tgt["trend_short_now"] = f"{short_tf} {short_trend}"
+                    tgt["trend_long_now"] = f"{long_tf} {long_trend}"
+                    return tgt
+        except Exception:
+            pass
+
         switch_ctl = str(cfg.get("regime_switch_control", "confirm2")).lower().strip()  # confirm2|hysteresis|off
         if regime_mode == "auto" and rec_style == cur_style:
             # 연속 확인 로직이 "연속"이 되도록, 동일 스타일이 나오면 pending을 초기화
@@ -6154,6 +6773,16 @@ def _maybe_switch_style_for_open_position(
                     return tgt
 
         if rec_style != cur_style:
+            # 전환 전 목표(RR) 스냅샷
+            try:
+                old_tp = float(tgt.get("tp", 0) or 0.0)
+            except Exception:
+                old_tp = 0.0
+            try:
+                old_sl = float(tgt.get("sl", 0) or 0.0)
+            except Exception:
+                old_sl = 0.0
+            rr_old = (old_tp / max(abs(old_sl), 0.01)) if (old_tp or old_sl) else 0.0
             # flip-back 방지용 메타(시간락 없이 흔들림 제어)
             try:
                 tgt["_last_style_switch_from"] = str(cur_style)
@@ -6176,14 +6805,115 @@ def _maybe_switch_style_for_open_position(
                 tgt["scalp_exit_mode"] = True
             else:
                 tgt["tp"] = float(clamp(float(tgt.get("tp", 6.0)), float(cfg.get("swing_tp_roi_min", 3.0)), float(cfg.get("swing_tp_roi_max", 50.0))))
-                tgt["sl"] = float(clamp(float(tgt.get("sl", 3.0)), float(cfg.get("swing_sl_roi_min", 1.5)), float(cfg.get("swing_sl_roi_max", 30.0))))
+                tgt["sl"] = float(clamp(float(tgt.get("sl", 3.0)), float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 30.0))))
                 tgt["scalp_exit_mode"] = False
 
-            mon_add_event(mon, "STYLE_SWITCH", sym, f"{cur_style} → {rec_style}", {"reason": tgt.get("style_reason", "")})
+            # ✅ 스타일 전환 시 SR 가격 라인도 함께 재계산(스윙인데 -2~-3%에 잘리는 문제 완화)
+            try:
+                lev0 = float(tgt.get("lev", 1) or 1)
+            except Exception:
+                lev0 = 1.0
+            try:
+                sl_roi0 = float(tgt.get("sl", 0) or 0.0)
+            except Exception:
+                sl_roi0 = 0.0
+            try:
+                tp_roi0 = float(tgt.get("tp", 0) or 0.0)
+            except Exception:
+                tp_roi0 = 0.0
+            sl_price_pct0 = abs(sl_roi0) / max(lev0, 1.0) if lev0 else abs(sl_roi0)
+            tp_price_pct0 = abs(tp_roi0) / max(lev0, 1.0) if lev0 else abs(tp_roi0)
+            tgt["sl_price_pct"] = float(sl_price_pct0)
+            tgt["tp_price_pct"] = float(tp_price_pct0)
+            try:
+                # 이전 AI 가격 라인은 스위치 이후에는 참고만(재계산 SR이 우선)
+                tgt["sl_price_ai"] = None
+                tgt["tp_price_ai"] = None
+            except Exception:
+                pass
+            try:
+                if cfg.get("use_sr_stop", True):
+                    dec2 = "buy" if str(pos_side) == "long" else "sell"
+                    entry_px0 = 0.0
+                    try:
+                        entry_px0 = float(tgt.get("entry_price", 0) or 0.0)
+                    except Exception:
+                        entry_px0 = 0.0
+                    if entry_px0 <= 0:
+                        entry_px0 = float(get_last_price(ex, sym) or 0.0)
+                    if entry_px0 > 0:
+                        sr_res2 = sr_prices_for_style(
+                            ex,
+                            sym,
+                            entry_price=float(entry_px0),
+                            side=str(dec2),
+                            style=str(rec_style),
+                            cfg=cfg,
+                            sl_price_pct=float(sl_price_pct0),
+                            tp_price_pct=float(tp_price_pct0),
+                            ai_sl_price=None,
+                            ai_tp_price=None,
+                        )
+                        if isinstance(sr_res2, dict):
+                            tgt["sl_price"] = sr_res2.get("sl_price", tgt.get("sl_price"))
+                            tgt["tp_price"] = sr_res2.get("tp_price", tgt.get("tp_price"))
+                            tgt["sl_price_source"] = str(sr_res2.get("sl_source", "") or "")
+                            tgt["tp_price_source"] = str(sr_res2.get("tp_source", "") or "")
+                            tgt["sr_used"] = {
+                                "tf": sr_res2.get("tf", ""),
+                                "lookback": sr_res2.get("lookback", 0),
+                                "pivot_order": sr_res2.get("pivot_order", 0),
+                                "buffer_atr_mult": sr_res2.get("buffer_atr_mult", 0.0),
+                                "rr_min": sr_res2.get("rr_min", 0.0),
+                            }
+                    # SR 실패 시에도 ROI 바운드로 가격 라인을 확보(가격 기반 stop 조건 유지)
+                    if tgt.get("sl_price") is None or tgt.get("tp_price") is None:
+                        try:
+                            slb2, tpb2 = _sr_price_bounds_from_price_pct(float(entry_px0), str(dec2), float(sl_price_pct0), float(tp_price_pct0))
+                            if tgt.get("sl_price") is None:
+                                tgt["sl_price"] = float(slb2)
+                                if not str(tgt.get("sl_price_source", "") or ""):
+                                    tgt["sl_price_source"] = "ROI"
+                            if tgt.get("tp_price") is None:
+                                tgt["tp_price"] = float(tpb2)
+                                if not str(tgt.get("tp_price_source", "") or ""):
+                                    tgt["tp_price_source"] = "ROI"
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # 전환 후 목표(RR)
+            try:
+                new_tp = float(tgt.get("tp", 0) or 0.0)
+            except Exception:
+                new_tp = 0.0
+            try:
+                new_sl = float(tgt.get("sl", 0) or 0.0)
+            except Exception:
+                new_sl = 0.0
+            rr_new = (new_tp / max(abs(new_sl), 0.01)) if (new_tp or new_sl) else 0.0
+
+            mon_add_event(
+                mon,
+                "STYLE_SWITCH",
+                sym,
+                f"{cur_style} → {rec_style} | RR {rr_old:.2f}→{rr_new:.2f} (TP {old_tp:.2f}→{new_tp:.2f} / SL {old_sl:.2f}→{new_sl:.2f})",
+                {"reason": tgt.get("style_reason", ""), "rr_old": rr_old, "rr_new": rr_new, "tp_old": old_tp, "tp_new": new_tp, "sl_old": old_sl, "sl_new": new_sl},
+            )
             # 사용자 체감용: 스타일 전환 즉시 알림(채널/이벤트 라우팅)
             try:
+                sr_line = ""
+                try:
+                    if tgt.get("sl_price") is not None and tgt.get("tp_price") is not None:
+                        sr_line = (
+                            f"\n- SR(TP/SL): {float(tgt.get('tp_price')):.6g} / {float(tgt.get('sl_price')):.6g} "
+                            f"({str(tgt.get('sl_price_source','') or '-')}/{str(tgt.get('tp_price_source','') or '-')})"
+                        )
+                except Exception:
+                    sr_line = ""
                 tg_send(
-                    f"🔄 스타일 전환\n- 코인: {sym}\n- {cur_style} → {rec_style}\n- 단기({short_tf}): {short_trend}\n- 장기({long_tf}): {long_trend}\n- 이유: {tgt.get('style_reason','')}",
+                    f"🔄 스타일 전환\n- 코인: {sym}\n- {cur_style} → {rec_style}\n- RR: {rr_old:.2f} → {rr_new:.2f}\n- 목표(TP/SL): {old_tp:.2f}%/{old_sl:.2f}% → {new_tp:.2f}%/{new_sl:.2f}%\n- 단기({short_tf}): {short_trend}\n- 장기({long_tf}): {long_trend}\n- 이유: {tgt.get('style_reason','')}{sr_line}",
                     target=cfg.get("tg_route_events_to", "channel"),
                     cfg=cfg,
                 )
@@ -6410,7 +7140,7 @@ def telegram_thread(ex):
 
             # ✅ 매일 아침 브리핑(한 번만)
             try:
-                if cfg.get("daily_btc_brief_enable", True):
+                if cfg.get("daily_btc_brief_enable", False):
                     h = int(cfg.get("daily_btc_brief_hour_kst", 9))
                     m = int(cfg.get("daily_btc_brief_minute_kst", 0))
                     now = now_kst()
@@ -6466,6 +7196,23 @@ def telegram_thread(ex):
                                                 lines.append(f"{emo} {title}\n   └ {note}")
                                             else:
                                                 lines.append(f"{emo} {title}")
+                                        # 🔮 (옵션) 코인/방향 예측(outlook)
+                                        try:
+                                            outlook = brief.get("outlook") or brief.get("signals") or []
+                                            if isinstance(outlook, list) and outlook:
+                                                lines.append("🔮 전망(예측, 참고용)")
+                                                for s0 in outlook[:10]:
+                                                    sym0 = str(s0.get("symbol", "") or "").strip()
+                                                    d0 = str(s0.get("dir", "") or s0.get("direction", "") or "").strip()
+                                                    conf0 = s0.get("confidence", "")
+                                                    note0 = str(s0.get("note", "") or "").strip()
+                                                    if sym0:
+                                                        if note0:
+                                                            lines.append(f"- {sym0}: {d0} ({conf0}%) | {note0[:60]}")
+                                                        else:
+                                                            lines.append(f"- {sym0}: {d0} ({conf0}%)")
+                                        except Exception:
+                                            pass
                                         tg_send("\n".join(lines), target="channel", cfg=cfg)
                                 except Exception:
                                     pass
@@ -6917,12 +7664,19 @@ def telegram_thread(ex):
                                 "tp": 5.0,
                                 "entry_usdt": 0.0,
                                 "entry_pct": 0.0,
+                                "entry_price": float(entry) if entry else 0.0,
                                 "lev": p.get("leverage", "?"),
                                 "reason": "",
                                 "trade_id": "",
                                 "sl_price": None,
                                 "tp_price": None,
                                 "sl_price_pct": None,
+                                "tp_price_pct": None,
+                                "sl_price_source": "",
+                                "tp_price_source": "",
+                                "sr_used": {},
+                                "sl_price_ai": None,
+                                "tp_price_ai": None,
                                 "style": "스캘핑",
                                 "entry_epoch": time.time(),
                                 "style_last_switch_epoch": time.time(),
@@ -6930,6 +7684,12 @@ def telegram_thread(ex):
                             for k0, v0 in base_tgt.items():
                                 if k0 not in tgt:
                                     tgt[k0] = v0
+                            # entry_price는 거래소 포지션 값으로 매 루프 보정(수동포지션/복구포지션 대응)
+                            try:
+                                if float(entry or 0) > 0:
+                                    tgt["entry_price"] = float(entry)
+                            except Exception:
+                                pass
                             active_targets[sym] = tgt
                         except Exception:
                             pass
@@ -7101,7 +7861,82 @@ def telegram_thread(ex):
                                 tgt["style_last_switch_epoch"] = time.time()
                                 # 스윙 목표로 확장
                                 tgt["tp"] = float(clamp(max(tp, float(cfg.get("swing_tp_roi_min", 3.0))), float(cfg.get("swing_tp_roi_min", 3.0)), float(cfg.get("swing_tp_roi_max", 50.0))))
-                                tgt["sl"] = float(clamp(max(sl, float(cfg.get("swing_sl_roi_min", 1.5))), float(cfg.get("swing_sl_roi_min", 1.5)), float(cfg.get("swing_sl_roi_max", 30.0))))
+                                tgt["sl"] = float(clamp(max(sl, float(cfg.get("swing_sl_roi_min", 12.0))), float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 30.0))))
+                                # ✅ 전환 시 SR 가격 라인도 스윙 기준으로 재계산(너무 타이트한 SL 방지)
+                                try:
+                                    lev0 = float(tgt.get("lev", 1) or 1)
+                                except Exception:
+                                    lev0 = 1.0
+                                try:
+                                    sl_roi0 = float(tgt.get("sl", 0) or 0.0)
+                                except Exception:
+                                    sl_roi0 = 0.0
+                                try:
+                                    tp_roi0 = float(tgt.get("tp", 0) or 0.0)
+                                except Exception:
+                                    tp_roi0 = 0.0
+                                sl_price_pct0 = abs(sl_roi0) / max(lev0, 1.0) if lev0 else abs(sl_roi0)
+                                tp_price_pct0 = abs(tp_roi0) / max(lev0, 1.0) if lev0 else abs(tp_roi0)
+                                tgt["sl_price_pct"] = float(sl_price_pct0)
+                                tgt["tp_price_pct"] = float(tp_price_pct0)
+                                try:
+                                    tgt["sl_price_ai"] = None
+                                    tgt["tp_price_ai"] = None
+                                except Exception:
+                                    pass
+                                try:
+                                    if cfg.get("use_sr_stop", True):
+                                        dec2 = "buy" if str(side) == "long" else "sell"
+                                        entry_px0 = 0.0
+                                        try:
+                                            entry_px0 = float(tgt.get("entry_price", 0) or 0.0)
+                                        except Exception:
+                                            entry_px0 = 0.0
+                                        if entry_px0 <= 0:
+                                            entry_px0 = float(entry or 0.0)
+                                        if entry_px0 <= 0:
+                                            entry_px0 = float(cur_px or 0.0)
+                                        if entry_px0 > 0:
+                                            sr_res2 = sr_prices_for_style(
+                                                ex,
+                                                sym,
+                                                entry_price=float(entry_px0),
+                                                side=str(dec2),
+                                                style="스윙",
+                                                cfg=cfg,
+                                                sl_price_pct=float(sl_price_pct0),
+                                                tp_price_pct=float(tp_price_pct0),
+                                                ai_sl_price=None,
+                                                ai_tp_price=None,
+                                            )
+                                            if isinstance(sr_res2, dict):
+                                                tgt["sl_price"] = sr_res2.get("sl_price", tgt.get("sl_price"))
+                                                tgt["tp_price"] = sr_res2.get("tp_price", tgt.get("tp_price"))
+                                                tgt["sl_price_source"] = str(sr_res2.get("sl_source", "") or "")
+                                                tgt["tp_price_source"] = str(sr_res2.get("tp_source", "") or "")
+                                                tgt["sr_used"] = {
+                                                    "tf": sr_res2.get("tf", ""),
+                                                    "lookback": sr_res2.get("lookback", 0),
+                                                    "pivot_order": sr_res2.get("pivot_order", 0),
+                                                    "buffer_atr_mult": sr_res2.get("buffer_atr_mult", 0.0),
+                                                    "rr_min": sr_res2.get("rr_min", 0.0),
+                                                }
+                                        # SR 실패 시에도 ROI 바운드로 가격 라인 확보
+                                        if tgt.get("sl_price") is None or tgt.get("tp_price") is None:
+                                            try:
+                                                slb2, tpb2 = _sr_price_bounds_from_price_pct(float(entry_px0), str(dec2), float(sl_price_pct0), float(tp_price_pct0))
+                                                if tgt.get("sl_price") is None:
+                                                    tgt["sl_price"] = float(slb2)
+                                                    if not str(tgt.get("sl_price_source", "") or ""):
+                                                        tgt["sl_price_source"] = "ROI"
+                                                if tgt.get("tp_price") is None:
+                                                    tgt["tp_price"] = float(tpb2)
+                                                    if not str(tgt.get("tp_price_source", "") or ""):
+                                                        tgt["tp_price_source"] = "ROI"
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    pass
                                 active_targets[sym] = tgt
                                 rt.setdefault("open_targets", {})[sym] = tgt
                                 save_runtime(rt)
@@ -7545,6 +8380,7 @@ def telegram_thread(ex):
                         )
 
                         # ✅ S/R 계산(스캔 과정 표시용) - 캐시 사용
+                        sr_ctx: Optional[Dict[str, Any]] = None
                         try:
                             sr_tf0 = str(cfg.get("sr_timeframe", "15m"))
                             sr_lb0 = int(cfg.get("sr_lookback", 220))
@@ -7574,6 +8410,13 @@ def telegram_thread(ex):
                             cs["sr_tf"] = sr_tf0
                             cs["sr_support_near"] = near_sup
                             cs["sr_resistance_near"] = near_res
+                            sr_ctx = {
+                                "tf": sr_tf0,
+                                "support_near": near_sup,
+                                "resistance_near": near_res,
+                                "supports": supports[:8],
+                                "resistances": resistances[:8],
+                            }
                             mon_add_scan(
                                 mon,
                                 stage="support_resistance",
@@ -7639,7 +8482,30 @@ def telegram_thread(ex):
 
                         # AI 판단
                         mon_add_scan(mon, stage="ai_call", symbol=sym, tf=str(cfg.get("timeframe", "5m")), message="AI 판단 요청")
-                        ai = ai_decide_trade(df, stt, sym, mode, cfg, external=ext)
+                        # ✅ 요구: 스윙 판단일 때만 외부시황을 AI에 제공(스캘핑/단기=차트만)
+                        try:
+                            tr_s = str(stt.get("추세", "") or "")
+                            tr_l = str(htf_trend or "")
+                            chart_style_hint = "스윙" if (("상승" in tr_s and "상승" in tr_l) or ("하락" in tr_s and "하락" in tr_l)) else "스캘핑"
+                        except Exception:
+                            chart_style_hint = "스캘핑"
+                        cs["chart_style_hint"] = chart_style_hint
+                        try:
+                            mon_add_scan(mon, stage="style_hint", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=chart_style_hint, message="차트 기반 스타일 힌트")
+                        except Exception:
+                            pass
+                        ext_for_ai = ext if chart_style_hint == "스윙" else {"enabled": False}
+                        ai = ai_decide_trade(
+                            df,
+                            stt,
+                            sym,
+                            mode,
+                            cfg,
+                            external=ext_for_ai,
+                            trend_long=str(htf_trend or ""),
+                            sr_context=sr_ctx,
+                            chart_style_hint=chart_style_hint,
+                        )
                         decision = ai.get("decision", "hold")
                         conf = int(ai.get("confidence", 0))
                         mon_add_scan(mon, stage="ai_result", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=conf, message=str(ai.get("reason_easy", ""))[:80])
@@ -7740,17 +8606,31 @@ def telegram_thread(ex):
                                     cs["style_reco"] = "스캘핑"
                                     cs["style_reason"] = f"장기추세({htf_tf}) 상승 → 역추세는 스캘핑만"
 
+                            # ✅ 왜 스캘핑/스윙인지(단기/장기 추세 포함) 더 직관적으로 남김
+                            try:
+                                r0 = str(cs.get("style_reason", "") or "").strip()
+                                ts0 = str(stt.get("추세", "") or "").strip()
+                                tl0 = f"{htf_tf} {htf_trend}".strip()
+                                if ts0 or tl0:
+                                    r0 = (r0 + f" | 단기:{ts0 or '-'} / 장기:{tl0 or '-'}").strip()
+                                cs["style_reason"] = r0[:240]
+                            except Exception:
+                                pass
+
                             # 스타일별 envelope + 리스크가드레일
                             ai2 = apply_style_envelope(ai, style, cfg, rule)
-                            ai2 = _risk_guardrail(ai2, df, decision, mode, style, ext)
+                            # ✅ 요구: 스윙만 외부시황 반영(스캘핑=차트만)
+                            ext_for_risk = ext if str(style) == "스윙" else {"enabled": False}
+                            ai2 = _risk_guardrail(ai2, df, decision, mode, style, ext_for_risk)
 
                             entry_pct = float(ai2.get("entry_pct", rule["entry_pct_min"]))
                             lev = int(ai2.get("leverage", rule["lev_min"]))
                             slp = float(ai2.get("sl_pct", 1.2))
                             tpp = float(ai2.get("tp_pct", 3.0))
 
-                            # 외부시황 위험 감산
-                            entry_usdt = free_usdt * (entry_pct / 100.0) * risk_mul
+                            # ✅ 외부시황 위험 감산은 스윙에서만 적용
+                            entry_risk_mul = float(risk_mul) if str(style) == "스윙" else 1.0
+                            entry_usdt = free_usdt * (entry_pct / 100.0) * entry_risk_mul
                             if entry_usdt < 5:
                                 cs["skip_reason"] = "잔고 부족(진입금 너무 작음)"
                                 continue
@@ -7804,30 +8684,54 @@ def telegram_thread(ex):
                                 except Exception:
                                     pass
 
-                                # SR 기반 SL/TP 가격도 계산
+                                # ✅ SL/TP 가격 라인(지지/저항 + AI 후보 + ROI 바운드)
                                 sl_price = None
                                 tp_price = None
+                                sl_price_source = ""
+                                tp_price_source = ""
+                                sr_used: Dict[str, Any] = {}
+                                ai_sl_price = ai2.get("sl_price", None)
+                                ai_tp_price = ai2.get("tp_price", None)
+                                try:
+                                    sl_price_pct = float(ai2.get("sl_price_pct", float(slp) / max(int(lev), 1)))
+                                except Exception:
+                                    sl_price_pct = float(slp) / max(int(lev), 1)
+                                try:
+                                    tp_price_pct = float(ai2.get("tp_price_pct", float(tpp) / max(int(lev), 1)))
+                                except Exception:
+                                    tp_price_pct = float(tpp) / max(int(lev), 1)
                                 if cfg.get("use_sr_stop", True):
                                     try:
-                                        sr_tf = cfg.get("sr_timeframe", "15m")
-                                        sr_lb = int(cfg.get("sr_lookback", 220))
-                                        htf = safe_fetch_ohlcv(ex, sym, str(sr_tf), limit=sr_lb)
-                                        if not htf:
-                                            raise RuntimeError("sr_ohlcv_empty_or_timeout")
-                                        hdf = pd.DataFrame(htf, columns=["time", "open", "high", "low", "close", "vol"])
-                                        hdf["time"] = pd.to_datetime(hdf["time"], unit="ms")
-                                        sr = sr_stop_take(
-                                            entry_price=px,
-                                            side=decision,
-                                            htf_df=hdf,
-                                            atr_period=int(cfg.get("sr_atr_period", 14)),
-                                            pivot_order=int(cfg.get("sr_pivot_order", 6)),
-                                            buffer_atr_mult=float(cfg.get("sr_buffer_atr_mult", 0.25)),
-                                            rr_min=float(cfg.get("sr_rr_min", 1.5)),
+                                        sr_res = sr_prices_for_style(
+                                            ex,
+                                            sym,
+                                            entry_price=float(px),
+                                            side=str(decision),
+                                            style=str(style),
+                                            cfg=cfg,
+                                            sl_price_pct=float(sl_price_pct),
+                                            tp_price_pct=float(tp_price_pct),
+                                            ai_sl_price=ai_sl_price,
+                                            ai_tp_price=ai_tp_price,
                                         )
-                                        if sr:
-                                            sl_price = sr["sl_price"]
-                                            tp_price = sr["tp_price"]
+                                        if isinstance(sr_res, dict):
+                                            sr_used = dict(sr_res)
+                                            sl_price = sr_res.get("sl_price", None)
+                                            tp_price = sr_res.get("tp_price", None)
+                                            sl_price_source = str(sr_res.get("sl_source", "") or "")
+                                            tp_price_source = str(sr_res.get("tp_source", "") or "")
+                                    except Exception:
+                                        pass
+                                # SR 계산 실패/값 비정상 시에도 최소한 "가격 기준 SL/TP"는 ROI 바운드로 확보
+                                if sl_price is None or tp_price is None:
+                                    try:
+                                        slb, tpb = _sr_price_bounds_from_price_pct(float(px), str(decision), float(sl_price_pct), float(tp_price_pct))
+                                        sl_price = float(slb)
+                                        tp_price = float(tpb)
+                                        if not sl_price_source:
+                                            sl_price_source = "ROI"
+                                        if not tp_price_source:
+                                            tp_price_source = "ROI"
                                     except Exception:
                                         pass
 
@@ -7838,6 +8742,7 @@ def telegram_thread(ex):
                                     "entry_usdt": entry_usdt,
                                     "entry_pct": entry_pct,
                                     "lev": lev,
+                                    "entry_price": float(px),
                                     # ✅ 잔고 스냅샷(시트/일지에 표시용)
                                     "bal_entry_total": float(total_usdt) if "total_usdt" in locals() else "",
                                     "bal_entry_free": float(free_usdt) if "free_usdt" in locals() else "",
@@ -7845,7 +8750,13 @@ def telegram_thread(ex):
                                     "trade_id": trade_id,
                                     "sl_price": sl_price,
                                     "tp_price": tp_price,
-                                    "sl_price_pct": float(ai2.get("sl_price_pct", slp / max(lev, 1))),
+                                    "sl_price_pct": float(sl_price_pct),
+                                    "tp_price_pct": float(tp_price_pct),
+                                    "sl_price_source": sl_price_source,
+                                    "tp_price_source": tp_price_source,
+                                    "sr_used": {"tf": sr_used.get("tf", ""), "lookback": sr_used.get("lookback", 0), "pivot_order": sr_used.get("pivot_order", 0), "buffer_atr_mult": sr_used.get("buffer_atr_mult", 0.0), "rr_min": sr_used.get("rr_min", 0.0)},
+                                    "sl_price_ai": ai_sl_price,
+                                    "tp_price_ai": ai_tp_price,
                                     "style": style,
                                     "style_confidence": int(cs.get("style_confidence", 0)),
                                     "style_reason": str(cs.get("style_reason", ""))[:240],
@@ -7875,6 +8786,11 @@ def telegram_thread(ex):
                                         "tp_pct_roi": tpp,
                                         "sl_price_sr": sl_price,
                                         "tp_price_sr": tp_price,
+                                        "sl_price_ai": ai_sl_price,
+                                        "tp_price_ai": ai_tp_price,
+                                        "sl_price_source": sl_price_source,
+                                        "tp_price_source": tp_price_source,
+                                        "sr_used": {"tf": sr_used.get("tf", ""), "lookback": sr_used.get("lookback", 0), "pivot_order": sr_used.get("pivot_order", 0), "buffer_atr_mult": sr_used.get("buffer_atr_mult", 0.0), "rr_min": sr_used.get("rr_min", 0.0)},
                                         "used_indicators": ai2.get("used_indicators", []),
                                         "reason_easy": ai2.get("reason_easy", ""),
                                         "raw_status": stt,
@@ -7884,12 +8800,16 @@ def telegram_thread(ex):
                                         "style_confidence": int(cs.get("style_confidence", 0)),
                                         "style_reason": str(cs.get("style_reason", ""))[:240],
                                         "events": [],
-                                        "external_used": {
-                                            "fear_greed": (ext or {}).get("fear_greed"),
-                                            "high_impact_events_soon": ((ext or {}).get("high_impact_events_soon") or [])[:3],
-                                            "asof_kst": (ext or {}).get("asof_kst", ""),
-                                            "daily_btc_brief": (ext or {}).get("daily_btc_brief", {}),
-                                        },
+                                        "external_used": (
+                                            {
+                                                "fear_greed": (ext or {}).get("fear_greed"),
+                                                "high_impact_events_soon": ((ext or {}).get("high_impact_events_soon") or [])[:3],
+                                                "asof_kst": (ext or {}).get("asof_kst", ""),
+                                                "daily_btc_brief": (ext or {}).get("daily_btc_brief", {}),
+                                            }
+                                            if str(style) == "스윙"
+                                            else {"enabled": False}
+                                        ),
                                     },
                                 )
 
@@ -7902,15 +8822,21 @@ def telegram_thread(ex):
                                     direction = "롱(상승에 베팅)" if decision == "buy" else "숏(하락에 베팅)"
                                     msg = (
                                         f"🎯 진입\n- 코인: {sym}\n- 스타일: {style}\n- 방향: {direction}\n"
+                                        f"- 스타일이유: {str(cs.get('style_reason','') or '').strip()[:180]}\n"
                                         f"- 진입금: {entry_usdt:.2f} USDT (잔고 {entry_pct:.1f}%)\n"
                                         f"- 레버리지: x{lev}\n"
                                         f"- 목표익절: +{tpp:.2f}% / 목표손절: -{slp:.2f}%\n"
                                         f"- 단기추세({cfg.get('timeframe','5m')}): {stt.get('추세','-')}\n"
                                         f"- 장기추세({htf_tf}): 🧭 {htf_trend}\n"
-                                        f"- 외부리스크 감산: x{risk_mul:.2f}\n"
+                                        f"- 외부리스크 감산: x{entry_risk_mul:.2f} ({'스윙만 적용' if str(style)=='스윙' else '스캘핑=미적용'})\n"
                                     )
                                     if sl_price is not None and tp_price is not None:
-                                        msg += f"- SR기준가: TP {tp_price:.6g} / SL {sl_price:.6g}\n"
+                                        src_txt = ""
+                                        try:
+                                            src_txt = f" ({sl_price_source or '-'} / {tp_price_source or '-'})"
+                                        except Exception:
+                                            src_txt = ""
+                                        msg += f"- SR기준가: TP {tp_price:.6g} / SL {sl_price:.6g}{src_txt}\n"
                                     msg += f"- 확신도: {conf}% (기준 {rule['min_conf']}%)\n- 일지ID: {trade_id}\n"
                                     if cfg.get("tg_send_entry_reason", False):
                                         # 요구사항: 텔레그램에는 '긴 근거'를 보내지 않고, /log <id>로 조회
@@ -8016,7 +8942,16 @@ def telegram_thread(ex):
                                 tg_send(m, target=cfg.get("tg_route_queries_to", "group"), cfg=cfg)
 
                         def _reply_admin_dm(m: str):
-                            # ✅ 요구: 관리/버튼 결과는 TG_ADMIN_USER_IDS(관리자 DM)로
+                            # ✅ 요구: "관리자가 봇을 작동하면, 답변은 채널로"
+                            # - 설정: tg_admin_replies_to = channel|admin|both
+                            how = str(cfg.get("tg_admin_replies_to", "channel") or "channel").lower().strip()
+                            if how == "channel":
+                                tg_send(m, target="channel", cfg=cfg)
+                                return
+                            if how == "both":
+                                tg_send(m, target="channel", cfg=cfg)
+                                # fallthrough to admin DM
+                            # admin DM
                             if TG_ADMIN_IDS:
                                 if uid is not None:
                                     tg_send_chat(uid, m)
@@ -8311,7 +9246,15 @@ def telegram_thread(ex):
                         cb_chat_id = (((cb.get("message") or {}).get("chat") or {}) if isinstance((cb.get("message") or {}).get("chat"), dict) else {}).get("id", None)
 
                         def _cb_reply(m: str):
-                            # ✅ 요구: 버튼 응답은 관리자 DM(TG_ADMIN_USER_IDS) 우선
+                            # ✅ 요구: "관리자가 봇을 작동하면, 답변은 채널로"
+                            how = str(cfg.get("tg_admin_replies_to", "channel") or "channel").lower().strip()
+                            if how == "channel":
+                                tg_send(m, target="channel", cfg=cfg)
+                                return
+                            if how == "both":
+                                tg_send(m, target="channel", cfg=cfg)
+                                # fallthrough to admin DM
+                            # admin DM
                             if TG_ADMIN_IDS:
                                 if uid is not None:
                                     tg_send_chat(uid, m)
@@ -8710,6 +9653,12 @@ config["vision_report_interval_min"] = st.sidebar.number_input("AI시야 리포�
 st.sidebar.subheader("📡 텔레그램 라우팅")
 config["tg_route_events_to"] = st.sidebar.selectbox("이벤트(진입/익절/손절/보고) 전송 대상", ["channel", "group", "both"], index=["channel", "group", "both"].index(config.get("tg_route_events_to", "channel")))
 config["tg_route_queries_to"] = st.sidebar.selectbox("조회/버튼 응답 전송 대상", ["group", "channel", "both"], index=["group", "channel", "both"].index(config.get("tg_route_queries_to", "group")))
+config["tg_admin_replies_to"] = st.sidebar.selectbox(
+    "관리자 명령 응답 위치",
+    ["channel", "admin", "both"],
+    index=["channel", "admin", "both"].index(config.get("tg_admin_replies_to", "channel")) if config.get("tg_admin_replies_to", "channel") in ["channel", "admin", "both"] else 0,
+    help="관리자가 DM으로 /scan /mode /positions 등을 실행했을 때, 결과를 어디로 보낼지 선택합니다.",
+)
 st.sidebar.caption("※ TG_CHAT_ID_GROUP / TG_CHAT_ID_CHANNEL secrets를 설정하면 채널/그룹 분리가 됩니다.")
 
 st.sidebar.divider()
@@ -8782,6 +9731,18 @@ c_sr3, c_sr4 = st.sidebar.columns(2)
 config["sr_atr_period"] = c_sr3.number_input("ATR 기간", 7, 30, int(config.get("sr_atr_period", 14)))
 config["sr_buffer_atr_mult"] = c_sr4.number_input("버퍼(ATR배)", 0.05, 2.0, float(config.get("sr_buffer_atr_mult", 0.25)), step=0.05)
 config["sr_rr_min"] = st.sidebar.number_input("SR 최소 RR", 1.0, 5.0, float(config.get("sr_rr_min", 1.5)), step=0.1)
+with st.sidebar.expander("스윙(Swing) SR 상세(선택)"):
+    c_sw1, c_sw2 = st.columns(2)
+    config["sr_timeframe_swing"] = c_sw1.selectbox(
+        "스윙 SR TF",
+        ["15m", "1h", "4h"],
+        index=["15m", "1h", "4h"].index(config.get("sr_timeframe_swing", "1h")) if config.get("sr_timeframe_swing", "1h") in ["15m", "1h", "4h"] else 1,
+    )
+    config["sr_lookback_swing"] = c_sw2.number_input("스윙 SR Lookback", 120, 800, int(config.get("sr_lookback_swing", 320)), step=10)
+    c_sw3, c_sw4 = st.columns(2)
+    config["sr_pivot_order_swing"] = c_sw3.number_input("스윙 피벗", 3, 12, int(config.get("sr_pivot_order_swing", 8)))
+    config["sr_buffer_atr_mult_swing"] = c_sw4.number_input("스윙 버퍼(ATR배)", 0.05, 2.0, float(config.get("sr_buffer_atr_mult_swing", 0.45)), step=0.05)
+    config["sr_rr_min_swing"] = st.number_input("스윙 SR 최소 RR", 1.0, 6.0, float(config.get("sr_rr_min_swing", 2.0)), step=0.1)
 
 st.sidebar.divider()
 st.sidebar.subheader("🛡️ 방어/자금 관리")
