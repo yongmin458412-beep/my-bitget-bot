@@ -570,6 +570,10 @@ def default_settings() -> Dict[str, Any]:
         # Telegram (기본 유지)
         "tg_enable_reports": True,  # 이벤트 알림(진입/청산 등)
         "tg_send_entry_reason": False,
+        # ✅ 텔레그램 메시지 가독성(요구사항):
+        # - 코인/선물 용어를 모르는 사람도 이해하도록 "쉬운 한글 + 핵심만" 모드(기본 ON)
+        # - OFF면 기존(상세) 메시지를 유지
+        "tg_simple_messages": True,
 
         # ✅ 주기 리포트/시야 리포트
         "tg_enable_periodic_report": True,
@@ -648,6 +652,10 @@ def default_settings() -> Dict[str, Any]:
         "regime_hysteresis_step": 0.2,
         "regime_hysteresis_enter_swing": 0.75,
         "regime_hysteresis_enter_scalp": 0.25,
+        # ✅ (옵션) 하이리스크/하이리턴 모드 신규진입 제한:
+        # - ON이면 auto 레짐에서 "스윙(단기+장기 정렬)"일 때만 신규 진입
+        # - OFF(기본)이면 스캘핑 진입도 허용하되, 모드의 레버/진입비중 범위는 유지
+        "highrisk_entry_requires_swing": False,
         # ✅ 스타일 AI 보조(선택): 레짐 전환/표시에서 불필요한 OpenAI 호출을 줄이기 위해 분리 옵션 제공
         # - style_auto_enable=True여도, 아래 옵션이 OFF면 스타일은 "룰 기반"만 사용
         # - 사용자가 원할 때만 ON (비용/지연/요금제 429 방지)
@@ -4130,6 +4138,45 @@ def clamp(v, lo, hi):
         return lo
 
 
+def _as_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return float(default)
+        # bool은 숫자 취급하면 UI/로그가 헷갈릴 수 있어 별도 처리
+        if isinstance(v, bool):
+            return float(int(v))
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            x = float(v)
+            # NaN/inf 방어
+            try:
+                if math.isnan(x) or math.isinf(x):
+                    return float(default)
+            except Exception:
+                pass
+            return x
+        s = str(v).strip()
+        if not s:
+            return float(default)
+        if s.lower() in ["none", "null", "nan"]:
+            return float(default)
+        return float(s)
+    except Exception:
+        return float(default)
+
+
+def _as_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None:
+            return int(default)
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, (int, np.integer)):
+            return int(v)
+        return int(round(_as_float(v, float(default))))
+    except Exception:
+        return int(default)
+
+
 def to_precision_qty(ex, sym: str, qty: float) -> float:
     try:
         return float(ex.amount_to_precision(sym, qty))
@@ -5412,12 +5459,24 @@ _EXT_LAST_ERROR = ""
 
 def external_context_snapshot() -> Dict[str, Any]:
     try:
-        with _EXT_SNAPSHOT_LOCK:
+        # ✅ safety: 잠재적 데드락/정체 방지(스레드 정체 → UI에 "멈춤 의심" 유발)
+        got = False
+        try:
+            got = bool(_EXT_SNAPSHOT_LOCK.acquire(timeout=0.25))
+        except Exception:
+            got = False
+        try:
             snap = dict(_EXT_SNAPSHOT or {})
             inflight = bool(_EXT_INFLIGHT)
             last_start = float(_EXT_LAST_START_EPOCH or 0.0)
             last_done = float(_EXT_LAST_DONE_EPOCH or 0.0)
             last_err = str(_EXT_LAST_ERROR or "")
+        finally:
+            if got:
+                try:
+                    _EXT_SNAPSHOT_LOCK.release()
+                except Exception:
+                    pass
         age_sec = (time.time() - last_done) if last_done else None
         snap["_inflight"] = inflight
         snap["_age_sec"] = float(age_sec) if age_sec is not None else None
@@ -5488,7 +5547,15 @@ def external_context_refresh_maybe(cfg: Dict[str, Any], rt: Dict[str, Any], forc
     refresh_sec = max(15, refresh_sec)
 
     now_ts = time.time()
-    with _EXT_SNAPSHOT_LOCK:
+    got = False
+    try:
+        got = bool(_EXT_SNAPSHOT_LOCK.acquire(timeout=0.35))
+    except Exception:
+        got = False
+    if not got:
+        # 잠재적 교착/정체 방지: 이번 턴은 갱신 트리거를 건너뛴다(봇은 계속)
+        return False
+    try:
         if _EXT_INFLIGHT:
             # 오래 걸리는 작업이 이미 수행 중이면 중복 실행하지 않음(스레드 누수 방지)
             return False
@@ -5497,6 +5564,11 @@ def external_context_refresh_maybe(cfg: Dict[str, Any], rt: Dict[str, Any], forc
         _EXT_INFLIGHT = True
         _EXT_LAST_START_EPOCH = now_ts
         _EXT_LAST_ERROR = ""
+    finally:
+        try:
+            _EXT_SNAPSHOT_LOCK.release()
+        except Exception:
+            pass
 
     th = threading.Thread(
         target=_external_context_worker,
@@ -5810,17 +5882,18 @@ JSON 형식:
         if out["decision"] not in ["buy", "sell", "hold"]:
             out["decision"] = "hold"
 
-        out["confidence"] = int(clamp(int(out.get("confidence", 0)), 0, 100))
+        out["confidence"] = int(clamp(_as_int(out.get("confidence", 0), 0), 0, 100))
 
-        out["entry_pct"] = float(out.get("entry_pct", rule["entry_pct_min"]))
+        # OpenAI가 null(None)을 줄 수 있으므로 숫자 변환은 항상 안전 변환 사용
+        out["entry_pct"] = float(_as_float(out.get("entry_pct", rule["entry_pct_min"]), float(rule["entry_pct_min"])))
         out["entry_pct"] = float(clamp(out["entry_pct"], rule["entry_pct_min"], rule["entry_pct_max"]))
 
-        out["leverage"] = int(out.get("leverage", rule["lev_min"]))
+        out["leverage"] = int(_as_int(out.get("leverage", rule["lev_min"]), int(rule["lev_min"])))
         out["leverage"] = int(clamp(out["leverage"], rule["lev_min"], rule["lev_max"]))
 
-        out["sl_pct"] = float(out.get("sl_pct", 1.2))
-        out["tp_pct"] = float(out.get("tp_pct", 3.0))
-        out["rr"] = float(out.get("rr", max(0.5, out["tp_pct"] / max(out["sl_pct"], 0.01))))
+        out["sl_pct"] = float(_as_float(out.get("sl_pct", 1.2), 1.2))
+        out["tp_pct"] = float(_as_float(out.get("tp_pct", 3.0), 3.0))
+        out["rr"] = float(_as_float(out.get("rr", max(0.5, out["tp_pct"] / max(out["sl_pct"], 0.01))), max(0.5, out["tp_pct"] / max(out["sl_pct"], 0.01))))
 
         # (선택) 가격 기반 SL/TP (SR 기반)
         try:
@@ -6009,7 +6082,20 @@ def apply_style_envelope(ai: Dict[str, Any], style: str, cfg: Dict[str, Any], ru
 
         if style == "스캘핑":
             entry_pct = float(clamp(entry_pct * float(cfg.get("scalp_entry_pct_mult", 0.65)), rule["entry_pct_min"], rule["entry_pct_max"]))
-            lev = int(min(lev, int(cfg.get("scalp_lev_cap", rule["lev_max"]))))
+            # ✅ 모드(MODE_RULES)의 레버 범위를 우선 존중:
+            # - 하이리스크/하이리턴(예: lev_min=12)에서 scalp_lev_cap=8 때문에 레버가 8로 고정되는 문제 방지
+            try:
+                cap_cfg = int(cfg.get("scalp_lev_cap", rule["lev_max"]) or rule["lev_max"])
+            except Exception:
+                cap_cfg = int(rule.get("lev_max", lev) or lev)
+            try:
+                rule_min = int(rule.get("lev_min", 1) or 1)
+                rule_max = int(rule.get("lev_max", cap_cfg) or cap_cfg)
+            except Exception:
+                rule_min, rule_max = 1, cap_cfg
+            # cap이 모드 최소보다 작으면(하이리스크 등) cap 자체를 무시하고 모드 범위 내에서 유지
+            cap = cap_cfg if cap_cfg >= rule_min else rule_max
+            lev = int(min(lev, int(cap)))
             sl = float(clamp(sl, float(cfg.get("scalp_sl_roi_min", 0.8)), float(cfg.get("scalp_sl_roi_max", 5.0))))
             tp = float(clamp(tp, float(cfg.get("scalp_tp_roi_min", 0.8)), float(cfg.get("scalp_tp_roi_max", 6.0))))
 
@@ -6441,6 +6527,138 @@ def tg_answer_callback(cb_id: str):
 
 
 # =========================================================
+# ✅ 16.1.5) Telegram 메시지: 쉬운말(핵심만) 포맷터 (요구사항)
+# =========================================================
+def _tg_simple_enabled(cfg: Optional[Dict[str, Any]] = None) -> bool:
+    try:
+        cfg = cfg or load_settings()
+        return bool(cfg.get("tg_simple_messages", True))
+    except Exception:
+        return True
+
+
+def _tg_fmt_pct(v: Any, digits: int = 2, signed: bool = True) -> str:
+    try:
+        x = float(v)
+        if not math.isfinite(x):
+            return "-"
+        return f"{x:+.{digits}f}%" if signed else f"{x:.{digits}f}%"
+    except Exception:
+        return "-"
+
+
+def _tg_fmt_usdt(v: Any, digits: int = 2, signed: bool = True) -> str:
+    try:
+        x = float(v)
+        if not math.isfinite(x):
+            return "-"
+        return f"{x:+.{digits}f}" if signed else f"{x:.{digits}f}"
+    except Exception:
+        return "-"
+
+
+def _tg_style_easy(style: str) -> str:
+    s = str(style or "").strip()
+    if s == "스캘핑":
+        return "짧게(스캘핑)"
+    if s == "스윙":
+        return "길게(스윙)"
+    return s or "-"
+
+
+def _tg_dir_easy(decision_or_side: str) -> str:
+    d = str(decision_or_side or "").strip().lower()
+    if d in ["buy", "long"]:
+        return "오를 것 같아(롱)"
+    if d in ["sell", "short"]:
+        return "내릴 것 같아(숏)"
+    return "-"
+
+
+def _tg_bal_line(
+    before_total: Optional[float],
+    after_total: Optional[float],
+    before_free: Optional[float],
+    after_free: Optional[float],
+) -> str:
+    try:
+        bt = f"{float(before_total):.2f}" if before_total is not None else "-"
+    except Exception:
+        bt = "-"
+    try:
+        at = f"{float(after_total):.2f}" if after_total is not None else "-"
+    except Exception:
+        at = "-"
+    try:
+        bf = f"{float(before_free):.2f}" if before_free is not None else "-"
+    except Exception:
+        bf = "-"
+    try:
+        af = f"{float(after_free):.2f}" if after_free is not None else "-"
+    except Exception:
+        af = "-"
+    return f"- 잔액(총/가용): {bt}→{at} / {bf}→{af} USDT"
+
+
+def tg_msg_entry_simple(
+    *,
+    symbol: str,
+    style: str,
+    decision: str,
+    lev: Any,
+    entry_usdt: float,
+    rr: float,
+    bal_before_total: Optional[float],
+    bal_after_total: Optional[float],
+    bal_before_free: Optional[float],
+    bal_after_free: Optional[float],
+    one_line: str,
+    trade_id: str,
+) -> str:
+    return (
+        "🎯 진입\n"
+        f"- 코인: {symbol}\n"
+        f"- 방식: {_tg_style_easy(style)}\n"
+        f"- 방향: {_tg_dir_easy(decision)}\n"
+        f"- 레버: x{lev}\n"
+        f"- 쓴 돈(마진): {float(entry_usdt):.2f} USDT\n"
+        f"- 손익비(이익:손실): {float(rr):.2f}\n"
+        f"{_tg_bal_line(bal_before_total, bal_after_total, bal_before_free, bal_after_free)}\n"
+        f"- 한줄: {str(one_line or '')[:120]}\n"
+        f"- ID: {trade_id}"
+    )
+
+
+def tg_msg_exit_simple(
+    *,
+    title: str,
+    symbol: str,
+    style: str,
+    side: str,
+    lev: Any,
+    roi_pct: float,
+    pnl_usdt: float,
+    contracts: float,
+    bal_before_total: Optional[float],
+    bal_after_total: Optional[float],
+    bal_before_free: Optional[float],
+    bal_after_free: Optional[float],
+    one_line: str,
+    trade_id: str,
+) -> str:
+    return (
+        f"{title}\n"
+        f"- 코인: {symbol}\n"
+        f"- 방식: {_tg_style_easy(style)} | {_tg_dir_easy(side)} | 레버 x{lev}\n"
+        f"- 결과: {_tg_fmt_pct(roi_pct)} (손익 {_tg_fmt_usdt(pnl_usdt)} USDT)\n"
+        f"- 청산수량: {contracts}\n"
+        f"{_tg_bal_line(bal_before_total, bal_after_total, bal_before_free, bal_after_free)}\n"
+        f"- 한줄: {str(one_line or '')[:120]}\n"
+        f"- ID: {trade_id}"
+    )
+
+
+# =========================================================
 # ✅ 16.2) 오류 알림(관리자 DM) - 요구사항
 # - "코드에서 나오는 모든 오류"를 TG_ADMIN_USER_IDS로 전송(스팸 방지용 dedup/쿨다운 포함)
 # =========================================================
@@ -6664,7 +6882,7 @@ def tg_is_admin(user_id: Optional[int]) -> bool:
 def _fmt_pos_line(sym: str, side: str, lev: Any, roi: float, upnl: float, style: str = "") -> str:
     emo = "🟢" if roi >= 0 else "🔴"
     s_txt = f" | 스타일:{style}" if style else ""
-    return f"{emo} {sym} {('롱' if side=='long' else '숏')} x{lev} | ROI {roi:.2f}% | PnL {upnl:.2f} USDT{s_txt}"
+    return f"{emo} {sym} {('롱' if side=='long' else '숏')} x{lev} | 수익률 {roi:.2f}% | 손익 {upnl:.2f} USDT{s_txt}"
 
 
 def _style_for_entry(
@@ -6707,6 +6925,20 @@ def _maybe_switch_style_for_open_position(
     포지션 보유 중 차트 상황이 바뀌면 스타일을 전환(스윙->스캘핑 청산모드, 스캘핑->스윙 전환)
     """
     try:
+        # ✅ 사용자가 자동 스타일 전환을 끈 경우(auto 레짐만):
+        # - 불필요한 전환/AI 호출/혼란을 막기 위해 현재 스타일을 유지한다.
+        try:
+            regime_mode0 = str(cfg.get("regime_mode", "auto") or "auto").lower().strip()
+        except Exception:
+            regime_mode0 = "auto"
+        if regime_mode0 == "auto" and (not bool(cfg.get("style_auto_enable", True))):
+            try:
+                tgt["style_reco"] = str(tgt.get("style", "스캘핑") or "스캘핑")
+                tgt["style_reco_note"] = "자동 전환 OFF"
+            except Exception:
+                pass
+            return tgt
+
         fast = int(cfg.get("ma_fast", 7))
         slow = int(cfg.get("ma_slow", 99))
 
@@ -7010,22 +7242,13 @@ def _maybe_switch_style_for_open_position(
                 mon,
                 "STYLE_SWITCH",
                 sym,
-                f"{cur_style} → {rec_style} | RR {rr_old:.2f}→{rr_new:.2f} (TP {old_tp:.2f}→{new_tp:.2f} / SL {old_sl:.2f}→{new_sl:.2f})",
+                f"{cur_style} → {rec_style} | 손익비 {rr_old:.2f}→{rr_new:.2f} (익절 {old_tp:.2f}→{new_tp:.2f} / 손절 {old_sl:.2f}→{new_sl:.2f})",
                 {"reason": tgt.get("style_reason", ""), "rr_old": rr_old, "rr_new": rr_new, "tp_old": old_tp, "tp_new": new_tp, "sl_old": old_sl, "sl_new": new_sl},
             )
             # 사용자 체감용: 스타일 전환 즉시 알림(채널/이벤트 라우팅)
             try:
-                sr_line = ""
-                try:
-                    if tgt.get("sl_price") is not None and tgt.get("tp_price") is not None:
-                        sr_line = (
-                            f"\n- SR(TP/SL): {float(tgt.get('tp_price')):.6g} / {float(tgt.get('sl_price')):.6g} "
-                            f"({str(tgt.get('sl_price_source','') or '-')}/{str(tgt.get('tp_price_source','') or '-')})"
-                        )
-                except Exception:
-                    sr_line = ""
                 tg_send(
-                    f"🔄 스타일 전환\n- 코인: {sym}\n- {cur_style} → {rec_style}\n- RR: {rr_old:.2f} → {rr_new:.2f}\n- 목표(TP/SL): {old_tp:.2f}%/{old_sl:.2f}% → {new_tp:.2f}%/{new_sl:.2f}%\n- 단기({short_tf}): {short_trend}\n- 장기({long_tf}): {long_trend}\n- 이유: {tgt.get('style_reason','')}{sr_line}",
+                    f"🔄 방식 바뀜\n- 코인: {sym}\n- {cur_style} → {rec_style}\n- 손익비(이익:손실): {rr_old:.2f} → {rr_new:.2f}\n- 목표(익절/손절): +{old_tp:.2f}%/-{old_sl:.2f}% → +{new_tp:.2f}%/-{new_sl:.2f}%\n- 이유: {str(tgt.get('style_reason','') or '')[:140]}",
                     target=cfg.get("tg_route_events_to", "channel"),
                     cfg=cfg,
                 )
@@ -7550,8 +7773,8 @@ def telegram_thread(ex):
                                         style, tp0, sl0, rr0 = "", 0.0, 0.0, 0.0
                                     emo = "🟢" if roi >= 0 else "🔴"
                                     pos_lines.append(
-                                        f"{emo} {sym} {('롱' if side=='long' else '숏')} x{lev} | ROI {roi:.2f}% | PnL {upnl:.2f} USDT"
-                                        f" | 스타일:{style or '-'} | TP {tp0:.2f}% / SL {sl0:.2f}% / RR {rr0:.2f}"
+                                        f"{emo} {sym} {('롱' if side=='long' else '숏')} x{lev} | 수익률 {roi:.2f}% | 손익 {upnl:.2f} USDT"
+                                        f" | 방식:{style or '-'} | 목표익절 +{tp0:.2f}% / 목표손절 -{sl0:.2f}% / 손익비 {rr0:.2f}"
                                     )
                             else:
                                 pos_lines.append("⚪ 무포지션(관망)")
@@ -7837,6 +8060,76 @@ def telegram_thread(ex):
                         tp = float(tgt.get("tp", 5.0))
                         trade_id = str(tgt.get("trade_id") or "")
 
+                        # ✅ 스윙은 "길게 가져가는" 매매:
+                        # - 스윙인데 -2~-3% 같은 짧은 손절로 잘리는 문제를 줄이기 위해,
+                        #   오픈 포지션에서도 하한(SL)과 최소 손익비(RR)를 강제 보정한다.
+                        try:
+                            if style_now == "스윙":
+                                changed_targets = False
+                                sl_min = float(cfg.get("swing_sl_roi_min", 12.0))
+                                if sl < sl_min:
+                                    sl = float(sl_min)
+                                    tgt["sl"] = float(sl_min)
+                                    changed_targets = True
+
+                                rr_min_now = max(float(_rr_min_by_mode(str(mode))), float(_rr_min_by_style("스윙")))
+                                tp_need = abs(float(sl)) * float(rr_min_now)
+                                if tp < float(tp_need):
+                                    tp_cap = float(cfg.get("swing_tp_roi_max", 50.0))
+                                    tp_new = float(clamp(tp_need, float(cfg.get("swing_tp_roi_min", 3.0)), tp_cap))
+                                    tp = float(tp_new)
+                                    tgt["tp"] = float(tp_new)
+                                    changed_targets = True
+
+                                if changed_targets:
+                                    # 가격 기준 퍼센트 갱신(레버 기준)
+                                    try:
+                                        lev0 = float(tgt.get("lev", lev_live) or lev_live or 1.0)
+                                    except Exception:
+                                        lev0 = float(lev_live or 1.0) or 1.0
+                                    if lev0 <= 0:
+                                        lev0 = 1.0
+                                    tgt["sl_price_pct"] = float(abs(float(sl)) / max(float(lev0), 1.0))
+                                    tgt["tp_price_pct"] = float(abs(float(tp)) / max(float(lev0), 1.0))
+
+                                    # SR 가격 라인도 최신 목표(가격폭)에 맞춰 재계산(가능할 때만)
+                                    try:
+                                        if cfg.get("use_sr_stop", True):
+                                            dec2 = "buy" if side == "long" else "sell"
+                                            try:
+                                                entry_px0 = float(tgt.get("entry_price", entry) or entry or 0.0)
+                                            except Exception:
+                                                entry_px0 = float(entry or 0.0)
+                                            if entry_px0 > 0:
+                                                sr_res2 = sr_prices_for_style(
+                                                    ex,
+                                                    sym,
+                                                    entry_price=float(entry_px0),
+                                                    side=str(dec2),
+                                                    style="스윙",
+                                                    cfg=cfg,
+                                                    sl_price_pct=float(tgt.get("sl_price_pct", 0.0) or 0.0),
+                                                    tp_price_pct=float(tgt.get("tp_price_pct", 0.0) or 0.0),
+                                                    ai_sl_price=None,
+                                                    ai_tp_price=None,
+                                                )
+                                                if isinstance(sr_res2, dict):
+                                                    tgt["sl_price"] = sr_res2.get("sl_price", tgt.get("sl_price"))
+                                                    tgt["tp_price"] = sr_res2.get("tp_price", tgt.get("tp_price"))
+                                                    tgt["sl_price_source"] = str(sr_res2.get("sl_source", "") or "")
+                                                    tgt["tp_price_source"] = str(sr_res2.get("tp_source", "") or "")
+                                                    tgt["sr_used"] = {
+                                                        "tf": sr_res2.get("tf", ""),
+                                                        "lookback": sr_res2.get("lookback", 0),
+                                                        "pivot_order": sr_res2.get("pivot_order", 0),
+                                                        "buffer_atr_mult": sr_res2.get("buffer_atr_mult", 0.0),
+                                                        "rr_min": sr_res2.get("rr_min", 0.0),
+                                                    }
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+
                         # 트레일링(가격폭 기준으로만 조임) - 기존 유지
                         if cfg.get("use_trailing_stop", True):
                             if roi >= (tp * 0.5):
@@ -7935,11 +8228,21 @@ def telegram_thread(ex):
                                         except Exception:
                                             pass
                                         # 텔레그램 채널 보고
-                                        tg_send(
-                                            f"🧩 부분익절({label})\n- 코인: {sym}\n- 스타일: 스윙\n- ROI: +{roi:.2f}%\n- 청산수량: {close_qty}\n- 청산마진(추정): {close_margin_est:.2f} USDT\n- 남은수량: {contracts_left}\n- 일지ID: {trade_id or '-'}",
-                                            target=cfg.get("tg_route_events_to", "channel"),
-                                            cfg=cfg,
-                                        )
+                                        if _tg_simple_enabled(cfg):
+                                            msg = (
+                                                f"🧩 부분익절({label})\n"
+                                                f"- 코인: {sym}\n"
+                                                f"- 방식: {_tg_style_easy('스윙')}\n"
+                                                f"- 지금 수익률: {_tg_fmt_pct(roi)}\n"
+                                                f"- 청산: {close_txt} (수량 {close_qty})\n"
+                                                f"- 남은수량: {contracts_left}\n"
+                                                f"- ID: {trade_id or '-'}"
+                                            )
+                                        else:
+                                            msg = (
+                                                f"🧩 부분익절({label})\n- 코인: {sym}\n- 스타일: 스윙\n- ROI: +{roi:.2f}%\n- 청산수량: {close_qty}\n- 청산마진(추정): {close_margin_est:.2f} USDT\n- 남은수량: {contracts_left}\n- 일지ID: {trade_id or '-'}"
+                                            )
+                                        tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
                                         # 상세일지 기록
                                         if trade_id:
                                             d = load_trade_detail(trade_id) or {}
@@ -8272,18 +8575,35 @@ def telegram_thread(ex):
                                     bb_free_s = f"{float(bb_free):.2f}" if bb_free is not None else "-"
                                 except Exception:
                                     bb_free_s = "-"
-                                tg_send(
-                                    f"{emo} 손절\n- 코인: {sym}\n- 스타일: {style_now}\n- 수익률: {roi:+.2f}% (손익 {pnl_usdt_snapshot:+.2f} USDT)\n"
-                                    f"- 진입가→청산가: {float(entry):.6g} → {float(exit_px):.6g}\n"
-                                    f"- 청산수량(contracts): {contracts}\n"
-                                    f"- 진입금: {float(tgt.get('entry_usdt',0)):.2f} USDT (잔고 {float(tgt.get('entry_pct',0)):.1f}%)\n"
-                                    f"- 레버: x{tgt.get('lev','?')}\n"
-                                    f"- 잔고(총/가용): {bb_total_s}→{total_after:.2f} / {bb_free_s}→{free_after:.2f} USDT\n"
-                                    f"- 이유: {'지지/저항 이탈' if hit_sl_by_price else '목표 손절 도달'}\n"
-                                    f"- 한줄평: {one}\n- 일지ID: {trade_id or '없음'}",
-                                    target=cfg.get("tg_route_events_to", "channel"),
-                                    cfg=cfg,
-                                )
+                                if _tg_simple_enabled(cfg):
+                                    msg = tg_msg_exit_simple(
+                                        title="🩸 손절",
+                                        symbol=str(sym),
+                                        style=str(style_now),
+                                        side=str(side),
+                                        lev=tgt.get("lev", "?"),
+                                        roi_pct=float(roi),
+                                        pnl_usdt=float(pnl_usdt_snapshot),
+                                        contracts=float(contracts),
+                                        bal_before_total=bb_total,
+                                        bal_after_total=float(total_after),
+                                        bal_before_free=bb_free,
+                                        bal_after_free=float(free_after),
+                                        one_line=str(one),
+                                        trade_id=str(trade_id or "-"),
+                                    )
+                                else:
+                                    msg = (
+                                        f"{emo} 손절\n- 코인: {sym}\n- 스타일: {style_now}\n- 수익률: {roi:+.2f}% (손익 {pnl_usdt_snapshot:+.2f} USDT)\n"
+                                        f"- 진입가→청산가: {float(entry):.6g} → {float(exit_px):.6g}\n"
+                                        f"- 청산수량(contracts): {contracts}\n"
+                                        f"- 진입금: {float(tgt.get('entry_usdt',0)):.2f} USDT (잔고 {float(tgt.get('entry_pct',0)):.1f}%)\n"
+                                        f"- 레버: x{tgt.get('lev','?')}\n"
+                                        f"- 잔고(총/가용): {bb_total_s}→{total_after:.2f} / {bb_free_s}→{free_after:.2f} USDT\n"
+                                        f"- 이유: {'지지/저항 이탈' if hit_sl_by_price else '목표 손절 도달'}\n"
+                                        f"- 한줄평: {one}\n- 일지ID: {trade_id or '없음'}"
+                                    )
+                                tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
 
                                 active_targets.pop(sym, None)
                                 rt.setdefault("trades", {}).pop(sym, None)
@@ -8369,18 +8689,35 @@ def telegram_thread(ex):
                                     bb_free_s = f"{float(bb_free):.2f}" if bb_free is not None else "-"
                                 except Exception:
                                     bb_free_s = "-"
-                                tg_send(
-                                    f"🎉 익절\n- 코인: {sym}\n- 스타일: {style_now}\n- 수익률: {roi:+.2f}% (손익 {pnl_usdt_snapshot:+.2f} USDT)\n"
-                                    f"- 진입가→청산가: {float(entry):.6g} → {float(exit_px):.6g}\n"
-                                    f"- 청산수량(contracts): {contracts}\n"
-                                    f"- 진입금: {float(tgt.get('entry_usdt',0)):.2f} USDT (잔고 {float(tgt.get('entry_pct',0)):.1f}%)\n"
-                                    f"- 레버: x{tgt.get('lev','?')}\n"
-                                    f"- 잔고(총/가용): {bb_total_s}→{total_after:.2f} / {bb_free_s}→{free_after:.2f} USDT\n"
-                                    f"- 이유: {'지지/저항 목표 도달' if hit_tp_by_price else '목표 익절 도달'}\n"
-                                    f"- 한줄평: {one}\n- 일지ID: {trade_id or '없음'}",
-                                    target=cfg.get("tg_route_events_to", "channel"),
-                                    cfg=cfg,
-                                )
+                                if _tg_simple_enabled(cfg):
+                                    msg = tg_msg_exit_simple(
+                                        title="🎉 익절",
+                                        symbol=str(sym),
+                                        style=str(style_now),
+                                        side=str(side),
+                                        lev=tgt.get("lev", "?"),
+                                        roi_pct=float(roi),
+                                        pnl_usdt=float(pnl_usdt_snapshot),
+                                        contracts=float(contracts),
+                                        bal_before_total=bb_total,
+                                        bal_after_total=float(total_after),
+                                        bal_before_free=bb_free,
+                                        bal_after_free=float(free_after),
+                                        one_line=str(one),
+                                        trade_id=str(trade_id or "-"),
+                                    )
+                                else:
+                                    msg = (
+                                        f"🎉 익절\n- 코인: {sym}\n- 스타일: {style_now}\n- 수익률: {roi:+.2f}% (손익 {pnl_usdt_snapshot:+.2f} USDT)\n"
+                                        f"- 진입가→청산가: {float(entry):.6g} → {float(exit_px):.6g}\n"
+                                        f"- 청산수량(contracts): {contracts}\n"
+                                        f"- 진입금: {float(tgt.get('entry_usdt',0)):.2f} USDT (잔고 {float(tgt.get('entry_pct',0)):.1f}%)\n"
+                                        f"- 레버: x{tgt.get('lev','?')}\n"
+                                        f"- 잔고(총/가용): {bb_total_s}→{total_after:.2f} / {bb_free_s}→{free_after:.2f} USDT\n"
+                                        f"- 이유: {'지지/저항 목표 도달' if hit_tp_by_price else '목표 익절 도달'}\n"
+                                        f"- 한줄평: {one}\n- 일지ID: {trade_id or '없음'}"
+                                    )
+                                tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
 
                                 active_targets.pop(sym, None)
                                 rt.setdefault("trades", {}).pop(sym, None)
@@ -8811,11 +9148,16 @@ def telegram_thread(ex):
                             except Exception:
                                 pass
 
-                            # ✅ 하이리스크/하이리턴 모드 정책:
-                            # - 레버/진입비중이 큰 모드이므로, 자동(auto)에서는 "스윙(단기+장기 정렬)"에서만 신규 진입.
-                            # - (레짐 강제 scalping/swing을 사용자가 명시한 경우는 예외)
-                            if str(mode) == "하이리스크/하이리턴" and str(regime_mode) == "auto" and str(style) != "스윙":
-                                cs["skip_reason"] = "하이리스크 모드: 스윙(단기+장기 추세 정렬)에서만 진입"
+                            # ✅ 하이리스크/하이리턴 모드 신규진입 제한(선택):
+                            # - 사용자가 원하면(auto에서) "스윙(단기+장기 정렬)"일 때만 신규 진입하도록 제한 가능
+                            # - 기본값은 OFF(진입 허용)이며, 이때도 MODE_RULES의 레버/진입비중 범위를 우선 존중한다.
+                            if (
+                                str(mode) == "하이리스크/하이리턴"
+                                and str(regime_mode) == "auto"
+                                and bool(cfg.get("highrisk_entry_requires_swing", False))
+                                and str(style) != "스윙"
+                            ):
+                                cs["skip_reason"] = "하이리스크: 스윙(단기+장기 정렬)만 진입(설정)"
                                 try:
                                     mon_add_scan(
                                         mon,
@@ -8960,6 +9302,9 @@ def telegram_thread(ex):
                                     # ✅ 잔고 스냅샷(시트/일지에 표시용)
                                     "bal_entry_total": float(total_usdt) if "total_usdt" in locals() else "",
                                     "bal_entry_free": float(free_usdt) if "free_usdt" in locals() else "",
+                                    # ✅ 진입 직후 잔고(총/가용) 스냅샷(요구사항: "진입후 잔액")
+                                    "bal_entry_after_total": "",
+                                    "bal_entry_after_free": "",
                                     "reason": ai2.get("reason_easy", ""),
                                     "trade_id": trade_id,
                                     "sl_price": sl_price,
@@ -8977,6 +9322,14 @@ def telegram_thread(ex):
                                     "entry_epoch": time.time(),
                                     "style_last_switch_epoch": time.time(),
                                 }
+
+                                # ✅ 진입 직후 잔고(총/가용) 스냅샷 갱신(가능할 때만; 실패해도 봇은 계속)
+                                try:
+                                    free_a, total_a = safe_fetch_balance(ex)
+                                    active_targets[sym]["bal_entry_after_total"] = float(total_a)
+                                    active_targets[sym]["bal_entry_after_free"] = float(free_a)
+                                except Exception:
+                                    pass
 
                                 rt.setdefault("open_targets", {})[sym] = active_targets[sym]
                                 save_runtime(rt)
@@ -8996,6 +9349,8 @@ def telegram_thread(ex):
                                         "lev": lev,
                                         "balance_before_total": float(total_usdt) if "total_usdt" in locals() else "",
                                         "balance_before_free": float(free_usdt) if "free_usdt" in locals() else "",
+                                        "balance_after_total": active_targets.get(sym, {}).get("bal_entry_after_total", ""),
+                                        "balance_after_free": active_targets.get(sym, {}).get("bal_entry_after_free", ""),
                                         "sl_pct_roi": slp,
                                         "tp_pct_roi": tpp,
                                         "sl_price_sr": sl_price,
@@ -9043,40 +9398,83 @@ def telegram_thread(ex):
                                             rr0 = float(tpp) / max(abs(float(slp)), 0.01)
                                         except Exception:
                                             rr0 = 0.0
-                                    try:
-                                        sl_price_pct0 = float(ai2.get("sl_price_pct", float(slp) / max(int(lev), 1)) or 0.0)
-                                    except Exception:
-                                        sl_price_pct0 = float(slp) / max(int(lev), 1)
-                                    try:
-                                        tp_price_pct0 = float(ai2.get("tp_price_pct", float(tpp) / max(int(lev), 1)) or 0.0)
-                                    except Exception:
-                                        tp_price_pct0 = float(tpp) / max(int(lev), 1)
-                                    msg = (
-                                        f"🎯 진입\n- 코인: {sym}\n- 스타일: {style}\n- 방향: {direction}\n"
-                                        f"- 스타일이유: {str(cs.get('style_reason','') or '').strip()[:180]}\n"
-                                        f"- 진입금: {entry_usdt:.2f} USDT (잔고 {entry_pct:.1f}%)\n"
-                                        f"- 레버리지: x{lev}\n"
-                                        f"- 목표익절/손절(ROI): +{tpp:.2f}% / -{slp:.2f}% | RR {rr0:.2f}\n"
-                                        f"- 가격기준(TP/SL): +{tp_price_pct0:.2f}% / -{sl_price_pct0:.2f}%\n"
-                                        f"- 단기추세({cfg.get('timeframe','5m')}): {stt.get('추세','-')}\n"
-                                        f"- 장기추세({htf_tf}): 🧭 {htf_trend}\n"
-                                        f"- 외부리스크 감산: x{entry_risk_mul:.2f} ({'스윙만 적용' if str(style)=='스윙' else '스캘핑=미적용'})\n"
-                                    )
-                                    if sl_price is not None and tp_price is not None:
-                                        src_txt = ""
+                                    if _tg_simple_enabled(cfg):
+                                        # ✅ 쉬운말(핵심만)
+                                        bb_total = None
+                                        bb_free = None
+                                        ba_total = None
+                                        ba_free = None
                                         try:
-                                            src_txt = f" ({sl_price_source or '-'} / {tp_price_source or '-'})"
+                                            bb_total = float(total_usdt) if "total_usdt" in locals() else None
                                         except Exception:
-                                            src_txt = ""
-                                        msg += f"- SR기준가: TP {tp_price:.6g} / SL {sl_price:.6g}{src_txt}\n"
-                                    msg += f"- 확신도: {conf}% (기준 {rule['min_conf']}%)\n- 일지ID: {trade_id}\n"
-                                    if cfg.get("tg_send_entry_reason", False):
-                                        # 요구사항: 텔레그램에는 '긴 근거'를 보내지 않고, /log <id>로 조회
-                                        msg += (
-                                            f"- 근거(짧게): {str(ai2.get('reason_easy',''))[:120]}\n"
-                                            f"- 자세한 근거: /log {trade_id}\n"
-                                            f"- AI지표: {', '.join(ai2.get('used_indicators', []))}\n"
+                                            bb_total = None
+                                        try:
+                                            bb_free = float(free_usdt) if "free_usdt" in locals() else None
+                                        except Exception:
+                                            bb_free = None
+                                        try:
+                                            v = (active_targets.get(sym, {}) or {}).get("bal_entry_after_total", "")
+                                            ba_total = float(v) if (v is not None and str(v).strip() != "") else None
+                                        except Exception:
+                                            ba_total = None
+                                        try:
+                                            v = (active_targets.get(sym, {}) or {}).get("bal_entry_after_free", "")
+                                            ba_free = float(v) if (v is not None and str(v).strip() != "") else None
+                                        except Exception:
+                                            ba_free = None
+                                        one_line0 = str(ai2.get("reason_easy", "") or "").strip()
+                                        if not one_line0:
+                                            one_line0 = str(cs.get("style_reason", "") or "").strip()
+                                        msg = tg_msg_entry_simple(
+                                            symbol=str(sym),
+                                            style=str(style),
+                                            decision=str(decision),
+                                            lev=lev,
+                                            entry_usdt=float(entry_usdt),
+                                            rr=float(rr0),
+                                            bal_before_total=bb_total,
+                                            bal_after_total=ba_total,
+                                            bal_before_free=bb_free,
+                                            bal_after_free=ba_free,
+                                            one_line=one_line0,
+                                            trade_id=str(trade_id),
                                         )
+                                    else:
+                                        # ✅ 기존(상세) 메시지 유지
+                                        try:
+                                            sl_price_pct0 = float(ai2.get("sl_price_pct", float(slp) / max(int(lev), 1)) or 0.0)
+                                        except Exception:
+                                            sl_price_pct0 = float(slp) / max(int(lev), 1)
+                                        try:
+                                            tp_price_pct0 = float(ai2.get("tp_price_pct", float(tpp) / max(int(lev), 1)) or 0.0)
+                                        except Exception:
+                                            tp_price_pct0 = float(tpp) / max(int(lev), 1)
+                                        msg = (
+                                            f"🎯 진입\n- 코인: {sym}\n- 스타일: {style}\n- 방향: {direction}\n"
+                                            f"- 스타일이유: {str(cs.get('style_reason','') or '').strip()[:180]}\n"
+                                            f"- 진입금: {entry_usdt:.2f} USDT (잔고 {entry_pct:.1f}%)\n"
+                                            f"- 레버리지: x{lev}\n"
+                                            f"- 목표익절/손절(ROI): +{tpp:.2f}% / -{slp:.2f}% | RR {rr0:.2f}\n"
+                                            f"- 가격기준(TP/SL): +{tp_price_pct0:.2f}% / -{sl_price_pct0:.2f}%\n"
+                                            f"- 단기추세({cfg.get('timeframe','5m')}): {stt.get('추세','-')}\n"
+                                            f"- 장기추세({htf_tf}): 🧭 {htf_trend}\n"
+                                            f"- 외부리스크 감산: x{entry_risk_mul:.2f} ({'스윙만 적용' if str(style)=='스윙' else '스캘핑=미적용'})\n"
+                                        )
+                                        if sl_price is not None and tp_price is not None:
+                                            src_txt = ""
+                                            try:
+                                                src_txt = f" ({sl_price_source or '-'} / {tp_price_source or '-'})"
+                                            except Exception:
+                                                src_txt = ""
+                                            msg += f"- SR기준가: TP {tp_price:.6g} / SL {sl_price:.6g}{src_txt}\n"
+                                        msg += f"- 확신도: {conf}% (기준 {rule['min_conf']}%)\n- 일지ID: {trade_id}\n"
+                                        if cfg.get("tg_send_entry_reason", False):
+                                            # 요구사항: 텔레그램에는 '긴 근거'를 보내지 않고, /log <id>로 조회
+                                            msg += (
+                                                f"- 근거(짧게): {str(ai2.get('reason_easy',''))[:120]}\n"
+                                                f"- 자세한 근거: /log {trade_id}\n"
+                                                f"- AI지표: {', '.join(ai2.get('used_indicators', []))}\n"
+                                            )
                                     tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
 
                                 mon_add_event(mon, "ENTRY", sym, f"{decision} {style} conf{conf}", {"trade_id": trade_id})
@@ -9875,6 +10273,11 @@ config["timeframe"] = st.sidebar.selectbox(
 )
 config["tg_enable_reports"] = st.sidebar.checkbox("📨 텔레그램 이벤트 알림(진입/청산 등)", value=bool(config.get("tg_enable_reports", True)))
 config["tg_send_entry_reason"] = st.sidebar.checkbox("📌 텔레그램에 진입근거(긴글)도 보내기", value=bool(config.get("tg_send_entry_reason", False)))
+config["tg_simple_messages"] = st.sidebar.checkbox(
+    "🧓 텔레그램 쉬운말(핵심만)",
+    value=bool(config.get("tg_simple_messages", True)),
+    help="진입/익절/손절/부분익절/추매 등 알림을 어려운 용어 없이 '핵심 정보'만 보내도록 합니다.",
+)
 
 st.sidebar.subheader("⏱️ 주기 리포트")
 config["tg_enable_periodic_report"] = st.sidebar.checkbox("15분(기본) 상황보고", value=bool(config.get("tg_enable_periodic_report", True)))
@@ -9919,6 +10322,12 @@ with st.sidebar.expander("히스테리시스 상세(선택)"):
     config["regime_hysteresis_step"] = c_h1.number_input("step", 0.05, 1.0, float(config.get("regime_hysteresis_step", 0.55)), step=0.05)
     config["regime_hysteresis_enter_swing"] = c_h2.number_input("enter swing", 0.1, 0.99, float(config.get("regime_hysteresis_enter_swing", 0.75)), step=0.05)
     config["regime_hysteresis_enter_scalp"] = c_h3.number_input("enter scalp", 0.01, 0.9, float(config.get("regime_hysteresis_enter_scalp", 0.25)), step=0.05)
+
+config["highrisk_entry_requires_swing"] = st.sidebar.checkbox(
+    "하이리스크: 스윙만 신규진입(선택)",
+    value=bool(config.get("highrisk_entry_requires_swing", False)),
+    help="하이리스크/하이리턴 모드에서 auto 레짐일 때만 적용됩니다. ON이면 단기+장기 추세 정렬(스윙)에서만 신규 진입합니다.",
+)
 
 config["style_auto_enable"] = st.sidebar.checkbox("스캘핑/스윙 자동 선택/전환", value=bool(config.get("style_auto_enable", True)))
 config["style_switch_ai_enable"] = st.sidebar.checkbox(
