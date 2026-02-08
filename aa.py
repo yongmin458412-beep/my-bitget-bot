@@ -182,6 +182,9 @@ OPENAI_TIMEOUT_SEC = 20
 # HTTP 요청 타임아웃(초)
 HTTP_TIMEOUT_SEC = 12
 
+# 외부 시황 갱신 hard-timeout(초) - 네트워크/번역 지연으로 봇 스레드가 멈춘 것처럼 보이는 문제 완화
+EXTERNAL_CONTEXT_TIMEOUT_SEC = max(10, HTTP_TIMEOUT_SEC + 4)
+
 _THREAD_POOL = ThreadPoolExecutor(max_workers=4)
 
 
@@ -1249,6 +1252,24 @@ _GSHEET_NOTIFY_LOCK = threading.RLock()
 _GSHEET_LAST_NOTIFY_EPOCH = 0.0
 _GSHEET_LAST_NOTIFY_MSG = ""
 
+# ✅ SCAN 로그는 빈도가 매우 높아 Google Sheets API rate-limit(429)을 유발할 수 있음
+# - UI(monitor_state.json)에는 전체 SCAN 과정을 남기되,
+# - 시트에는 stage/심볼별로 일정 간격(throttle) 샘플링해서 누적한다.
+_GSHEET_SCAN_THROTTLE_LOCK = threading.RLock()
+_GSHEET_SCAN_LAST: Dict[str, float] = {}
+_GSHEET_SCAN_THROTTLE_SEC = 8.0
+_GSHEET_SCAN_THROTTLE_MAX_KEYS = 1500
+_GSHEET_SCAN_ALWAYS_STAGES = {
+    "ai_result",
+    "trade_opened",
+    "trade_skipped",
+    "in_position",
+    "ai_error",
+    "fetch_short_fail",
+    "fetch_long_fail",
+    "support_resistance_fail",
+}
+
 
 def gsheet_is_enabled() -> bool:
     # secrets 우선 (요구사항)
@@ -1591,6 +1612,28 @@ def gsheet_log_event(stage: str, message: str = "", payload: Optional[Dict[str, 
 
 
 def gsheet_log_scan(stage: str, symbol: str, tf: str = "", signal: str = "", score: Any = "", message: str = "", payload: Optional[Dict[str, Any]] = None):
+    # ✅ SCAN은 매우 자주 발생하므로(특히 5코인 * 다단계),
+    #    시트에는 stage/심볼별로 throttle 샘플링해서 API 에러/레이트리밋을 줄인다.
+    try:
+        stg = str(stage or "").strip()
+        sym = str(symbol or "").strip()
+        stg_key = stg.lower()
+        # 중요한 단계는 무조건 기록
+        if stg_key and (stg_key not in _GSHEET_SCAN_ALWAYS_STAGES) and sym and sym != "*":
+            now = time.time()
+            k = f"{sym}|{stg_key}"
+            with _GSHEET_SCAN_THROTTLE_LOCK:
+                last = float(_GSHEET_SCAN_LAST.get(k, 0) or 0)
+                if (now - last) < float(_GSHEET_SCAN_THROTTLE_SEC):
+                    return
+                _GSHEET_SCAN_LAST[k] = now
+                if len(_GSHEET_SCAN_LAST) > int(_GSHEET_SCAN_THROTTLE_MAX_KEYS):
+                    # 오래된 것부터 정리(메모리 누수 방지)
+                    for kk in sorted(_GSHEET_SCAN_LAST, key=_GSHEET_SCAN_LAST.get)[:300]:
+                        _GSHEET_SCAN_LAST.pop(kk, None)
+    except Exception:
+        pass
+
     gsheet_enqueue(
         {
             "type": "SCAN",
@@ -1608,6 +1651,8 @@ def gsheet_log_scan(stage: str, symbol: str, tf: str = "", signal: str = "", sco
 def gsheet_worker_thread():
     backoff = 1.0
     while True:
+        batch: List[Dict[str, Any]] = []
+        batch_is_high = False  # TRADE/EVENT batch
         try:
             if not gsheet_is_enabled():
                 time.sleep(2.0)
@@ -1629,14 +1674,17 @@ def gsheet_worker_thread():
             except Exception:
                 pass
 
-            rec = None
+            # ✅ batch pop: Google Sheets API 호출 수를 줄이기 위해 묶어서 append (rate limit 완화)
             with _GSHEET_QUEUE_LOCK:
-                if _GSHEET_QUEUE_HIGH:
-                    rec = _GSHEET_QUEUE_HIGH.popleft()
-                elif _GSHEET_QUEUE_SCAN:
-                    rec = _GSHEET_QUEUE_SCAN.popleft()
-            if rec is None:
-                time.sleep(0.3)
+                while _GSHEET_QUEUE_HIGH and len(batch) < 25:
+                    batch.append(_GSHEET_QUEUE_HIGH.popleft())
+                if batch:
+                    batch_is_high = True
+                else:
+                    while _GSHEET_QUEUE_SCAN and len(batch) < 40:
+                        batch.append(_GSHEET_QUEUE_SCAN.popleft())
+            if not batch:
+                time.sleep(0.35)
                 continue
 
             # 연결 캐시
@@ -1659,49 +1707,62 @@ def gsheet_worker_thread():
                 except Exception:
                     pass
                 with _GSHEET_QUEUE_LOCK:
-                    typ = str(rec.get("type", "EVENT")).strip().upper()
-                    if typ in ["TRADE", "EVENT"]:
-                        _GSHEET_QUEUE_HIGH.appendleft(rec)
+                    if batch_is_high:
+                        for r in reversed(batch):
+                            _GSHEET_QUEUE_HIGH.appendleft(r)
                     else:
-                        _GSHEET_QUEUE_SCAN.appendleft(rec)
+                        for r in reversed(batch):
+                            _GSHEET_QUEUE_SCAN.appendleft(r)
                 time.sleep(backoff)
                 backoff = float(clamp(backoff * 1.4, 1.0, 12.0))
                 continue
 
             _gsheet_ensure_header(ws)
 
-            row = [
-                str(rec.get("time_kst", "")),
-                str(rec.get("type", "")),
-                str(rec.get("stage", "")),
-                str(rec.get("symbol", "")),
-                str(rec.get("tf", "")),
-                str(rec.get("signal", "")),
-                str(rec.get("score", "")),
-                str(rec.get("trade_id", "")),
-                str(rec.get("message", ""))[:500],
-                str(rec.get("payload_json", ""))[:1800],
-            ]
+            rows = []
+            for rec in batch:
+                rows.append(
+                    [
+                        str(rec.get("time_kst", "")),
+                        str(rec.get("type", "")),
+                        str(rec.get("stage", "")),
+                        str(rec.get("symbol", "")),
+                        str(rec.get("tf", "")),
+                        str(rec.get("signal", "")),
+                        str(rec.get("score", "")),
+                        str(rec.get("trade_id", "")),
+                        str(rec.get("message", ""))[:500],
+                        str(rec.get("payload_json", ""))[:1800],
+                    ]
+                )
 
-            def _append():
-                return ws.append_row(row, value_input_option="USER_ENTERED")
+            def _append_batch():
+                # gspread 5+ 에서 append_rows 지원(요청 수 절감)
+                if hasattr(ws, "append_rows"):
+                    return ws.append_rows(rows, value_input_option="USER_ENTERED")  # type: ignore[attr-defined]
+                # fallback: 구버전은 append_row 루프
+                for row in rows:
+                    ws.append_row(row, value_input_option="USER_ENTERED")
+                return True
 
             if retry is not None:
                 @_retry_wrapper_append_row  # type: ignore  # defined below
                 def _append_retry():
-                    return _append()
+                    return _append_batch()
 
                 _append_retry()
             else:
-                _append()
+                _append_batch()
 
             try:
+                last_rec = batch[-1] if batch else {}
                 with _GSHEET_CACHE_LOCK:
                     _GSHEET_CACHE["last_append_epoch"] = time.time()
                     _GSHEET_CACHE["last_append_kst"] = now_kst_str()
-                    _GSHEET_CACHE["last_append_type"] = str(rec.get("type", "") or "")
-                    _GSHEET_CACHE["last_append_stage"] = str(rec.get("stage", "") or "")
+                    _GSHEET_CACHE["last_append_type"] = str(last_rec.get("type", "") or "")
+                    _GSHEET_CACHE["last_append_stage"] = str(last_rec.get("stage", "") or "")
                     _GSHEET_CACHE["last_err"] = ""
+                    _GSHEET_CACHE["last_tb"] = ""
             except Exception:
                 pass
             backoff = 1.0
@@ -1709,10 +1770,50 @@ def gsheet_worker_thread():
             # 실패해도 봇은 살아야 함(오류는 관리자에게 알림)
             try:
                 with _GSHEET_CACHE_LOCK:
-                    _GSHEET_CACHE["last_err"] = f"GSHEET append 실패: {e}"
+                    # tenacity RetryError는 메시지가 빈 경우가 많아, root cause를 뽑아서 보여준다.
+                    root = e
+                    wrapped = ""
+                    try:
+                        if type(e).__name__ == "RetryError" or hasattr(e, "last_attempt"):
+                            la = getattr(e, "last_attempt", None)
+                            if la is not None and hasattr(la, "exception"):
+                                ex0 = la.exception()
+                                if ex0 is not None:
+                                    root = ex0
+                                    wrapped = type(e).__name__
+                    except Exception:
+                        root = e
+                        wrapped = ""
+                    _GSHEET_CACHE["last_err"] = f"GSHEET append 실패: {type(root).__name__}: {root}"
+                    _GSHEET_CACHE["last_tb"] = traceback.format_exc()
             except Exception:
                 pass
-            notify_admin_error("GSHEET_THREAD", e, min_interval_sec=120.0)
+            # 실패한 batch는 되돌려서(특히 TRADE/EVENT) 나중에 재시도
+            try:
+                if batch:
+                    with _GSHEET_QUEUE_LOCK:
+                        if batch_is_high:
+                            for r in reversed(batch):
+                                _GSHEET_QUEUE_HIGH.appendleft(r)
+                        else:
+                            for r in reversed(batch):
+                                _GSHEET_QUEUE_SCAN.appendleft(r)
+            except Exception:
+                pass
+            try:
+                # 관리자 DM에 root cause를 최대한 전달
+                with _GSHEET_CACHE_LOCK:
+                    msg2 = str(_GSHEET_CACHE.get("last_err", "") or str(e))
+                    tb2 = str(_GSHEET_CACHE.get("last_tb", "") or "")
+                notify_admin_error(
+                    "GSHEET_THREAD",
+                    RuntimeError(msg2),
+                    context={"batch_len": len(batch), "batch_is_high": bool(batch_is_high)},
+                    tb=tb2,
+                    min_interval_sec=120.0,
+                )
+            except Exception:
+                notify_admin_error("GSHEET_THREAD", e, min_interval_sec=120.0)
             time.sleep(backoff)
             backoff = float(clamp(backoff * 1.5, 1.0, 12.0))
 
@@ -3363,6 +3464,11 @@ def mon_add_scan(mon: Dict[str, Any], stage: str, symbol: str, tf: str = "", sig
             gsheet_log_scan(stage=stage, symbol=symbol, tf=tf, signal=signal, score=score, message=message, payload=extra or {})
         except Exception:
             pass
+        # ✅ 블로킹 호출(ex.fetch_ohlcv 등) 직전에 stage/heartbeat가 화면에 보이도록 파일을 주기적으로 flush
+        try:
+            monitor_write_throttled(mon, min_interval_sec=0.8)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -4092,7 +4198,23 @@ def telegram_thread(ex):
             try:
                 mon["loop_stage"] = "EXTERNAL_CONTEXT"
                 mon["loop_stage_kst"] = now_kst_str()
-                ext = build_external_context(cfg, rt=rt)
+                # stage를 먼저 flush(외부 호출이 길어져도 UI에서 어디서 멈췄는지 보이게)
+                try:
+                    monitor_write_throttled(mon, 0.2)
+                except Exception:
+                    pass
+                try:
+                    ext = _call_with_timeout(lambda: build_external_context(cfg, rt=rt), EXTERNAL_CONTEXT_TIMEOUT_SEC)
+                except FuturesTimeoutError:
+                    # 타임아웃이면 이전 ext(있으면)로 유지하고, 이벤트로만 남김
+                    prev = mon.get("external") if isinstance(mon.get("external"), dict) else {}
+                    if prev:
+                        ext = dict(prev)
+                        ext["asof_kst"] = now_kst_str()
+                        ext["timeout"] = True
+                    else:
+                        ext = {"enabled": False, "error": "external_context_timeout", "asof_kst": now_kst_str(), "timeout": True}
+                    mon_add_event(mon, "EXTERNAL_TIMEOUT", "", "external_context timeout", {"timeout_sec": int(EXTERNAL_CONTEXT_TIMEOUT_SEC)})
             except Exception as e:
                 ext = {"enabled": False, "error": str(e)[:240], "asof_kst": now_kst_str()}
                 notify_admin_error("EXTERNAL_CONTEXT", e, tb=traceback.format_exc(), min_interval_sec=180.0)
