@@ -1,4 +1,3 @@
-
 # =========================================================
 #  Bitget AI Wonyoti Agent (Final Integrated) - 유지보수/확장판
 #  - Streamlit: 제어판/차트/포지션/일지/AI 시야/백테스트/내보내기
@@ -630,6 +629,11 @@ def default_settings() -> Dict[str, Any]:
         "regime_hysteresis_step": 0.55,
         "regime_hysteresis_enter_swing": 0.75,
         "regime_hysteresis_enter_scalp": 0.25,
+        # ✅ 스타일 AI 보조(선택): 레짐 전환/표시에서 불필요한 OpenAI 호출을 줄이기 위해 분리 옵션 제공
+        # - style_auto_enable=True여도, 아래 옵션이 OFF면 스타일은 "룰 기반"만 사용
+        # - 사용자가 원할 때만 ON (비용/지연/요금제 429 방지)
+        "style_switch_ai_enable": False,  # 포지션 보유 중 스타일 전환 판단에 AI 사용(기본 OFF)
+        "style_ai_cache_sec": 600,        # 동일 입력의 스타일 AI 결과 캐시(초)
         "style_auto_enable": True,
         "style_lock_minutes": 20,  # 전환 최소 유지 시간
         "scalp_max_hold_minutes": 25,          # 스캘핑 포지션 최대 보유(넘으면 스윙 전환 검토)
@@ -691,6 +695,8 @@ def default_settings() -> Dict[str, Any]:
         # ✅ Google Sheets 원본 로그(TRADE/EVENT/SCAN) 레거시 모드 허용 여부(기본 OFF)
         # - 사용자 요구: 구글시트에는 "매매일지 + 시간대/일별 총합"만(=trades_only)
         "gsheet_allow_legacy_logs": False,
+        # ✅ Google Sheets 표(서식) 자동 적용(권장): 1회만 적용되며, UI에서 강제 재적용 가능
+        "gsheet_auto_format_enable": True,
     }
 
 
@@ -1932,6 +1938,13 @@ def _gsheet_sync_state_default() -> Dict[str, Any]:
         "trade_ws_title": "",
         "hourly_ws_title": "",
         "daily_ws_title": "",
+        # ✅ 서식(표) 자동 적용 상태(중복 batchUpdate 방지)
+        "format_version_applied": 0,
+        "format_applied_epoch": 0.0,
+        "format_applied_kst": "",
+        "format_trade_title": "",
+        "format_hourly_title": "",
+        "format_daily_title": "",
     }
 
 
@@ -2103,6 +2116,540 @@ def _gsheet_prepare_trades_only_sheets(sh: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
+# =========================================================
+# ✅ 7.5.1) Google Sheets: 표(서식) 자동 적용 (trades_only 전용)
+# - batchUpdate 1회로 3개 시트(매매일지/시간대/일별)에 서식을 적용
+# - gspread-formatting 없이도 동작(추가 설치 불필요)
+# - 레이트리밋 방지: sync state에 "버전+시트명"을 저장해 1회만 적용
+# =========================================================
+
+GSHEET_FORMAT_VERSION = 1
+
+
+def _gsheet_auto_format_enabled() -> bool:
+    """
+    우선순위:
+    1) secrets: GSHEET_AUTO_FORMAT (true/false)
+    2) settings: gsheet_auto_format_enable (기본 True)
+    """
+    try:
+        v = str(_sget_str("GSHEET_AUTO_FORMAT") or "").strip()
+        if v:
+            return bool(_boolish(v))
+    except Exception:
+        pass
+    try:
+        cfg = load_settings()
+        return bool(cfg.get("gsheet_auto_format_enable", True))
+    except Exception:
+        return True
+
+
+def _gsheet_format_is_already_applied(st0: Dict[str, Any], trade_title: str, hourly_title: str, daily_title: str) -> bool:
+    try:
+        ver = int(st0.get("format_version_applied", 0) or 0)
+        if ver != int(GSHEET_FORMAT_VERSION):
+            return False
+        if str(st0.get("format_trade_title", "") or "") != str(trade_title or ""):
+            return False
+        if str(st0.get("format_hourly_title", "") or "") != str(hourly_title or ""):
+            return False
+        if str(st0.get("format_daily_title", "") or "") != str(daily_title or ""):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _gsheet_fetch_metadata_safe(sh: Any) -> Dict[str, Any]:
+    try:
+        # includeGridData=false: formatting/metadata만 필요(응답 크기↓)
+        return sh.fetch_sheet_metadata(params={"includeGridData": "false"}) or {}
+    except Exception:
+        try:
+            return sh.fetch_sheet_metadata() or {}
+        except Exception:
+            return {}
+
+
+def _gsheet_batch_update_safe(sh: Any, body: Dict[str, Any]) -> Any:
+    """
+    gspread 버전 차이/래핑 차이 대응:
+    - Spreadsheet.batch_update 가 있으면 사용
+    - 없으면 low-level client.request로 fallback
+    """
+    try:
+        if hasattr(sh, "batch_update"):
+            return sh.batch_update(body)
+    except Exception:
+        pass
+    # fallback: direct REST call via gspread client
+    try:
+        sid = str(getattr(sh, "id", "") or getattr(sh, "spreadsheet_id", "") or "").strip()
+        if not sid:
+            # gspread Spreadsheet는 보통 .id가 존재
+            sid = str(getattr(getattr(sh, "client", None), "spreadsheet_id", "") or "").strip()
+        if not sid:
+            raise RuntimeError("spreadsheet_id_not_found")
+        client = getattr(sh, "client", None)
+        if client is None or not hasattr(client, "request"):
+            raise RuntimeError("gspread_client_request_missing")
+        return client.request("post", f"spreadsheets/{sid}:batchUpdate", json=body)
+    except Exception:
+        # 호출부에서 예외를 잡아 관리자 알림 처리
+        raise
+
+
+def _gsheet_meta_by_sheet_id(md: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    out: Dict[int, Dict[str, Any]] = {}
+    try:
+        for s in (md.get("sheets") or []):
+            try:
+                props = (s or {}).get("properties") or {}
+                sid = int(props.get("sheetId", -1))
+                if sid >= 0:
+                    out[sid] = dict(s or {})
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return out
+
+
+def _gsheet_build_cleanup_requests(sheet_id: int, sheet_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    reqs: List[Dict[str, Any]] = []
+    try:
+        # basic filter 제거(중복 방지)
+        if (sheet_meta or {}).get("basicFilter"):
+            reqs.append({"clearBasicFilter": {"sheetId": int(sheet_id)}})
+    except Exception:
+        pass
+    # conditional formats 제거(중복 방지)
+    try:
+        cfs = (sheet_meta or {}).get("conditionalFormats") or []
+        if isinstance(cfs, list) and cfs:
+            for idx in range(len(cfs) - 1, -1, -1):
+                reqs.append({"deleteConditionalFormatRule": {"sheetId": int(sheet_id), "index": int(idx)}})
+    except Exception:
+        pass
+    # banding 제거(중복 방지)
+    try:
+        brs = (sheet_meta or {}).get("bandedRanges") or []
+        if isinstance(brs, list) and brs:
+            for br in brs:
+                bid = (br or {}).get("bandedRangeId")
+                if bid is None:
+                    continue
+                try:
+                    reqs.append({"deleteBanding": {"bandedRangeId": int(bid)}})
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return reqs
+
+
+def _gsheet_color(hex_rgb: str) -> Dict[str, float]:
+    h = str(hex_rgb or "").strip().lstrip("#")
+    if len(h) != 6:
+        return {"red": 1.0, "green": 1.0, "blue": 1.0}
+    try:
+        r = int(h[0:2], 16) / 255.0
+        g = int(h[2:4], 16) / 255.0
+        b = int(h[4:6], 16) / 255.0
+        return {"red": float(r), "green": float(g), "blue": float(b)}
+    except Exception:
+        return {"red": 1.0, "green": 1.0, "blue": 1.0}
+
+
+def _gsheet_build_table_requests(
+    sheet_id: int,
+    row_count: int,
+    col_count: int,
+    *,
+    header_bg: str = "#1f2937",
+    header_fg: str = "#ffffff",
+    band1: str = "#f8fafc",
+    band2: str = "#ffffff",
+    default_col_width_px: int = 140,
+    col_width_px: Optional[Dict[int, int]] = None,
+    wrap_cols: Optional[List[int]] = None,
+    number_formats: Optional[List[Tuple[int, int, str]]] = None,  # [(start_col, end_col_excl, pattern)]
+    right_align_cols: Optional[List[Tuple[int, int]]] = None,      # [(start_col, end_col_excl)]
+    cond_formats: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    sheetId 기준으로 "표 형태" 서식 요청을 생성한다.
+    - cond_formats: addConditionalFormatRule 용 rule dict 리스트
+    """
+    sid = int(sheet_id)
+    rc = max(2, int(row_count))
+    cc = max(1, int(col_count))
+    reqs: List[Dict[str, Any]] = []
+
+    # 1) Freeze header row
+    reqs.append(
+        {
+            "updateSheetProperties": {
+                "properties": {"sheetId": sid, "gridProperties": {"frozenRowCount": 1}},
+                "fields": "gridProperties.frozenRowCount",
+            }
+        }
+    )
+
+    # 2) Header row style
+    reqs.append(
+        {
+            "repeatCell": {
+                "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": cc},
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": _gsheet_color(header_bg),
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                        "wrapStrategy": "WRAP",
+                        "textFormat": {"foregroundColor": _gsheet_color(header_fg), "bold": True},
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment,wrapStrategy)",
+            }
+        }
+    )
+
+    # 3) Default column width
+    reqs.append(
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": cc},
+                "properties": {"pixelSize": int(default_col_width_px)},
+                "fields": "pixelSize",
+            }
+        }
+    )
+
+    # 4) Specific column widths
+    try:
+        if col_width_px:
+            for c, w in sorted(col_width_px.items(), key=lambda kv: kv[0]):
+                c0 = int(c)
+                if c0 < 0 or c0 >= cc:
+                    continue
+                reqs.append(
+                    {
+                        "updateDimensionProperties": {
+                            "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": c0, "endIndex": c0 + 1},
+                            "properties": {"pixelSize": int(w)},
+                            "fields": "pixelSize",
+                        }
+                    }
+                )
+    except Exception:
+        pass
+
+    # 5) Wrap long-text columns (data rows only)
+    try:
+        if wrap_cols:
+            for c in wrap_cols:
+                c0 = int(c)
+                if c0 < 0 or c0 >= cc:
+                    continue
+                reqs.append(
+                    {
+                        "repeatCell": {
+                            "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": rc, "startColumnIndex": c0, "endColumnIndex": c0 + 1},
+                            "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP", "verticalAlignment": "TOP"}},
+                            "fields": "userEnteredFormat(wrapStrategy,verticalAlignment)",
+                        }
+                    }
+                )
+    except Exception:
+        pass
+
+    # 6) Number formats
+    try:
+        if number_formats:
+            for start_c, end_c, pattern in number_formats:
+                sc = int(start_c)
+                ec = int(end_c)
+                if sc < 0:
+                    sc = 0
+                if ec > cc:
+                    ec = cc
+                if ec <= sc:
+                    continue
+                reqs.append(
+                    {
+                        "repeatCell": {
+                            "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": rc, "startColumnIndex": sc, "endColumnIndex": ec},
+                            "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": str(pattern)}}},
+                            "fields": "userEnteredFormat.numberFormat",
+                        }
+                    }
+                )
+    except Exception:
+        pass
+
+    # 7) Right-align numeric columns (optional)
+    try:
+        if right_align_cols:
+            for sc0, ec0 in right_align_cols:
+                sc = int(sc0)
+                ec = int(ec0)
+                if sc < 0:
+                    sc = 0
+                if ec > cc:
+                    ec = cc
+                if ec <= sc:
+                    continue
+                reqs.append(
+                    {
+                        "repeatCell": {
+                            "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": rc, "startColumnIndex": sc, "endColumnIndex": ec},
+                            "cell": {"userEnteredFormat": {"horizontalAlignment": "RIGHT"}},
+                            "fields": "userEnteredFormat.horizontalAlignment",
+                        }
+                    }
+                )
+    except Exception:
+        pass
+
+    # 8) Add banding (header 포함)
+    try:
+        reqs.append(
+            {
+                "addBanding": {
+                    "bandedRange": {
+                        "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": rc, "startColumnIndex": 0, "endColumnIndex": cc},
+                        "rowProperties": {
+                            "headerColor": _gsheet_color(header_bg),
+                            "firstBandColor": _gsheet_color(band1),
+                            "secondBandColor": _gsheet_color(band2),
+                        },
+                    }
+                }
+            }
+        )
+    except Exception:
+        pass
+
+    # 9) Basic filter
+    try:
+        reqs.append({"setBasicFilter": {"filter": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": rc, "startColumnIndex": 0, "endColumnIndex": cc}}}})
+    except Exception:
+        pass
+
+    # 10) Conditional formats
+    try:
+        if cond_formats:
+            idx = 0
+            for rule in cond_formats:
+                if not isinstance(rule, dict):
+                    continue
+                reqs.append({"addConditionalFormatRule": {"rule": rule, "index": int(idx)}})
+                idx += 1
+    except Exception:
+        pass
+
+    return reqs
+
+
+def _gsheet_build_pnl_cond_formats(sheet_id: int, row_count: int, start_col: int, end_col: int) -> List[Dict[str, Any]]:
+    sid = int(sheet_id)
+    rc = max(2, int(row_count))
+    sc = int(start_col)
+    ec = int(end_col)
+    # green for >0, red for <0
+    rng = {"sheetId": sid, "startRowIndex": 1, "endRowIndex": rc, "startColumnIndex": sc, "endColumnIndex": ec}
+    green = {
+        "ranges": [rng],
+        "booleanRule": {
+            "condition": {"type": "NUMBER_GREATER", "values": [{"userEnteredValue": "0"}]},
+            "format": {"backgroundColor": _gsheet_color("#e6f4ea"), "textFormat": {"foregroundColor": _gsheet_color("#137333"), "bold": True}},
+        },
+    }
+    red = {
+        "ranges": [rng],
+        "booleanRule": {
+            "condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]},
+            "format": {"backgroundColor": _gsheet_color("#fce8e6"), "textFormat": {"foregroundColor": _gsheet_color("#a50e0e"), "bold": True}},
+        },
+    }
+    return [green, red]
+
+
+def _gsheet_apply_trades_only_format_internal(
+    sh: Any,
+    sheets: Dict[str, Any],
+    st0: Dict[str, Any],
+    *,
+    force: bool = False,
+) -> Dict[str, Any]:
+    try:
+        trade_title = str(sheets.get("trade_title", "") or "")
+        hourly_title = str(sheets.get("hourly_title", "") or "")
+        daily_title = str(sheets.get("daily_title", "") or "")
+        ws_trade = sheets.get("ws_trade")
+        ws_hourly = sheets.get("ws_hourly")
+        ws_daily = sheets.get("ws_daily")
+        if ws_trade is None or ws_hourly is None or ws_daily is None:
+            return {"ok": False, "error": "missing_worksheets"}
+
+        if not _gsheet_auto_format_enabled():
+            return {"ok": True, "skipped": True, "reason": "auto_format_disabled"}
+
+        if (not force) and _gsheet_format_is_already_applied(st0, trade_title, hourly_title, daily_title):
+            return {"ok": True, "skipped": True, "reason": "already_applied"}
+
+        md = _gsheet_fetch_metadata_safe(sh)
+        by_id = _gsheet_meta_by_sheet_id(md)
+
+        reqs: List[Dict[str, Any]] = []
+
+        # ---- Trade journal ----
+        try:
+            sid = int(getattr(ws_trade, "id", -1))
+            rc = int(getattr(ws_trade, "row_count", 5000) or 5000)
+            cc = int(getattr(ws_trade, "col_count", len(GSHEET_TRADE_JOURNAL_HEADER)) or len(GSHEET_TRADE_JOURNAL_HEADER))
+            cc = max(cc, len(GSHEET_TRADE_JOURNAL_HEADER))
+            sm = by_id.get(sid, {})
+            reqs += _gsheet_build_cleanup_requests(sid, sm)
+            reqs += _gsheet_build_table_requests(
+                sid,
+                rc,
+                cc,
+                default_col_width_px=140,
+                col_width_px={
+                    0: 165,  # Time
+                    1: 120,  # Coin
+                    2: 80,   # Side
+                    7: 240,  # Reason
+                    8: 240,  # OneLine
+                    9: 420,  # Review
+                    10: 160,  # TradeID
+                },
+                wrap_cols=[7, 8, 9],
+                number_formats=[
+                    (3, 5, "0.########"),  # Entry/Exit
+                    (5, 6, "0.00"),        # PnL_USDT
+                    (6, 7, "0.00"),        # PnL_Percent
+                ],
+                right_align_cols=[(3, 7)],
+                cond_formats=_gsheet_build_pnl_cond_formats(sid, rc, 5, 7),
+            )
+        except Exception:
+            pass
+
+        # ---- Hourly summary ----
+        try:
+            sid = int(getattr(ws_hourly, "id", -1))
+            rc = int(getattr(ws_hourly, "row_count", 2000) or 2000)
+            cc = int(getattr(ws_hourly, "col_count", len(GSHEET_HOURLY_SUMMARY_HEADER)) or len(GSHEET_HOURLY_SUMMARY_HEADER))
+            cc = max(cc, len(GSHEET_HOURLY_SUMMARY_HEADER))
+            sm = by_id.get(sid, {})
+            reqs += _gsheet_build_cleanup_requests(sid, sm)
+            reqs += _gsheet_build_table_requests(
+                sid,
+                rc,
+                cc,
+                default_col_width_px=150,
+                col_width_px={0: 185, 6: 185},
+                number_formats=[
+                    (1, 2, "0"),     # Trades
+                    (2, 3, "0.0"),   # WinRate
+                    (3, 4, "0.00"),  # TotalPnL
+                    (4, 5, "0.00"),  # AvgPnL
+                    (5, 6, "0.00"),  # ProfitFactor
+                ],
+                right_align_cols=[(1, 6)],
+                cond_formats=_gsheet_build_pnl_cond_formats(sid, rc, 3, 4),
+            )
+        except Exception:
+            pass
+
+        # ---- Daily summary ----
+        try:
+            sid = int(getattr(ws_daily, "id", -1))
+            rc = int(getattr(ws_daily, "row_count", 2000) or 2000)
+            cc = int(getattr(ws_daily, "col_count", len(GSHEET_DAILY_SUMMARY_HEADER)) or len(GSHEET_DAILY_SUMMARY_HEADER))
+            cc = max(cc, len(GSHEET_DAILY_SUMMARY_HEADER))
+            sm = by_id.get(sid, {})
+            reqs += _gsheet_build_cleanup_requests(sid, sm)
+            reqs += _gsheet_build_table_requests(
+                sid,
+                rc,
+                cc,
+                default_col_width_px=155,
+                col_width_px={0: 150, 7: 185},
+                number_formats=[
+                    (1, 2, "0"),     # Trades
+                    (2, 3, "0.0"),   # WinRate
+                    (3, 4, "0.00"),  # TotalPnL
+                    (4, 5, "0.00"),  # AvgPnL
+                    (5, 6, "0.00"),  # MaxDD
+                    (6, 7, "0.00"),  # ProfitFactor
+                ],
+                right_align_cols=[(1, 7)],
+                cond_formats=_gsheet_build_pnl_cond_formats(sid, rc, 3, 4),
+            )
+        except Exception:
+            pass
+
+        if not reqs:
+            return {"ok": True, "skipped": True, "reason": "no_requests"}
+
+        # 1회 batchUpdate로 적용
+        _gsheet_batch_update_safe(sh, {"requests": reqs})
+
+        # 상태 업데이트(중복 적용 방지)
+        try:
+            st0["format_version_applied"] = int(GSHEET_FORMAT_VERSION)
+            st0["format_applied_epoch"] = time.time()
+            st0["format_applied_kst"] = now_kst_str()
+            st0["format_trade_title"] = trade_title
+            st0["format_hourly_title"] = hourly_title
+            st0["format_daily_title"] = daily_title
+        except Exception:
+            pass
+        return {"ok": True, "applied": True, "requests": int(len(reqs))}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def gsheet_apply_trades_only_format(force: bool = False, timeout_sec: int = 35) -> Dict[str, Any]:
+    """
+    UI/운영자가 수동으로 서식 적용을 강제할 때 사용.
+    - trades_only 모드에서만 동작.
+    """
+    if not gsheet_is_enabled():
+        return {"ok": False, "error": "GSHEET_ENABLED=false"}
+    if gsheet_mode() == "legacy":
+        return {"ok": False, "error": "GSHEET_MODE=legacy(서식 자동 적용은 trades_only 전용)"}
+    if gspread is None or GoogleCredentials is None:
+        return {"ok": False, "error": "gspread/google-auth 미설치(requirements.txt 확인)"}
+
+    def _do():
+        sh = _gsheet_connect_spreadsheet()
+        if sh is None:
+            err = str(_GSHEET_CACHE.get("last_err", "") or "GSHEET 연결 실패")
+            raise RuntimeError(err)
+        sheets = _gsheet_prepare_trades_only_sheets(sh)
+        if sheets is None:
+            err = str(_GSHEET_CACHE.get("last_err", "") or "GSHEET 시트 준비 실패")
+            raise RuntimeError(err)
+        st0 = _gsheet_sync_state_load()
+        res = _gsheet_apply_trades_only_format_internal(sh, sheets, st0, force=bool(force))
+        if not bool(res.get("ok", False)):
+            raise RuntimeError(str(res.get("error", "") or "format_failed"))
+        _gsheet_sync_state_save(st0)
+        return res
+
+    try:
+        return _call_with_timeout(_do, max(15, int(timeout_sec)))
+    except Exception as e:
+        notify_admin_error("GSHEET_FORMAT", e, context={"force": bool(force), "code": CODE_VERSION}, tb=traceback.format_exc(), min_interval_sec=180.0)
+        return {"ok": False, "error": str(e)}
+
+
 def _gsheet_sync_seed_from_sheet(ws_trade: Any, trade_id_col_index_1based: int = 11, max_ids: int = 6000) -> List[str]:
     """
     state 파일이 없는 환경(배포 재시작 등)에서도 중복 append를 줄이기 위해,
@@ -2261,6 +2808,16 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
             st0["daily_ws_title"] = str(sheets.get("daily_title", "") or "")
         except Exception:
             pass
+
+        # ✅ Google Sheets 표(서식) 자동 적용(권장)
+        # - 1회만 적용(버전+시트명으로 중복 방지)
+        # - 실패해도 매매일지 sync는 계속 진행
+        try:
+            fmt = _gsheet_apply_trades_only_format_internal(sh, sheets, st0, force=False)
+            if isinstance(fmt, dict) and (not bool(fmt.get("ok", True))):
+                notify_admin_error("GSHEET_FORMAT_AUTO", RuntimeError(str(fmt.get("error", "format_failed"))), context={"code": CODE_VERSION}, min_interval_sec=300.0)
+        except Exception as _e:
+            notify_admin_error("GSHEET_FORMAT_AUTO", _e, context={"code": CODE_VERSION}, tb=traceback.format_exc(), min_interval_sec=300.0)
 
         synced_list = st0.get("synced_trade_ids", []) or []
         if not synced_list:
@@ -2436,6 +2993,8 @@ def gsheet_status_snapshot() -> Dict[str, Any]:
                             "last_trade_sync_kst": str(st0.get("last_trade_sync_kst", "") or ""),
                             "last_summary_sync_kst": str(st0.get("last_summary_sync_kst", "") or ""),
                             "synced_trade_ids": int(len(st0.get("synced_trade_ids", []) or [])),
+                            "format_version_applied": int(st0.get("format_version_applied", 0) or 0),
+                            "format_applied_kst": str(st0.get("format_applied_kst", "") or ""),
                         }
                     )
                 except Exception:
@@ -4491,6 +5050,11 @@ JSON 형식:
         return {"decision": "hold", "confidence": 0, "reason_easy": f"AI 오류: {e}", "used_indicators": status.get("_used_indicators", [])}
 
 
+# ✅ 스타일 AI 호출 캐시(스캔/포지션 루프에서 반복 호출되면 비용/지연/429가 쉽게 발생)
+_AI_STYLE_CACHE_LOCK = threading.RLock()
+_AI_STYLE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
 def ai_decide_style(symbol: str, decision: str, trend_short: str, trend_long: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
     룰 기반으로 애매할 때만 AI로 스캘핑/스윙 판단.
@@ -4504,6 +5068,21 @@ def ai_decide_style(symbol: str, decision: str, trend_short: str, trend_long: st
         if until:
             msg = f"{msg} (~{until} KST)"
         return {"style": "스캘핑", "confidence": 55, "reason": f"{msg} → 룰 기반(보수적으로 스캘핑)"}
+
+    cache_sec = int(cfg.get("style_ai_cache_sec", 600) or 0)
+    key = f"{symbol}|{decision}|{trend_short}|{trend_long}"
+    if cache_sec > 0:
+        try:
+            with _AI_STYLE_CACHE_LOCK:
+                ent = _AI_STYLE_CACHE.get(key)
+                if ent:
+                    ts = float(ent.get("ts", 0) or 0)
+                    if ts and (time.time() - ts) < float(cache_sec):
+                        out_cached = ent.get("out", {})
+                        if isinstance(out_cached, dict) and out_cached:
+                            return dict(out_cached)
+        except Exception:
+            pass
 
     payload = {
         "symbol": symbol,
@@ -4538,7 +5117,8 @@ def ai_decide_style(symbol: str, decision: str, trend_short: str, trend_long: st
             models=models2,
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             response_format={"type": "json_object"},
-            temperature=0.2,
+            # 분류 태스크는 온도를 낮춰 흔들림(스캘핑↔스윙 플랩)을 줄인다.
+            temperature=0.0,
             max_tokens=250,
             timeout_sec=OPENAI_TIMEOUT_SEC,
         )
@@ -4548,7 +5128,20 @@ def ai_decide_style(symbol: str, decision: str, trend_short: str, trend_long: st
             style = "스캘핑"
         conf = int(clamp(int(out.get("confidence", 55)), 0, 100))
         reason = str(out.get("reason", ""))[:240]
-        return {"style": style, "confidence": conf, "reason": reason}
+        res = {"style": style, "confidence": conf, "reason": reason}
+        if cache_sec > 0:
+            try:
+                with _AI_STYLE_CACHE_LOCK:
+                    _AI_STYLE_CACHE[key] = {"ts": time.time(), "out": dict(res)}
+                    # 메모리 누수 방지: 너무 커지면 오래된 것 일부 삭제
+                    if len(_AI_STYLE_CACHE) > 2500:
+                        # ts 기준 정렬 후 앞쪽(오래된) 정리
+                        items = sorted(_AI_STYLE_CACHE.items(), key=lambda kv: float((kv[1] or {}).get("ts", 0) or 0))
+                        for k0, _ in items[:500]:
+                            _AI_STYLE_CACHE.pop(k0, None)
+            except Exception:
+                pass
+        return res
     except Exception as e:
         openai_handle_failure(e, cfg, where="DECIDE_STYLE")
         notify_admin_error("AI:DECIDE_STYLE", e, context={"symbol": symbol}, tb=traceback.format_exc(), min_interval_sec=180.0)
@@ -5146,10 +5739,11 @@ def _style_for_entry(
     trend_short: str,
     trend_long: str,
     cfg: Dict[str, Any],
+    allow_ai: bool = True,
 ) -> Dict[str, Any]:
     style, conf, reason = decide_style_rule_based(decision, trend_short, trend_long)
     # 애매하면 AI로 2차 판단
-    if cfg.get("style_auto_enable", True) and conf <= 60:
+    if allow_ai and cfg.get("style_auto_enable", True) and conf <= 60:
         ai = ai_decide_style(symbol, decision, trend_short, trend_long, cfg)
         # AI가 스윙이라고 강하게 말하면 반영
         if int(ai.get("confidence", 0)) >= 70:
@@ -5191,7 +5785,7 @@ def _maybe_switch_style_for_open_position(
         cur_style = str(tgt.get("style", "스캘핑"))
         # 추천 스타일(룰 기반)
         dec = "buy" if pos_side == "long" else "sell"
-        rec = _style_for_entry(sym, dec, short_trend, long_trend, cfg)
+        rec = _style_for_entry(sym, dec, short_trend, long_trend, cfg, allow_ai=bool(cfg.get("style_switch_ai_enable", False)))
         rec_style = rec.get("style", cur_style)
         # ✅ 레짐(스캘핑/스윙) 강제/자동 선택
         # 요구사항: "시간 기반 최소유지기간(style_lock_minutes) 강제 금지"
@@ -5998,6 +6592,34 @@ def telegram_thread(ex):
                                 "style_last_switch_epoch": time.time(),
                             },
                         )
+
+                        # ✅ 수동포지션/복구포지션에서도 타겟/스타일 상태를 "in-memory"에 고정
+                        # - active_targets에 없으면 매 루프 default dict로 재생성되어
+                        #   스타일 전환/confirm2 상태가 리셋되며, 같은 이유로 반복 전환(플랩)될 수 있음.
+                        try:
+                            if not isinstance(tgt, dict):
+                                tgt = {}
+                            base_tgt = {
+                                "sl": 2.0,
+                                "tp": 5.0,
+                                "entry_usdt": 0.0,
+                                "entry_pct": 0.0,
+                                "lev": p.get("leverage", "?"),
+                                "reason": "",
+                                "trade_id": "",
+                                "sl_price": None,
+                                "tp_price": None,
+                                "sl_price_pct": None,
+                                "style": "스캘핑",
+                                "entry_epoch": time.time(),
+                                "style_last_switch_epoch": time.time(),
+                            }
+                            for k0, v0 in base_tgt.items():
+                                if k0 not in tgt:
+                                    tgt[k0] = v0
+                            active_targets[sym] = tgt
+                        except Exception:
+                            pass
 
                         # ✅ 스타일 자동 전환(포지션 보유 중)
                         tgt = _maybe_switch_style_for_open_position(ex, sym, side, tgt, cfg, mon)
@@ -7726,6 +8348,12 @@ with st.sidebar.expander("히스테리시스 상세(선택)"):
     config["regime_hysteresis_enter_scalp"] = c_h3.number_input("enter scalp", 0.01, 0.9, float(config.get("regime_hysteresis_enter_scalp", 0.25)), step=0.05)
 
 config["style_auto_enable"] = st.sidebar.checkbox("스캘핑/스윙 자동 선택/전환", value=bool(config.get("style_auto_enable", True)))
+config["style_switch_ai_enable"] = st.sidebar.checkbox(
+    "🤖 포지션 스타일 전환에 AI 사용(비용↑)",
+    value=bool(config.get("style_switch_ai_enable", False)),
+    help="포지션 보유 중 스타일 전환 판단에 OpenAI를 추가로 호출합니다. 기본은 룰 기반(비용/429 방지).",
+)
+config["style_ai_cache_sec"] = st.sidebar.number_input("스타일 AI 캐시(초)", 0, 36000, int(config.get("style_ai_cache_sec", 600)))
 config["style_lock_minutes"] = st.sidebar.number_input("스타일 전환 락(분) [DEPRECATED]", 0, 180, int(config.get("style_lock_minutes", 20)))
 st.sidebar.caption("※ 요구사항 반영: 시간 기반 최소유지기간은 사용하지 않습니다(레짐 흔들림 방지=confirm2/hysteresis).")
 
@@ -7886,6 +8514,11 @@ if st.sidebar.button("🤖 OpenAI 연결 테스트"):
             notify_admin_error("UI:OPENAI_TEST", last_err, context={"models_tried": tried})
 
 # ✅ Google Sheets 연결 테스트(요구사항)
+config["gsheet_auto_format_enable"] = st.sidebar.checkbox(
+    "📊 Google Sheets 표 서식 자동 적용(권장)",
+    value=bool(config.get("gsheet_auto_format_enable", True)),
+    help="매매일지/시간대/일별 시트를 '표'처럼 보기 좋게 1회 자동 서식 적용합니다.",
+)
 if st.sidebar.button("📎 Google Sheets 연결 테스트"):
     try:
         res = gsheet_test_append_row(timeout_sec=25)
@@ -7904,6 +8537,18 @@ if st.sidebar.button("📎 Google Sheets 연결 테스트"):
     except Exception as e:
         st.sidebar.error(f"❌ 테스트 오류: {e}")
         notify_admin_error("UI:GSHEET_TEST", e, context={"code": CODE_VERSION})
+
+# ✅ Google Sheets 표(서식) 강제 적용(요구사항)
+if st.sidebar.button("📊 Google Sheets 표 서식 적용(강제)"):
+    try:
+        res = gsheet_apply_trades_only_format(force=True, timeout_sec=35)
+        if res.get("ok"):
+            st.sidebar.success("✅ 서식 적용 완료")
+        else:
+            st.sidebar.error(f"❌ 서식 적용 실패: {res.get('error','')}")
+    except Exception as e:
+        st.sidebar.error(f"❌ 서식 적용 오류: {e}")
+        notify_admin_error("UI:GSHEET_FORMAT", e, context={"code": CODE_VERSION})
 
 save_settings(config)
 
@@ -7984,7 +8629,8 @@ with right:
             if last is None:
                 # 지표가 부족해도 장기추세/스타일은 표시(사용자 체감 개선)
                 st.warning("지표 계산 실패(데이터 부족/지표 계산 오류)")
-                style_hint = _style_for_entry(symbol, "buy", "", htf_trend, config)
+                # UI 표시에서는 OpenAI를 호출하지 않음(스트림릿 rerun/자동새로고침으로 비용 폭증 방지)
+                style_hint = _style_for_entry(symbol, "buy", "", htf_trend, config, allow_ai=False)
                 st.write(
                     {
                         "장기추세(1h)": f"🧭 {htf_trend}",
@@ -7995,7 +8641,8 @@ with right:
             else:
                 st.metric("현재가", f"{float(last['close']):,.4f}")
                 # 스타일 추천(현재 차트 기준)
-                style_hint = _style_for_entry(symbol, "buy", stt.get("추세", ""), htf_trend, config)
+                # UI 표시에서는 OpenAI를 호출하지 않음(스트림릿 rerun/자동새로고침으로 비용 폭증 방지)
+                style_hint = _style_for_entry(symbol, "buy", stt.get("추세", ""), htf_trend, config, allow_ai=False)
                 show = {
                     "단기추세(현재봉)": stt.get("추세", "-"),
                     "장기추세(1h)": f"🧭 {htf_trend}",
@@ -8283,7 +8930,8 @@ with t1:
                     ai = ai_decide_trade(df2, stt, symbol, config.get("trade_mode", "안전모드"), config, external=ext_now)
                     # 스타일 힌트
                     htf_trend = get_htf_trend_cached(exchange, symbol, "1h", int(config.get("ma_fast", 7)), int(config.get("ma_slow", 99)), int(config.get("trend_filter_cache_sec", 60)))
-                    style_info = _style_for_entry(symbol, ai.get("decision", "hold"), stt.get("추세", ""), htf_trend, config)
+                    # 수동 분석에서도 스타일 힌트는 룰 기반만 사용(불필요한 추가 OpenAI 호출 방지)
+                    style_info = _style_for_entry(symbol, ai.get("decision", "hold"), stt.get("추세", ""), htf_trend, config, allow_ai=False)
                     st.json({"ai": ai, "style": style_info, "htf_trend": htf_trend})
             except Exception as e:
                 st.error(f"분석 오류: {e}")
