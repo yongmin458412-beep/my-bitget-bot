@@ -626,6 +626,10 @@ def default_settings() -> Dict[str, Any]:
         # - regime_switch_control: 시간락 없이 흔들림 방지(confirm2/hysteresis/off)
         "regime_mode": "auto",                 # "auto"|"scalping"|"swing"
         "regime_switch_control": "confirm2",   # "confirm2"|"hysteresis"|"off"
+        # confirm2 상세: n회 연속 동일 레짐일 때만 전환(기본 2)
+        # - 플립백(바로 되돌림) 방지: 직전 전환의 반대방향으로는 더 많은 확인(기본 3)
+        "regime_confirm_n": 2,
+        "regime_confirm_n_flipback": 3,
         "regime_hysteresis_step": 0.55,
         "regime_hysteresis_enter_swing": 0.75,
         "regime_hysteresis_enter_scalp": 0.25,
@@ -896,9 +900,29 @@ def log_trade(
     one_line: str = "",
     review: str = "",
     trade_id: str = "",
+    balance_before_total: Optional[float] = None,
+    balance_after_total: Optional[float] = None,
+    balance_before_free: Optional[float] = None,
+    balance_after_free: Optional[float] = None,
 ) -> None:
     # ⚠️ CSV 컬럼 호환성 유지: 기존 컬럼 유지하면서 안전하게 append
-    base_cols = ["Time", "Coin", "Side", "Entry", "Exit", "PnL_USDT", "PnL_Percent", "Reason", "OneLine", "Review", "TradeID"]
+    base_cols = [
+        "Time",
+        "Coin",
+        "Side",
+        "Entry",
+        "Exit",
+        "PnL_USDT",
+        "PnL_Percent",
+        "BalanceBefore_Total",
+        "BalanceAfter_Total",
+        "BalanceBefore_Free",
+        "BalanceAfter_Free",
+        "Reason",
+        "OneLine",
+        "Review",
+        "TradeID",
+    ]
     try:
         row_dict = {
             "Time": now_kst_str(),
@@ -908,6 +932,10 @@ def log_trade(
             "Exit": exit_price,
             "PnL_USDT": pnl_amount,
             "PnL_Percent": pnl_percent,
+            "BalanceBefore_Total": "" if balance_before_total is None else float(balance_before_total),
+            "BalanceAfter_Total": "" if balance_after_total is None else float(balance_after_total),
+            "BalanceBefore_Free": "" if balance_before_free is None else float(balance_before_free),
+            "BalanceAfter_Free": "" if balance_after_free is None else float(balance_after_free),
             "Reason": reason,
             "OneLine": one_line,
             "Review": review,
@@ -919,6 +947,21 @@ def log_trade(
         else:
             existing_cols = _read_csv_header_cols(LOG_FILE)
             cols = existing_cols if existing_cols else base_cols
+            # 기존 파일에 신규 컬럼이 없다면 헤더/기록을 업그레이드(삭제 없이 컬럼만 추가)
+            try:
+                missing = [c for c in base_cols if c not in cols]
+                if missing:
+                    df_old = pd.read_csv(LOG_FILE)
+                    for c in missing:
+                        if c not in df_old.columns:
+                            df_old[c] = ""
+                    new_cols = cols + missing
+                    tmp = LOG_FILE + ".tmp"
+                    df_old.to_csv(tmp, index=False, encoding="utf-8-sig")
+                    os.replace(tmp, LOG_FILE)
+                    cols = new_cols
+            except Exception:
+                pass
             # 기존 파일 헤더와 컬럼 순서 맞춤(누락값은 공백)
             out = {c: row_dict.get(c, "") for c in cols}
             pd.DataFrame([out], columns=cols).to_csv(LOG_FILE, mode="a", header=False, index=False, encoding="utf-8-sig")
@@ -941,6 +984,10 @@ def log_trade(
                     "exit": row_dict.get("Exit"),
                     "pnl_usdt": row_dict.get("PnL_USDT"),
                     "pnl_pct": row_dict.get("PnL_Percent"),
+                    "balance_before_total": row_dict.get("BalanceBefore_Total"),
+                    "balance_after_total": row_dict.get("BalanceAfter_Total"),
+                    "balance_before_free": row_dict.get("BalanceBefore_Free"),
+                    "balance_after_free": row_dict.get("BalanceAfter_Free"),
                     "reason": row_dict.get("Reason"),
                     "one_line": row_dict.get("OneLine"),
                     "review": str(row_dict.get("Review", ""))[:800],
@@ -1550,11 +1597,33 @@ def openai_chat_create_with_fallback(
 GSHEET_HEADER = ["time_kst", "type", "stage", "symbol", "tf", "signal", "score", "trade_id", "message", "payload_json"]
 
 # (기본) 매매일지(=trade_log.csv) 헤더
-GSHEET_TRADE_JOURNAL_HEADER = ["Time", "Coin", "Side", "Entry", "Exit", "PnL_USDT", "PnL_Percent", "Reason", "OneLine", "Review", "TradeID"]
+# - 요청: Google Sheets에는 "한글 + 직관" 형태로 보이게
+# - 내부 CSV(trade_log.csv)는 기존 컬럼을 유지하며, 시트에 올릴 때만 한글 헤더/표현으로 매핑한다.
+GSHEET_TRADE_JOURNAL_HEADER_EN = ["Time", "Coin", "Side", "Entry", "Exit", "PnL_USDT", "PnL_Percent", "Reason", "OneLine", "Review", "TradeID"]
+GSHEET_TRADE_JOURNAL_HEADER = [
+    "상태",
+    "시간(KST)",
+    "코인",
+    "방향",
+    "진입가",
+    "청산가",
+    "손익(USDT)",
+    "수익률(%)",
+    "진입전 총자산(USDT)",
+    "청산후 총자산(USDT)",
+    "진입전 가용(USDT)",
+    "청산후 가용(USDT)",
+    "사유",
+    "한줄평",
+    "후기",
+    "일지ID",
+]
 
-# (기본) 시간대/일별 총합 헤더
-GSHEET_HOURLY_SUMMARY_HEADER = ["Hour(KST)", "Trades", "WinRate(%)", "TotalPnL(USDT)", "AvgPnL(%)", "ProfitFactor", "AsOf(KST)"]
-GSHEET_DAILY_SUMMARY_HEADER = ["Date(KST)", "Trades", "WinRate(%)", "TotalPnL(USDT)", "AvgPnL(%)", "MaxDD(%)", "ProfitFactor", "AsOf(KST)"]
+# (기본) 시간대/일별 총합 헤더(한글)
+GSHEET_HOURLY_SUMMARY_HEADER_EN = ["Hour(KST)", "Trades", "WinRate(%)", "TotalPnL(USDT)", "AvgPnL(%)", "ProfitFactor", "AsOf(KST)"]
+GSHEET_DAILY_SUMMARY_HEADER_EN = ["Date(KST)", "Trades", "WinRate(%)", "TotalPnL(USDT)", "AvgPnL(%)", "MaxDD(%)", "ProfitFactor", "AsOf(KST)"]
+GSHEET_HOURLY_SUMMARY_HEADER = ["시간대(KST)", "거래수", "승률(%)", "총손익(USDT)", "평균수익률(%)", "PF", "갱신시각(KST)"]
+GSHEET_DAILY_SUMMARY_HEADER = ["날짜(KST)", "거래수", "승률(%)", "총손익(USDT)", "평균수익률(%)", "최대DD(%)", "PF", "갱신시각(KST)"]
 
 # trades_only 동기화 상태(중복 append 방지)
 GSHEET_SYNC_STATE_FILE = "gsheet_sync_state.json"
@@ -1991,9 +2060,14 @@ def _gsheet_row_looks_like_trade_header(row: List[str]) -> bool:
         if not row:
             return False
         # 정확히 일치하면 좋지만, 일부는 BOM/공백이 섞일 수 있어 trim 비교
-        a = [str(x or "").strip() for x in row[: len(GSHEET_TRADE_JOURNAL_HEADER)]]
-        b = [str(x or "").strip() for x in GSHEET_TRADE_JOURNAL_HEADER]
-        return a == b
+        # - 한글 헤더(현재) 또는 과거 영문 헤더 둘 다 허용
+        a_ko = [str(x or "").strip() for x in row[: len(GSHEET_TRADE_JOURNAL_HEADER)]]
+        b_ko = [str(x or "").strip() for x in GSHEET_TRADE_JOURNAL_HEADER]
+        if a_ko == b_ko:
+            return True
+        a_en = [str(x or "").strip() for x in row[: len(GSHEET_TRADE_JOURNAL_HEADER_EN)]]
+        b_en = [str(x or "").strip() for x in GSHEET_TRADE_JOURNAL_HEADER_EN]
+        return a_en == b_en
     except Exception:
         return False
 
@@ -2068,6 +2142,15 @@ def _gsheet_prepare_trades_only_sheets(sh: Any) -> Optional[Dict[str, Any]]:
 
         if ws_trade is None:
             ws_trade = _gsheet_get_or_create_worksheet(sh, base, rows=5000, cols=len(GSHEET_TRADE_JOURNAL_HEADER) + 2)
+        else:
+            # 기존 시트가 예전(컬럼 수가 적음)일 수 있어, 한글 헤더/추가 컬럼을 위해 cols 확장
+            try:
+                need_cols = int(len(GSHEET_TRADE_JOURNAL_HEADER) + 2)
+                cur_cols = int(getattr(ws_trade, "col_count", 0) or 0)
+                if cur_cols and cur_cols < need_cols:
+                    ws_trade.resize(cols=need_cols)
+            except Exception:
+                pass
 
         # 헤더 확인/생성
         try:
@@ -2079,32 +2162,42 @@ def _gsheet_prepare_trades_only_sheets(sh: Any) -> Optional[Dict[str, Any]]:
                 ws_trade.append_row(GSHEET_TRADE_JOURNAL_HEADER, value_input_option="USER_ENTERED")
             except Exception:
                 pass
-        elif not _gsheet_row_looks_like_trade_header(first2):
-            # 헤더가 다른데 데이터가 이미 있으면 건드리지 않고 새 시트로 우회
-            try:
-                vals = ws_trade.get_all_values() or []
-            except Exception:
-                vals = []
-            if len(vals) > 1:
-                alt = f"{base}_TRADE_LOG"
-                ws_trade = _gsheet_get_or_create_worksheet(sh, alt, rows=5000, cols=len(GSHEET_TRADE_JOURNAL_HEADER) + 2)
+        else:
+            if not _gsheet_row_looks_like_trade_header(first2):
+                # 헤더가 다른데 데이터가 이미 있으면 건드리지 않고 새 시트로 우회
                 try:
-                    first3 = ws_trade.row_values(1) or []
+                    vals = ws_trade.get_all_values() or []
                 except Exception:
-                    first3 = []
-                if not first3:
+                    vals = []
+                if len(vals) > 1:
+                    alt = f"{base}_TRADE_LOG"
+                    ws_trade = _gsheet_get_or_create_worksheet(sh, alt, rows=5000, cols=len(GSHEET_TRADE_JOURNAL_HEADER) + 2)
                     try:
-                        ws_trade.append_row(GSHEET_TRADE_JOURNAL_HEADER, value_input_option="USER_ENTERED")
+                        first3 = ws_trade.row_values(1) or []
+                    except Exception:
+                        first3 = []
+                    if not first3:
+                        try:
+                            ws_trade.append_row(GSHEET_TRADE_JOURNAL_HEADER, value_input_option="USER_ENTERED")
+                        except Exception:
+                            pass
+                    try:
+                        tg_send(f"📎 Google Sheets: 매매일지 시트가 '{alt}'로 생성되었습니다(기존 헤더 충돌).", target="admin")
                     except Exception:
                         pass
-                try:
-                    tg_send(f"📎 Google Sheets: 매매일지 시트가 '{alt}'로 생성되었습니다(기존 헤더 충돌).", target="admin")
-                except Exception:
-                    pass
+                else:
+                    # 데이터가 거의 없으면 헤더만 교체(삭제는 하지 않음)
+                    try:
+                        ws_trade.update("A1", [GSHEET_TRADE_JOURNAL_HEADER])
+                    except Exception:
+                        pass
             else:
-                # 데이터가 거의 없으면 헤더만 교체(삭제는 하지 않음)
+                # 과거 영문 헤더인 경우, 데이터는 유지하고 헤더만 한글로 교체(직관성 개선)
                 try:
-                    ws_trade.update("A1", [GSHEET_TRADE_JOURNAL_HEADER])
+                    a1 = [str(x or "").strip() for x in first2[: len(GSHEET_TRADE_JOURNAL_HEADER_EN)]]
+                    b1 = [str(x or "").strip() for x in GSHEET_TRADE_JOURNAL_HEADER_EN]
+                    if a1 == b1:
+                        ws_trade.update("A1", [GSHEET_TRADE_JOURNAL_HEADER])
                 except Exception:
                     pass
 
@@ -2123,7 +2216,7 @@ def _gsheet_prepare_trades_only_sheets(sh: Any) -> Optional[Dict[str, Any]]:
 # - 레이트리밋 방지: sync state에 "버전+시트명"을 저장해 1회만 적용
 # =========================================================
 
-GSHEET_FORMAT_VERSION = 1
+GSHEET_FORMAT_VERSION = 2
 
 
 def _gsheet_auto_format_enabled() -> bool:
@@ -2519,22 +2612,32 @@ def _gsheet_apply_trades_only_format_internal(
                 cc,
                 default_col_width_px=140,
                 col_width_px={
-                    0: 165,  # Time
-                    1: 120,  # Coin
-                    2: 80,   # Side
-                    7: 240,  # Reason
-                    8: 240,  # OneLine
-                    9: 420,  # Review
-                    10: 160,  # TradeID
+                    0: 70,    # 상태
+                    1: 165,   # 시간(KST)
+                    2: 120,   # 코인
+                    3: 80,    # 방향
+                    4: 110,   # 진입가
+                    5: 110,   # 청산가
+                    6: 120,   # 손익(USDT)
+                    7: 95,    # 수익률(%)
+                    8: 150,   # 진입전 총자산
+                    9: 150,   # 청산후 총자산
+                    10: 150,  # 진입전 가용
+                    11: 150,  # 청산후 가용
+                    12: 240,  # 사유
+                    13: 240,  # 한줄평
+                    14: 420,  # 후기
+                    15: 160,  # 일지ID
                 },
-                wrap_cols=[7, 8, 9],
+                wrap_cols=[12, 13, 14],
                 number_formats=[
-                    (3, 5, "0.########"),  # Entry/Exit
-                    (5, 6, "0.00"),        # PnL_USDT
-                    (6, 7, "0.00"),        # PnL_Percent
+                    (4, 6, "0.########"),  # 진입가/청산가
+                    (6, 7, "0.00"),        # 손익(USDT)
+                    (7, 8, "0.00"),        # 수익률(%)
+                    (8, 12, "0.00"),       # 잔고/가용
                 ],
-                right_align_cols=[(3, 7)],
-                cond_formats=_gsheet_build_pnl_cond_formats(sid, rc, 5, 7),
+                right_align_cols=[(4, 12)],
+                cond_formats=_gsheet_build_pnl_cond_formats(sid, rc, 6, 8),
             )
         except Exception:
             pass
@@ -2666,6 +2769,33 @@ def _gsheet_sync_seed_from_sheet(ws_trade: Any, trade_id_col_index_1based: int =
         return []
 
 
+def _gsheet_tradeid_col_index_1based(ws_trade: Any) -> int:
+    """
+    시트 헤더에서 '일지ID/TradeID' 컬럼을 찾아 1-based index 반환.
+    - 헤더가 없거나 탐지 실패 시 11(구버전) 또는 마지막 컬럼 fallback.
+    """
+    try:
+        header = []
+        try:
+            header = ws_trade.row_values(1) or []
+        except Exception:
+            header = []
+        cand = {"tradeid", "일지id", "journalid", "logid"}
+        for i, v in enumerate(header):
+            key = str(v or "").strip().lower().replace(" ", "")
+            if key in cand:
+                return int(i + 1)
+        # 구버전 영문 헤더(11번째)
+        if len(header) >= 11:
+            return 11
+        if len(header) >= 1:
+            return int(len(header))
+        # 헤더가 비어있으면 최신 헤더 기준 마지막
+        return int(len(GSHEET_TRADE_JOURNAL_HEADER))
+    except Exception:
+        return 11
+
+
 def _trade_log_to_hourly_daily(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     trade_log.csv(df) -> (hourly_summary_df, daily_summary_df)
@@ -2685,8 +2815,8 @@ def _trade_log_to_hourly_daily(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     dfx["PnL_USDT_num"] = pd.to_numeric(dfx.get("PnL_USDT"), errors="coerce").fillna(0.0)
     dfx["PnL_Pct_num"] = pd.to_numeric(dfx.get("PnL_Percent"), errors="coerce").fillna(0.0)
 
-    dfx["Hour(KST)"] = dfx["Time_dt"].dt.strftime("%Y-%m-%d %H:00")
-    dfx["Date(KST)"] = dfx["Time_dt"].dt.strftime("%Y-%m-%d")
+    dfx["_hour_kst"] = dfx["Time_dt"].dt.strftime("%Y-%m-%d %H:00")
+    dfx["_date_kst"] = dfx["Time_dt"].dt.strftime("%Y-%m-%d")
 
     asof = now_kst_str()
 
@@ -2703,7 +2833,7 @@ def _trade_log_to_hourly_daily(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     # Hourly
     h_rows = []
     try:
-        g = dfx.groupby("Hour(KST)", dropna=False)
+        g = dfx.groupby("_hour_kst", dropna=False)
         for k, sub in g:
             pnl_pct = sub["PnL_Pct_num"]
             pnl_usdt = sub["PnL_USDT_num"]
@@ -2711,13 +2841,13 @@ def _trade_log_to_hourly_daily(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
             win_rate = float((pnl_pct > 0).sum() / max(1, trades) * 100.0)
             h_rows.append(
                 {
-                    "Hour(KST)": str(k),
-                    "Trades": trades,
-                    "WinRate(%)": round(win_rate, 2),
-                    "TotalPnL(USDT)": round(float(pnl_usdt.sum()), 6),
-                    "AvgPnL(%)": round(float(pnl_pct.mean()) if trades else 0.0, 4),
-                    "ProfitFactor": round(_pf(pnl_usdt), 4) if trades else 0.0,
-                    "AsOf(KST)": asof,
+                    "시간대(KST)": str(k),
+                    "거래수": trades,
+                    "승률(%)": round(win_rate, 2),
+                    "총손익(USDT)": round(float(pnl_usdt.sum()), 6),
+                    "평균수익률(%)": round(float(pnl_pct.mean()) if trades else 0.0, 4),
+                    "PF": round(_pf(pnl_usdt), 4) if trades else 0.0,
+                    "갱신시각(KST)": asof,
                 }
             )
     except Exception:
@@ -2725,14 +2855,14 @@ def _trade_log_to_hourly_daily(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     df_h = pd.DataFrame(h_rows, columns=GSHEET_HOURLY_SUMMARY_HEADER)
     if not df_h.empty:
         try:
-            df_h = df_h.sort_values("Hour(KST)", ascending=False).reset_index(drop=True)
+            df_h = df_h.sort_values("시간대(KST)", ascending=False).reset_index(drop=True)
         except Exception:
             pass
 
     # Daily
     d_rows = []
     try:
-        g2 = dfx.groupby("Date(KST)", dropna=False)
+        g2 = dfx.groupby("_date_kst", dropna=False)
         for k, sub in g2:
             pnl_pct = sub["PnL_Pct_num"]
             pnl_usdt = sub["PnL_USDT_num"]
@@ -2743,14 +2873,14 @@ def _trade_log_to_hourly_daily(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
             dd = float((eq - eq.cummax()).min()) if len(eq) else 0.0
             d_rows.append(
                 {
-                    "Date(KST)": str(k),
-                    "Trades": trades,
-                    "WinRate(%)": round(win_rate, 2),
-                    "TotalPnL(USDT)": round(float(pnl_usdt.sum()), 6),
-                    "AvgPnL(%)": round(float(pnl_pct.mean()) if trades else 0.0, 4),
-                    "MaxDD(%)": round(dd, 4),
-                    "ProfitFactor": round(_pf(pnl_usdt), 4) if trades else 0.0,
-                    "AsOf(KST)": asof,
+                    "날짜(KST)": str(k),
+                    "거래수": trades,
+                    "승률(%)": round(win_rate, 2),
+                    "총손익(USDT)": round(float(pnl_usdt.sum()), 6),
+                    "평균수익률(%)": round(float(pnl_pct.mean()) if trades else 0.0, 4),
+                    "최대DD(%)": round(dd, 4),
+                    "PF": round(_pf(pnl_usdt), 4) if trades else 0.0,
+                    "갱신시각(KST)": asof,
                 }
             )
     except Exception:
@@ -2758,7 +2888,7 @@ def _trade_log_to_hourly_daily(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     df_d = pd.DataFrame(d_rows, columns=GSHEET_DAILY_SUMMARY_HEADER)
     if not df_d.empty:
         try:
-            df_d = df_d.sort_values("Date(KST)", ascending=False).reset_index(drop=True)
+            df_d = df_d.sort_values("날짜(KST)", ascending=False).reset_index(drop=True)
         except Exception:
             pass
 
@@ -2822,7 +2952,8 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
         synced_list = st0.get("synced_trade_ids", []) or []
         if not synced_list:
             # 시트에서 seed(배포 재시작/파일 초기화 대비)
-            seeded = _gsheet_sync_seed_from_sheet(ws_trade, trade_id_col_index_1based=11, max_ids=6000)
+            tid_col = _gsheet_tradeid_col_index_1based(ws_trade)
+            seeded = _gsheet_sync_seed_from_sheet(ws_trade, trade_id_col_index_1based=int(tid_col), max_ids=6000)
             if seeded:
                 synced_list = seeded
                 st0["synced_trade_ids"] = list(seeded)
@@ -2855,18 +2986,53 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
                     tid = f"NOID:{str(r.get('Time',''))}|{str(r.get('Coin',''))}|{str(r.get('Side',''))}"
                 if tid in synced:
                     continue
+                # Google Sheets(한글) 행 구성
+                def _cell(col: str, limit: int = 0) -> str:
+                    try:
+                        v = r.get(col, "")
+                        if v is None:
+                            s = ""
+                        else:
+                            # pandas NaN 처리
+                            try:
+                                if pd.isna(v):
+                                    s = ""
+                                else:
+                                    s = str(v)
+                            except Exception:
+                                s = str(v)
+                        if limit and len(s) > limit:
+                            return s[:limit]
+                        return s
+                    except Exception:
+                        return ""
+
+                # 상태/방향(직관)
+                try:
+                    pnl_pct_f = float(pd.to_numeric(r.get("PnL_Percent", 0), errors="coerce") or 0.0)
+                except Exception:
+                    pnl_pct_f = 0.0
+                status_txt = "🟢 수익" if pnl_pct_f > 0 else ("🔴 손실" if pnl_pct_f < 0 else "⚪ 보합")
+                side_raw = str(r.get("Side", "") or "").strip().lower()
+                side_ko = "롱" if side_raw in ["long", "buy"] else ("숏" if side_raw in ["short", "sell"] else side_raw)
+
                 row = [
-                    str(r.get("Time", "") or ""),
-                    str(r.get("Coin", "") or ""),
-                    str(r.get("Side", "") or ""),
-                    str(r.get("Entry", "") or ""),
-                    str(r.get("Exit", "") or ""),
-                    str(r.get("PnL_USDT", "") or ""),
-                    str(r.get("PnL_Percent", "") or ""),
-                    str(r.get("Reason", "") or "")[:200],
-                    str(r.get("OneLine", "") or "")[:200],
-                    str(r.get("Review", "") or "")[:800],
-                    str(r.get("TradeID", "") or tid)[:60],
+                    status_txt,
+                    _cell("Time"),
+                    _cell("Coin"),
+                    side_ko,
+                    _cell("Entry"),
+                    _cell("Exit"),
+                    _cell("PnL_USDT"),
+                    _cell("PnL_Percent"),
+                    _cell("BalanceBefore_Total"),
+                    _cell("BalanceAfter_Total"),
+                    _cell("BalanceBefore_Free"),
+                    _cell("BalanceAfter_Free"),
+                    _cell("Reason", limit=200),
+                    _cell("OneLine", limit=200),
+                    _cell("Review", limit=800),
+                    (_cell("TradeID", limit=60) or str(tid)[:60]),
                 ]
                 new_rows.append(row)
                 new_ids.append(tid)
@@ -3123,7 +3289,11 @@ def gsheet_log_trade(stage: str, symbol: str, trade_id: str = "", message: str =
     # trades_only 모드: trade_log.csv 동기화 트리거만 수행(실제 append는 워커가 처리)
     if gsheet_mode() != "legacy":
         try:
-            _GSHEET_TRADE_SYNC_EVENT.set()
+            # trade_log.csv가 갱신되는 타이밍(=log_trade 호출)에서만 sync 트리거
+            # - stage=JOURNAL은 log_trade()에서 호출됨
+            stg = str(stage or "").strip().upper()
+            if stg in ["JOURNAL", "TRADE_LOG", "LOG"]:
+                _GSHEET_TRADE_SYNC_EVENT.set()
         except Exception:
             pass
         return
@@ -5377,17 +5547,130 @@ def mon_recent_events(mon: Dict[str, Any], within_min: int = 15) -> List[Dict[st
 # =========================================================
 # ✅ 16) 텔레그램 유틸 (timeout/retry + 채널/그룹 라우팅)
 # =========================================================
-def _tg_post(url: str, data: Dict[str, Any]):
+def _tg_post(url: str, data: Dict[str, Any], timeout_sec: Optional[float] = None):
+    """
+    Telegram Bot API POST helper.
+    - TG_THREAD(트레이딩 루프)가 네트워크로 멈춰 보이지 않게, 전송은 별도 워커(TG_SEND_THREAD)에서 수행한다.
+    - 여기서는 timeout을 항상 지정(영구 대기 방지)한다.
+    """
+    to = float(timeout_sec or HTTP_TIMEOUT_SEC)
+    # requests timeout: (connect, read)
+    # - connect는 짧게, read는 설정값 사용
+    timeout = (min(4.0, max(1.0, to * 0.5)), max(2.0, to))
     if retry is None:
-        return requests.post(url, data=data, timeout=HTTP_TIMEOUT_SEC)
+        return requests.post(url, data=data, timeout=timeout)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(initial=0.6, max=3.0))
     def _do():
-        r = requests.post(url, data=data, timeout=HTTP_TIMEOUT_SEC)
+        r = requests.post(url, data=data, timeout=timeout)
         r.raise_for_status()
         return r
 
     return _do()
+
+
+# =========================================================
+# ✅ 16.1) Telegram Send Worker (daemon)
+# - 요구사항/실전 이슈: TG_THREAD가 requests.post(sendMessage)에서 블로킹되면
+#   하트비트/스캔/매매가 "멈춘 것처럼" 보일 수 있음.
+# - 해결: 전송은 큐에 넣고 TG_SEND_THREAD가 처리한다.
+# =========================================================
+_TG_SEND_QUEUE_HIGH = deque()
+_TG_SEND_QUEUE_NORMAL = deque()
+_TG_SEND_QUEUE_LOCK = threading.RLock()
+_TG_SEND_QUEUE_EVENT = threading.Event()
+_TG_SEND_QUEUE_MAX_HIGH = 300
+_TG_SEND_QUEUE_MAX_NORMAL = 1200
+_TG_SEND_LAST_ERR = ""
+_TG_SEND_LAST_ERR_KST = ""
+
+
+def tg_enqueue(method: str, data: Dict[str, Any], *, priority: str = "normal") -> None:
+    """
+    method: "sendMessage" | "answerCallbackQuery" | ...
+    priority: "high"(admin/중요) | "normal"
+    """
+    if not tg_token:
+        return
+    m = str(method or "").strip()
+    if not m:
+        return
+    rec = {"method": m, "data": dict(data or {}), "priority": str(priority or "normal"), "attempt": 0, "ts": time.time()}
+    try:
+        with _TG_SEND_QUEUE_LOCK:
+            if str(priority).lower() == "high":
+                _TG_SEND_QUEUE_HIGH.append(rec)
+                while len(_TG_SEND_QUEUE_HIGH) > int(_TG_SEND_QUEUE_MAX_HIGH):
+                    _TG_SEND_QUEUE_HIGH.popleft()
+            else:
+                _TG_SEND_QUEUE_NORMAL.append(rec)
+                while len(_TG_SEND_QUEUE_NORMAL) > int(_TG_SEND_QUEUE_MAX_NORMAL):
+                    _TG_SEND_QUEUE_NORMAL.popleft()
+        _TG_SEND_QUEUE_EVENT.set()
+    except Exception:
+        return
+
+
+def telegram_send_worker_thread():
+    """
+    Telegram sendMessage/answerCallbackQuery worker.
+    - 네트워크 장애/레이트리밋이 있어도 TG_THREAD는 계속 돈다.
+    """
+    backoff = 0.5
+    while True:
+        rec = None
+        try:
+            if not tg_token:
+                time.sleep(2.0)
+                continue
+            rec = None
+            with _TG_SEND_QUEUE_LOCK:
+                if _TG_SEND_QUEUE_HIGH:
+                    rec = _TG_SEND_QUEUE_HIGH.popleft()
+                elif _TG_SEND_QUEUE_NORMAL:
+                    rec = _TG_SEND_QUEUE_NORMAL.popleft()
+            if rec is None:
+                _TG_SEND_QUEUE_EVENT.wait(timeout=2.0)
+                try:
+                    _TG_SEND_QUEUE_EVENT.clear()
+                except Exception:
+                    pass
+                continue
+
+            method = str(rec.get("method", "") or "").strip()
+            data = rec.get("data", {}) or {}
+            if not method:
+                continue
+
+            url = f"https://api.telegram.org/bot{tg_token}/{method}"
+            # send worker는 너무 오래 붙잡지 않게 timeout을 조금 더 짧게
+            _tg_post(url, data, timeout_sec=min(float(HTTP_TIMEOUT_SEC), 10.0))
+            backoff = 0.5
+        except Exception as e:
+            # 재시도는 제한적으로만(무한루프/스팸 방지)
+            try:
+                global _TG_SEND_LAST_ERR, _TG_SEND_LAST_ERR_KST
+                _TG_SEND_LAST_ERR = str(e)[:500]
+                _TG_SEND_LAST_ERR_KST = now_kst_str()
+            except Exception:
+                pass
+            try:
+                att = int(rec.get("attempt", 0) or 0) + 1 if isinstance(rec, dict) else 99
+            except Exception:
+                att = 99
+            if isinstance(rec, dict) and att <= 2:
+                try:
+                    rec["attempt"] = att
+                    pri = str(rec.get("priority", "normal")).lower()
+                    with _TG_SEND_QUEUE_LOCK:
+                        if pri == "high":
+                            _TG_SEND_QUEUE_HIGH.appendleft(rec)
+                        else:
+                            _TG_SEND_QUEUE_NORMAL.appendleft(rec)
+                except Exception:
+                    pass
+            time.sleep(float(clamp(backoff, 0.5, 8.0)))
+            backoff = float(clamp(backoff * 1.4, 0.5, 10.0))
 
 
 def tg_admin_chat_ids() -> List[str]:
@@ -5419,7 +5702,7 @@ def tg_send_chat(chat_id: Any, text: str):
     if not cid:
         return
     try:
-        _tg_post(f"https://api.telegram.org/bot{tg_token}/sendMessage", {"chat_id": cid, "text": text})
+        tg_enqueue("sendMessage", {"chat_id": cid, "text": text}, priority="normal")
     except Exception:
         pass
 
@@ -5455,11 +5738,12 @@ def tg_send(text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = 
     # 요구사항: Telegram 상태/라우팅이 전역 config가 아니라 최신 load_settings() 기준으로 일치
     cfg = cfg or load_settings()
     ids = _tg_chat_id_by_target(target, cfg)
+    pri = "high" if str(target or "").lower().strip() == "admin" else "normal"
     for cid in ids:
         if not cid:
             continue
         try:
-            _tg_post(f"https://api.telegram.org/bot{tg_token}/sendMessage", {"chat_id": cid, "text": text})
+            tg_enqueue("sendMessage", {"chat_id": cid, "text": text}, priority=pri)
         except Exception:
             pass
 
@@ -5485,14 +5769,15 @@ def tg_send_menu(cfg: Optional[Dict[str, Any]] = None):
         return
     try:
         for cid in to_ids:
-            _tg_post(
-                f"https://api.telegram.org/bot{tg_token}/sendMessage",
+            tg_enqueue(
+                "sendMessage",
                 {
                     "chat_id": cid,
-                "text": "✅ /menu\n/status /positions /scan /mode auto|scalping|swing /log <id> /gsheet\n(일지상세: '일지상세 <ID>')",
-                "reply_markup": json.dumps(kb, ensure_ascii=False),
-            },
-        )
+                    "text": "✅ /menu\n/status /positions /scan /mode auto|scalping|swing /log <id> /gsheet\n(일지상세: '일지상세 <ID>')",
+                    "reply_markup": json.dumps(kb, ensure_ascii=False),
+                },
+                priority="high",
+            )
     except Exception:
         pass
 
@@ -5501,7 +5786,7 @@ def tg_answer_callback(cb_id: str):
     if not tg_token:
         return
     try:
-        _tg_post(f"https://api.telegram.org/bot{tg_token}/answerCallbackQuery", {"callback_query_id": cb_id})
+        tg_enqueue("answerCallbackQuery", {"callback_query_id": cb_id}, priority="high")
     except Exception:
         pass
 
@@ -5806,6 +6091,28 @@ def _maybe_switch_style_for_open_position(
                 pass
         if regime_mode == "auto" and rec_style != cur_style:
             if switch_ctl == "confirm2":
+                # 기본 2회 확인(confirm2) + "플립백(바로 되돌리기)" 방지:
+                # - 직전 전환의 반대 방향으로 되돌리려면 더 많은 확인이 필요(시간락 없이 흔들림 방지)
+                required_n = 2
+                flipback_n = 3
+                try:
+                    required_n = int(cfg.get("regime_confirm_n", 2) or 2)
+                except Exception:
+                    required_n = 2
+                try:
+                    flipback_n = int(cfg.get("regime_confirm_n_flipback", 3) or 3)
+                except Exception:
+                    flipback_n = 3
+                required_n = max(2, min(8, required_n))
+                flipback_n = max(required_n, min(10, flipback_n))
+                try:
+                    last_from = str(tgt.get("_last_style_switch_from", "") or "")
+                    last_to = str(tgt.get("_last_style_switch_to", "") or "")
+                    # 현재 스타일이 직전 전환 "to"이고, 이번 추천이 직전 "from"으로 되돌리기라면 더 엄격
+                    if last_to and last_from and (last_to == cur_style) and (rec_style == last_from):
+                        required_n = max(required_n, flipback_n)
+                except Exception:
+                    pass
                 pending = str(tgt.get("_pending_style", ""))
                 cnt = int(tgt.get("_pending_style_count", 0) or 0)
                 if pending == rec_style:
@@ -5815,7 +6122,7 @@ def _maybe_switch_style_for_open_position(
                     cnt = 1
                 tgt["_pending_style"] = pending
                 tgt["_pending_style_count"] = cnt
-                if cnt < 2:
+                if cnt < int(required_n):
                     # 2회 연속 동일 레짐일 때만 전환
                     tgt["style_reco"] = rec_style
                     tgt["trend_short_now"] = f"{short_tf} {short_trend}"
@@ -5847,6 +6154,12 @@ def _maybe_switch_style_for_open_position(
                     return tgt
 
         if rec_style != cur_style:
+            # flip-back 방지용 메타(시간락 없이 흔들림 제어)
+            try:
+                tgt["_last_style_switch_from"] = str(cur_style)
+                tgt["_last_style_switch_to"] = str(rec_style)
+            except Exception:
+                pass
             # 전환 기록
             tgt["style"] = rec_style
             tgt["style_confidence"] = int(rec.get("confidence", 0))
@@ -6870,7 +7183,35 @@ def telegram_thread(ex):
                                 free_after, total_after = safe_fetch_balance(ex)
 
                                 one, review = ai_write_review(sym, side, roi, "자동 손절", cfg)
-                                log_trade(sym, side, entry, exit_px, pnl_usdt_snapshot, roi, "자동 손절", one_line=one, review=review, trade_id=trade_id)
+                                # ✅ 매매일지/구글시트에 "진입 전/청산 후 잔액"을 같이 기록(요구사항)
+                                bb_total = None
+                                bb_free = None
+                                try:
+                                    v0 = tgt.get("bal_entry_total", "")
+                                    bb_total = float(v0) if (v0 is not None and str(v0).strip() != "") else None
+                                except Exception:
+                                    bb_total = None
+                                try:
+                                    v1 = tgt.get("bal_entry_free", "")
+                                    bb_free = float(v1) if (v1 is not None and str(v1).strip() != "") else None
+                                except Exception:
+                                    bb_free = None
+                                log_trade(
+                                    sym,
+                                    side,
+                                    entry,
+                                    exit_px,
+                                    pnl_usdt_snapshot,
+                                    roi,
+                                    "자동 손절",
+                                    one_line=one,
+                                    review=review,
+                                    trade_id=trade_id,
+                                    balance_before_total=bb_total,
+                                    balance_after_total=total_after,
+                                    balance_before_free=bb_free,
+                                    balance_after_free=free_after,
+                                )
                                 try:
                                     gsheet_log_trade(
                                         stage="EXIT_SL",
@@ -6892,6 +7233,8 @@ def telegram_thread(ex):
                                             "pnl_pct": roi,
                                             "result": "SL",
                                             "review": review,
+                                            "balance_after_total": total_after,
+                                            "balance_after_free": free_after,
                                         }
                                     )
                                     save_trade_detail(trade_id, d)
@@ -6940,7 +7283,35 @@ def telegram_thread(ex):
                                 free_after, total_after = safe_fetch_balance(ex)
 
                                 one, review = ai_write_review(sym, side, roi, "자동 익절", cfg)
-                                log_trade(sym, side, entry, exit_px, pnl_usdt_snapshot, roi, "자동 익절", one_line=one, review=review, trade_id=trade_id)
+                                # ✅ 매매일지/구글시트에 "진입 전/청산 후 잔액"을 같이 기록(요구사항)
+                                bb_total = None
+                                bb_free = None
+                                try:
+                                    v0 = tgt.get("bal_entry_total", "")
+                                    bb_total = float(v0) if (v0 is not None and str(v0).strip() != "") else None
+                                except Exception:
+                                    bb_total = None
+                                try:
+                                    v1 = tgt.get("bal_entry_free", "")
+                                    bb_free = float(v1) if (v1 is not None and str(v1).strip() != "") else None
+                                except Exception:
+                                    bb_free = None
+                                log_trade(
+                                    sym,
+                                    side,
+                                    entry,
+                                    exit_px,
+                                    pnl_usdt_snapshot,
+                                    roi,
+                                    "자동 익절",
+                                    one_line=one,
+                                    review=review,
+                                    trade_id=trade_id,
+                                    balance_before_total=bb_total,
+                                    balance_after_total=total_after,
+                                    balance_before_free=bb_free,
+                                    balance_after_free=free_after,
+                                )
                                 try:
                                     gsheet_log_trade(
                                         stage="EXIT_TP",
@@ -6962,6 +7333,8 @@ def telegram_thread(ex):
                                             "pnl_pct": roi,
                                             "result": "TP",
                                             "review": review,
+                                            "balance_after_total": total_after,
+                                            "balance_after_free": free_after,
                                         }
                                     )
                                     save_trade_detail(trade_id, d)
@@ -7040,14 +7413,16 @@ def telegram_thread(ex):
                     risk_mul = external_risk_multiplier(ext, cfg)
                     mon["entry_risk_multiplier"] = risk_mul
                     free_usdt = 0.0
+                    total_usdt = 0.0
                     if entry_allowed_global:
                         _to_before_bal = float(getattr(ex, "_wonyoti_ccxt_timeout_epoch", 0) or 0)
-                        free_usdt, _ = safe_fetch_balance(ex)
+                        free_usdt, total_usdt = safe_fetch_balance(ex)
                         _to_after_bal = float(getattr(ex, "_wonyoti_ccxt_timeout_epoch", 0) or 0)
                         if _to_after_bal and _to_after_bal > _to_before_bal:
                             need_exchange_refresh = True
                             entry_allowed_global = False
                             free_usdt = 0.0
+                            total_usdt = 0.0
 
                     # ✅ 잔고 조회에서 timeout이 발생했다면, 스캔 전에 인스턴스 교체(동시 호출 꼬임 방지)
                     if need_exchange_refresh:
@@ -7463,6 +7838,9 @@ def telegram_thread(ex):
                                     "entry_usdt": entry_usdt,
                                     "entry_pct": entry_pct,
                                     "lev": lev,
+                                    # ✅ 잔고 스냅샷(시트/일지에 표시용)
+                                    "bal_entry_total": float(total_usdt) if "total_usdt" in locals() else "",
+                                    "bal_entry_free": float(free_usdt) if "free_usdt" in locals() else "",
                                     "reason": ai2.get("reason_easy", ""),
                                     "trade_id": trade_id,
                                     "sl_price": sl_price,
@@ -7491,6 +7869,8 @@ def telegram_thread(ex):
                                         "entry_usdt": entry_usdt,
                                         "entry_pct": entry_pct,
                                         "lev": lev,
+                                        "balance_before_total": float(total_usdt) if "total_usdt" in locals() else "",
+                                        "balance_before_free": float(free_usdt) if "free_usdt" in locals() else "",
                                         "sl_pct_roi": slp,
                                         "tp_pct_roi": tpp,
                                         "sl_price_sr": sl_price,
@@ -8240,6 +8620,7 @@ def ensure_threads_started():
     has_wd = False
     has_poll = False
     has_gs = False
+    has_send = False
     for t in threading.enumerate():
         if t.name == "TG_THREAD":
             has_tg = True
@@ -8247,8 +8628,15 @@ def ensure_threads_started():
             has_poll = True
         if t.name == "GSHEET_THREAD":
             has_gs = True
+        if t.name == "TG_SEND_THREAD":
+            has_send = True
         if t.name == "WATCHDOG_THREAD":
             has_wd = True
+    if not has_send:
+        # Telegram send worker (sendMessage) - 네트워크 블로킹으로 TG_THREAD가 멈추는 현상 완화
+        ths = threading.Thread(target=telegram_send_worker_thread, args=(), daemon=True, name="TG_SEND_THREAD")
+        add_script_run_ctx(ths)
+        ths.start()
     if not has_poll:
         # Telegram long polling(getUpdates) 전용 스레드 (요구사항)
         thp = threading.Thread(target=telegram_polling_thread, args=(), daemon=True, name="TG_POLL_THREAD")
@@ -8341,6 +8729,10 @@ config["regime_switch_control"] = st.sidebar.selectbox(
     ["confirm2", "hysteresis", "off"],
     index=["confirm2", "hysteresis", "off"].index(str(config.get("regime_switch_control", "confirm2")).lower() if str(config.get("regime_switch_control", "confirm2")).lower() in ["confirm2", "hysteresis", "off"] else "confirm2"),
 )
+with st.sidebar.expander("confirm2 상세(선택)"):
+    c_c1, c_c2 = st.columns(2)
+    config["regime_confirm_n"] = c_c1.number_input("confirm n", 2, 8, int(config.get("regime_confirm_n", 2)))
+    config["regime_confirm_n_flipback"] = c_c2.number_input("flipback n", 2, 10, int(config.get("regime_confirm_n_flipback", 3)))
 with st.sidebar.expander("히스테리시스 상세(선택)"):
     c_h1, c_h2, c_h3 = st.columns(3)
     config["regime_hysteresis_step"] = c_h1.number_input("step", 0.05, 1.0, float(config.get("regime_hysteresis_step", 0.55)), step=0.05)
@@ -9039,7 +9431,29 @@ with t4:
         except Exception:
             pass
 
-        show_cols = [c for c in ["상태", "Time", "Coin", "Side", "PnL_Percent", "PnL_USDT", "OneLine", "Reason", "Review", "TradeID"] if c in df_show.columns]
+        # ✅ 잔고(진입 전/청산 후)까지 같이 보기(요구사항: 직관화)
+        show_cols = [
+            c
+            for c in [
+                "상태",
+                "Time",
+                "Coin",
+                "Side",
+                "Entry",
+                "Exit",
+                "PnL_Percent",
+                "PnL_USDT",
+                "BalanceBefore_Total",
+                "BalanceAfter_Total",
+                "BalanceBefore_Free",
+                "BalanceAfter_Free",
+                "OneLine",
+                "Reason",
+                "Review",
+                "TradeID",
+            ]
+            if c in df_show.columns
+        ]
 
         def _color_pnl(v):
             try:
