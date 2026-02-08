@@ -1154,7 +1154,16 @@ def get_openai_client(cfg: Dict[str, Any]) -> Optional[OpenAI]:
 def _call_with_timeout(fn, timeout_sec: int):
     # 스레드가 멈추는 걸 방지하기 위해 OpenAI 같은 외부 호출에 hard-timeout을 건다.
     global _THREAD_POOL, _THREAD_POOL_CREATED_EPOCH
-    with _THREAD_POOL_LOCK:
+    # ✅ safety: executor lock이 어떤 이유로든 오래 잡히면(비정상) 호출 스레드가 영구 정체될 수 있음
+    # → lock 획득도 hard-timeout 처리
+    got = False
+    try:
+        got = bool(_THREAD_POOL_LOCK.acquire(timeout=0.8))
+    except Exception:
+        got = False
+    if not got:
+        raise FuturesTimeoutError("thread_pool_lock_timeout")
+    try:
         try:
             fut = _THREAD_POOL.submit(fn)
         except RuntimeError as e:
@@ -1167,6 +1176,11 @@ def _call_with_timeout(fn, timeout_sec: int):
                 fut = _THREAD_POOL.submit(fn)
             else:
                 raise
+    finally:
+        try:
+            _THREAD_POOL_LOCK.release()
+        except Exception:
+            pass
     return fut.result(timeout=timeout_sec)
 
 
@@ -5063,7 +5077,13 @@ def telegram_thread(ex):
                 except Exception:
                     pass
                 try:
-                    ext = _call_with_timeout(lambda: build_external_context(cfg, rt=rt), EXTERNAL_CONTEXT_TIMEOUT_SEC)
+                    # 외부시황 통합 OFF면 외부 호출/timeout 스레드풀 자체를 건드리지 않음(정체 방지)
+                    if not bool(cfg.get("use_external_context", True)):
+                        ext = {"enabled": False, "asof_kst": now_kst_str()}
+                        mon["loop_stage"] = "EXTERNAL_CONTEXT_OFF"
+                        mon["loop_stage_kst"] = now_kst_str()
+                    else:
+                        ext = _call_with_timeout(lambda: build_external_context(cfg, rt=rt), EXTERNAL_CONTEXT_TIMEOUT_SEC)
                 except FuturesTimeoutError:
                     # 타임아웃이면 이전 ext(있으면)로 유지하고, 이벤트로만 남김
                     prev = mon.get("external") if isinstance(mon.get("external"), dict) else {}
@@ -7371,12 +7391,18 @@ with t1:
         mon_exists = os.path.exists(mon_abs)
         mon_mtime = os.path.getmtime(mon_abs) if mon_exists else 0.0
         mon_size = os.path.getsize(mon_abs) if mon_exists else 0
+        try:
+            th_names = [t.name for t in threading.enumerate()]
+            th_core = [n for n in th_names if any(k in n for k in ["TG_THREAD", "TG_POLL_THREAD", "WATCHDOG_THREAD", "GSHEET_THREAD"])]
+        except Exception:
+            th_core = []
         mon_diag = {
             "path": mon_abs,
             "exists": mon_exists,
             "mtime_kst": _epoch_to_kst_str(mon_mtime) if mon_mtime else "",
             "size_bytes": mon_size,
             "last_read_error": (_READ_JSON_LAST_ERROR.get(MONITOR_FILE) or _READ_JSON_LAST_ERROR.get(mon_abs) or "").strip(),
+            "threads": th_core,
         }
         with st.expander("🧪 monitor_state.json 진단(출력/갱신 문제 확인)", expanded=False):
             st.write(mon_diag)
