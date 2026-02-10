@@ -570,10 +570,11 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 4,
+        "settings_schema_version": 5,
         "openai_api_key": "",
-        "auto_trade": False,
-        "trade_mode": "안전모드",
+        # ✅ 사용자 기본값 프리셋(요청): 하이리스크/하이리턴 + 자동매매 ON
+        "auto_trade": True,
+        "trade_mode": "하이리스크/하이리턴",
         "timeframe": "5m",
         "order_usdt": 100.0,
 
@@ -588,7 +589,20 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 주기 리포트/시야 리포트
         "tg_enable_periodic_report": True,
         "report_interval_min": 15,
-        "tg_enable_hourly_vision_report": True,
+        # ✅ 하트비트(15분) 전송: 사용자 요청으로 기본 OFF
+        "tg_enable_heartbeat_report": False,
+        "tg_heartbeat_interval_sec": 900,
+        # ✅ 메시지별 알림(푸시) 제어:
+        # - silent=True면 Telegram에서 '무음 전송'(disable_notification)로 보냄
+        # - 채널/그룹을 사용자가 '완전 음소거'했다면, 봇이 푸시를 강제로 켤 수는 없음(텔레그램 정책)
+        "tg_heartbeat_silent": True,
+        "tg_periodic_report_silent": True,
+        # ✅ 사용자 요구: 알림(푸시)은 진입/청산(익절/손절)만 (기본 ON)
+        "tg_notify_entry_exit_only": True,
+        # ✅ 채널이 음소거여도 중요한 알림을 놓치지 않게, 진입/청산은 관리자 DM에도 복사(기본 ON)
+        "tg_trade_alert_to_admin": True,
+        # ✅ 사용자 요구: AI 시야 리포트(자동 전송)는 기본 OFF (필요할 때만 /vision 으로 조회)
+        "tg_enable_hourly_vision_report": False,
         "vision_report_interval_min": 60,
 
         # ✅ 텔레그램 라우팅: channel/group (secrets로 설정 권장)
@@ -626,8 +640,8 @@ def default_settings() -> Dict[str, Any]:
         # - circuit_breaker: "자동매매 OFF" (강제 정지)
         # - daily_loss_limit: "하루 손실 한도" 도달 시 자동매매 OFF
         "circuit_breaker_enable": True,
-        "circuit_breaker_after": 12,  # 연속 손실 N번이면 자동매매 OFF
-        "daily_loss_limit_enable": True,
+        "circuit_breaker_after": 10,  # 연속 손실 N번이면 자동매매 OFF
+        "daily_loss_limit_enable": False,
         "daily_loss_limit_pct": 8.0,   # day_start_equity 대비 -8%면 정지(0이면 미사용)
         "daily_loss_limit_usdt": 0.0,  # -USDT 기준(0이면 미사용)
 
@@ -682,8 +696,8 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 스타일 AI 보조(선택): 레짐 전환/표시에서 불필요한 OpenAI 호출을 줄이기 위해 분리 옵션 제공
         # - style_auto_enable=True여도, 아래 옵션이 OFF면 스타일은 "룰 기반"만 사용
         # - 사용자가 원할 때만 ON (비용/지연/요금제 429 방지)
-        "style_entry_ai_enable": False,   # 신규진입(스타일 선택)에 AI 사용(기본 OFF)
-        "style_switch_ai_enable": False,  # 포지션 보유 중 스타일 전환 판단에 AI 사용(기본 OFF)
+        "style_entry_ai_enable": True,   # 신규진입(스타일 선택)에 AI 사용
+        "style_switch_ai_enable": True,  # 포지션 보유 중 스타일 전환 판단에 AI 사용
         "style_ai_cache_sec": 600,        # 동일 입력의 스타일 AI 결과 캐시(초)
         "style_auto_enable": True,
         "style_lock_minutes": 20,  # 전환 최소 유지 시간
@@ -898,6 +912,13 @@ def load_settings() -> Dict[str, Any]:
                 if float(cfg.get("swing_tp_roi_max", 0.0) or 0.0) == 50.0:
                     cfg["swing_tp_roi_max"] = 80.0
                     changed = True
+            except Exception:
+                pass
+        # v5: AI 시야 리포트 자동 전송 기본 OFF
+        if saved_ver < 5:
+            try:
+                cfg["tg_enable_hourly_vision_report"] = False
+                changed = True
             except Exception:
                 pass
         cfg["settings_schema_version"] = base_ver
@@ -6817,7 +6838,7 @@ def _tg_chat_id_by_target(target: str, cfg: Dict[str, Any]) -> List[str]:
     return [tg_id_default] if tg_id_default else []
 
 
-def tg_send(text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = None):
+def tg_send(text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False, parse_mode: str = ""):
     if not tg_token:
         return
     # 요구사항: Telegram 상태/라우팅이 전역 config가 아니라 최신 load_settings() 기준으로 일치
@@ -6828,7 +6849,13 @@ def tg_send(text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = 
         if not cid:
             continue
         try:
-            tg_enqueue("sendMessage", {"chat_id": cid, "text": text}, priority=pri)
+            data = {"chat_id": cid, "text": text}
+            if bool(silent):
+                data["disable_notification"] = True
+            pm = str(parse_mode or "").strip()
+            if pm:
+                data["parse_mode"] = pm
+            tg_enqueue("sendMessage", data, priority=pri)
         except Exception:
             pass
 
@@ -7736,7 +7763,12 @@ def _maybe_switch_style_for_open_position(
                         f"🔄 방식 바뀜\n- 코인: {sym}\n- {cur_style} → {rec_style}\n- 손익비(이익:손실): {rr_old:.2f} → {rr_new:.2f}\n"
                         f"- 목표(익절/손절): +{old_tp:.2f}%/-{old_sl:.2f}% → +{new_tp:.2f}%/-{new_sl:.2f}%\n- 이유: {str(tgt.get('style_reason','') or '')[:140]}"
                     )
-                tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
+                tg_send(
+                    msg,
+                    target=cfg.get("tg_route_events_to", "channel"),
+                    cfg=cfg,
+                    silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
+                )
             except Exception:
                 pass
         else:
@@ -8154,7 +8186,12 @@ def telegram_thread(ex):
                                             f"- csv: {res.get('csv_path','')}\n"
                                             f"- gsheet: {res.get('gsheet','')}"
                                         )
-                                        tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
+                                        tg_send(
+                                            msg,
+                                            target=cfg.get("tg_route_events_to", "channel"),
+                                            cfg=cfg,
+                                            silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
+                                        )
                                 except Exception:
                                     pass
             except Exception:
@@ -8171,7 +8208,7 @@ def telegram_thread(ex):
 
             # ✅ 하트비트(요구사항: 15분=900초마다)
             try:
-                if tg_token:
+                if tg_token and bool(cfg.get("tg_enable_heartbeat_report", False)):
                     if next_heartbeat_ts <= 0:
                         # 부팅 직후 첫 하트비트는 조금 지연(스팸 방지)
                         next_heartbeat_ts = time.time() + 20
@@ -8225,7 +8262,12 @@ def telegram_thread(ex):
                                 f"- 마지막 하트비트: {last_hb_kst}",
                             ]
                         )
-                        tg_send(txt, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
+                        tg_send(
+                            txt,
+                            target=cfg.get("tg_route_events_to", "channel"),
+                            cfg=cfg,
+                            silent=bool(cfg.get("tg_heartbeat_silent", True)),
+                        )
                         try:
                             mon["last_tg_heartbeat_epoch"] = time.time()
                             mon["last_tg_heartbeat_kst"] = now_kst_str()
@@ -8235,7 +8277,11 @@ def telegram_thread(ex):
                             gsheet_log_event("HEARTBEAT", message=f"regime={regime_txt} pos={len(act)} bal={total:.2f}", payload={"regime": regime_txt, "positions": len(act), "total": total, "free": free})
                         except Exception:
                             pass
-                        next_heartbeat_ts = time.time() + 900
+                        try:
+                            hb_int = int(cfg.get("tg_heartbeat_interval_sec", 900) or 900)
+                        except Exception:
+                            hb_int = 900
+                        next_heartbeat_ts = time.time() + float(clamp(hb_int, 60, 7200))
             except Exception:
                 pass
 
@@ -8244,7 +8290,7 @@ def telegram_thread(ex):
                 if cfg.get("tg_enable_periodic_report", True):
                     interval = max(3, int(cfg.get("report_interval_min", 15)))
                     # 하트비트(15분)는 별도 고정 스케줄이므로, 동일(15)이면 중복 전송 방지
-                    if interval == 15:
+                    if bool(cfg.get("tg_enable_heartbeat_report", False)) and interval == 15:
                         # heartbeat가 이미 15분 고정으로 전송되므로, 별도 주기 리포트는 스킵
                         next_report_ts = 0.0
                     else:
@@ -8327,7 +8373,7 @@ def telegram_thread(ex):
                                 ]
                             )
                             tgt = cfg.get("tg_route_events_to", "channel")
-                            tg_send(txt, target=tgt, cfg=cfg)
+                            tg_send(txt, target=tgt, cfg=cfg, silent=bool(cfg.get("tg_periodic_report_silent", True)))
                             try:
                                 gsheet_log_event(
                                     "PERIODIC_REPORT",
@@ -8360,7 +8406,7 @@ def telegram_thread(ex):
 
             # ✅ 1시간마다 AI 시야 리포트(채널)
             try:
-                if cfg.get("tg_enable_hourly_vision_report", True):
+                if cfg.get("tg_enable_hourly_vision_report", False):
                     interval = max(10, int(cfg.get("vision_report_interval_min", 60)))
                     if next_vision_ts <= 0:
                         next_vision_ts = time.time() + interval * 60
@@ -8381,7 +8427,12 @@ def telegram_thread(ex):
                                 f"/ 단기 {cs.get('trend_short','-')} / 장기 {cs.get('trend_long','-')} "
                                 f"/ {str(cs.get('ai_reason_easy') or cs.get('skip_reason') or '')[:35]}"
                             )
-                        tg_send("\n".join(lines), target="channel", cfg=cfg)
+                        tg_send(
+                            "\n".join(lines),
+                            target="channel",
+                            cfg=cfg,
+                            silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
+                        )
                         next_vision_ts = time.time() + interval * 60
             except Exception:
                 pass
@@ -8883,7 +8934,12 @@ def telegram_thread(ex):
                                             msg = (
                                                 f"🧩 부분익절({label})\n- 코인: {sym}\n- 스타일: 스윙\n- ROI: +{roi:.2f}%\n- 청산수량: {close_qty}\n- 청산마진(추정): {close_margin_est:.2f} USDT\n- 남은수량: {contracts_left}\n- 일지ID: {trade_id or '-'}"
                                             )
-                                        tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
+                                        tg_send(
+                                            msg,
+                                            target=cfg.get("tg_route_events_to", "channel"),
+                                            cfg=cfg,
+                                            silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
+                                        )
                                         # 상세일지 기록
                                         if trade_id:
                                             d = load_trade_detail(trade_id) or {}
@@ -8956,7 +9012,12 @@ def telegram_thread(ex):
                                                                 f"- 조건: ROI {roi:.2f}% <= {reentry_roi}%\n- 단기({short_tf}): {short_tr}\n- 장기({long_tf}): {long_tr}\n"
                                                                 f"- 일지ID: {trade_id or '-'}"
                                                             )
-                                                        tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
+                                                        tg_send(
+                                                            msg,
+                                                            target=cfg.get("tg_route_events_to", "channel"),
+                                                            cfg=cfg,
+                                                            silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
+                                                        )
                                                         if trade_id:
                                                             d = load_trade_detail(trade_id) or {}
                                                             evs = d.get("events", []) or []
@@ -9111,7 +9172,12 @@ def telegram_thread(ex):
                                         f"🔄 스타일 전환\n- 코인: {sym}\n- 스캘핑 → 스윙\n- 이유: {tgt.get('style_reason','')}\n- ROI: {roi:.2f}%\n"
                                         f"- (전환추매): {'있음' if did_dca else '없음'}\n- 일지ID: {trade_id or '-'}"
                                     )
-                                tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
+                                tg_send(
+                                    msg,
+                                    target=cfg.get("tg_route_events_to", "channel"),
+                                    cfg=cfg,
+                                    silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
+                                )
                         except Exception:
                             pass
 
@@ -9167,7 +9233,12 @@ def telegram_thread(ex):
                                                 f"💧 물타기(DCA)\n- 코인: {sym}\n- 스타일: {style_now}\n- 추가금(마진): {float(add_usdt):.2f} USDT (추정 {float(margin_est):.2f})\n"
                                                 f"- 추가수량: {qty}\n- 레버: x{lev}\n- 이유: 손실 {roi:.2f}% (기준 {dca_trig}%)\n- 일지ID: {trade_id or '-'}"
                                             )
-                                        tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
+                                        tg_send(
+                                            msg,
+                                            target=cfg.get("tg_route_events_to", "channel"),
+                                            cfg=cfg,
+                                            silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
+                                        )
                                         mon_add_event(mon, "DCA", sym, f"DCA {add_usdt:.2f} USDT", {"roi": roi})
                                         try:
                                             gsheet_log_trade(
@@ -9393,7 +9464,12 @@ def telegram_thread(ex):
                                         f"- 이유: {reason_ko}\n"
                                         f"- 한줄평: {one}\n- 일지ID: {trade_id or '없음'}"
                                     )
-                                tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
+                                tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                try:
+                                    if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
+                                        tg_send(msg, target="admin", cfg=cfg, silent=False)
+                                except Exception:
+                                    pass
 
                                 active_targets.pop(sym, None)
                                 rt.setdefault("trades", {}).pop(sym, None)
@@ -9588,7 +9664,12 @@ def telegram_thread(ex):
                                         f"- 이유: {take_reason_ko}\n"
                                         f"- 한줄평: {one}\n- 일지ID: {trade_id or '없음'}"
                                     )
-                                tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
+                                tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                try:
+                                    if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
+                                        tg_send(msg, target="admin", cfg=cfg, silent=False)
+                                except Exception:
+                                    pass
 
                                 active_targets.pop(sym, None)
                                 rt.setdefault("trades", {}).pop(sym, None)
@@ -10430,7 +10511,13 @@ def telegram_thread(ex):
                                                 f"- 자세한 근거: /log {trade_id}\n"
                                                 f"- AI지표: {', '.join(ai2.get('used_indicators', []))}\n"
                                             )
-                                    tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
+                                    tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                    # ✅ 채널을 음소거해도 중요한 알림을 놓치지 않도록(사용자 요구): 관리자 DM에도 복사
+                                    try:
+                                        if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
+                                            tg_send(msg, target="admin", cfg=cfg, silent=False)
+                                    except Exception:
+                                        pass
 
                                 mon_add_event(mon, "ENTRY", sym, f"{decision} {style} conf{conf}", {"trade_id": trade_id})
                                 monitor_write_throttled(mon, 0.2)
@@ -11219,6 +11306,17 @@ if not openai_key_secret and not config.get("openai_api_key"):
 
 with st.sidebar.expander("🧪 디버그: 저장된 설정(bot_settings.json) 확인"):
     st.json(read_json_safe(SETTINGS_FILE, {}))
+    st.caption("⚠️ 아래 버튼은 `bot_settings.json`을 '기본값(프리셋)'으로 덮어씁니다.")
+    _reset_ok = st.checkbox("덮어쓰기 확인", value=False, key="reset_settings_confirm")
+    if st.button("♻️ 기본값(프리셋) 적용", disabled=not _reset_ok):
+        try:
+            config.clear()
+            config.update(default_settings())
+            save_settings(config)
+            st.success("✅ 기본값(프리셋) 적용 완료")
+            st.rerun()
+        except Exception as e:
+            st.error(f"적용 실패: {e}")
 
 mode_keys = list(MODE_RULES.keys())
 safe_mode = config.get("trade_mode", "안전모드")
@@ -11254,10 +11352,49 @@ config["ai_scan_once_per_bar"] = st.sidebar.checkbox(
 )
 
 st.sidebar.subheader("⏱️ 주기 리포트")
-config["tg_enable_periodic_report"] = st.sidebar.checkbox("15분(기본) 상황보고", value=bool(config.get("tg_enable_periodic_report", True)))
+config["tg_enable_heartbeat_report"] = st.sidebar.checkbox(
+    "💓 하트비트(요약) 전송",
+    value=bool(config.get("tg_enable_heartbeat_report", False)),
+    help="기본은 OFF. 켜면 지정한 주기마다 잔고/포지션 요약을 보냅니다.",
+)
+config["tg_heartbeat_interval_sec"] = st.sidebar.number_input(
+    "하트비트 주기(초)",
+    60,
+    7200,
+    int(config.get("tg_heartbeat_interval_sec", 900)),
+    step=60,
+)
+config["tg_heartbeat_silent"] = st.sidebar.checkbox(
+    "하트비트는 무음(알림X)",
+    value=bool(config.get("tg_heartbeat_silent", True)),
+    help="무음 전송(disable_notification)로 보내서 알림을 줄입니다.",
+)
+st.sidebar.divider()
+config["tg_enable_periodic_report"] = st.sidebar.checkbox(
+    "상황보고 전송",
+    value=bool(config.get("tg_enable_periodic_report", True)),
+    help="요청대로 OpenAI를 부르지 않는 '상태 요약'만 전송합니다.",
+)
 config["report_interval_min"] = st.sidebar.number_input("상황보고 주기(분)", 3, 120, int(config.get("report_interval_min", 15)))
-config["tg_enable_hourly_vision_report"] = st.sidebar.checkbox("1시간 AI시야 리포트(채널)", value=bool(config.get("tg_enable_hourly_vision_report", True)))
+config["tg_periodic_report_silent"] = st.sidebar.checkbox(
+    "상황보고는 무음(알림X)",
+    value=bool(config.get("tg_periodic_report_silent", True)),
+    help="무음 전송(disable_notification)로 보내서 알림을 줄입니다.",
+)
+config["tg_enable_hourly_vision_report"] = st.sidebar.checkbox("1시간 AI시야 리포트(채널)", value=bool(config.get("tg_enable_hourly_vision_report", False)))
 config["vision_report_interval_min"] = st.sidebar.number_input("AI시야 리포트 주기(분)", 10, 240, int(config.get("vision_report_interval_min", 60)))
+
+st.sidebar.subheader("🔔 알림(푸시) 제어")
+config["tg_notify_entry_exit_only"] = st.sidebar.checkbox(
+    "알림은 진입/청산만(권장)",
+    value=bool(config.get("tg_notify_entry_exit_only", True)),
+    help="ON이면 DCA/부분익절/방식전환 같은 '중간 이벤트'는 무음 전송으로 보냅니다.",
+)
+config["tg_trade_alert_to_admin"] = st.sidebar.checkbox(
+    "진입/청산은 관리자 DM에도 전송",
+    value=bool(config.get("tg_trade_alert_to_admin", True)),
+    help="채널을 음소거해도 알림을 놓치지 않게, 관리자 DM으로 한 번 더 보냅니다. (관리자는 먼저 봇에 /start 필요)",
+)
 
 st.sidebar.subheader("📡 텔레그램 라우팅")
 config["tg_route_events_to"] = st.sidebar.selectbox("이벤트(진입/익절/손절/보고) 전송 대상", ["channel", "group", "both"], index=["channel", "group", "both"].index(config.get("tg_route_events_to", "channel")))
