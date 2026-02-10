@@ -622,6 +622,12 @@ def default_settings() -> Dict[str, Any]:
 
         # 방어/전략
         "use_trailing_stop": True,
+        # ✅ 손절(ROI) 확인(휩쏘 방지):
+        # - SR(지지/저항) 가격 이탈 손절은 즉시 실행
+        # - ROI(퍼센트) 손절은 n회 연속 조건일 때만 실행(순간 위꼬리/툭 찍고 복구 방지)
+        "sl_confirm_enable": True,
+        "sl_confirm_n": 2,
+        "sl_confirm_window_sec": 6.0,
         "use_dca": True,
         "dca_trigger": -20.0,
         "dca_max_count": 1,
@@ -7418,6 +7424,173 @@ def _trend_align(trend_txt: str, side: str) -> bool:
     return False
 
 
+def _trend_clean_for_reason(trend_txt: Any) -> str:
+    try:
+        s = str(trend_txt or "").strip()
+    except Exception:
+        return ""
+    if not s:
+        return ""
+    # 예: "📈 상승추세" / "🧭 1h 상승추세" -> "상승추세"
+    try:
+        s = s.replace("📈", "").replace("🧭", "").strip()
+        # 선행 이모지/기호 제거
+        s = re.sub(r"^[^0-9A-Za-z가-힣]+", "", s).strip()
+        # "1h 상승추세" -> "상승추세" (타임프레임 제거)
+        s = re.sub(r"^(?:\\d+[mhdw]|\\d+h)\\s+", "", s).strip()
+    except Exception:
+        pass
+    return s
+
+
+def _rsi_state_ko(rsi: Optional[float], cfg: Dict[str, Any]) -> str:
+    try:
+        if rsi is None:
+            return ""
+        v = float(rsi)
+        if not math.isfinite(v):
+            return ""
+    except Exception:
+        return ""
+    try:
+        rsi_buy = float(cfg.get("rsi_buy", 30) or 30)
+        rsi_sell = float(cfg.get("rsi_sell", 70) or 70)
+    except Exception:
+        rsi_buy, rsi_sell = 30.0, 70.0
+    if v <= rsi_buy:
+        return "과매도"
+    if v >= rsi_sell:
+        return "과매수"
+    return "중립"
+
+
+def chart_snapshot_for_reason(ex, sym: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    행동(손절/익절/본절/추매/순환매) 직전에,
+    '왜 그렇게 했는지' 설명을 만들기 위한 최소 차트 스냅샷(룰 기반).
+    - AI 호출 없음
+    - 네트워크/ta 문제로 실패해도 봇이 멈추지 않음
+    """
+    out: Dict[str, Any] = {"time_kst": now_kst_str(), "symbol": str(sym)}
+    try:
+        tf = str(cfg.get("timeframe", "5m") or "5m")
+        out["tf"] = tf
+        fast = int(cfg.get("ma_fast", 7) or 7)
+        slow = int(cfg.get("ma_slow", 99) or 99)
+        out["trend_short"] = str(get_htf_trend_cached(ex, sym, tf, fast=fast, slow=slow, cache_sec=20))
+        htf_tf = str(cfg.get("trend_filter_timeframe", "1h") or "1h")
+        out["htf_tf"] = htf_tf
+        out["trend_long"] = str(
+            get_htf_trend_cached(ex, sym, htf_tf, fast=fast, slow=slow, cache_sec=int(cfg.get("trend_filter_cache_sec", 60) or 60))
+        )
+    except Exception:
+        pass
+
+    # RSI/MACD/ADX는 선택(ta 있을 때만)
+    try:
+        tf = str(out.get("tf") or cfg.get("timeframe", "5m") or "5m")
+        ohlcv = safe_fetch_ohlcv(ex, sym, tf, limit=220)
+        if not ohlcv or len(ohlcv) < 40:
+            return out
+        df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
+        close = df["close"].astype(float)
+        if ta is None:
+            return out
+
+        if bool(cfg.get("use_rsi", True)):
+            try:
+                rsi_p = int(cfg.get("rsi_period", 14) or 14)
+                rsi_s = ta.momentum.rsi(close, window=rsi_p)
+                rsi_v = float(rsi_s.iloc[-1]) if pd.notna(rsi_s.iloc[-1]) else None
+                out["rsi"] = rsi_v
+                out["rsi_state"] = _rsi_state_ko(rsi_v, cfg)
+            except Exception:
+                pass
+
+        if bool(cfg.get("use_macd", True)):
+            try:
+                m = ta.trend.MACD(close)
+                macd_v = float(m.macd().iloc[-1])
+                sig_v = float(m.macd_signal().iloc[-1])
+                if pd.notna(macd_v) and pd.notna(sig_v):
+                    out["macd_state"] = "골든" if macd_v > sig_v else "데드"
+            except Exception:
+                pass
+
+        if bool(cfg.get("use_adx", True)):
+            try:
+                adx_s = ta.trend.adx(df["high"].astype(float), df["low"].astype(float), close, window=14)
+                adx_v = float(adx_s.iloc[-1]) if pd.notna(adx_s.iloc[-1]) else None
+                out["adx"] = adx_v
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+def _fmt_indicator_line_for_reason(entry_snap: Optional[Dict[str, Any]], now_snap: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(now_snap, dict):
+        return ""
+    parts: List[str] = []
+    try:
+        ts = _trend_clean_for_reason(now_snap.get("trend_short", ""))
+        if ts:
+            parts.append(f"단기추세:{ts}")
+    except Exception:
+        pass
+    try:
+        tl = _trend_clean_for_reason(now_snap.get("trend_long", ""))
+        if tl:
+            parts.append(f"장기추세:{tl}")
+    except Exception:
+        pass
+    try:
+        r1 = now_snap.get("rsi", None)
+        if r1 is not None:
+            r1f = float(r1)
+            if isinstance(entry_snap, dict) and entry_snap.get("rsi", None) is not None:
+                r0f = float(entry_snap.get("rsi", 0.0))
+                parts.append(f"RSI:{r0f:.0f}→{r1f:.0f}({str(now_snap.get('rsi_state','') or '')})")
+            else:
+                parts.append(f"RSI:{r1f:.0f}({str(now_snap.get('rsi_state','') or '')})")
+    except Exception:
+        pass
+    try:
+        ms = str(now_snap.get("macd_state", "") or "").strip()
+        if ms:
+            parts.append(f"MACD:{ms}")
+    except Exception:
+        pass
+    try:
+        adx_v = now_snap.get("adx", None)
+        if adx_v is not None:
+            adx_f = float(adx_v)
+            if math.isfinite(adx_f):
+                parts.append(f"ADX:{adx_f:.0f}")
+    except Exception:
+        pass
+    return " | ".join(parts)[:220]
+
+
+def build_exit_one_line(
+    *,
+    base_reason: str,
+    entry_snap: Optional[Dict[str, Any]],
+    now_snap: Optional[Dict[str, Any]],
+) -> str:
+    """
+    텔레그램/일지에 들어갈 '짧은 근거(2줄)' 생성.
+    - 1줄: 행동 이유(한국어)
+    - 2줄: 단기/장기추세 + RSI + MACD 등 핵심 변화
+    """
+    base = str(base_reason or "").strip() or "-"
+    ind = _fmt_indicator_line_for_reason(entry_snap, now_snap)
+    if ind:
+        return f"{base}\n{ind}"
+    return base
+
+
 def _maybe_switch_style_for_open_position(
     ex,
     sym: str,
@@ -9008,53 +9181,63 @@ def telegram_thread(ex):
                                                 set_leverage_safe(ex, sym, lev)
                                                 qty_re = to_precision_qty(ex, sym, qty_avail)
                                                 if qty_re > 0:
-                                                    ok = market_order_safe(ex, sym, "buy" if side == "long" else "sell", qty_re)
-                                                    if ok:
-                                                        trade_state["recycle_count"] = rc + 1
-                                                        trade_state["recycle_qty"] = max(0.0, qty_avail - float(qty_re))
-                                                        save_runtime(rt)
-                                                        mon_add_event(mon, "RECYCLE_REENTRY", sym, f"재진입 {qty_re}", {"roi": roi, "trend": f"{short_tr}/{long_tr}"})
-                                                        try:
-                                                            gsheet_log_trade(
-                                                                stage="RECYCLE_REENTRY",
-                                                                symbol=sym,
-                                                                trade_id=trade_id,
-                                                                message=f"qty={qty_re}",
-                                                                payload={"roi": roi, "qty": qty_re, "trend": f"{short_tr}/{long_tr}", "recycle_count": rc + 1},
-                                                            )
-                                                        except Exception:
-                                                            pass
-                                                        if _tg_simple_enabled(cfg):
-                                                            msg = (
-                                                                "♻️ 순환매도(재진입)\n"
-                                                                f"- 코인: {sym}\n"
-                                                                f"- 방식: 스윙\n"
-                                                                f"- 포지션: {_tg_dir_easy(side)}\n"
-                                                                "\n"
-                                                                f"- 재진입금액(마진): {float(margin_need):.2f} USDT\n"
-                                                                f"- 재진입수량: {qty_re}\n"
-                                                                f"- 지금 수익률: {_tg_fmt_pct(roi)}\n"
-                                                                "\n"
-                                                                f"- ID: {trade_id or '-'}"
-                                                            )
-                                                        else:
-                                                            msg = (
-                                                                f"♻️ 순환매도 재진입\n- 코인: {sym}\n- 스타일: 스윙\n- 재진입수량: {qty_re}\n"
-                                                                f"- 조건: ROI {roi:.2f}% <= {reentry_roi}%\n- 단기({short_tf}): {short_tr}\n- 장기({long_tf}): {long_tr}\n"
-                                                                f"- 일지ID: {trade_id or '-'}"
-                                                            )
-                                                        tg_send(
-                                                            msg,
-                                                            target=cfg.get("tg_route_events_to", "channel"),
-                                                            cfg=cfg,
-                                                            silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
-                                                        )
-                                                        if trade_id:
-                                                            d = load_trade_detail(trade_id) or {}
-                                                            evs = d.get("events", []) or []
-                                                            evs.append({"time": now_kst_str(), "type": "RECYCLE_REENTRY", "roi": roi, "qty": qty_re})
-                                                            d["events"] = evs
-                                                            save_trade_detail(trade_id, d)
+	                                                    ok = market_order_safe(ex, sym, "buy" if side == "long" else "sell", qty_re)
+	                                                    if ok:
+	                                                        trade_state["recycle_count"] = rc + 1
+	                                                        trade_state["recycle_qty"] = max(0.0, qty_avail - float(qty_re))
+	                                                        save_runtime(rt)
+	                                                        # ✅ 순환매도도 "왜 재진입하는지" 남기기(차트 스냅샷, AI 호출 없음)
+	                                                        snap_re = {}
+	                                                        try:
+	                                                            snap_re = chart_snapshot_for_reason(ex, sym, cfg)
+	                                                        except Exception:
+	                                                            snap_re = {}
+	                                                        entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
+	                                                        why_re = _fmt_indicator_line_for_reason(entry_snap, snap_re) or f"단기:{short_tr} | 장기:{long_tr}"
+	                                                        mon_add_event(mon, "RECYCLE_REENTRY", sym, f"재진입 {qty_re}", {"roi": roi, "trend": f"{short_tr}/{long_tr}"})
+	                                                        try:
+	                                                            gsheet_log_trade(
+	                                                                stage="RECYCLE_REENTRY",
+	                                                                symbol=sym,
+	                                                                trade_id=trade_id,
+	                                                                message=f"qty={qty_re}",
+	                                                                payload={"roi": roi, "qty": qty_re, "trend": f"{short_tr}/{long_tr}", "recycle_count": rc + 1},
+	                                                            )
+	                                                        except Exception:
+	                                                            pass
+	                                                        if _tg_simple_enabled(cfg):
+	                                                            why_line = f"- 근거: {why_re}\n" if why_re else ""
+	                                                            msg = (
+	                                                                "♻️ 순환매도(재진입)\n"
+	                                                                f"- 코인: {sym}\n"
+	                                                                f"- 방식: 스윙\n"
+	                                                                f"- 포지션: {_tg_dir_easy(side)}\n"
+	                                                                "\n"
+	                                                                f"- 재진입금액(마진): {float(margin_need):.2f} USDT\n"
+	                                                                f"- 재진입수량: {qty_re}\n"
+	                                                                f"- 지금 수익률: {_tg_fmt_pct(roi)}\n"
+	                                                                f"{why_line}"
+	                                                                "\n"
+	                                                                f"- ID: {trade_id or '-'}"
+	                                                            )
+	                                                        else:
+	                                                            msg = (
+	                                                                f"♻️ 순환매도 재진입\n- 코인: {sym}\n- 스타일: 스윙\n- 재진입수량: {qty_re}\n"
+	                                                                f"- 조건: ROI {roi:.2f}% <= {reentry_roi}%\n- 단기({short_tf}): {short_tr}\n- 장기({long_tf}): {long_tr}\n"
+	                                                                f"- 일지ID: {trade_id or '-'}"
+	                                                            )
+	                                                        tg_send(
+	                                                            msg,
+	                                                            target=cfg.get("tg_route_events_to", "channel"),
+	                                                            cfg=cfg,
+	                                                            silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
+	                                                        )
+	                                                        if trade_id:
+	                                                            d = load_trade_detail(trade_id) or {}
+	                                                            evs = d.get("events", []) or []
+	                                                            evs.append({"time": now_kst_str(), "type": "RECYCLE_REENTRY", "roi": roi, "qty": qty_re})
+	                                                            d["events"] = evs
+	                                                            save_trade_detail(trade_id, d)
                             except Exception:
                                 pass
 
@@ -9242,12 +9425,21 @@ def telegram_thread(ex):
                                     if ok:
                                         trade_state["dca_count"] = dca_count + 1
                                         save_runtime(rt)
+                                        # ✅ 추매도 "왜 하는지" 남기기(차트 스냅샷, AI 호출 없음)
+                                        snap_dca = {}
+                                        try:
+                                            snap_dca = chart_snapshot_for_reason(ex, sym, cfg)
+                                        except Exception:
+                                            snap_dca = {}
+                                        entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
+                                        why_dca = _fmt_indicator_line_for_reason(entry_snap, snap_dca)
                                         # 실제 마진 추정(근사): notional/lev
                                         try:
                                             margin_est = (float(qty) * float(cur_px)) / max(float(lev), 1.0)
                                         except Exception:
                                             margin_est = float(add_usdt)
                                         if _tg_simple_enabled(cfg):
+                                            why_line = f"- 근거: {why_dca}\n" if why_dca else ""
                                             msg = (
                                                 "💧 추매(DCA)\n"
                                                 f"- 코인: {sym}\n"
@@ -9256,6 +9448,7 @@ def telegram_thread(ex):
                                                 "\n"
                                                 f"- 추가금액(마진): {float(add_usdt):.2f} USDT\n"
                                                 f"- 지금 수익률: {_tg_fmt_pct(roi)} (기준 {float(dca_trig):+.1f}%)\n"
+                                                f"{why_line}"
                                                 "\n"
                                                 f"- ID: {trade_id or '-'}"
                                             )
@@ -9297,7 +9490,41 @@ def telegram_thread(ex):
                         except Exception:
                             hard_take = False
 
-                        do_stop = hit_sl_by_price or (roi <= -abs(sl))
+                        # ✅ ROI 손절은 "확인 n회"로 한 번 더 생각(휩쏘 방지)
+                        roi_stop_hit = bool(float(roi) <= -abs(float(sl)))
+                        roi_stop_confirmed = roi_stop_hit
+                        if roi_stop_hit and (not bool(hit_sl_by_price)) and bool(cfg.get("sl_confirm_enable", True)):
+                            try:
+                                n_need = max(1, int(cfg.get("sl_confirm_n", 2) or 2))
+                            except Exception:
+                                n_need = 2
+                            try:
+                                win_sec = float(cfg.get("sl_confirm_window_sec", 6.0) or 6.0)
+                            except Exception:
+                                win_sec = 6.0
+                            now_ep = time.time()
+                            try:
+                                last_ep = float(tgt.get("sl_confirm_last_epoch", 0) or 0)
+                            except Exception:
+                                last_ep = 0.0
+                            try:
+                                last_cnt = int(tgt.get("sl_confirm_count", 0) or 0)
+                            except Exception:
+                                last_cnt = 0
+                            cnt = 1 if (now_ep - last_ep) > float(win_sec) else (last_cnt + 1)
+                            tgt["sl_confirm_last_epoch"] = float(now_ep)
+                            tgt["sl_confirm_count"] = int(cnt)
+                            roi_stop_confirmed = bool(int(cnt) >= int(n_need))
+                        else:
+                            # 조건이 풀리면 카운트 리셋
+                            if not roi_stop_hit:
+                                try:
+                                    tgt["sl_confirm_count"] = 0
+                                    tgt["sl_confirm_last_epoch"] = 0.0
+                                except Exception:
+                                    pass
+
+                        do_stop = bool(hit_sl_by_price) or bool(roi_stop_confirmed)
                         do_take = hit_tp_by_price or hard_take or (roi >= tp)
 
                         # 손절
@@ -9313,17 +9540,42 @@ def telegram_thread(ex):
                                 reason_ko = "손절(지지/저항 이탈)"
                             else:
                                 reason_ko = "손절(목표 손절)"
+                            # ✅ 차트 근거(룰 기반) 스냅샷: "왜 정리했는지"를 명확히 남긴다(AI 호출 없음)
+                            entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
+                            snap_now = {}
+                            try:
+                                snap_now = chart_snapshot_for_reason(ex, sym, cfg)
+                            except Exception:
+                                snap_now = {}
+                            sl_price_now = tgt.get("sl_price", None)
+                            sl_line_txt = ""
+                            try:
+                                if sl_price_now is not None:
+                                    sl_line_txt = f" (라인 {float(sl_price_now):.6g})"
+                            except Exception:
+                                sl_line_txt = ""
+                            if is_protect:
+                                base_reason = f"수익 지키려고 본전에서 정리했어요{sl_line_txt}"
+                            elif bool(hit_sl_by_price):
+                                base_reason = f"지지/저항 이탈로 손절했어요{sl_line_txt}"
+                            else:
+                                base_reason = f"손실이 목표손절(-{abs(float(sl)):.1f}%)에 닿아서 정리했어요"
+                            one_rule = build_exit_one_line(base_reason=base_reason, entry_snap=entry_snap, now_snap=snap_now)
                             ok = close_position_market(ex, sym, side, contracts)
                             if ok:
                                 exit_px = get_last_price(ex, sym) or entry
                                 free_after, total_after = safe_fetch_balance(ex)
 
                                 # ✅ AI 회고 비용 절감: 손실일 때만 AI 회고 작성(사용자 요구)
+                                review = ""
                                 if is_loss:
-                                    one, review = ai_write_review(sym, side, roi, reason_ko, cfg)
-                                else:
-                                    one = "본전으로 지킴" if is_protect else "정리 완료"
-                                    review = ""
+                                    try:
+                                        _ai_one, _ai_review = ai_write_review(sym, side, roi, reason_ko, cfg)
+                                        review = str(_ai_review or "")
+                                    except Exception:
+                                        review = ""
+                                # ✅ 텔레그램/일지에는 "차트 기반 한줄 근거"를 우선 기록
+                                one = str(one_rule or "").strip() or ("본전으로 지킴" if is_protect else "정리 완료")
                                 # ✅ 매매일지/구글시트에 "진입 전/청산 후 잔액"을 같이 기록(요구사항)
                                 bb_total = None
                                 bb_free = None
@@ -9381,6 +9633,8 @@ def telegram_thread(ex):
                                             "pnl_usdt": pnl_usdt_snapshot,
                                             "pnl_pct": roi,
                                             "result": "PROTECT" if is_protect else "SL",
+                                            "exit_reason_detail": one,
+                                            "exit_snapshot": snap_now,
                                             "review": review,
                                             "balance_after_total": total_after,
                                             "balance_after_free": free_after,
@@ -9515,17 +9769,42 @@ def telegram_thread(ex):
                             pnl_usdt_snapshot = float(p.get("unrealizedPnl") or 0.0)
                             take_reason_ko = "익절(저항/목표 도달)" if bool(hit_tp_by_price) else ("익절(강제)" if bool(hard_take) else "익절(목표 익절)")
                             is_loss_take = (float(pnl_usdt_snapshot) < 0.0) or (float(roi) < 0.0)
+                            # ✅ 차트 근거(룰 기반) 스냅샷: "왜 익절했는지"를 명확히 남긴다(AI 호출 없음)
+                            entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
+                            snap_now = {}
+                            try:
+                                snap_now = chart_snapshot_for_reason(ex, sym, cfg)
+                            except Exception:
+                                snap_now = {}
+                            tp_price_now = tgt.get("tp_price", None)
+                            tp_line_txt = ""
+                            try:
+                                if tp_price_now is not None:
+                                    tp_line_txt = f" (라인 {float(tp_price_now):.6g})"
+                            except Exception:
+                                tp_line_txt = ""
+                            if bool(hard_take):
+                                base_reason = "수익이 많이 나서 일단 챙겼어요(강제익절)"
+                            elif bool(hit_tp_by_price):
+                                base_reason = f"저항/목표가에 닿아서 익절했어요{tp_line_txt}"
+                            else:
+                                base_reason = f"목표익절(+{abs(float(tp)):.1f}%)에 닿아서 익절했어요"
+                            one_rule = build_exit_one_line(base_reason=base_reason, entry_snap=entry_snap, now_snap=snap_now)
                             ok = close_position_market(ex, sym, side, contracts)
                             if ok:
                                 exit_px = get_last_price(ex, sym) or entry
                                 free_after, total_after = safe_fetch_balance(ex)
 
                                 # ✅ AI 회고 비용 절감: 손실일 때만 AI 회고 작성
+                                review = ""
                                 if is_loss_take:
-                                    one, review = ai_write_review(sym, side, roi, take_reason_ko, cfg)
-                                else:
-                                    one = "익절 성공"
-                                    review = ""
+                                    try:
+                                        _ai_one, _ai_review = ai_write_review(sym, side, roi, take_reason_ko, cfg)
+                                        review = str(_ai_review or "")
+                                    except Exception:
+                                        review = ""
+                                # ✅ 텔레그램/일지에는 "차트 기반 한줄 근거"를 우선 기록
+                                one = str(one_rule or "").strip() or "익절 성공"
                                 # ✅ 매매일지/구글시트에 "진입 전/청산 후 잔액"을 같이 기록(요구사항)
                                 bb_total = None
                                 bb_free = None
@@ -9583,6 +9862,8 @@ def telegram_thread(ex):
                                             "pnl_usdt": pnl_usdt_snapshot,
                                             "pnl_pct": roi,
                                             "result": "TP",
+                                            "exit_reason_detail": one,
+                                            "exit_snapshot": snap_now,
                                             "review": review,
                                             "balance_after_total": total_after,
                                             "balance_after_free": free_after,
@@ -10346,6 +10627,20 @@ def telegram_thread(ex):
                                         pass
 
                                 # 목표 저장
+                                # ✅ 진입 시점 차트 스냅샷(손절/익절/본절/추매/순환매 근거용)
+                                entry_rsi = None
+                                entry_adx = None
+                                try:
+                                    v = last.get("RSI", None) if isinstance(last, pd.Series) else None
+                                    entry_rsi = float(v) if (v is not None and pd.notna(v)) else None
+                                except Exception:
+                                    entry_rsi = None
+                                try:
+                                    v = last.get("ADX", None) if isinstance(last, pd.Series) else None
+                                    entry_adx = float(v) if (v is not None and pd.notna(v)) else None
+                                except Exception:
+                                    entry_adx = None
+
                                 active_targets[sym] = {
                                     "sl": slp,
                                     "tp": tpp,
@@ -10353,6 +10648,15 @@ def telegram_thread(ex):
                                     "entry_pct": entry_pct,
                                     "lev": lev,
                                     "entry_price": float(px),
+                                    "entry_snapshot": {
+                                        "time_kst": now_kst_str(),
+                                        "price": float(px),
+                                        "trend_short": str(stt.get("추세", "") or ""),
+                                        "trend_long": str(htf_trend or ""),
+                                        "rsi": entry_rsi,
+                                        "adx": entry_adx,
+                                        "macd": str(stt.get("MACD", "") or ""),
+                                    },
                                     # ✅ 잔고 스냅샷(시트/일지에 표시용)
                                     "bal_entry_total": float(total_usdt) if "total_usdt" in locals() else "",
                                     "bal_entry_free": float(free_usdt) if "free_usdt" in locals() else "",
@@ -11555,6 +11859,12 @@ with st.sidebar.expander("추가 방어(서킷브레이커/일일 손실 한도)
 
 st.sidebar.divider()
 config["use_trailing_stop"] = st.sidebar.checkbox("🚀 트레일링 스탑(수익보호)", value=bool(config.get("use_trailing_stop", True)))
+with st.sidebar.expander("손절 확인(휩쏘 방지)"):
+    config["sl_confirm_enable"] = st.checkbox("ROI 손절은 확인 후 실행", value=bool(config.get("sl_confirm_enable", True)))
+    c_slc1, c_slc2 = st.columns(2)
+    config["sl_confirm_n"] = c_slc1.number_input("확인 횟수", 1, 5, int(config.get("sl_confirm_n", 2)), step=1)
+    config["sl_confirm_window_sec"] = c_slc2.number_input("시간창(초)", 1.0, 60.0, float(config.get("sl_confirm_window_sec", 6.0) or 6.0), step=0.5)
+    st.caption("※ SR(지지/저항) 가격 이탈 손절은 즉시 실행됩니다.")
 config["use_dca"] = st.sidebar.checkbox("💧 물타기(DCA) (스윙 중심)", value=bool(config.get("use_dca", True)))
 c3, c4 = st.sidebar.columns(2)
 config["dca_trigger"] = c3.number_input("DCA 발동(%)", -90.0, -1.0, float(config.get("dca_trigger", -20.0)), step=0.5)
