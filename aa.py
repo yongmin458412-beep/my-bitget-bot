@@ -7292,6 +7292,9 @@ def telegram_polling_thread():
     """
     offset = 0
     backoff = 1.0
+    last_ok_epoch = 0.0
+    last_ok_kst = ""
+    consec_fail = 0
     while True:
         if not tg_token:
             time.sleep(2.0)
@@ -7299,7 +7302,8 @@ def telegram_polling_thread():
         try:
             url = f"https://api.telegram.org/bot{tg_token}/getUpdates"
             params = {"offset": offset + 1, "timeout": 25}
-            r = requests.get(url, params=params, timeout=40)
+            # long-poll은 read timeout을 길게, connect timeout은 짧게(네트워크 장애 시 빠르게 복구 루프)
+            r = requests.get(url, params=params, timeout=(6.0, 45.0))
             data = {}
             try:
                 data = r.json()
@@ -7308,6 +7312,9 @@ def telegram_polling_thread():
 
             if data.get("ok"):
                 backoff = 1.0
+                consec_fail = 0
+                last_ok_epoch = time.time()
+                last_ok_kst = now_kst_str()
                 for up in data.get("result", []) or []:
                     try:
                         offset = max(offset, int(up.get("update_id", offset)))
@@ -7315,10 +7322,34 @@ def telegram_polling_thread():
                         pass
                     tg_updates_push(up)
             else:
+                consec_fail += 1
                 time.sleep(0.4)
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # Telegram 네트워크 장애는 흔할 수 있어, "지속 장애"일 때만 관리자에게 알림(스팸 방지)
+            consec_fail += 1
+            try:
+                outage_sec = int(time.time() - float(last_ok_epoch or 0.0)) if last_ok_epoch else 999999
+            except Exception:
+                outage_sec = 999999
+            # 3분 이상 지속될 때만 알림(10분 dedup)
+            if outage_sec >= 180:
+                notify_admin_error(
+                    "TG_POLL_THREAD",
+                    e,
+                    context={"offset": offset, "outage_sec": outage_sec, "consecutive_fail": consec_fail, "last_ok_kst": last_ok_kst},
+                    min_interval_sec=600.0,
+                )
+            time.sleep(backoff)
+            backoff = float(clamp(backoff * 1.5, 1.0, 30.0))
         except Exception as e:
             # 폴링 오류도 관리자에게 알림(과다 스팸 방지: 120s dedup)
-            notify_admin_error("TG_POLL_THREAD", e, context={"offset": offset}, min_interval_sec=120.0)
+            consec_fail += 1
+            notify_admin_error(
+                "TG_POLL_THREAD",
+                e,
+                context={"offset": offset, "consecutive_fail": consec_fail, "last_ok_kst": last_ok_kst},
+                min_interval_sec=120.0,
+            )
             time.sleep(backoff)
             backoff = float(clamp(backoff * 1.5, 1.0, 15.0))
 
