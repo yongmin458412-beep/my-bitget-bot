@@ -1348,6 +1348,7 @@ def ai_get_optimal_params(
     sym: str, df: pd.DataFrame, signals: Dict[str, Any],
     ext: Dict[str, Any], cfg: Dict[str, Any], rt: Dict[str, Any],
 ) -> Dict[str, Any]:
+    global _AI_PARAMS_CACHE_TIME
     cache_min = _as_float(cfg.get("ai_params_cache_min", 30))
     with _AI_PARAMS_LOCK:
         if (time.time() - _AI_PARAMS_CACHE_TIME) < cache_min * 60:
@@ -1397,7 +1398,6 @@ def ai_get_optimal_params(
         defaults["sl_roi"] = max(_as_float(defaults["sl_roi"]), min_tp * 0.3)
         defaults["leverage"] = clamp(_as_int(defaults["leverage"]), 1, 20)
     with _AI_PARAMS_LOCK:
-        global _AI_PARAMS_CACHE_TIME
         _AI_PARAMS_CACHE[sym] = defaults
         _AI_PARAMS_CACHE_TIME = time.time()
     return defaults
@@ -2752,6 +2752,7 @@ def _tab_coin_analysis():
             st.bar_chart(reason_counts)
 
 def _tab_ai_management(cfg: Dict[str, Any], rt: Dict[str, Any]):
+    global _AI_PARAMS_CACHE_TIME
     st.header("🤖 AI 관리")
     gh = gemini_health_info(cfg)
     col1, col2, col3 = st.columns(3)
@@ -2781,7 +2782,6 @@ def _tab_ai_management(cfg: Dict[str, Any], rt: Dict[str, Any]):
     if st.button("🔄 AI 파라미터 캐시 초기화"):
         with _AI_PARAMS_LOCK:
             _AI_PARAMS_CACHE.clear()
-            global _AI_PARAMS_CACHE_TIME
             _AI_PARAMS_CACHE_TIME = 0.0
         st.success("캐시 초기화 완료")
 
