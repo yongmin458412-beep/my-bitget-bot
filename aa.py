@@ -2522,7 +2522,34 @@ def _gsheet_prepare_trades_only_sheets(sh: Any) -> Optional[Dict[str, Any]]:
             "reviews_title": reviews_ws,
         }
     except Exception as e:
-        notify_admin_error("GSHEET_PREPARE", e, min_interval_sec=180.0)
+        # ✅ Google Sheets 503 등은 "일시 장애"일 가능성이 높아, 과도한 DM 스팸을 피한다.
+        # - 오류 상세는 _GSHEET_CACHE에 남기고, 워커(GSHEET_SYNC)에서 throttle된 알림을 처리한다.
+        try:
+            detail = _gsheet_exception_detail(e, limit=900)
+        except Exception:
+            detail = str(e)[:900]
+        try:
+            with _GSHEET_CACHE_LOCK:
+                _GSHEET_CACHE["last_err"] = f"GSHEET_PREPARE 실패: {detail}"
+                _GSHEET_CACHE["last_tb"] = traceback.format_exc()
+        except Exception:
+            pass
+        # 503(Service Unavailable)이면 잠깐 쉬었다가 재시도(무한 반복 방지)
+        try:
+            code = None
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                code = getattr(resp, "status_code", None)
+            if code is None:
+                m = str(e or "").lower()
+                if " 503" in m or "[503]" in m or "service is currently unavailable" in m:
+                    code = 503
+            if int(code or 0) == 503:
+                with _GSHEET_CACHE_LOCK:
+                    _GSHEET_CACHE["service_unavailable_until_epoch"] = time.time() + 60 * 3
+                    _GSHEET_CACHE["service_unavailable_kst"] = now_kst_str()
+        except Exception:
+            pass
         return None
 
 
@@ -3809,14 +3836,35 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
         res = _call_with_timeout(_do, timeout_sec)
         return res if isinstance(res, dict) else {"ok": True}
     except Exception as e:
+        # 503(Service Unavailable)은 일시 장애일 가능성이 높음 → 잠깐 쉬었다가 재시도
+        detail = ""
+        try:
+            detail = _gsheet_exception_detail(e, limit=900)
+        except Exception:
+            detail = str(e)[:900]
+        low = str(detail or "").lower()
+        try:
+            if ("http=503" in low) or ("[503]" in low) or ("service is currently unavailable" in low) or (" 503" in low):
+                with _GSHEET_CACHE_LOCK:
+                    _GSHEET_CACHE["service_unavailable_until_epoch"] = time.time() + 60 * 3
+                    _GSHEET_CACHE["service_unavailable_kst"] = now_kst_str()
+        except Exception:
+            pass
         with _GSHEET_CACHE_LOCK:
-            _GSHEET_CACHE["last_err"] = f"GSHEET sync 실패: {e}"
+            _GSHEET_CACHE["last_err"] = f"GSHEET sync 실패: {detail}"
             try:
                 _GSHEET_CACHE["last_tb"] = traceback.format_exc()
             except Exception:
                 _GSHEET_CACHE["last_tb"] = ""
-        _gsheet_notify_connect_issue("GSHEET_SYNC", str(_GSHEET_CACHE.get("last_err", "") or str(e)), min_interval_sec=180.0)
-        return {"ok": False, "error": str(e)}
+        # 503은 사용자 조치가 거의 없으므로 알림 간격을 더 길게(스팸 방지)
+        min_int = 180.0
+        try:
+            if ("http=503" in low) or ("[503]" in low) or ("service is currently unavailable" in low) or (" 503" in low):
+                min_int = 1800.0
+        except Exception:
+            min_int = 180.0
+        _gsheet_notify_connect_issue("GSHEET_SYNC", str(_GSHEET_CACHE.get("last_err", "") or detail), min_interval_sec=min_int)
+        return {"ok": False, "error": str(detail or e)}
 
 
 def gsheet_reset_trades_only(timeout_sec: int = 45) -> Dict[str, Any]:
@@ -4209,6 +4257,15 @@ def gsheet_worker_thread():
                 if cd_until and now_ts < cd_until:
                     time.sleep(1.0)
                     continue
+                # service unavailable cooldown (503 등)
+                try:
+                    with _GSHEET_CACHE_LOCK:
+                        su_until = float(_GSHEET_CACHE.get("service_unavailable_until_epoch", 0) or 0)
+                    if su_until and now_ts < su_until:
+                        time.sleep(1.0)
+                        continue
+                except Exception:
+                    pass
 
                 # 이벤트 기반(매매일지 발생 시) + 주기적 self-heal
                 try:
@@ -4239,7 +4296,23 @@ def gsheet_worker_thread():
                                 _GSHEET_CACHE["quota_cooldown_until_epoch"] = time.time() + float(_GSHEET_QUOTA_COOLDOWN_SEC)
                                 _GSHEET_CACHE["last_429_epoch"] = time.time()
                             backoff = max(backoff, float(_GSHEET_QUOTA_COOLDOWN_SEC))
-                        _gsheet_notify_connect_issue("GSHEET_THREAD", msg, min_interval_sec=180.0)
+                        # 503 service unavailable 대응(일시 장애): 조금 길게 쉬었다가 재시도
+                        if ("http=503" in low) or ("[503]" in low) or ("service is currently unavailable" in low) or (" 503" in low):
+                            try:
+                                with _GSHEET_CACHE_LOCK:
+                                    _GSHEET_CACHE["service_unavailable_until_epoch"] = time.time() + 60 * 3
+                                    _GSHEET_CACHE["service_unavailable_kst"] = now_kst_str()
+                            except Exception:
+                                pass
+                            backoff = max(backoff, 10.0)
+                        # 503은 사용자가 할 수 있는 조치가 거의 없으므로 알림 간격을 더 길게(스팸 방지)
+                        min_int = 180.0
+                        try:
+                            if ("http=503" in low) or ("[503]" in low) or ("service is currently unavailable" in low) or (" 503" in low):
+                                min_int = 1800.0
+                        except Exception:
+                            min_int = 180.0
+                        _gsheet_notify_connect_issue("GSHEET_THREAD", msg, min_interval_sec=min_int)
                         time.sleep(backoff)
                         backoff = float(clamp(backoff * 1.4, 1.0, 90.0))
                         continue
@@ -4823,6 +4896,17 @@ def get_htf_trend_cached(ex, sym: str, tf: str, fast: int, slow: int, cache_sec:
             last_bar_ms = int((ohlcv[-1] or [0])[0] or 0)
         except Exception:
             last_bar_ms = 0
+        # ✅ "봉 스냅샷" 안정화:
+        # - 일부 거래소/환경에서는 마지막 봉 timestamp가 자주 흔들릴 수 있어(초 단위 변동 등),
+        #   레짐(confirm2/hysteresis) 전환 토큰이 몇 초마다 바뀌며 스타일이 플립플롭하는 문제가 생길 수 있다.
+        # - 타임프레임 경계로 내림(round down)해 동일 봉에서는 토큰이 고정되게 만든다.
+        try:
+            tf_sec = int(_timeframe_seconds(str(tf or ""), 0) or 0)
+            if tf_sec > 0 and last_bar_ms > 0:
+                unit = int(tf_sec) * 1000
+                last_bar_ms = int((last_bar_ms // unit) * unit)
+        except Exception:
+            pass
         hdf = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
         trend = compute_ma_trend_from_df(hdf, fast=fast, slow=slow)
         _TREND_CACHE[key] = {"ts": now, "trend": trend, "last_bar_ms": last_bar_ms}
@@ -9050,10 +9134,13 @@ def telegram_thread(ex):
                         except Exception:
                             pass
 
-                        # ✅ 스타일 자동 전환(포지션 보유 중)
-                        tgt = _maybe_switch_style_for_open_position(ex, sym, side, tgt, cfg, mon)
-                        style_now = str(tgt.get("style", "스캘핑"))
                         forced_exit = bool(cfg.get("exit_trailing_protect_enable", False))
+                        # ✅ 스타일 자동 전환(포지션 보유 중)
+                        # - 강제 Exit(수익보존) 정책이 ON이면, 스타일 전환/목표(tp/sl) 보정을 멈추고 "진입 당시 값"을 고정한다.
+                        #   (스윙↔스캘핑 반복 전환 + 목표 손익비가 계속 바뀌는 현상 방지)
+                        if not forced_exit:
+                            tgt = _maybe_switch_style_for_open_position(ex, sym, side, tgt, cfg, mon)
+                        style_now = str(tgt.get("style", "스캘핑"))
                         try:
                             tgt["exit_trailing_protect_enable"] = bool(forced_exit)
                         except Exception:
@@ -9071,7 +9158,7 @@ def telegram_thread(ex):
                         # - 스윙인데 -2~-3% 같은 짧은 손절로 잘리는 문제를 줄이기 위해,
                         #   오픈 포지션에서도 하한(SL)과 최소 손익비(RR)를 강제 보정한다.
                         try:
-                            if style_now == "스윙":
+                            if (not forced_exit) and style_now == "스윙":
                                 changed_targets = False
                                 sl_min = float(cfg.get("swing_sl_roi_min", 12.0))
                                 if sl < sl_min:
@@ -9140,7 +9227,7 @@ def telegram_thread(ex):
                         # ✅ 스캘핑: 포지션 보유 중에도 "가격%" 가드레일을 유지해 TP/SL 과도 방지
                         # - (중요) 스캘핑인데 TP/SL이 커져 +50%가 넘어도 익절을 못 하는 문제를 줄임
                         try:
-                            if style_now == "스캘핑":
+                            if (not forced_exit) and style_now == "스캘핑":
                                 changed_targets = False
                                 try:
                                     lev0 = float(tgt.get("lev", lev_live) or lev_live or 1.0)
