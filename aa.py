@@ -9884,7 +9884,16 @@ def telegram_thread(ex):
                                     if float(roi) >= float(trail_start):
                                         tgt["forced_trail_active"] = True
                                     if bool(tgt.get("forced_trail_active", False)):
-                                        pk = float(tgt.get("forced_peak_roi", roi) or roi)
+                                        pk_raw = tgt.get("forced_peak_roi", None)
+                                        try:
+                                            pk = float(pk_raw) if (pk_raw is not None and str(pk_raw).strip() != "") else float(roi)
+                                        except Exception:
+                                            pk = float(roi)
+                                        # 첫 활성화 시점에 peak를 반드시 저장(이 값이 없으면 드로다운 감지가 안 됨)
+                                        if pk_raw is None or str(pk_raw).strip() == "":
+                                            tgt["forced_peak_roi"] = float(pk)
+                                            tgt["forced_peak_time_kst"] = now_kst_str()
+                                        # peak 갱신
                                         if float(roi) > float(pk):
                                             pk = float(roi)
                                             tgt["forced_peak_roi"] = float(pk)
