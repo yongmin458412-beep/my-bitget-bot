@@ -628,6 +628,11 @@ def default_settings() -> Dict[str, Any]:
         "sl_confirm_enable": True,
         "sl_confirm_n": 2,
         "sl_confirm_window_sec": 6.0,
+        # ✅ 청산 후 재진입 쿨다운(과매매/수수료/AI호출 낭비 방지)
+        # - "bars"는 현재 단기 timeframe 기준 봉 개수(예: 5m에서 2 bars = 10분)
+        "cooldown_after_exit_tp_bars": 1,
+        "cooldown_after_exit_sl_bars": 3,
+        "cooldown_after_exit_protect_bars": 2,
         "use_dca": True,
         "dca_trigger": -20.0,
         "dca_max_count": 1,
@@ -955,6 +960,8 @@ def default_runtime() -> Dict[str, Any]:
         "pause_until": 0,
         "cooldowns": {},
         "trades": {},
+        # ✅ 직전 청산 기록(재진입/근거 표시용)
+        "last_exit": {},
         # ✅ 일별 브리핑/내보내기/상태 보존
         "daily_btc_brief": {},
         "last_export_date": "",
@@ -4453,6 +4460,33 @@ def clamp(v, lo, hi):
         return max(lo, min(hi, v))
     except Exception:
         return lo
+
+
+def _timeframe_seconds(tf: str, default_sec: int = 300) -> int:
+    """
+    "1m"|"3m"|"5m"|"15m"|"1h"|"4h"|"1d" 등을 초로 변환.
+    실패 시 default_sec 반환.
+    """
+    try:
+        s = str(tf or "").strip().lower()
+        m = re.match(r"^(\d+)\s*([mhdw])$", s)
+        if not m:
+            return int(default_sec)
+        n = int(m.group(1))
+        u = m.group(2)
+        if n <= 0:
+            return int(default_sec)
+        if u == "m":
+            return int(n * 60)
+        if u == "h":
+            return int(n * 60 * 60)
+        if u == "d":
+            return int(n * 24 * 60 * 60)
+        if u == "w":
+            return int(n * 7 * 24 * 60 * 60)
+        return int(default_sec)
+    except Exception:
+        return int(default_sec)
 
 
 def _as_float(v: Any, default: float = 0.0) -> float:
@@ -9007,6 +9041,11 @@ def telegram_thread(ex):
                         # - 손절이 아니라 "수익 보호" 목적(연속 손절 카운트에도 포함하지 않게 별도 처리)
                         try:
                             if bool(cfg.get("trail_breakeven_enable", True)):
+                                prev_sl_src = ""
+                                try:
+                                    prev_sl_src = str(tgt.get("sl_price_source", "") or "").strip().upper()
+                                except Exception:
+                                    prev_sl_src = ""
                                 at_roi = float(
                                     cfg.get(
                                         "trail_breakeven_at_roi_scalp" if str(style_now) == "스캘핑" else "trail_breakeven_at_roi_swing",
@@ -9027,6 +9066,20 @@ def telegram_thread(ex):
                                                     sl_price = float(be_price)
                                                     tgt["sl_price"] = float(be_price)
                                                     tgt["sl_price_source"] = "BE"
+                                                    try:
+                                                        tgt["be_arm_price"] = float(be_price)
+                                                        tgt["be_arm_at_roi"] = float(at_roi)
+                                                        tgt["be_arm_offset_pct"] = float(off_pct)
+                                                        if prev_sl_src != "BE":
+                                                            tgt["be_arm_time_kst"] = now_kst_str()
+                                                            tgt["be_arm_epoch"] = time.time()
+                                                            tgt["be_arm_roi"] = float(roi)
+                                                            if not str(tgt.get("be_arm_ind", "") or "").strip():
+                                                                snap_be = chart_snapshot_for_reason(ex, sym, cfg)
+                                                                entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
+                                                                tgt["be_arm_ind"] = _fmt_indicator_line_for_reason(entry_snap, snap_be)
+                                                    except Exception:
+                                                        pass
                                         else:
                                             be_price = entry_px_be * (1.0 - (off_pct / 100.0))
                                             if float(be_price) > float(cur_px):
@@ -9034,6 +9087,20 @@ def telegram_thread(ex):
                                                     sl_price = float(be_price)
                                                     tgt["sl_price"] = float(be_price)
                                                     tgt["sl_price_source"] = "BE"
+                                                    try:
+                                                        tgt["be_arm_price"] = float(be_price)
+                                                        tgt["be_arm_at_roi"] = float(at_roi)
+                                                        tgt["be_arm_offset_pct"] = float(off_pct)
+                                                        if prev_sl_src != "BE":
+                                                            tgt["be_arm_time_kst"] = now_kst_str()
+                                                            tgt["be_arm_epoch"] = time.time()
+                                                            tgt["be_arm_roi"] = float(roi)
+                                                            if not str(tgt.get("be_arm_ind", "") or "").strip():
+                                                                snap_be = chart_snapshot_for_reason(ex, sym, cfg)
+                                                                entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
+                                                                tgt["be_arm_ind"] = _fmt_indicator_line_for_reason(entry_snap, snap_be)
+                                                    except Exception:
+                                                        pass
                         except Exception:
                             pass
                         if cfg.get("use_sr_stop", True):
@@ -9555,7 +9622,24 @@ def telegram_thread(ex):
                             except Exception:
                                 sl_line_txt = ""
                             if is_protect:
-                                base_reason = f"수익 지키려고 본전에서 정리했어요{sl_line_txt}"
+                                arm_roi = None
+                                arm_at = None
+                                try:
+                                    v = tgt.get("be_arm_roi", None)
+                                    arm_roi = float(v) if v is not None else None
+                                except Exception:
+                                    arm_roi = None
+                                try:
+                                    v = tgt.get("be_arm_at_roi", None)
+                                    arm_at = float(v) if v is not None else None
+                                except Exception:
+                                    arm_at = None
+                                if arm_roi is not None and arm_at is not None:
+                                    base_reason = f"수익이 {arm_roi:+.1f}%까지 나서(기준 {arm_at:.1f}%) 본절 라인을 올렸고, 그 라인에 닿아 정리했어요{sl_line_txt}"
+                                elif arm_roi is not None:
+                                    base_reason = f"수익이 {arm_roi:+.1f}%까지 나서 본절 라인을 올렸고, 그 라인에 닿아 정리했어요{sl_line_txt}"
+                                else:
+                                    base_reason = f"수익이 나서 본절 라인을 올렸고, 그 라인에 닿아 정리했어요{sl_line_txt}"
                             elif bool(hit_sl_by_price):
                                 base_reason = f"지지/저항 이탈로 손절했어요{sl_line_txt}"
                             else:
@@ -9640,6 +9724,19 @@ def telegram_thread(ex):
                                             "balance_after_free": free_after,
                                         }
                                     )
+                                    try:
+                                        if bool(is_protect):
+                                            d["be_arm"] = {
+                                                "time_kst": str(tgt.get("be_arm_time_kst", "") or ""),
+                                                "epoch": float(tgt.get("be_arm_epoch", 0) or 0.0),
+                                                "roi": _as_float(tgt.get("be_arm_roi", None), 0.0),
+                                                "at_roi": _as_float(tgt.get("be_arm_at_roi", None), 0.0),
+                                                "offset_price_pct": _as_float(tgt.get("be_arm_offset_pct", None), 0.0),
+                                                "price": _as_float(tgt.get("be_arm_price", None), 0.0),
+                                                "ind": str(tgt.get("be_arm_ind", "") or "")[:220],
+                                            }
+                                    except Exception:
+                                        pass
                                     save_trade_detail(trade_id, d)
 
                                 # ✅ 일일 손익/연속손실 업데이트 + 방어 로직
@@ -9753,6 +9850,58 @@ def telegram_thread(ex):
                                 try:
                                     if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
                                         tg_send(msg, target="admin", cfg=cfg, silent=False)
+                                except Exception:
+                                    pass
+
+                                # ✅ 청산 후 재진입 쿨다운 + 직전 청산 기록(과매매/수수료/AI호출 낭비 방지)
+                                try:
+                                    tf_sec = int(_timeframe_seconds(str(cfg.get("timeframe", "5m") or "5m"), 300))
+                                    if bool(is_protect):
+                                        bars = int(cfg.get("cooldown_after_exit_protect_bars", 2) or 0)
+                                    else:
+                                        bars = int(cfg.get("cooldown_after_exit_sl_bars", 3) or 0)
+                                    bars = max(0, bars)
+                                    if tf_sec > 0 and bars > 0:
+                                        rt.setdefault("cooldowns", {})[sym] = time.time() + float(tf_sec) * float(bars)
+                                except Exception:
+                                    pass
+                                try:
+                                    rt.setdefault("last_exit", {})[sym] = {
+                                        "time_kst": now_kst_str(),
+                                        "epoch": float(time.time()),
+                                        "type": "PROTECT" if bool(is_protect) else "SL",
+                                        "symbol": str(sym),
+                                        "side": str(side),
+                                        "style": str(style_now),
+                                        "roi": float(roi),
+                                        "pnl_usdt": float(pnl_usdt_snapshot),
+                                        "trade_id": str(trade_id or ""),
+                                    }
+                                except Exception:
+                                    pass
+
+                                # ✅ 청산 후 재진입 쿨다운 + 직전 청산 기록(과매매/수수료/AI호출 낭비 방지)
+                                try:
+                                    tf_sec = int(_timeframe_seconds(str(cfg.get("timeframe", "5m") or "5m"), 300))
+                                    bars = int(cfg.get("cooldown_after_exit_tp_bars", 1) or 0)
+                                    bars = max(0, bars)
+                                    if tf_sec > 0 and bars > 0:
+                                        rt.setdefault("cooldowns", {})[sym] = time.time() + float(tf_sec) * float(bars)
+                                except Exception:
+                                    pass
+                                try:
+                                    rt.setdefault("last_exit", {})[sym] = {
+                                        "time_kst": now_kst_str(),
+                                        "epoch": float(time.time()),
+                                        "type": "TP",
+                                        "symbol": str(sym),
+                                        "side": str(side),
+                                        "style": str(style_now),
+                                        "roi": float(roi),
+                                        "pnl_usdt": float(pnl_usdt_snapshot),
+                                        "trade_id": str(trade_id or ""),
+                                        "hard_take": bool(hard_take),
+                                    }
                                 except Exception:
                                     pass
 
@@ -10786,11 +10935,46 @@ def telegram_thread(ex):
                                         # 를 2줄로 함께 보여준다(가독성: 인용 2줄까지만 표시).
                                         ai_reason = str(ai2.get("reason_easy", "") or "").strip()
                                         style_reason = str(cs.get("style_reason", "") or "").strip()
+                                        # ✅ 직전 청산 정보(본절/손절/익절)도 함께 표시: "왜 또 들어갔는지" 이해하기 쉽게
+                                        last_exit_note = ""
+                                        try:
+                                            le_map = rt.get("last_exit", {}) or {}
+                                            le = le_map.get(sym) if isinstance(le_map, dict) else None
+                                            if isinstance(le, dict):
+                                                try:
+                                                    le_ep = float(le.get("epoch", 0) or 0.0)
+                                                except Exception:
+                                                    le_ep = 0.0
+                                                max_age = float(_timeframe_seconds(str(cfg.get("timeframe", "5m") or "5m"), 300)) * 20.0
+                                                if le_ep > 0 and (time.time() - le_ep) <= max_age:
+                                                    le_type = str(le.get("type", "") or "").strip().upper()
+                                                    type_ko = {"PROTECT": "본절", "SL": "손절", "TP": "익절"}.get(le_type, le_type or "")
+                                                    tm = str(le.get("time_kst", "") or "").strip()
+                                                    tm_hm = tm[11:16] if len(tm) >= 16 else tm
+                                                    le_roi = None
+                                                    try:
+                                                        v = le.get("roi", None)
+                                                        le_roi = float(v) if v is not None else None
+                                                    except Exception:
+                                                        le_roi = None
+                                                    if type_ko:
+                                                        if le_roi is not None:
+                                                            last_exit_note = f"직전:{type_ko}({_tg_fmt_pct(le_roi)}) {tm_hm}".strip()
+                                                        else:
+                                                            last_exit_note = f"직전:{type_ko} {tm_hm}".strip()
+                                        except Exception:
+                                            last_exit_note = ""
+
                                         one_line_parts: List[str] = []
                                         if ai_reason:
                                             one_line_parts.append(ai_reason)
+                                        line2_parts: List[str] = []
                                         if style_reason and (style_reason not in ai_reason):
-                                            one_line_parts.append(style_reason)
+                                            line2_parts.append(style_reason)
+                                        if last_exit_note:
+                                            line2_parts.append(last_exit_note)
+                                        if line2_parts:
+                                            one_line_parts.append(" | ".join(line2_parts)[:220])
                                         one_line0 = "\n".join(one_line_parts).strip()
                                         if not one_line0:
                                             one_line0 = "-"
@@ -11865,6 +12049,12 @@ with st.sidebar.expander("손절 확인(휩쏘 방지)"):
     config["sl_confirm_n"] = c_slc1.number_input("확인 횟수", 1, 5, int(config.get("sl_confirm_n", 2)), step=1)
     config["sl_confirm_window_sec"] = c_slc2.number_input("시간창(초)", 1.0, 60.0, float(config.get("sl_confirm_window_sec", 6.0) or 6.0), step=0.5)
     st.caption("※ SR(지지/저항) 가격 이탈 손절은 즉시 실행됩니다.")
+with st.sidebar.expander("청산 후 재진입 쿨다운(과매매 방지)"):
+    cd1, cd2, cd3 = st.columns(3)
+    config["cooldown_after_exit_tp_bars"] = cd1.number_input("익절(봉)", 0, 30, int(config.get("cooldown_after_exit_tp_bars", 1) or 0), step=1)
+    config["cooldown_after_exit_sl_bars"] = cd2.number_input("손절(봉)", 0, 60, int(config.get("cooldown_after_exit_sl_bars", 3) or 0), step=1)
+    config["cooldown_after_exit_protect_bars"] = cd3.number_input("본절(봉)", 0, 60, int(config.get("cooldown_after_exit_protect_bars", 2) or 0), step=1)
+    st.caption("※ 현재 단기 타임프레임 기준 봉 개수입니다. (예: 5m에서 2봉=10분)")
 config["use_dca"] = st.sidebar.checkbox("💧 물타기(DCA) (스윙 중심)", value=bool(config.get("use_dca", True)))
 c3, c4 = st.sidebar.columns(2)
 config["dca_trigger"] = c3.number_input("DCA 발동(%)", -90.0, -1.0, float(config.get("dca_trigger", -20.0)), step=0.5)
