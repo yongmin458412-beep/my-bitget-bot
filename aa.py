@@ -570,7 +570,7 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 5,
+        "settings_schema_version": 6,
         "openai_api_key": "",
         # ✅ 사용자 기본값 프리셋(요청): 하이리스크/하이리턴 + 자동매매 ON
         "auto_trade": True,
@@ -599,8 +599,8 @@ def default_settings() -> Dict[str, Any]:
         "tg_periodic_report_silent": True,
         # ✅ 사용자 요구: 알림(푸시)은 진입/청산(익절/손절)만 (기본 ON)
         "tg_notify_entry_exit_only": True,
-        # ✅ 채널이 음소거여도 중요한 알림을 놓치지 않게, 진입/청산은 관리자 DM에도 복사(기본 ON)
-        "tg_trade_alert_to_admin": True,
+        # ✅ 사용자 요구: 진입/청산(익절/손절)은 채널에서만 확인 → 관리자 DM 복사는 기본 OFF
+        "tg_trade_alert_to_admin": False,
         # ✅ 사용자 요구: AI 시야 리포트(자동 전송)는 기본 OFF (필요할 때만 /vision 으로 조회)
         "tg_enable_hourly_vision_report": False,
         "vision_report_interval_min": 60,
@@ -953,6 +953,13 @@ def load_settings() -> Dict[str, Any]:
         if saved_ver < 5:
             try:
                 cfg["tg_enable_hourly_vision_report"] = False
+                changed = True
+            except Exception:
+                pass
+        # v6: 관리자 DM으로 거래알림(진입/청산) 복사 전송 기본 OFF
+        if saved_ver < 6:
+            try:
+                cfg["tg_trade_alert_to_admin"] = False
                 changed = True
             except Exception:
                 pass
@@ -12312,9 +12319,9 @@ config["tg_notify_entry_exit_only"] = st.sidebar.checkbox(
     help="ON이면 DCA/부분익절/방식전환 같은 '중간 이벤트'는 무음 전송으로 보냅니다.",
 )
 config["tg_trade_alert_to_admin"] = st.sidebar.checkbox(
-    "진입/청산은 관리자 DM에도 전송",
-    value=bool(config.get("tg_trade_alert_to_admin", True)),
-    help="채널을 음소거해도 알림을 놓치지 않게, 관리자 DM으로 한 번 더 보냅니다. (관리자는 먼저 봇에 /start 필요)",
+    "진입/청산도 관리자 DM으로 복사",
+    value=bool(config.get("tg_trade_alert_to_admin", False)),
+    help="사용자 요청: 기본은 OFF(관리자는 버튼만). 켜면 진입/청산 알림을 관리자 DM으로 한 번 더 보냅니다. (관리자는 먼저 봇에 /start 필요)",
 )
 
 st.sidebar.subheader("📡 텔레그램 라우팅")
