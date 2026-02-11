@@ -2244,6 +2244,9 @@ def _gsheet_sync_state_default() -> Dict[str, Any]:
     return {
         "synced_trade_ids": [],
         "synced_review_ids": [],
+        # ✅ 구글시트 초기화(Reset) 기준 시각: 이 시각 이후의 trade_log.csv만 시트에 반영
+        "reset_epoch": 0.0,
+        "reset_kst": "",
         "last_trade_sync_epoch": 0.0,
         "last_trade_sync_kst": "",
         "last_summary_sync_epoch": 0.0,
@@ -3549,6 +3552,14 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
         except Exception:
             df2 = df.iloc[::-1]
 
+        # ✅ 구글시트 초기화(Reset) 이후에는 reset_kst 이후의 로그만 반영
+        reset_kst = str(st0.get("reset_kst", "") or "").strip()
+        if reset_kst:
+            try:
+                df2 = df2[df2["Time"].astype(str) >= reset_kst].copy()
+            except Exception:
+                pass
+
         new_rows = []
         new_ids: List[str] = []
         for _, r in df2.iterrows():
@@ -3717,7 +3728,7 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
         did_summary = False
         did_calendar = False
         if summary_due:
-            df_h, df_d = _trade_log_to_hourly_daily(df)
+            df_h, df_d = _trade_log_to_hourly_daily(df2)
             # update (clear+update: 표가 짧아질 때 잔여행 방지)
             try:
                 ws_hourly.clear()
@@ -3774,6 +3785,121 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
             except Exception:
                 _GSHEET_CACHE["last_tb"] = ""
         _gsheet_notify_connect_issue("GSHEET_SYNC", str(_GSHEET_CACHE.get("last_err", "") or str(e)), min_interval_sec=180.0)
+        return {"ok": False, "error": str(e)}
+
+
+def gsheet_reset_trades_only(timeout_sec: int = 45) -> Dict[str, Any]:
+    """
+    ✅ UI 버튼용: trades_only 구글시트 매매일지 초기화
+    - 매매일지/시간대/일별/달력/회고 시트를 clear + 헤더 재작성
+    - reset_kst를 기록해, reset_kst 이전 trade_log.csv가 다시 올라가지 않게 방지
+    """
+    if not gsheet_is_enabled():
+        return {"ok": False, "error": "GSHEET_ENABLED=false"}
+    if gsheet_mode() == "legacy":
+        return {"ok": False, "error": "GSHEET_MODE=legacy(초기화는 trades_only 전용)"}
+    if gspread is None or GoogleCredentials is None:
+        return {"ok": False, "error": "gspread/google-auth 미설치(requirements.txt 확인)"}
+
+    def _do():
+        sh = _gsheet_connect_spreadsheet()
+        if sh is None:
+            err = str(_GSHEET_CACHE.get("last_err", "") or "GSHEET 연결 실패")
+            raise RuntimeError(err)
+
+        sheets = _gsheet_prepare_trades_only_sheets(sh)
+        if sheets is None:
+            err = str(_GSHEET_CACHE.get("last_err", "") or "GSHEET 시트 준비 실패")
+            raise RuntimeError(err)
+
+        ws_trade = sheets["ws_trade"]
+        ws_hourly = sheets["ws_hourly"]
+        ws_daily = sheets["ws_daily"]
+        ws_calendar = sheets.get("ws_calendar")
+        ws_reviews = sheets.get("ws_reviews")
+
+        # 1) sync state 먼저 초기화(동시 실행 시 재업로드 방지)
+        st0 = _gsheet_sync_state_load()
+        st0["reset_epoch"] = float(time.time())
+        st0["reset_kst"] = now_kst_str()
+        st0["synced_trade_ids"] = []
+        st0["synced_review_ids"] = []
+        st0["last_trade_sync_epoch"] = 0.0
+        st0["last_trade_sync_kst"] = ""
+        st0["last_summary_sync_epoch"] = 0.0
+        st0["last_summary_sync_kst"] = ""
+        st0["last_calendar_sync_epoch"] = 0.0
+        st0["last_calendar_sync_kst"] = ""
+        st0["last_review_sync_epoch"] = 0.0
+        st0["last_review_sync_kst"] = ""
+        # 서식은 다음 sync에서 다시 1회 적용되게(안정/가독성)
+        st0["format_version_applied"] = 0
+        st0["format_applied_epoch"] = 0.0
+        st0["format_applied_kst"] = ""
+        st0["format_trade_title"] = ""
+        st0["format_hourly_title"] = ""
+        st0["format_daily_title"] = ""
+        st0["format_calendar_title"] = ""
+        st0["format_reviews_title"] = ""
+        _gsheet_sync_state_save(st0)
+
+        # 2) 시트 clear + 헤더 재작성
+        try:
+            ws_trade.clear()
+        except Exception:
+            pass
+        ws_trade.update("A1", [GSHEET_TRADE_JOURNAL_HEADER])
+
+        try:
+            ws_hourly.clear()
+        except Exception:
+            pass
+        ws_hourly.update("A1", [GSHEET_HOURLY_SUMMARY_HEADER])
+
+        try:
+            ws_daily.clear()
+        except Exception:
+            pass
+        ws_daily.update("A1", [GSHEET_DAILY_SUMMARY_HEADER])
+
+        if ws_reviews is not None:
+            try:
+                ws_reviews.clear()
+            except Exception:
+                pass
+            ws_reviews.update("A1", [GSHEET_REVIEWS_HEADER])
+
+        if ws_calendar is not None:
+            try:
+                ws_calendar.clear()
+            except Exception:
+                pass
+            try:
+                n0 = now_kst()
+                cal_vals = _daily_summary_to_calendar_values(pd.DataFrame(), int(n0.year), int(n0.month))
+                ws_calendar.update("A1", cal_vals)
+            except Exception:
+                pass
+
+        try:
+            _GSHEET_TRADE_SYNC_EVENT.set()
+        except Exception:
+            pass
+
+        return {
+            "ok": True,
+            "reset_kst": str(st0.get("reset_kst", "") or ""),
+            "trade_sheet": str(sheets.get("trade_title", "") or ""),
+            "hourly_sheet": str(sheets.get("hourly_title", "") or ""),
+            "daily_sheet": str(sheets.get("daily_title", "") or ""),
+            "calendar_sheet": str(sheets.get("calendar_title", "") or ""),
+            "reviews_sheet": str(sheets.get("reviews_title", "") or ""),
+        }
+
+    try:
+        return _call_with_timeout(_do, max(20, int(timeout_sec)))
+    except Exception as e:
+        notify_admin_error("GSHEET_RESET", e, context={"code": CODE_VERSION}, tb=traceback.format_exc(), min_interval_sec=180.0)
         return {"ok": False, "error": str(e)}
 
 
@@ -7332,6 +7458,7 @@ def telegram_polling_thread():
     """
     offset = 0
     backoff = 1.0
+    start_epoch = time.time()
     last_ok_epoch = 0.0
     last_ok_kst = ""
     consec_fail = 0
@@ -7341,9 +7468,10 @@ def telegram_polling_thread():
             continue
         try:
             url = f"https://api.telegram.org/bot{tg_token}/getUpdates"
-            params = {"offset": offset + 1, "timeout": 25}
-            # long-poll은 read timeout을 길게, connect timeout은 짧게(네트워크 장애 시 빠르게 복구 루프)
-            r = requests.get(url, params=params, timeout=(6.0, 45.0))
+            # Telegram 서버 long-poll timeout(초). requests read timeout보다 작게 유지.
+            params = {"offset": offset + 1, "timeout": 35}
+            # long-poll은 read timeout을 넉넉히(텔레그램/네트워크 지연 대비), connect timeout은 짧게(장애 시 빠른 복구)
+            r = requests.get(url, params=params, timeout=(6.0, 90.0))
             data = {}
             try:
                 data = r.json()
@@ -7368,16 +7496,18 @@ def telegram_polling_thread():
             # Telegram 네트워크 장애는 흔할 수 있어, "지속 장애"일 때만 관리자에게 알림(스팸 방지)
             consec_fail += 1
             try:
-                outage_sec = int(time.time() - float(last_ok_epoch or 0.0)) if last_ok_epoch else 999999
+                base = float(last_ok_epoch) if last_ok_epoch else float(start_epoch)
+                outage_sec = int(time.time() - base)
             except Exception:
-                outage_sec = 999999
-            # 3분 이상 지속될 때만 알림(10분 dedup)
-            if outage_sec >= 180:
+                outage_sec = 0
+            # ✅ 장시간 지속될 때만 알림(스팸 방지)
+            # - ReadTimeout은 일시적으로 발생할 수 있어, 10분 이상 + 연속 실패 누적 시만
+            if outage_sec >= 600 and consec_fail >= 10:
                 notify_admin_error(
                     "TG_POLL_THREAD",
                     e,
                     context={"offset": offset, "outage_sec": outage_sec, "consecutive_fail": consec_fail, "last_ok_kst": last_ok_kst},
-                    min_interval_sec=600.0,
+                    min_interval_sec=1800.0,
                 )
             time.sleep(backoff)
             backoff = float(clamp(backoff * 1.5, 1.0, 30.0))
@@ -12684,6 +12814,16 @@ with t4:
         except Exception as e:
             st.error(f"내보내기 오류: {e}")
             notify_admin_error("UI:EXPORT_TODAY", e, min_interval_sec=120.0)
+    if c4.button("🧨 구글시트 매매일지 초기화(오늘부터)"):
+        try:
+            res = gsheet_reset_trades_only(timeout_sec=55)
+            if bool(res.get("ok", False)):
+                st.success(f"구글시트 초기화 완료 ✅ (reset_kst={res.get('reset_kst','')})")
+            else:
+                st.error(f"구글시트 초기화 실패: {res.get('error','')}")
+        except Exception as e:
+            st.error(f"구글시트 초기화 오류: {e}")
+            notify_admin_error("UI:GSHEET_RESET", e, min_interval_sec=120.0)
 
     df_log = read_trade_log()
     if df_log.empty:
