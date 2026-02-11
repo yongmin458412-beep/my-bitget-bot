@@ -739,6 +739,10 @@ def default_settings() -> Dict[str, Any]:
         "scalp_max_hold_minutes": 25,          # 스캘핑 포지션 최대 보유(넘으면 스윙 전환 검토)
         "scalp_to_swing_min_roi": -12.0,       # 너무 큰 손실이면 전환 대신 정리 유도(기본)
         "scalp_to_swing_require_long_align": True,  # 장기추세까지 맞아야 스윙 전환
+        # ✅ 스캘핑→스윙 전환(보유시간) 안전장치:
+        # - 이미 익절에 거의 도달했거나(또는 충분히 수익 구간이면) 전환으로 손절만 넓히지 않게 스킵
+        "scalp_to_swing_skip_when_roi_ge_tp_frac": 0.85,  # TP의 85% 이상 수익이면 전환 스킵
+        "scalp_to_swing_skip_when_tp_slack_roi": 1.0,     # TP까지 남은 ROI가 1%p 이하이면 전환 스킵
         "scalp_disable_dca": True,             # 스캘핑은 기본 추매 금지
         "scalp_tp_roi_min": 0.8,
         "scalp_tp_roi_max": 6.0,
@@ -7962,6 +7966,23 @@ def _maybe_switch_style_for_open_position(
         elif regime_mode in ["swing", "long"]:
             rec_style = "스윙"
 
+        # ✅ 스캘핑→스윙(보유시간) 전환을 이미 실행한 포지션은, 같은 포지션에서 곧바로 스윙→스캘핑으로 되돌리는 플립플롭을 막는다.
+        # - 전환 직후 손절만 넓어지고(익절은 그대로) 반복 전환이 발생하면, 수익을 반납하거나 수수료/혼란만 커질 수 있음
+        try:
+            if (
+                str(regime_mode or "") == "auto"
+                and bool(tgt.get("_hold_convert_to_swing", False))
+                and str(tgt.get("style", "")) == "스윙"
+                and str(rec_style or "") == "스캘핑"
+            ):
+                tgt["style_reco"] = "스윙"
+                tgt["style_reco_note"] = "보유시간 전환(스윙) 완료 → 되돌림 방지"
+                tgt["trend_short_now"] = f"{short_tf} {short_trend}"
+                tgt["trend_long_now"] = f"{long_tf} {long_trend}"
+                return tgt
+        except Exception:
+            pass
+
         # ✅ confirm2/hysteresis가 "같은 데이터 스냅샷"으로 몇 초 만에 누적되어
         #    레짐이 빠르게 바뀌는 현상을 방지:
         # - get_htf_trend_cached는 cache_sec 동안 같은 값을 반환할 수 있으므로,
@@ -8309,6 +8330,9 @@ def _maybe_switch_style_for_open_position(
 
 def _should_convert_scalp_to_swing(tgt: Dict[str, Any], roi: float, cfg: Dict[str, Any], long_align: bool) -> bool:
     try:
+        # ✅ 강제 수익보존(트레일링 보호) 모드에서는 스타일 전환으로 목표/리스크가 흔들리면 안 됨
+        if bool(cfg.get("exit_trailing_protect_enable", False)):
+            return False
         if str(tgt.get("style", "")) != "스캘핑":
             return False
         entry_epoch = float(tgt.get("entry_epoch", 0) or 0)
@@ -8317,6 +8341,26 @@ def _should_convert_scalp_to_swing(tgt: Dict[str, Any], roi: float, cfg: Dict[st
         hold_min = (time.time() - entry_epoch) / 60.0
         if hold_min < float(cfg.get("scalp_max_hold_minutes", 25)):
             return False
+        # ✅ 이미 익절에 가까우면(또는 충분히 수익 구간이면) 스윙 전환으로 SL만 넓히지 않는다
+        try:
+            tp_roi = float(tgt.get("tp", 0) or 0.0)
+        except Exception:
+            tp_roi = 0.0
+        if tp_roi > 0:
+            try:
+                frac = float(cfg.get("scalp_to_swing_skip_when_roi_ge_tp_frac", 0.85) or 0.85)
+            except Exception:
+                frac = 0.85
+            frac = float(clamp(frac, 0.55, 0.98))
+            try:
+                slack = float(cfg.get("scalp_to_swing_skip_when_tp_slack_roi", 1.0) or 1.0)
+            except Exception:
+                slack = 1.0
+            slack = float(max(0.0, slack))
+            if roi >= (tp_roi * frac):
+                return False
+            if (roi > 0) and ((tp_roi - roi) <= slack):
+                return False
         # 너무 큰 손실이면 전환보다 정리가 낫다(기본)
         if roi < float(cfg.get("scalp_to_swing_min_roi", -12.0)):
             return False
@@ -9628,9 +9672,27 @@ def telegram_thread(ex):
                                 tgt["style"] = "스윙"
                                 tgt["style_reason"] = f"스캘핑 장기화({cfg.get('scalp_max_hold_minutes',25)}m+) → 스윙 전환"
                                 tgt["style_last_switch_epoch"] = time.time()
+                                # ✅ 보유시간 전환 플래그(같은 포지션에서 스윙→스캘핑 되돌림 방지)
+                                try:
+                                    tgt["_hold_convert_to_swing"] = True
+                                except Exception:
+                                    pass
                                 # 스윙 목표로 확장
                                 tgt["tp"] = float(clamp(max(tp, float(cfg.get("swing_tp_roi_min", 3.0))), float(cfg.get("swing_tp_roi_min", 3.0)), float(cfg.get("swing_tp_roi_max", 50.0))))
                                 tgt["sl"] = float(clamp(max(sl, float(cfg.get("swing_sl_roi_min", 12.0))), float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 30.0))))
+                                # ✅ 스윙 전환이면 "손절폭을 넓힌 만큼 익절도 같이" 늘려서 손익비가 나빠지지 않게 한다.
+                                # - (중요) 손절만 넓히고 익절은 그대로면, 이미 수익 중인 포지션에서 되레 수익 반납 리스크만 커질 수 있음
+                                try:
+                                    mode_now = str(cfg.get("trade_mode", "안전모드") or "안전모드")
+                                    rr_min_now = max(float(_rr_min_by_mode(mode_now)), float(_rr_min_by_style("스윙")))
+                                    sl_now = float(tgt.get("sl", 0) or 0.0)
+                                    tp_now = float(tgt.get("tp", 0) or 0.0)
+                                    tp_need = abs(sl_now) * float(rr_min_now)
+                                    if tp_now < tp_need:
+                                        tp_cap = float(cfg.get("swing_tp_roi_max", 50.0))
+                                        tgt["tp"] = float(clamp(tp_need, float(cfg.get("swing_tp_roi_min", 3.0)), tp_cap))
+                                except Exception:
+                                    pass
                                 # ✅ 전환 시 SR 가격 라인도 스윙 기준으로 재계산(너무 타이트한 SL 방지)
                                 try:
                                     lev0 = float(tgt.get("lev", 1) or 1)
