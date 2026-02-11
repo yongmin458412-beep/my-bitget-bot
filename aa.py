@@ -622,6 +622,30 @@ def default_settings() -> Dict[str, Any]:
 
         # 방어/전략
         "use_trailing_stop": True,
+        # ✅ (핵심) 강제 청산 정책: "수익을 손실로 마감"하지 않기
+        # - 진입 판단(AI)은 유지하되, 청산(Exit)만큼은 아래 규칙을 우선 적용한다.
+        # - ON이면 기존 TP/SL/SR/부분익절/트레일링(기존)보다 아래 정책이 우선한다.
+        "exit_trailing_protect_enable": True,
+        "exit_trailing_protect_check_sec": 1.0,
+        # 포지션 보유 중에는 스캔/AI 호출로 루프가 길어져 청산 타이밍을 놓칠 수 있어,
+        # 강제 Exit 정책 사용 시 기본은 "포지션이 있을 때 신규 스캔/진입을 쉬고" 청산 모니터링에 집중한다.
+        "exit_trailing_protect_pause_scan_while_in_position": True,
+        "exit_trailing_protect_sl_roi": 15.0,                 # 기본 손절: -15%
+        "exit_trailing_protect_be_roi": 10.0,                 # 1단계: +10% → 본전(진입가) 보호
+        "exit_trailing_protect_partial_roi": 30.0,            # 2단계: +30% → 50% 익절(부분청산)
+        "exit_trailing_protect_partial_close_pct": 50.0,      # 부분청산 비율(%)
+        "exit_trailing_protect_trail_start_roi": 50.0,        # 3단계: +50% 이후부터 추적손절 활성
+        "exit_trailing_protect_trail_dd_roi": 10.0,           # 최고점 대비 -10%면 전량 청산
+
+        # ✅ 진입 고정(요구사항): 레버 20배 고정 + 잔고 20% 진입
+        # - 기존 모드/AI의 entry_pct/leverage 출력은 "표시용"으로만 남기고, 실제 주문은 아래 값을 사용
+        "fixed_leverage_enable": True,
+        "fixed_leverage": 20,
+        "fixed_entry_pct_enable": True,
+        "fixed_entry_pct": 20.0,
+        # cross/isolated 선택(거래소/계정 설정에 따라 실패할 수 있으니 safe 적용)
+        "margin_mode": "cross",  # "cross"|"isolated"
+
         # ✅ 손절(ROI) 확인(휩쏘 방지):
         # - SR(지지/저항) 가격 이탈 손절은 즉시 실행
         # - ROI(퍼센트) 손절은 n회 연속 조건일 때만 실행(순간 위꼬리/툭 찍고 복구 방지)
@@ -4668,6 +4692,25 @@ def set_leverage_safe(ex, sym: str, lev: int) -> None:
         pass
 
 
+def set_margin_mode_safe(ex, sym: str, mode: str) -> None:
+    """
+    Bitget 선물 마진 모드 설정(cross/isolated).
+    - 거래소/계정/심볼에 따라 실패할 수 있으니, 실패해도 봇이 죽지 않게 safe 처리.
+    """
+    try:
+        m = str(mode or "").strip().lower()
+        if m not in ["cross", "isolated"]:
+            return
+        # ccxt 표준 메서드: set_margin_mode(mode, symbol, params)
+        if hasattr(ex, "set_margin_mode"):
+            try:
+                ex.set_margin_mode(m, sym)  # type: ignore[attr-defined]
+            except TypeError:
+                ex.set_margin_mode(m, sym, {})  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def market_order_safe(ex, sym: str, side: str, qty: float) -> bool:
     try:
         ex.create_market_order(sym, side, qty)
@@ -4691,6 +4734,28 @@ def position_roi_percent(p: Dict[str, Any]) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def estimate_roi_from_price(entry_price: float, last_price: float, side: str, leverage: float) -> float:
+    """
+    가격/진입가/레버로 ROI%(=대략적인 ROE%)를 추정한다.
+    - 거래소가 percentage를 제공하지 않거나 지연될 때 보조 지표로 사용.
+    """
+    try:
+        ep = float(entry_price or 0.0)
+        lp = float(last_price or 0.0)
+        lev = float(leverage or 1.0)
+        if ep <= 0 or lp <= 0:
+            return 0.0
+        if lev <= 0:
+            lev = 1.0
+        if str(side) == "long":
+            pct = (lp - ep) / ep * 100.0
+        else:
+            pct = (ep - lp) / ep * 100.0
+        return float(pct * lev)
+    except Exception:
+        return 0.0
 
 
 def position_side_normalize(p: Dict[str, Any]) -> str:
@@ -7793,7 +7858,9 @@ def _maybe_switch_style_for_open_position(
         cur_style = str(tgt.get("style", "스캘핑"))
         # 추천 스타일(룰 기반)
         dec = "buy" if pos_side == "long" else "sell"
-        rec = _style_for_entry(sym, dec, short_trend, long_trend, cfg, allow_ai=bool(cfg.get("style_switch_ai_enable", False)))
+        # ✅ 강제 Exit(수익보존) 정책이 ON이면, 포지션 관리 루프가 AI 호출로 지연되지 않게 스타일 전환 AI는 잠시 비활성
+        allow_ai_switch = bool(cfg.get("style_switch_ai_enable", False)) and (not bool(cfg.get("exit_trailing_protect_enable", False)))
+        rec = _style_for_entry(sym, dec, short_trend, long_trend, cfg, allow_ai=bool(allow_ai_switch))
         rec_style = rec.get("style", cur_style)
         # ✅ 레짐(스캘핑/스윙) 강제/자동 선택
         # 요구사항: "시간 기반 최소유지기간(style_lock_minutes) 강제 금지"
@@ -8903,7 +8970,8 @@ def telegram_thread(ex):
                         except Exception:
                             pass
 
-                    for sym in (TARGET_COINS if entry_allowed_global else []):
+                    # ✅ 포지션 관리는 "항상" 수행해야 함(자동매매 OFF/일시정지/주말이어도 청산은 계속 필요)
+                    for sym in TARGET_COINS:
                         p = pos_by_sym.get(sym)
                         if not p:
                             continue
@@ -8978,6 +9046,11 @@ def telegram_thread(ex):
                         # ✅ 스타일 자동 전환(포지션 보유 중)
                         tgt = _maybe_switch_style_for_open_position(ex, sym, side, tgt, cfg, mon)
                         style_now = str(tgt.get("style", "스캘핑"))
+                        forced_exit = bool(cfg.get("exit_trailing_protect_enable", False))
+                        try:
+                            tgt["exit_trailing_protect_enable"] = bool(forced_exit)
+                        except Exception:
+                            pass
 
                         # 저장(스레드 재시작 대비)
                         rt.setdefault("open_targets", {})[sym] = tgt
@@ -9153,8 +9226,8 @@ def telegram_thread(ex):
                         except Exception:
                             pass
 
-                        # 트레일링(가격폭 기준으로만 조임) - 기존 유지
-                        if cfg.get("use_trailing_stop", True):
+                        # 트레일링(기존): 강제 수익보존 Exit 정책이 ON이면 사용하지 않음(Exit는 강제 정책이 우선)
+                        if (not forced_exit) and cfg.get("use_trailing_stop", True):
                             if roi >= (tp * 0.5):
                                 lev_now = float(tgt.get("lev", p.get("leverage", 1))) or 1.0
                                 base_price_sl = float(tgt.get("sl_price_pct") or max(0.25, float(sl) / max(lev_now, 1)))
@@ -9170,7 +9243,7 @@ def telegram_thread(ex):
                         # ✅ 본전 보호(브레이크이븐): 수익이 어느 정도 나면 SL을 진입가 근처로 끌어올림(가격 기준)
                         # - 손절이 아니라 "수익 보호" 목적(연속 손절 카운트에도 포함하지 않게 별도 처리)
                         try:
-                            if bool(cfg.get("trail_breakeven_enable", True)):
+                            if (not forced_exit) and bool(cfg.get("trail_breakeven_enable", True)):
                                 prev_sl_src = ""
                                 try:
                                     prev_sl_src = str(tgt.get("sl_price_source", "") or "").strip().upper()
@@ -9233,7 +9306,7 @@ def telegram_thread(ex):
                                                         pass
                         except Exception:
                             pass
-                        if cfg.get("use_sr_stop", True):
+                        if (not forced_exit) and cfg.get("use_sr_stop", True):
                             if sl_price is not None:
                                 if side == "long" and cur_px <= float(sl_price):
                                     hit_sl_by_price = True
@@ -9246,7 +9319,7 @@ def telegram_thread(ex):
                                     hit_tp_by_price = True
 
                         # ✅ 스윙: 부분익절(순환매도 옵션) - 요구사항 반영
-                        if style_now == "스윙" and cfg.get("swing_partial_tp_enable", True) and contracts > 0:
+                        if (not forced_exit) and style_now == "스윙" and cfg.get("swing_partial_tp_enable", True) and contracts > 0:
                             trade_state = rt.setdefault("trades", {}).setdefault(sym, {"dca_count": 0, "partial_tp_done": [], "recycle_count": 0})
                             done = set(trade_state.get("partial_tp_done", []) or [])
                             # TP 기반 트리거
@@ -9350,7 +9423,7 @@ def telegram_thread(ex):
                                             save_trade_detail(trade_id, d)
 
                         # ✅ 스윙: 순환매도(부분익절 후 재진입/리밸런싱) - 옵션 ON일 때만
-                        if style_now == "스윙" and cfg.get("swing_recycle_enable", False) and contracts > 0:
+                        if (not forced_exit) and style_now == "스윙" and cfg.get("swing_recycle_enable", False) and contracts > 0:
                             try:
                                 trade_state = rt.setdefault("trades", {}).setdefault(sym, {"dca_count": 0, "partial_tp_done": [], "recycle_count": 0})
                                 rc = int(trade_state.get("recycle_count", 0) or 0)
@@ -9678,19 +9751,171 @@ def telegram_thread(ex):
                             tp = min(tp, float(cfg.get("scalp_tp_roi_max", 6.0)))
                             sl = min(sl, float(cfg.get("scalp_sl_roi_max", 5.0)))
 
-                        hard_take = False
+                        # =================================================
+                        # ✅ 강제 수익 보존(Trailing Protect) Exit 정책
+                        # - 진입(AI)은 유지하되, 청산은 AI를 배제하고 아래 규칙을 우선 적용
+                        #   1) +10% → 본전(진입가) 보호
+                        #   2) +30% → 50% 부분익절(시장가)
+                        #   3) +50% 이후: 최고점 대비 -10%면 전량 청산
+                        #   4) 기본 손절: -15%면 전량 손절
+                        # =================================================
+                        forced_take_reason = ""
+                        forced_take_detail = ""
+                        forced_trail_hit = False
                         try:
-                            if str(style_now) == "스캘핑" and bool(cfg.get("scalp_hard_take_enable", True)):
-                                ht = float(cfg.get("scalp_hard_take_roi_pct", 35.0))
-                                if float(roi) >= float(ht):
-                                    hard_take = True
+                            if bool(forced_exit):
+                                # percentage가 비어있거나 지연될 수 있어, 가격 기반 ROI 추정도 같이 사용(보조)
+                                try:
+                                    if p.get("percentage") is None:
+                                        roi = float(estimate_roi_from_price(float(entry), float(cur_px), str(side), float(lev_live)))
+                                except Exception:
+                                    pass
+
+                                sl_fixed = float(cfg.get("exit_trailing_protect_sl_roi", 15.0) or 15.0)
+                                be_roi = float(cfg.get("exit_trailing_protect_be_roi", 10.0) or 10.0)
+                                part_roi = float(cfg.get("exit_trailing_protect_partial_roi", 30.0) or 30.0)
+                                part_pct = float(cfg.get("exit_trailing_protect_partial_close_pct", 50.0) or 50.0)
+                                trail_start = float(cfg.get("exit_trailing_protect_trail_start_roi", 50.0) or 50.0)
+                                trail_dd = float(cfg.get("exit_trailing_protect_trail_dd_roi", 10.0) or 10.0)
+
+                                # 강제 정책에서는 기존 TP/SL 목표는 "표시용"으로만 두고, Exit는 고정 기준을 사용
+                                sl = float(abs(sl_fixed))
+                                tp = 999999.0
+
+                                # 1) 본전 보호(진입가): +be_roi% 넘으면 SL을 진입가로 고정
+                                try:
+                                    if (not bool(tgt.get("forced_be_armed", False))) and (float(roi) >= float(be_roi)):
+                                        be_price = float(entry) if float(entry or 0.0) > 0 else float(tgt.get("entry_price", 0.0) or 0.0)
+                                        if be_price > 0:
+                                            tgt["forced_be_armed"] = True
+                                            tgt["forced_be_price"] = float(be_price)
+                                            tgt["sl_price"] = float(be_price)
+                                            tgt["sl_price_source"] = "BE"
+                                            tgt["be_arm_time_kst"] = now_kst_str()
+                                            tgt["be_arm_epoch"] = time.time()
+                                            tgt["be_arm_roi"] = float(roi)
+                                            tgt["be_arm_at_roi"] = float(be_roi)
+                                            tgt["be_arm_offset_pct"] = 0.0
+                                            tgt["be_arm_price"] = float(be_price)
+                                            if not str(tgt.get("be_arm_ind", "") or "").strip():
+                                                try:
+                                                    snap_be = chart_snapshot_for_reason(ex, sym, cfg)
+                                                    entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
+                                                    tgt["be_arm_ind"] = _fmt_indicator_line_for_reason(entry_snap, snap_be)
+                                                except Exception:
+                                                    pass
+                                except Exception:
+                                    pass
+
+                                # BE 트리거: 가격이 진입가(본전)로 되돌아오면 전량 청산(수익을 손실로 마감 방지)
+                                try:
+                                    if bool(tgt.get("forced_be_armed", False)):
+                                        be_price = float(tgt.get("forced_be_price", 0.0) or tgt.get("be_arm_price", 0.0) or 0.0)
+                                        if be_price > 0:
+                                            if (str(side) == "long" and float(cur_px) <= float(be_price)) or (str(side) == "short" and float(cur_px) >= float(be_price)):
+                                                tgt["sl_price"] = float(be_price)
+                                                tgt["sl_price_source"] = "BE"
+                                                hit_sl_by_price = True
+                                except Exception:
+                                    pass
+
+                                # 2) +part_roi% 넘기면 50% 부분익절(한 번만)
+                                try:
+                                    if (not bool(tgt.get("forced_partial_done", False))) and float(roi) >= float(part_roi) and float(contracts) > 0:
+                                        frac = float(part_pct) / 100.0
+                                        frac = float(clamp(frac, 0.05, 0.95))
+                                        close_qty = to_precision_qty(ex, sym, float(contracts) * frac)
+                                        if close_qty > 0 and float(close_qty) < float(contracts):
+                                            ok = close_position_market(ex, sym, side, close_qty)
+                                            if ok:
+                                                tgt["forced_partial_done"] = True
+                                                tgt["forced_partial_time_kst"] = now_kst_str()
+                                                tgt["forced_partial_roi"] = float(roi)
+                                                tgt["forced_partial_qty"] = float(close_qty)
+                                                try:
+                                                    margin_est = (float(close_qty) * float(cur_px)) / max(float(lev_live), 1.0)
+                                                except Exception:
+                                                    margin_est = 0.0
+                                                mon_add_event(mon, "FORCED_PARTIAL_TP", sym, f"+{part_roi:.0f}% 50% 익절", {"roi": roi, "qty": close_qty, "margin_usdt_est": margin_est})
+                                                try:
+                                                    gsheet_log_trade(
+                                                        stage="FORCED_PARTIAL_TP",
+                                                        symbol=sym,
+                                                        trade_id=trade_id,
+                                                        message=f"roi>={part_roi} close_pct={part_pct}",
+                                                        payload={"roi": roi, "qty": close_qty, "margin_usdt_est": margin_est, "part_roi": part_roi, "part_pct": part_pct},
+                                                    )
+                                                except Exception:
+                                                    pass
+                                                if _tg_simple_enabled(cfg):
+                                                    msg = (
+                                                        "🧩 부분익절(강제)\n"
+                                                        f"- 코인: {sym}\n"
+                                                        f"- 방식: {_tg_style_easy(style_now)}\n"
+                                                        f"- 포지션: {_tg_dir_easy(side)}\n"
+                                                        "\n"
+                                                        f"- 지금 수익률: {_tg_fmt_pct(roi)}\n"
+                                                        f"- 청산비율: {float(part_pct):.0f}%\n"
+                                                        f"- 청산금액(마진): {float(margin_est):.2f} USDT\n"
+                                                        "\n"
+                                                        f"- ID: {trade_id or '-'}"
+                                                    )
+                                                else:
+                                                    msg = f"🧩 부분익절(강제)\n- 코인: {sym}\n- ROI: +{roi:.2f}%\n- 청산비율: {float(part_pct):.0f}%\n- 청산수량: {close_qty}\n- 청산마진(추정): {margin_est:.2f} USDT\n- 일지ID: {trade_id or '-'}"
+                                                tg_send(
+                                                    msg,
+                                                    target=cfg.get("tg_route_events_to", "channel"),
+                                                    cfg=cfg,
+                                                    silent=True,
+                                                )
+                                                if trade_id:
+                                                    d = load_trade_detail(trade_id) or {}
+                                                    evs = d.get("events", []) or []
+                                                    evs.append({"time": now_kst_str(), "type": "FORCED_PARTIAL_TP", "roi": roi, "qty": close_qty, "margin_usdt_est": margin_est, "part_roi": part_roi, "part_pct": part_pct})
+                                                    d["events"] = evs
+                                                    save_trade_detail(trade_id, d)
+                                                rt.setdefault("open_targets", {})[sym] = tgt
+                                                save_runtime(rt)
+                                except Exception:
+                                    pass
+
+                                # 3) +trail_start% 넘긴 이후: 최고점 대비 -trail_dd%면 전량 청산
+                                try:
+                                    if float(roi) >= float(trail_start):
+                                        tgt["forced_trail_active"] = True
+                                    if bool(tgt.get("forced_trail_active", False)):
+                                        pk = float(tgt.get("forced_peak_roi", roi) or roi)
+                                        if float(roi) > float(pk):
+                                            pk = float(roi)
+                                            tgt["forced_peak_roi"] = float(pk)
+                                            tgt["forced_peak_time_kst"] = now_kst_str()
+                                        # 드로다운 체크
+                                        if float(roi) <= (float(pk) - float(trail_dd)):
+                                            forced_trail_hit = True
+                                            forced_take_reason = "익절(추적손절)"
+                                            forced_take_detail = f"최고 {pk:.1f}% → 현재 {float(roi):.1f}% (-{(pk - float(roi)):.1f}%)"
+                                            tgt["force_take_reason"] = forced_take_reason
+                                            tgt["force_take_detail"] = forced_take_detail
+                                except Exception:
+                                    pass
                         except Exception:
-                            hard_take = False
+                            pass
+
+                        # 강제 정책의 전량 청산(추적손절) → do_take로 처리(익절 로그/메시지 흐름 재사용)
+                        hard_take = bool(forced_exit and forced_trail_hit)
+                        if (not forced_exit) and (not hard_take):
+                            try:
+                                if str(style_now) == "스캘핑" and bool(cfg.get("scalp_hard_take_enable", True)):
+                                    ht = float(cfg.get("scalp_hard_take_roi_pct", 35.0))
+                                    if float(roi) >= float(ht):
+                                        hard_take = True
+                            except Exception:
+                                hard_take = False
 
                         # ✅ ROI 손절은 "확인 n회"로 한 번 더 생각(휩쏘 방지)
                         roi_stop_hit = bool(float(roi) <= -abs(float(sl)))
                         roi_stop_confirmed = roi_stop_hit
-                        if roi_stop_hit and (not bool(hit_sl_by_price)) and bool(cfg.get("sl_confirm_enable", True)):
+                        if (not forced_exit) and roi_stop_hit and (not bool(hit_sl_by_price)) and bool(cfg.get("sl_confirm_enable", True)):
                             try:
                                 n_need = max(1, int(cfg.get("sl_confirm_n", 2) or 2))
                             except Exception:
@@ -10046,7 +10271,12 @@ def telegram_thread(ex):
                         # 익절
                         elif do_take:
                             pnl_usdt_snapshot = float(p.get("unrealizedPnl") or 0.0)
-                            take_reason_ko = "익절(저항/목표 도달)" if bool(hit_tp_by_price) else ("익절(강제)" if bool(hard_take) else "익절(목표 익절)")
+                            force_take_reason = str(tgt.get("force_take_reason", "") or "").strip()
+                            force_take_detail = str(tgt.get("force_take_detail", "") or "").strip()
+                            if force_take_reason:
+                                take_reason_ko = force_take_reason
+                            else:
+                                take_reason_ko = "익절(저항/목표 도달)" if bool(hit_tp_by_price) else ("익절(강제)" if bool(hard_take) else "익절(목표 익절)")
                             is_loss_take = (float(pnl_usdt_snapshot) < 0.0) or (float(roi) < 0.0)
                             # ✅ 차트 근거(룰 기반) 스냅샷: "왜 익절했는지"를 명확히 남긴다(AI 호출 없음)
                             entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
@@ -10062,7 +10292,9 @@ def telegram_thread(ex):
                                     tp_line_txt = f" (라인 {float(tp_price_now):.6g})"
                             except Exception:
                                 tp_line_txt = ""
-                            if bool(hard_take):
+                            if force_take_reason:
+                                base_reason = f"{force_take_reason}" + (f" | {force_take_detail}" if force_take_detail else "")
+                            elif bool(hard_take):
                                 base_reason = "수익이 많이 나서 일단 챙겼어요(강제익절)"
                             elif bool(hit_tp_by_price):
                                 base_reason = f"저항/목표가에 닿아서 익절했어요{tp_line_txt}"
@@ -10350,7 +10582,19 @@ def telegram_thread(ex):
 
                     scan_cycle_start = time.time()
                     ccxt_timeout_epoch_scan_start = float(getattr(ex, "_wonyoti_ccxt_timeout_epoch", 0) or 0)
-                    for sym in TARGET_COINS:
+                    # ✅ 강제 Exit(수익보존) 정책 사용 시:
+                    # - 포지션 보유 중에는 스캔/AI 호출로 루프가 길어져 청산 타이밍을 놓칠 수 있어,
+                    #   기본은 "포지션 모니터링 우선"으로 스캔을 잠깐 쉰다.
+                    skip_scan_loop = False
+                    try:
+                        if bool(cfg.get("exit_trailing_protect_enable", False)) and bool(cfg.get("exit_trailing_protect_pause_scan_while_in_position", True)):
+                            if active_syms and (not bool(force_scan_pending)):
+                                skip_scan_loop = True
+                                mon_add_scan(mon, stage="scan_skipped", symbol="*", tf=str(cfg.get("timeframe", "")), message="포지션 모니터링 우선(강제 Exit)")
+                    except Exception:
+                        skip_scan_loop = False
+
+                    for sym in (TARGET_COINS if (not skip_scan_loop) else []):
                         # 포지션 있으면 스킵
                         if sym in active_syms:
                             mon_add_scan(mon, stage="in_position", symbol=sym, tf=str(cfg.get("timeframe", "")), message="이미 포지션 보유")
@@ -10798,6 +11042,20 @@ def telegram_thread(ex):
                             slp = float(ai2.get("sl_pct", 1.2))
                             tpp = float(ai2.get("tp_pct", 3.0))
 
+                            # ✅ 요구사항: 레버 20배 고정 + 잔고 20% 진입(고정값 우선)
+                            try:
+                                if bool(cfg.get("fixed_entry_pct_enable", False)):
+                                    entry_pct = float(cfg.get("fixed_entry_pct", 20.0) or 20.0)
+                                    ai2["entry_pct"] = float(entry_pct)
+                            except Exception:
+                                pass
+                            try:
+                                if bool(cfg.get("fixed_leverage_enable", False)):
+                                    lev = int(cfg.get("fixed_leverage", 20) or 20)
+                                    ai2["leverage"] = int(lev)
+                            except Exception:
+                                pass
+
                             # ✅ 외부시황 위험 감산은 스윙에서만 적용
                             entry_risk_mul = float(risk_mul) if str(style) == "스윙" else 1.0
                             entry_usdt = free_usdt * (entry_pct / 100.0) * entry_risk_mul
@@ -10805,6 +11063,11 @@ def telegram_thread(ex):
                                 cs["skip_reason"] = "잔고 부족(진입금 너무 작음)"
                                 continue
 
+                            # margin mode(cross/isolated) + leverage
+                            try:
+                                set_margin_mode_safe(ex, sym, str(cfg.get("margin_mode", "cross")))
+                            except Exception:
+                                pass
                             set_leverage_safe(ex, sym, lev)
                             qty = to_precision_qty(ex, sym, (entry_usdt * lev) / max(px, 1e-9))
                             if qty <= 0:
