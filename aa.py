@@ -4795,20 +4795,89 @@ def set_margin_mode_safe(ex, sym: str, mode: str) -> None:
         pass
 
 
-def market_order_safe(ex, sym: str, side: str, qty: float) -> bool:
+def market_order_safe(ex, sym: str, side: str, qty: float, params: Optional[Dict[str, Any]] = None) -> bool:
     try:
-        ex.create_market_order(sym, side, qty)
+        params = params or {}
+        q = to_precision_qty(ex, sym, float(qty or 0.0))
+        if q <= 0:
+            return False
+        # create_market_order는 거래소/ccxt 버전에 따라 params 지원이 다를 수 있어 표준 create_order로 호출
+        _ccxt_call_with_timeout(
+            lambda: ex.create_order(sym, "market", side, q, None, params),
+            CCXT_TIMEOUT_SEC_PRIVATE,
+            where="create_market_order",
+            context={"symbol": sym, "side": side, "qty": q, "params": params},
+        )
         return True
     except Exception:
         return False
 
 
+def market_order_safe_ex(ex, sym: str, side: str, qty: float, params: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+    try:
+        params = params or {}
+        q = to_precision_qty(ex, sym, float(qty or 0.0))
+        if q <= 0:
+            return False, "qty<=0"
+        _ccxt_call_with_timeout(
+            lambda: ex.create_order(sym, "market", side, q, None, params),
+            CCXT_TIMEOUT_SEC_PRIVATE,
+            where="create_market_order",
+            context={"symbol": sym, "side": side, "qty": q, "params": params},
+        )
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 def close_position_market(ex, sym: str, pos_side: str, contracts: float) -> bool:
-    if contracts <= 0:
-        return False
-    if pos_side in ["long", "buy"]:
-        return market_order_safe(ex, sym, "sell", contracts)
-    return market_order_safe(ex, sym, "buy", contracts)
+    ok, _err = close_position_market_ex(ex, sym, pos_side, contracts)
+    return bool(ok)
+
+
+def close_position_market_ex(ex, sym: str, pos_side: str, contracts: float) -> Tuple[bool, str]:
+    """
+    Bitget 선물 포지션 청산을 최대한 '확실하게' 수행.
+    - hedge 모드에서는 holdSide가 필요할 수 있음
+    - reduceOnly가 없으면 반대 포지션이 열릴 수 있어 우선 reduceOnly로 시도
+    """
+    try:
+        qty = float(contracts or 0.0)
+    except Exception:
+        qty = 0.0
+    if qty <= 0:
+        return False, "contracts<=0"
+
+    ps = str(pos_side or "").lower().strip()
+    if ps in ["long", "buy"]:
+        side = "sell"
+        hold_side = "long"
+    elif ps in ["short", "sell"]:
+        side = "buy"
+        hold_side = "short"
+    else:
+        # fallback: long으로 취급
+        side = "sell"
+        hold_side = "long"
+
+    # 우선순위: reduceOnly + holdSide → reduceOnly → holdSide → bare
+    params_try: List[Dict[str, Any]] = []
+    if hold_side:
+        params_try.append({"reduceOnly": True, "holdSide": hold_side})
+        params_try.append({"reduceOnly": "true", "holdSide": hold_side})
+    params_try.append({"reduceOnly": True})
+    params_try.append({"reduceOnly": "true"})
+    if hold_side:
+        params_try.append({"holdSide": hold_side})
+    params_try.append({})
+
+    last_err = ""
+    for params in params_try:
+        ok, err = market_order_safe_ex(ex, sym, side, qty, params=params)
+        if ok:
+            return True, ""
+        last_err = err or last_err
+    return False, (last_err or "close_failed")
 
 
 def position_roi_percent(p: Dict[str, Any]) -> float:
@@ -9498,7 +9567,7 @@ def telegram_thread(ex):
                                     if close_qty <= 0:
                                         done.add(label)
                                         continue
-                                    ok = close_position_market(ex, sym, side, close_qty)
+                                    ok, err_close = close_position_market_ex(ex, sym, side, close_qty)
                                     if ok:
                                         done.add(label)
                                         # 청산 마진(추정): notional/lev
@@ -9559,6 +9628,18 @@ def telegram_thread(ex):
                                             evs.append({"time": now_kst_str(), "type": "PARTIAL_TP", "label": label, "roi": roi, "qty": close_qty, "margin_usdt_est": close_margin_est, "mode": close_mode})
                                             d["events"] = evs
                                             save_trade_detail(trade_id, d)
+                                    else:
+                                        mon_add_event(mon, "ORDER_FAIL", sym, f"부분익절 실패({label})", {"err": err_close, "qty": close_qty, "roi": roi, "trade_id": trade_id})
+                                        try:
+                                            notify_admin_error(
+                                                where="ORDER:PARTIAL_TP_CLOSE",
+                                                err=RuntimeError(str(err_close)),
+                                                context={"symbol": sym, "label": label, "qty": close_qty, "roi": roi, "trade_id": trade_id},
+                                                tb="",
+                                                min_interval_sec=60.0,
+                                            )
+                                        except Exception:
+                                            pass
 
                         # ✅ 스윙: 순환매도(부분익절 후 재진입/리밸런싱) - 옵션 ON일 때만
                         if (not forced_exit) and style_now == "스윙" and cfg.get("swing_recycle_enable", False) and contracts > 0:
@@ -9982,7 +10063,7 @@ def telegram_thread(ex):
                                         frac = float(clamp(frac, 0.05, 0.95))
                                         close_qty = to_precision_qty(ex, sym, float(contracts) * frac)
                                         if close_qty > 0 and float(close_qty) < float(contracts):
-                                            ok = close_position_market(ex, sym, side, close_qty)
+                                            ok, err_close = close_position_market_ex(ex, sym, side, close_qty)
                                             if ok:
                                                 tgt["forced_partial_done"] = True
                                                 tgt["forced_partial_time_kst"] = now_kst_str()
@@ -10032,6 +10113,18 @@ def telegram_thread(ex):
                                                     save_trade_detail(trade_id, d)
                                                 rt.setdefault("open_targets", {})[sym] = tgt
                                                 save_runtime(rt)
+                                            else:
+                                                mon_add_event(mon, "ORDER_FAIL", sym, "강제 부분익절 실패", {"err": err_close, "qty": close_qty, "roi": roi, "trade_id": trade_id})
+                                                try:
+                                                    notify_admin_error(
+                                                        where="ORDER:FORCED_PARTIAL_TP_CLOSE",
+                                                        err=RuntimeError(str(err_close)),
+                                                        context={"symbol": sym, "qty": close_qty, "roi": roi, "trade_id": trade_id},
+                                                        tb="",
+                                                        min_interval_sec=60.0,
+                                                    )
+                                                except Exception:
+                                                    pass
                                 except Exception:
                                     pass
 
@@ -10165,7 +10258,7 @@ def telegram_thread(ex):
                             else:
                                 base_reason = f"손실이 목표손절(-{abs(float(sl)):.1f}%)에 닿아서 정리했어요"
                             one_rule = build_exit_one_line(base_reason=base_reason, entry_snap=entry_snap, now_snap=snap_now)
-                            ok = close_position_market(ex, sym, side, contracts)
+                            ok, err_close = close_position_market_ex(ex, sym, side, contracts)
                             if ok:
                                 exit_px = get_last_price(ex, sym) or entry
                                 free_after, total_after = safe_fetch_balance(ex)
@@ -10432,6 +10525,18 @@ def telegram_thread(ex):
 
                                 mon_add_event(mon, "PROTECT" if is_protect else "STOP", sym, f"{reason_ko} ROI {roi:.2f}%", {"trade_id": trade_id, "reason": reason_ko})
                                 monitor_write_throttled(mon, 0.2)
+                            else:
+                                mon_add_event(mon, "ORDER_FAIL", sym, "청산 실패(손절)", {"err": err_close, "roi": roi, "sl": sl, "trade_id": trade_id})
+                                try:
+                                    notify_admin_error(
+                                        where="ORDER:EXIT_SL",
+                                        err=RuntimeError(str(err_close)),
+                                        context={"symbol": sym, "roi": roi, "sl": sl, "trade_id": trade_id, "mode": mode, "style": style_now},
+                                        tb="",
+                                        min_interval_sec=60.0,
+                                    )
+                                except Exception:
+                                    pass
 
                         # 익절
                         elif do_take:
@@ -10466,7 +10571,7 @@ def telegram_thread(ex):
                             else:
                                 base_reason = f"목표익절(+{abs(float(tp)):.1f}%)에 닿아서 익절했어요"
                             one_rule = build_exit_one_line(base_reason=base_reason, entry_snap=entry_snap, now_snap=snap_now)
-                            ok = close_position_market(ex, sym, side, contracts)
+                            ok, err_close = close_position_market_ex(ex, sym, side, contracts)
                             if ok:
                                 exit_px = get_last_price(ex, sym) or entry
                                 free_after, total_after = safe_fetch_balance(ex)
@@ -10666,6 +10771,18 @@ def telegram_thread(ex):
 
                                 mon_add_event(mon, "TAKE", sym, f"ROI +{roi:.2f}%", {"trade_id": trade_id})
                                 monitor_write_throttled(mon, 0.2)
+                            else:
+                                mon_add_event(mon, "ORDER_FAIL", sym, "청산 실패(익절)", {"err": err_close, "roi": roi, "tp": tp, "trade_id": trade_id})
+                                try:
+                                    notify_admin_error(
+                                        where="ORDER:EXIT_TP",
+                                        err=RuntimeError(str(err_close)),
+                                        context={"symbol": sym, "roi": roi, "tp": tp, "trade_id": trade_id, "mode": mode, "style": style_now},
+                                        tb="",
+                                        min_interval_sec=60.0,
+                                    )
+                                except Exception:
+                                    pass
 
                         open_pos_snapshot.append(
                             {
