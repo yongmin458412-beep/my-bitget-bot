@@ -6706,25 +6706,49 @@ def ai_decide_trade(
 
     ext_hdr = "[외부 시황(참고)]\n" + "\n".join([x for x in [fg_txt, ev_txt, brief_txt] if x]) if ext_enabled else "[외부 시황] (스캘핑/단기 판단: 적용하지 않음)"
 
-    sys = f"""
-너는 '워뇨띠 스타일(눌림목/해소 타이밍) + 손익비' 기반의 자동매매 트레이더 AI다.
+    # ✅ 소액 탐색 진입(soft entry) 힌트: 확신이 min_conf에 조금 못 미쳐도, 아주 작게/보수적으로 진입 가능
+    soft_entry_hint = ""
+    try:
+        if bool(cfg.get("soft_entry_enable", True)):
+            gap = 0
+            if str(mode) == "안전모드":
+                gap = int(cfg.get("soft_entry_conf_gap_safe", 0) or 0)
+            elif str(mode) == "공격모드":
+                gap = int(cfg.get("soft_entry_conf_gap_attack", 8) or 8)
+            else:
+                gap = int(cfg.get("soft_entry_conf_gap_highrisk", 6) or 6)
+            gap = int(max(0, gap))
+            if gap > 0:
+                min_soft = int(max(0, int(rule.get("min_conf", 0) or 0) - int(gap)))
+                if min_soft > 0 and min_soft < int(rule.get("min_conf", 0) or 0):
+                    soft_entry_hint = (
+                        f"\n4) (소액 탐색 진입)\n"
+                        f"- 확신도가 {min_soft}~{int(rule.get('min_conf',0))-1}%이면, '소액 탐색'으로 buy/sell을 줄 수 있다.\n"
+                        f"- 이때는 entry_pct/leverage를 최소값 근처로, tp_pct/sl_pct도 보수적으로(짧게) 설정해라."
+                    )
+    except Exception:
+        soft_entry_hint = ""
 
-[과거 실수(요약)]
+    sys = f"""
+	너는 '워뇨띠 스타일(눌림목/해소 타이밍) + 손익비' 기반의 자동매매 트레이더 AI다.
+
+	[과거 실수(요약)]
 {past_mistakes}
 
 {ext_hdr}
 
-[핵심 룰]
-1) RSI 과매도/과매수 '상태'에 즉시 진입하지 말고, '해소되는 시점'에서만 진입 후보.
-2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. (역추세는 더 짧게/보수적으로)
-3) 모드 규칙 반드시 준수:
-   - 최소 확신도: {rule["min_conf"]}
-   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
-   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
+	[핵심 룰]
+	1) RSI 과매도/과매수 '상태'에 즉시 진입하지 말고, '해소되는 시점'에서만 진입 후보.
+	2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. (역추세는 더 짧게/보수적으로)
+	3) 모드 규칙 반드시 준수:
+	   - 최소 확신도: {rule["min_conf"]}
+	   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
+	   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
+	{soft_entry_hint}
 
-[중요]
-- sl_pct / tp_pct는 ROI%(레버 반영 수익률)로 출력한다.
-- 변동성(atr_price_pct)이 작으면 손절을 너무 타이트하게 잡지 마라.
+	[중요]
+	- sl_pct / tp_pct는 ROI%(레버 반영 수익률)로 출력한다.
+	- 변동성(atr_price_pct)이 작으면 손절을 너무 타이트하게 잡지 마라.
 - sr_context(지지/저항) 정보를 참고해, 가능하면 sl_price/tp_price(가격)를 함께 지정해라.
   - buy(롱): sl_price는 price보다 낮게, tp_price는 price보다 높게
   - sell(숏): sl_price는 price보다 높게, tp_price는 price보다 낮게
