@@ -642,6 +642,17 @@ def default_settings() -> Dict[str, Any]:
         "time_exit_bars": 12,            # 5m 기준 12 bars = 1시간
         "time_exit_target_frac": 0.5,    # 목표 수익의 50% 미만이면 정리
 
+        # ✅ Fail-safe(요구: "수익을 못 내거나 전부 잃으면 AI는 꺼진다")
+        # - 실제로 "수익 보장"은 불가능하므로, 현실적인 안전장치로 자동매매를 강제 종료한다.
+        # - 1) 계좌 드로다운이 임계치 이상이면 OFF
+        # - 2) 일정 횟수 거래 후에도 당일 실현손익이 0 이하이면 OFF(과매매/손실 누적 방지)
+        "fail_safe_enable": True,
+        "fail_safe_drawdown_enable": True,
+        "fail_safe_drawdown_from_peak_pct": 30.0,   # peak equity 대비 -30%면 OFF
+        "fail_safe_profit_guard_enable": False,     # 기본 OFF(너무 빡빡하면 금방 멈춤) → 원하면 ON
+        "fail_safe_profit_guard_min_trades": 10,
+        "fail_safe_profit_guard_min_pnl_usdt": 0.0, # 0 이하(=수익 못 냄)면 OFF
+
         # ✅ 진입 고정(요구사항): 레버 20배 고정 + 잔고 20% 진입
         # - 기존 모드/AI의 entry_pct/leverage 출력은 "표시용"으로만 남기고, 실제 주문은 아래 값을 사용
         "fixed_leverage_enable": False,
@@ -1035,7 +1046,14 @@ def default_runtime() -> Dict[str, Any]:
     return {
         "date": today_kst_str(),
         "day_start_equity": 0.0,
+        # ✅ 당일 peak equity(드로다운 fail-safe용)
+        "peak_equity": 0.0,
+        "peak_equity_kst": "",
         "daily_realized_pnl": 0.0,
+        # ✅ 당일 통계(실패/과매매 방지용)
+        "daily_trade_count": 0,
+        "daily_win_count": 0,
+        "daily_loss_count": 0,
         "consec_losses": 0,
         "pause_until": 0,
         "cooldowns": {},
@@ -1070,6 +1088,112 @@ def load_runtime() -> Dict[str, Any]:
 
 def save_runtime(rt: Dict[str, Any]) -> None:
     write_json_atomic(RUNTIME_FILE, rt)
+
+
+# =========================================================
+# ✅ Fail-safe: 조건 충족 시 자동매매 OFF
+# =========================================================
+def _fail_safe_disable_auto_trade(cfg: Dict[str, Any], rt: Dict[str, Any], mon: Optional[Dict[str, Any]], reason: str, detail: str = "") -> None:
+    """
+    - 안전장치 발동 시 auto_trade를 끄고, 당일 재가동을 막기 위해 pause_until을 자정까지 올린다.
+    - "AI가 사라진다"는 표현 대신, 실제 동작은 '자동매매 OFF'로 구현한다.
+    """
+    try:
+        already_reason = str(rt.get("auto_trade_stop_reason", "") or "")
+        already_epoch = float(rt.get("auto_trade_stop_epoch", 0) or 0.0)
+        # 같은 이유로 연속 알림 스팸 방지(5분)
+        if (not bool(cfg.get("auto_trade", False))) and already_reason == str(reason or "") and already_epoch > 0 and (time.time() - already_epoch) < 300:
+            return
+    except Exception:
+        pass
+    try:
+        if bool(cfg.get("auto_trade", False)):
+            cfg["auto_trade"] = False
+            save_settings(cfg)
+    except Exception:
+        pass
+    try:
+        rt["pause_until"] = max(float(rt.get("pause_until", 0) or 0.0), float(next_midnight_kst_epoch()))
+        rt["auto_trade_stop_reason"] = str(reason or "")
+        rt["auto_trade_stop_kst"] = now_kst_str()
+        rt["auto_trade_stop_epoch"] = float(time.time())
+        save_runtime(rt)
+    except Exception:
+        pass
+    try:
+        if mon is not None:
+            mon_add_event(mon, "AUTO_TRADE_OFF", "", f"fail_safe:{reason}", {"detail": detail, "code": CODE_VERSION})
+    except Exception:
+        pass
+    try:
+        msg = "⛔️ 자동매매 OFF(안전장치)\n" f"- 이유: {reason}\n"
+        if detail:
+            msg += f"- 상세: {detail}\n"
+        msg += f"- 시각: {now_kst_str()}"
+        tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg)
+    except Exception:
+        pass
+
+
+def maybe_trigger_fail_safe(cfg: Dict[str, Any], rt: Dict[str, Any], total_equity: float, mon: Optional[Dict[str, Any]] = None, where: str = "") -> bool:
+    """
+    사용자 요구(의도): "수익을 내지 못하거나 전부 잃으면 AI는 없어진다"
+    현실 구현: '손실 확대/과매매'를 막는 fail-safe로 자동매매를 강제 종료한다.
+    """
+    try:
+        if not bool(cfg.get("fail_safe_enable", True)):
+            return False
+    except Exception:
+        return False
+
+    triggered = False
+
+    # 1) Drawdown from peak (당일 peak 기준)
+    try:
+        if bool(cfg.get("fail_safe_drawdown_enable", True)) and float(total_equity or 0.0) > 0:
+            pk = _as_float(rt.get("peak_equity", 0.0), 0.0)
+            if pk <= 0 or float(total_equity) > float(pk):
+                rt["peak_equity"] = float(total_equity)
+                rt["peak_equity_kst"] = now_kst_str()
+                pk = float(total_equity)
+                try:
+                    save_runtime(rt)
+                except Exception:
+                    pass
+            dd_pct = ((float(pk) - float(total_equity)) / float(pk) * 100.0) if float(pk) > 0 else 0.0
+            lim_dd = float(cfg.get("fail_safe_drawdown_from_peak_pct", 30.0) or 30.0)
+            if lim_dd > 0 and dd_pct >= float(lim_dd):
+                _fail_safe_disable_auto_trade(
+                    cfg,
+                    rt,
+                    mon,
+                    reason="DRAWDOWN_LIMIT",
+                    detail=f"peak {pk:.2f} → now {float(total_equity):.2f} ({dd_pct:.1f}% ≥ {lim_dd:.1f}%) @ {where}",
+                )
+                triggered = True
+    except Exception:
+        pass
+
+    # 2) Profit guard (오늘 일정 횟수 거래 후에도 수익이 없으면 OFF)
+    try:
+        if (not triggered) and bool(cfg.get("fail_safe_profit_guard_enable", False)):
+            n_need = int(cfg.get("fail_safe_profit_guard_min_trades", 10) or 10)
+            min_pnl = float(cfg.get("fail_safe_profit_guard_min_pnl_usdt", 0.0) or 0.0)
+            n_tr = int(rt.get("daily_trade_count", 0) or 0)
+            pnl = float(rt.get("daily_realized_pnl", 0.0) or 0.0)
+            if n_need > 0 and n_tr >= n_need and pnl <= float(min_pnl):
+                _fail_safe_disable_auto_trade(
+                    cfg,
+                    rt,
+                    mon,
+                    reason="PROFIT_GUARD",
+                    detail=f"trades {n_tr} / pnl {pnl:+.2f} ≤ {min_pnl:+.2f} @ {where}",
+                )
+                triggered = True
+    except Exception:
+        pass
+
+    return bool(triggered)
 
 
 # =========================================================
@@ -6576,6 +6700,9 @@ def ai_decide_trade(
 - sr_context(지지/저항) 정보를 참고해, 가능하면 sl_price/tp_price(가격)를 함께 지정해라.
   - buy(롱): sl_price는 price보다 낮게, tp_price는 price보다 높게
   - sell(숏): sl_price는 price보다 높게, tp_price는 price보다 낮게
+[생존(중요)]
+- 이 시스템은 손실 확대/과매매가 감지되면 자동매매를 강제 종료한다.
+- 확신이 애매하면 'hold'를 선택해라. (무리한 진입 금지)
 - 영어 금지. 쉬운 한글.
 - 반드시 JSON만 출력.
 """
@@ -9715,63 +9842,63 @@ def telegram_thread(ex):
                                                 set_leverage_safe(ex, sym, lev)
                                                 qty_re = to_precision_qty(ex, sym, qty_avail)
                                                 if qty_re > 0:
-	                                                    ok = market_order_safe(ex, sym, "buy" if side == "long" else "sell", qty_re)
-	                                                    if ok:
-	                                                        trade_state["recycle_count"] = rc + 1
-	                                                        trade_state["recycle_qty"] = max(0.0, qty_avail - float(qty_re))
-	                                                        save_runtime(rt)
-	                                                        # ✅ 순환매도도 "왜 재진입하는지" 남기기(차트 스냅샷, AI 호출 없음)
-	                                                        snap_re = {}
-	                                                        try:
-	                                                            snap_re = chart_snapshot_for_reason(ex, sym, cfg)
-	                                                        except Exception:
-	                                                            snap_re = {}
-	                                                        entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
-	                                                        why_re = _fmt_indicator_line_for_reason(entry_snap, snap_re) or f"단기:{short_tr} | 장기:{long_tr}"
-	                                                        mon_add_event(mon, "RECYCLE_REENTRY", sym, f"재진입 {qty_re}", {"roi": roi, "trend": f"{short_tr}/{long_tr}"})
-	                                                        try:
-	                                                            gsheet_log_trade(
-	                                                                stage="RECYCLE_REENTRY",
-	                                                                symbol=sym,
-	                                                                trade_id=trade_id,
-	                                                                message=f"qty={qty_re}",
-	                                                                payload={"roi": roi, "qty": qty_re, "trend": f"{short_tr}/{long_tr}", "recycle_count": rc + 1},
-	                                                            )
-	                                                        except Exception:
-	                                                            pass
-	                                                        if _tg_simple_enabled(cfg):
-	                                                            why_line = f"- 근거: {why_re}\n" if why_re else ""
-	                                                            msg = (
-	                                                                "♻️ 순환매도(재진입)\n"
-	                                                                f"- 코인: {sym}\n"
-	                                                                f"- 방식: 스윙\n"
-	                                                                f"- 포지션: {_tg_dir_easy(side)}\n"
-	                                                                "\n"
-	                                                                f"- 재진입금액(마진): {float(margin_need):.2f} USDT\n"
-	                                                                f"- 재진입수량: {qty_re}\n"
-	                                                                f"- 지금 수익률: {_tg_fmt_pct(roi)}\n"
-	                                                                f"{why_line}"
-	                                                                "\n"
-	                                                                f"- ID: {trade_id or '-'}"
-	                                                            )
-	                                                        else:
-	                                                            msg = (
-	                                                                f"♻️ 순환매도 재진입\n- 코인: {sym}\n- 스타일: 스윙\n- 재진입수량: {qty_re}\n"
-	                                                                f"- 조건: ROI {roi:.2f}% <= {reentry_roi}%\n- 단기({short_tf}): {short_tr}\n- 장기({long_tf}): {long_tr}\n"
-	                                                                f"- 일지ID: {trade_id or '-'}"
-	                                                            )
-	                                                        tg_send(
-	                                                            msg,
-	                                                            target=cfg.get("tg_route_events_to", "channel"),
-	                                                            cfg=cfg,
-	                                                            silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
-	                                                        )
-	                                                        if trade_id:
-	                                                            d = load_trade_detail(trade_id) or {}
-	                                                            evs = d.get("events", []) or []
-	                                                            evs.append({"time": now_kst_str(), "type": "RECYCLE_REENTRY", "roi": roi, "qty": qty_re})
-	                                                            d["events"] = evs
-	                                                            save_trade_detail(trade_id, d)
+                                                        ok = market_order_safe(ex, sym, "buy" if side == "long" else "sell", qty_re)
+                                                        if ok:
+                                                            trade_state["recycle_count"] = rc + 1
+                                                            trade_state["recycle_qty"] = max(0.0, qty_avail - float(qty_re))
+                                                            save_runtime(rt)
+                                                            # ✅ 순환매도도 "왜 재진입하는지" 남기기(차트 스냅샷, AI 호출 없음)
+                                                            snap_re = {}
+                                                            try:
+                                                                snap_re = chart_snapshot_for_reason(ex, sym, cfg)
+                                                            except Exception:
+                                                                snap_re = {}
+                                                            entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
+                                                            why_re = _fmt_indicator_line_for_reason(entry_snap, snap_re) or f"단기:{short_tr} | 장기:{long_tr}"
+                                                            mon_add_event(mon, "RECYCLE_REENTRY", sym, f"재진입 {qty_re}", {"roi": roi, "trend": f"{short_tr}/{long_tr}"})
+                                                            try:
+                                                                gsheet_log_trade(
+                                                                    stage="RECYCLE_REENTRY",
+                                                                    symbol=sym,
+                                                                    trade_id=trade_id,
+                                                                    message=f"qty={qty_re}",
+                                                                    payload={"roi": roi, "qty": qty_re, "trend": f"{short_tr}/{long_tr}", "recycle_count": rc + 1},
+                                                                )
+                                                            except Exception:
+                                                                pass
+                                                            if _tg_simple_enabled(cfg):
+                                                                why_line = f"- 근거: {why_re}\n" if why_re else ""
+                                                                msg = (
+                                                                    "♻️ 순환매도(재진입)\n"
+                                                                    f"- 코인: {sym}\n"
+                                                                    f"- 방식: 스윙\n"
+                                                                    f"- 포지션: {_tg_dir_easy(side)}\n"
+                                                                    "\n"
+                                                                    f"- 재진입금액(마진): {float(margin_need):.2f} USDT\n"
+                                                                    f"- 재진입수량: {qty_re}\n"
+                                                                    f"- 지금 수익률: {_tg_fmt_pct(roi)}\n"
+                                                                    f"{why_line}"
+                                                                    "\n"
+                                                                    f"- ID: {trade_id or '-'}"
+                                                                )
+                                                            else:
+                                                                msg = (
+                                                                    f"♻️ 순환매도 재진입\n- 코인: {sym}\n- 스타일: 스윙\n- 재진입수량: {qty_re}\n"
+                                                                    f"- 조건: ROI {roi:.2f}% <= {reentry_roi}%\n- 단기({short_tf}): {short_tr}\n- 장기({long_tf}): {long_tr}\n"
+                                                                    f"- 일지ID: {trade_id or '-'}"
+                                                                )
+                                                            tg_send(
+                                                                msg,
+                                                                target=cfg.get("tg_route_events_to", "channel"),
+                                                                cfg=cfg,
+                                                                silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
+                                                            )
+                                                            if trade_id:
+                                                                d = load_trade_detail(trade_id) or {}
+                                                                evs = d.get("events", []) or []
+                                                                evs.append({"time": now_kst_str(), "type": "RECYCLE_REENTRY", "roi": roi, "qty": qty_re})
+                                                                d["events"] = evs
+                                                                save_trade_detail(trade_id, d)
                             except Exception:
                                 pass
 
@@ -10435,6 +10562,15 @@ def telegram_thread(ex):
                                     rt["daily_realized_pnl"] = float(rt.get("daily_realized_pnl", 0) or 0.0) + float(pnl_usdt_snapshot)
                                 except Exception:
                                     pass
+                                # ✅ 당일 통계(거래수/승패) 업데이트 (fail-safe profit guard용)
+                                try:
+                                    rt["daily_trade_count"] = int(rt.get("daily_trade_count", 0) or 0) + 1
+                                    if float(pnl_usdt_snapshot) > 0:
+                                        rt["daily_win_count"] = int(rt.get("daily_win_count", 0) or 0) + 1
+                                    elif float(pnl_usdt_snapshot) < 0:
+                                        rt["daily_loss_count"] = int(rt.get("daily_loss_count", 0) or 0) + 1
+                                except Exception:
+                                    pass
 
                                 if is_loss:
                                     rt["consec_losses"] = int(rt.get("consec_losses", 0) or 0) + 1
@@ -10492,6 +10628,14 @@ def telegram_thread(ex):
                                                 cfg=cfg,
                                             )
                                             mon_add_event(mon, "AUTO_TRADE_OFF", "", "daily_loss_limit", {"day_pnl": day_pnl, "day_pct": day_pct})
+                                except Exception:
+                                    pass
+
+                                # ✅ Fail-safe(요구): 수익 못 내거나 큰 손실이면 자동매매 OFF
+                                try:
+                                    w = "EXIT_PROTECT" if bool(is_protect) else "EXIT_SL"
+                                    if maybe_trigger_fail_safe(cfg, rt, float(total_after), mon=mon, where=w):
+                                        entry_allowed_global = False
                                 except Exception:
                                     pass
 
@@ -10734,6 +10878,15 @@ def telegram_thread(ex):
                                     rt["daily_realized_pnl"] = float(rt.get("daily_realized_pnl", 0) or 0.0) + float(pnl_usdt_snapshot)
                                 except Exception:
                                     pass
+                                # ✅ 당일 통계(거래수/승패) 업데이트 (fail-safe profit guard용)
+                                try:
+                                    rt["daily_trade_count"] = int(rt.get("daily_trade_count", 0) or 0) + 1
+                                    if float(pnl_usdt_snapshot) > 0:
+                                        rt["daily_win_count"] = int(rt.get("daily_win_count", 0) or 0) + 1
+                                    elif float(pnl_usdt_snapshot) < 0:
+                                        rt["daily_loss_count"] = int(rt.get("daily_loss_count", 0) or 0) + 1
+                                except Exception:
+                                    pass
 
                                 if is_loss_take:
                                     rt["consec_losses"] = int(rt.get("consec_losses", 0) or 0) + 1
@@ -10791,6 +10944,13 @@ def telegram_thread(ex):
                                                 cfg=cfg,
                                             )
                                             mon_add_event(mon, "AUTO_TRADE_OFF", "", "daily_loss_limit", {"day_pnl": day_pnl, "day_pct": day_pct})
+                                except Exception:
+                                    pass
+
+                                # ✅ Fail-safe(요구): 수익 못 내거나 큰 손실이면 자동매매 OFF
+                                try:
+                                    if maybe_trigger_fail_safe(cfg, rt, float(total_after), mon=mon, where="EXIT_TP"):
+                                        entry_allowed_global = False
                                 except Exception:
                                     pass
 
@@ -10921,6 +11081,13 @@ def telegram_thread(ex):
                             entry_allowed_global = False
                             free_usdt = 0.0
                             total_usdt = 0.0
+                        # ✅ Fail-safe 체크(잔고 기반): 즉시 신규진입 차단
+                        if entry_allowed_global and float(total_usdt or 0.0) > 0:
+                            if maybe_trigger_fail_safe(cfg, rt, float(total_usdt), mon=mon, where="BALANCE"):
+                                entry_allowed_global = False
+                                trade_enabled = False
+                                free_usdt = 0.0
+                                total_usdt = 0.0
 
                     # ✅ 잔고 조회에서 timeout이 발생했다면, 스캔 전에 인스턴스 교체(동시 호출 꼬임 방지)
                     if need_exchange_refresh:
@@ -13003,6 +13170,40 @@ with st.sidebar.expander("진입 사이징/레버(고정/ATR/리스크캡/Kelly)
     t1, t2 = st.columns(2)
     config["time_exit_bars"] = t1.number_input("N봉 경과", 1, 200, int(config.get("time_exit_bars", 12) or 12), step=1)
     config["time_exit_target_frac"] = t2.number_input("목표의 X%", 0.05, 0.95, float(config.get("time_exit_target_frac", 0.5) or 0.5), step=0.05)
+
+with st.sidebar.expander("Fail-safe(자동매매 강제 종료)"):
+    config["fail_safe_enable"] = st.checkbox("Fail-safe 사용", value=bool(config.get("fail_safe_enable", True)))
+    st.caption("수익을 '보장'할 수는 없어서, 손실 확대/과매매를 막는 안전장치로 자동매매를 강제 OFF합니다.")
+    st.divider()
+    config["fail_safe_drawdown_enable"] = st.checkbox("드로다운 제한(피크 대비)", value=bool(config.get("fail_safe_drawdown_enable", True)))
+    config["fail_safe_drawdown_from_peak_pct"] = st.number_input(
+        "피크 대비 손실(%)",
+        5.0,
+        99.0,
+        float(config.get("fail_safe_drawdown_from_peak_pct", 30.0) or 30.0),
+        step=1.0,
+        help="예: 30이면, 오늘 최고 자산(피크) 대비 -30% 이상 내려가면 자동매매를 끕니다.",
+    )
+    st.divider()
+    config["fail_safe_profit_guard_enable"] = st.checkbox("수익 가드(거래 후 수익 없으면 OFF)", value=bool(config.get("fail_safe_profit_guard_enable", False)))
+    pg1, pg2 = st.columns(2)
+    config["fail_safe_profit_guard_min_trades"] = pg1.number_input(
+        "최소 거래수",
+        1,
+        200,
+        int(config.get("fail_safe_profit_guard_min_trades", 10) or 10),
+        step=1,
+        help="이 거래 수 이상 진행한 뒤에도 수익이 없으면 자동매매를 끕니다.",
+    )
+    config["fail_safe_profit_guard_min_pnl_usdt"] = pg2.number_input(
+        "최소 실현손익(USDT)",
+        -1000000.0,
+        1000000.0,
+        float(config.get("fail_safe_profit_guard_min_pnl_usdt", 0.0) or 0.0),
+        step=1.0,
+        help="0이면 '수익(+)이 아닌 경우' OFF. -50이면 -50 USDT 이하이면 OFF.",
+    )
+
 with st.sidebar.expander("추가 방어(서킷브레이커/일일 손실 한도)"):
     config["circuit_breaker_enable"] = st.checkbox("서킷브레이커 사용(연속 손실 시 자동매매 OFF)", value=bool(config.get("circuit_breaker_enable", True)))
     config["circuit_breaker_after"] = st.number_input("연속 손실 N번 → OFF", 3, 50, int(config.get("circuit_breaker_after", 12)), step=1)
