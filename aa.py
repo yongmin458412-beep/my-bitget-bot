@@ -12045,7 +12045,27 @@ def telegram_thread(ex):
                                 pass
 
                             ok, err_order = market_order_safe_ex(ex, sym, decision, qty)
-                            if ok:
+                            if not ok:
+                                try:
+                                    msg0 = f"주문 실패: {str(err_order or '')}".strip()
+                                    if len(msg0) > 160:
+                                        msg0 = msg0[:160] + "..."
+                                    cs["skip_reason"] = msg0
+                                    mon_add_scan(
+                                        mon,
+                                        stage="trade_skipped",
+                                        symbol=sym,
+                                        tf=str(cfg.get("timeframe", "5m")),
+                                        signal=str(decision),
+                                        score=conf,
+                                        message=msg0,
+                                        extra={"qty": qty, "entry_usdt": entry_usdt, "lev": lev, "style": style},
+                                    )
+                                    mon_add_event(mon, "ORDER_FAIL", sym, "ENTRY 주문 실패", {"err": str(err_order or ""), "qty": qty, "entry_usdt": entry_usdt, "lev": lev, "style": style})
+                                except Exception:
+                                    pass
+                                continue
+                            else:
                                 trade_id = uuid.uuid4().hex[:10]
                                 mon_add_scan(
                                     mon,
@@ -12065,25 +12085,6 @@ def telegram_thread(ex):
                                         message=f"{decision} style={style} conf={conf}",
                                         payload={"qty": qty, "entry_usdt": entry_usdt, "lev": lev, "style": style, "tp": tpp, "sl": slp},
                                     )
-                                except Exception:
-                                    pass
-                            else:
-                                try:
-                                    msg0 = f"주문 실패: {str(err_order or '')}".strip()
-                                    if len(msg0) > 160:
-                                        msg0 = msg0[:160] + "..."
-                                    cs["skip_reason"] = msg0
-                                    mon_add_scan(
-                                        mon,
-                                        stage="trade_skipped",
-                                        symbol=sym,
-                                        tf=str(cfg.get("timeframe", "5m")),
-                                        signal=str(decision),
-                                        score=conf,
-                                        message=msg0,
-                                        extra={"qty": qty, "entry_usdt": entry_usdt, "lev": lev, "style": style},
-                                    )
-                                    mon_add_event(mon, "ORDER_FAIL", sym, "ENTRY 주문 실패", {"err": str(err_order or ""), "qty": qty, "entry_usdt": entry_usdt, "lev": lev, "style": style})
                                 except Exception:
                                     pass
 
