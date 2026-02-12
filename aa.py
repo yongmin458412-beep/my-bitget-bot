@@ -570,7 +570,7 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 6,
+        "settings_schema_version": 7,
         "openai_api_key": "",
         # ✅ 사용자 기본값 프리셋(요청): 하이리스크/하이리턴 + 자동매매 ON
         "auto_trade": True,
@@ -636,15 +636,39 @@ def default_settings() -> Dict[str, Any]:
         "exit_trailing_protect_partial_close_pct": 50.0,      # 부분청산 비율(%)
         "exit_trailing_protect_trail_start_roi": 50.0,        # 3단계: +50% 이후부터 추적손절 활성
         "exit_trailing_protect_trail_dd_roi": 10.0,           # 최고점 대비 -10%면 전량 청산
+        # ✅ Time-based Exit(요구): 진입 후 일정 시간이 지났는데 "목표 수익의 X%"도 못 가면 기회비용 정리
+        # - AI 재호출 없이 룰 기반으로만 종료(비용 절감)
+        "time_exit_enable": True,
+        "time_exit_bars": 12,            # 5m 기준 12 bars = 1시간
+        "time_exit_target_frac": 0.5,    # 목표 수익의 50% 미만이면 정리
 
         # ✅ 진입 고정(요구사항): 레버 20배 고정 + 잔고 20% 진입
         # - 기존 모드/AI의 entry_pct/leverage 출력은 "표시용"으로만 남기고, 실제 주문은 아래 값을 사용
-        "fixed_leverage_enable": True,
+        "fixed_leverage_enable": False,
         "fixed_leverage": 20,
-        "fixed_entry_pct_enable": True,
+        "fixed_entry_pct_enable": False,
         "fixed_entry_pct": 20.0,
         # cross/isolated 선택(거래소/계정 설정에 따라 실패할 수 있으니 safe 적용)
         "margin_mode": "cross",  # "cross"|"isolated"
+        # ✅ ATR 기반 레버리지(요구): 변동성이 크면 레버↓, 변동성이 작으면 레버↑
+        # - fixed_leverage_enable=OFF일 때만 적용
+        "atr_leverage_enable": True,
+        "atr_leverage_window": 14,
+        # atr_price_pct(%)가 low 이하이면 max_lev, high 이상이면 min_lev (사이 구간은 선형 보간)
+        "atr_leverage_low_pct": 0.35,
+        "atr_leverage_high_pct": 1.20,
+        "atr_leverage_min": 5,
+        "atr_leverage_max": 20,
+        # ✅ 포지션 사이징 보호(요구): 한 번의 거래에서 잃는 돈을 전체 시드의 2~3% 이내로 제한
+        # - 손절(ROI%) 기준으로 "진입금(마진)"을 자동 감산한다.
+        "max_risk_per_trade_enable": True,
+        "max_risk_per_trade_pct": 2.5,
+        "max_risk_per_trade_usdt": 0.0,
+        # ✅ (선택) Kelly sizing: AI confidence(확신도) + 손익비(rr)로 entry_pct 상한을 계산(기본 OFF)
+        # - 과대진입을 줄이는 용도로만 사용(기본은 min(AI entry_pct, Kelly cap))
+        "kelly_sizing_enable": False,
+        "kelly_fraction_mult": 0.5,   # half-kelly 권장
+        "kelly_max_entry_pct": 20.0,  # Kelly cap 상한(% of free)
 
         # ✅ 손절(ROI) 확인(휩쏘 방지):
         # - SR(지지/저항) 가격 이탈 손절은 즉시 실행
@@ -689,6 +713,15 @@ def default_settings() -> Dict[str, Any]:
         # - 자동 스캔에서 AI는 "같은 봉(단기 TF)에서는 1회만" 호출하고, 이후에는 캐시를 재사용한다.
         # - (강제스캔 /scan 은 예외)
         "ai_scan_once_per_bar": True,
+        # ✅ 진입 필터 강화(요구): 거래량(스파이크) + 이격도(Disparity) 조건
+        # - 횡보 박스(거래량 없음)에서 RSI 해소만 보고 진입하는 실수를 줄이기 위해 AI 호출 자체를 제한한다.
+        # - /scan 강제스캔은 이 필터를 우회(사용자 의도)한다.
+        "ai_call_require_volume_spike": True,
+        "ai_call_volume_spike_mul": 1.5,
+        "ai_call_volume_spike_period": 20,
+        "ai_call_require_disparity": True,
+        "ai_call_disparity_ma_period": 20,
+        "ai_call_disparity_max_abs_pct": 4.0,
 
         # 🌍 외부 시황 통합
         "use_external_context": True,
@@ -964,6 +997,18 @@ def load_settings() -> Dict[str, Any]:
         if saved_ver < 6:
             try:
                 cfg["tg_trade_alert_to_admin"] = False
+                changed = True
+            except Exception:
+                pass
+        # v7: 고정 레버/고정 진입비중 기본 OFF (ATR 레버/리스크 캡 기반으로 유연화)
+        if saved_ver < 7:
+            try:
+                cfg["fixed_leverage_enable"] = False
+                changed = True
+            except Exception:
+                pass
+            try:
+                cfg["fixed_entry_pct_enable"] = False
                 changed = True
             except Exception:
                 pass
@@ -10170,6 +10215,36 @@ def telegram_thread(ex):
                             except Exception:
                                 hard_take = False
 
+                        # ✅ Time-based Exit(요구): 일정 시간(봉 수) 안에 목표 수익의 일부도 못 가면 정리(기회비용)
+                        try:
+                            if (not hard_take) and bool(cfg.get("time_exit_enable", True)):
+                                bars_need = max(1, int(cfg.get("time_exit_bars", 12) or 12))
+                                frac_need = float(cfg.get("time_exit_target_frac", 0.5) or 0.5)
+                                frac_need = float(clamp(frac_need, 0.05, 0.95))
+                                entry_ep = float(tgt.get("entry_epoch", 0) or 0.0)
+                                if entry_ep > 0:
+                                    tf_sec = int(_timeframe_seconds(str(cfg.get("timeframe", "5m")), 300))
+                                    if (time.time() - float(entry_ep)) >= float(bars_need) * float(tf_sec):
+                                        # 목표수익(ROI%) 기준: tgt["tp"] 우선, 없으면 forced 정책의 part_roi를 사용
+                                        tp_target = _as_float(tgt.get("tp", 0.0), 0.0)
+                                        if tp_target <= 0:
+                                            tp_target = _as_float(cfg.get("exit_trailing_protect_partial_roi", 30.0), 30.0)
+                                        # forced_exit에서는 part_roi(30%)를 기준으로 너무 큰 목표를 방지(시간초과 과잉 종료 방지)
+                                        try:
+                                            if bool(forced_exit):
+                                                tp_target = float(min(tp_target, _as_float(cfg.get("exit_trailing_protect_partial_roi", 30.0), 30.0)))
+                                        except Exception:
+                                            pass
+                                        thr = float(tp_target) * float(frac_need)
+                                        if float(roi) < float(thr):
+                                            tgt["force_take_reason"] = "시간초과 정리"
+                                            tgt["force_take_detail"] = f"{bars_need}봉(≈{int((bars_need*tf_sec)/60)}분) 경과, 목표의 {int(frac_need*100)}%({thr:.1f}%) 미만"
+                                            tgt["time_exit_hit"] = True
+                                            tgt["time_exit_kst"] = now_kst_str()
+                                            hard_take = True
+                        except Exception:
+                            pass
+
                         # ✅ ROI 손절은 "확인 n회"로 한 번 더 생각(휩쏘 방지)
                         roi_stop_hit = bool(float(roi) <= -abs(float(sl)))
                         roi_stop_confirmed = roi_stop_hit
@@ -11049,6 +11124,66 @@ def telegram_thread(ex):
                             if adxv >= 25:
                                 call_ai = True
 
+                        # ✅ 추가 필터(요구): 거래량 스파이크 + 이격도(Disparity) 체크
+                        # - call_ai=True라도, 조건을 만족하지 않으면 AI 호출을 막아 비용/휩쏘 진입을 줄인다.
+                        # - /scan 강제스캔은 아래 forced_ai에서 우회한다.
+                        filter_msgs: List[str] = []
+                        vol_ratio: Optional[float] = None
+                        disparity_pct: Optional[float] = None
+                        try:
+                            if call_ai and bool(cfg.get("ai_call_require_volume_spike", True)):
+                                per = max(5, int(cfg.get("ai_call_volume_spike_period", 20) or 20))
+                                mul = float(cfg.get("ai_call_volume_spike_mul", 1.5) or 1.5)
+                                try:
+                                    vv = df["vol"].astype(float)
+                                    if len(vv) >= per + 1:
+                                        v_now = float(vv.iloc[-1])
+                                        v_ma = float(vv.iloc[-(per + 1):-1].mean())
+                                        if v_ma > 0:
+                                            vol_ratio = float(v_now / v_ma)
+                                            if float(vol_ratio) < float(mul):
+                                                filter_msgs.append(f"거래량 부족({vol_ratio:.2f}x < {mul:.2f}x)")
+                                except Exception:
+                                    pass
+
+                            if call_ai and bool(cfg.get("ai_call_require_disparity", True)):
+                                ma_p = max(5, int(cfg.get("ai_call_disparity_ma_period", 20) or 20))
+                                max_abs = float(cfg.get("ai_call_disparity_max_abs_pct", 4.0) or 4.0)
+                                try:
+                                    cc = df["close"].astype(float)
+                                    if len(cc) >= ma_p:
+                                        ma = float(cc.rolling(ma_p).mean().iloc[-1])
+                                        if ma > 0:
+                                            px_now = float(cc.iloc[-1])
+                                            disparity_pct = float((px_now - ma) / ma * 100.0)
+                                            if abs(float(disparity_pct)) > float(max_abs):
+                                                filter_msgs.append(f"이격도 과다({abs(disparity_pct):.1f}% > {max_abs:.1f}%)")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        if call_ai:
+                            try:
+                                mon_add_scan(
+                                    mon,
+                                    stage="rule_filter",
+                                    symbol=sym,
+                                    tf=str(cfg.get("timeframe", "5m")),
+                                    signal="vol/disparity",
+                                    score="",
+                                    message="PASS" if not filter_msgs else ("BLOCK: " + " / ".join(filter_msgs))[:180],
+                                    extra={"vol_ratio": vol_ratio, "disparity_pct": disparity_pct},
+                                )
+                            except Exception:
+                                pass
+                        if call_ai and filter_msgs:
+                            call_ai = False
+                            try:
+                                cs["skip_reason"] = " / ".join(filter_msgs)[:160]
+                            except Exception:
+                                pass
+
                         # ✅ /scan 강제스캔: 원래 call_ai=False인 경우에만 AI를 "추가로" 호출(주문은 막기 위해 플래그 보관)
                         forced_ai = False
                         try:
@@ -11312,6 +11447,44 @@ def telegram_thread(ex):
 
                             # 스타일별 envelope + 리스크가드레일
                             ai2 = apply_style_envelope(ai, style, cfg, rule)
+                            # ✅ ATR 기반 레버리지(요구): 변동성이 크면 레버↓(손절/익절 가격폭 일관성을 위해, risk_guardrail 이전에 결정)
+                            try:
+                                if (not bool(cfg.get("fixed_leverage_enable", False))) and bool(cfg.get("atr_leverage_enable", True)):
+                                    w = int(cfg.get("atr_leverage_window", 14) or 14)
+                                    atr_pct = float(_atr_price_pct(df, max(7, w)))
+                                    lo_pct = float(cfg.get("atr_leverage_low_pct", 0.35) or 0.35)
+                                    hi_pct = float(cfg.get("atr_leverage_high_pct", 1.20) or 1.20)
+                                    min_lev_cfg = int(cfg.get("atr_leverage_min", 5) or 5)
+                                    max_lev_cfg = int(cfg.get("atr_leverage_max", 20) or 20)
+
+                                    # 모드/스타일 상한 반영
+                                    lev_min_allowed = int(rule.get("lev_min", 1) or 1)
+                                    lev_max_allowed = int(rule.get("lev_max", max_lev_cfg) or max_lev_cfg)
+                                    try:
+                                        if str(style) == "스캘핑":
+                                            lev_max_allowed = min(lev_max_allowed, int(cfg.get("scalp_lev_cap", lev_max_allowed) or lev_max_allowed))
+                                        elif str(style) == "스윙":
+                                            lev_max_allowed = min(lev_max_allowed, int(cfg.get("swing_lev_cap", lev_max_allowed) or lev_max_allowed))
+                                    except Exception:
+                                        pass
+                                    lev_min_allowed = max(1, lev_min_allowed, int(min_lev_cfg))
+                                    lev_max_allowed = max(lev_min_allowed, min(int(max_lev_cfg), lev_max_allowed))
+
+                                    lev_atr = float(lev_max_allowed)
+                                    if atr_pct > 0 and hi_pct > lo_pct:
+                                        if atr_pct <= lo_pct:
+                                            lev_atr = float(lev_max_allowed)
+                                        elif atr_pct >= hi_pct:
+                                            lev_atr = float(lev_min_allowed)
+                                        else:
+                                            t = float((atr_pct - lo_pct) / (hi_pct - lo_pct))
+                                            lev_atr = float(lev_max_allowed - t * (lev_max_allowed - lev_min_allowed))
+                                    lev_atr_i = int(clamp(int(round(lev_atr)), lev_min_allowed, lev_max_allowed))
+                                    ai2["leverage"] = int(lev_atr_i)
+                                    ai2["leverage_source"] = "ATR"
+                                    ai2["atr_price_pct"] = float(atr_pct)
+                            except Exception:
+                                pass
                             # ✅ 요구: 스윙만 외부시황 반영(스캘핑=차트만)
                             ext_for_risk = ext if str(style) == "스윙" else {"enabled": False}
                             ai2 = _risk_guardrail(ai2, df, decision, mode, style, ext_for_risk)
@@ -11325,22 +11498,86 @@ def telegram_thread(ex):
                             tpp = float(ai2.get("tp_pct", 3.0))
 
                             # ✅ 요구사항: 레버 20배 고정 + 잔고 20% 진입(고정값 우선)
+                            entry_pct_src = "AI"
+                            lev_src = "AI"
                             try:
                                 if bool(cfg.get("fixed_entry_pct_enable", False)):
                                     entry_pct = float(cfg.get("fixed_entry_pct", 20.0) or 20.0)
                                     ai2["entry_pct"] = float(entry_pct)
+                                    entry_pct_src = "FIXED"
                             except Exception:
                                 pass
                             try:
                                 if bool(cfg.get("fixed_leverage_enable", False)):
                                     lev = int(cfg.get("fixed_leverage", 20) or 20)
                                     ai2["leverage"] = int(lev)
+                                    lev_src = "FIXED"
                             except Exception:
                                 pass
+
+                            # ✅ Kelly sizing(선택): AI entry_pct가 과대할 때만 상한으로 눌러준다(half-kelly)
+                            kelly_cap_pct: Optional[float] = None
+                            try:
+                                if (not bool(cfg.get("fixed_entry_pct_enable", False))) and bool(cfg.get("kelly_sizing_enable", False)):
+                                    rr0 = float(_as_float(ai2.get("rr", 0.0), 0.0))
+                                    p0 = float(clamp(float(conf) / 100.0, 0.05, 0.95))
+                                    if rr0 > 0:
+                                        f_star = p0 - ((1.0 - p0) / float(rr0))
+                                    else:
+                                        f_star = 0.0
+                                    f_star = float(clamp(float(f_star), 0.0, 1.0))
+                                    mult = float(cfg.get("kelly_fraction_mult", 0.5) or 0.5)
+                                    f_use = float(clamp(float(f_star) * float(mult), 0.0, 1.0))
+                                    cap_max = float(cfg.get("kelly_max_entry_pct", 20.0) or 20.0)
+                                    kelly_cap_pct = float(clamp(float(f_use) * 100.0, 0.0, max(0.0, cap_max)))
+                                    if kelly_cap_pct > 0:
+                                        entry_pct = float(min(float(entry_pct), float(kelly_cap_pct)))
+                                        ai2["entry_pct"] = float(entry_pct)
+                                        ai2["entry_pct_kelly_cap"] = float(kelly_cap_pct)
+                                        entry_pct_src = f"{entry_pct_src}+KELLY"
+                            except Exception:
+                                kelly_cap_pct = None
 
                             # ✅ 외부시황 위험 감산은 스윙에서만 적용
                             entry_risk_mul = float(risk_mul) if str(style) == "스윙" else 1.0
                             entry_usdt = free_usdt * (entry_pct / 100.0) * entry_risk_mul
+
+                            # ✅ Max Risk Per Trade(요구): 손절(ROI%) 기준으로 1회 최대 손실을 2~3%로 제한
+                            try:
+                                if bool(cfg.get("max_risk_per_trade_enable", True)):
+                                    # forced exit(수익보존) 정책이면 실제 손절은 고정(-15%)이므로 그 기준을 우선 사용
+                                    sl_for_risk = float(abs(float(slp)))
+                                    try:
+                                        if bool(cfg.get("exit_trailing_protect_enable", False)):
+                                            sl_forced = float(cfg.get("exit_trailing_protect_sl_roi", 15.0) or 15.0)
+                                            sl_for_risk = float(max(sl_for_risk, abs(sl_forced)))
+                                    except Exception:
+                                        pass
+                                    # max loss 계산(퍼센트/USDT 중 더 엄격한 쪽)
+                                    base_eq = float(total_usdt) if float(total_usdt) > 0 else float(free_usdt)
+                                    lim_pct = float(cfg.get("max_risk_per_trade_pct", 2.5) or 0.0)
+                                    lim_usdt = float(cfg.get("max_risk_per_trade_usdt", 0.0) or 0.0)
+                                    max_loss_pct = (base_eq * abs(lim_pct) / 100.0) if lim_pct > 0 else float("inf")
+                                    max_loss_abs = abs(lim_usdt) if lim_usdt > 0 else float("inf")
+                                    max_loss = float(min(max_loss_pct, max_loss_abs))
+                                    if sl_for_risk > 0 and max_loss != float("inf") and entry_usdt > 0:
+                                        risk_now = float(entry_usdt * (sl_for_risk / 100.0))
+                                        if risk_now > max_loss:
+                                            entry_usdt_cap = float(max_loss * 100.0 / sl_for_risk)
+                                            entry_usdt = float(min(entry_usdt, entry_usdt_cap))
+                                            ai2["entry_usdt_risk_cap"] = float(entry_usdt)
+                                            ai2["risk_cap_usdt"] = float(max_loss)
+                                            ai2["risk_sl_for_risk"] = float(sl_for_risk)
+                            except Exception:
+                                pass
+
+                            # entry_pct는 최종 entry_usdt 기준으로 다시 계산(표시/일지 일관성)
+                            try:
+                                if free_usdt > 0:
+                                    entry_pct = float((float(entry_usdt) / float(free_usdt)) * 100.0)
+                                    ai2["entry_pct"] = float(entry_pct)
+                            except Exception:
+                                pass
                             if entry_usdt < 5:
                                 cs["skip_reason"] = "잔고 부족(진입금 너무 작음)"
                                 continue
@@ -12544,6 +12781,24 @@ config["ai_scan_once_per_bar"] = st.sidebar.checkbox(
     value=bool(config.get("ai_scan_once_per_bar", True)),
     help="자동 스캔에서 같은 봉(단기 TF)에서는 AI를 다시 부르지 않고 마지막 결과를 재사용합니다. /scan은 예외입니다.",
 )
+with st.sidebar.expander("진입 전 AI 호출 필터(거래량/이격도)"):
+    config["ai_call_require_volume_spike"] = st.checkbox(
+        "거래량 스파이크 없으면 AI 호출 안함",
+        value=bool(config.get("ai_call_require_volume_spike", True)),
+        help="현재 봉 거래량이 최근 평균보다 충분히 커야만 AI를 호출합니다(박스권/힘 없는 해소 진입 방지).",
+    )
+    v1, v2 = st.columns(2)
+    config["ai_call_volume_spike_mul"] = v1.number_input("스파이크 배수", 1.0, 10.0, float(config.get("ai_call_volume_spike_mul", 1.5) or 1.5), step=0.1)
+    config["ai_call_volume_spike_period"] = v2.number_input("평균 기간", 5, 120, int(config.get("ai_call_volume_spike_period", 20) or 20), step=1)
+    st.divider()
+    config["ai_call_require_disparity"] = st.checkbox(
+        "이격도 과하면 AI 호출 안함",
+        value=bool(config.get("ai_call_require_disparity", True)),
+        help="가격이 MA(기본 20)에서 너무 멀면(과열/급락) 눌림목이 아니라 추세 꺾임일 수 있어 AI 호출을 막습니다.",
+    )
+    d1, d2 = st.columns(2)
+    config["ai_call_disparity_max_abs_pct"] = d1.number_input("최대 |이격도|%", 0.5, 30.0, float(config.get("ai_call_disparity_max_abs_pct", 4.0) or 4.0), step=0.5)
+    config["ai_call_disparity_ma_period"] = d2.number_input("이격도 MA 기간", 5, 120, int(config.get("ai_call_disparity_ma_period", 20) or 20), step=1)
 
 st.sidebar.subheader("⏱️ 주기 리포트")
 config["tg_enable_heartbeat_report"] = st.sidebar.checkbox(
@@ -12706,6 +12961,48 @@ config["loss_pause_enable"] = st.sidebar.checkbox("연속손실 보호(자동 �
 c1, c2 = st.sidebar.columns(2)
 config["loss_pause_after"] = c1.number_input("연속손실 N회", 1, 20, int(config.get("loss_pause_after", 3)))
 config["loss_pause_minutes"] = c2.number_input("정지(분)", 1, 240, int(config.get("loss_pause_minutes", 30)))
+with st.sidebar.expander("진입 사이징/레버(고정/ATR/리스크캡/Kelly)"):
+    config["margin_mode"] = st.selectbox(
+        "마진 모드",
+        ["cross", "isolated"],
+        index=["cross", "isolated"].index(str(config.get("margin_mode", "cross") or "cross")) if str(config.get("margin_mode", "cross") or "cross") in ["cross", "isolated"] else 0,
+        help="계정/마켓 설정에 따라 실패할 수 있습니다. 실패해도 봇은 죽지 않고 주문만 시도합니다.",
+    )
+    st.divider()
+    c_fx1, c_fx2 = st.columns(2)
+    config["fixed_entry_pct_enable"] = c_fx1.checkbox("진입비중 고정", value=bool(config.get("fixed_entry_pct_enable", False)))
+    config["fixed_leverage_enable"] = c_fx2.checkbox("레버 고정", value=bool(config.get("fixed_leverage_enable", False)))
+    c_fx3, c_fx4 = st.columns(2)
+    config["fixed_entry_pct"] = c_fx3.number_input("고정 진입비중(%)", 1.0, 100.0, float(config.get("fixed_entry_pct", 20.0) or 20.0), step=1.0)
+    config["fixed_leverage"] = c_fx4.number_input("고정 레버", 1, 125, int(config.get("fixed_leverage", 20) or 20), step=1)
+    st.caption("※ 고정이 ON이면 AI/ATR 출력은 '표시용'이고, 실제 주문은 고정값으로 들어갑니다.")
+    st.divider()
+    config["atr_leverage_enable"] = st.checkbox("ATR 기반 레버리지(권장)", value=bool(config.get("atr_leverage_enable", True)))
+    a1, a2, a3 = st.columns(3)
+    config["atr_leverage_low_pct"] = a1.number_input("ATR low(%)", 0.05, 10.0, float(config.get("atr_leverage_low_pct", 0.35) or 0.35), step=0.05)
+    config["atr_leverage_high_pct"] = a2.number_input("ATR high(%)", 0.1, 30.0, float(config.get("atr_leverage_high_pct", 1.20) or 1.20), step=0.1)
+    config["atr_leverage_window"] = a3.number_input("ATR 기간", 7, 50, int(config.get("atr_leverage_window", 14) or 14), step=1)
+    a4, a5 = st.columns(2)
+    config["atr_leverage_min"] = a4.number_input("ATR 최소 레버", 1, 125, int(config.get("atr_leverage_min", 5) or 5), step=1)
+    config["atr_leverage_max"] = a5.number_input("ATR 최대 레버", 1, 125, int(config.get("atr_leverage_max", 20) or 20), step=1)
+    st.caption("※ ATR%가 커질수록 레버리지를 낮추고, ATR%가 작을수록 높입니다.")
+    st.divider()
+    config["max_risk_per_trade_enable"] = st.checkbox("1회 최대손실 제한(권장)", value=bool(config.get("max_risk_per_trade_enable", True)))
+    r1, r2 = st.columns(2)
+    config["max_risk_per_trade_pct"] = r1.number_input("최대손실(%)", 0.1, 20.0, float(config.get("max_risk_per_trade_pct", 2.5) or 2.5), step=0.1)
+    config["max_risk_per_trade_usdt"] = r2.number_input("최대손실(USDT)", 0.0, 100000000.0, float(config.get("max_risk_per_trade_usdt", 0.0) or 0.0), step=10.0)
+    st.caption("※ 퍼센트/USDT 중 더 엄격한 기준으로 '진입금(마진)'을 자동 감산합니다.")
+    st.divider()
+    config["kelly_sizing_enable"] = st.checkbox("Kelly cap(선택)", value=bool(config.get("kelly_sizing_enable", False)))
+    k1, k2 = st.columns(2)
+    config["kelly_fraction_mult"] = k1.number_input("Kelly 배수(half=0.5)", 0.05, 1.0, float(config.get("kelly_fraction_mult", 0.5) or 0.5), step=0.05)
+    config["kelly_max_entry_pct"] = k2.number_input("Kelly 상한(%)", 1.0, 100.0, float(config.get("kelly_max_entry_pct", 20.0) or 20.0), step=1.0)
+    st.caption("※ 현재는 AI 확신도(confidence)를 승률(p)로 근사합니다. (보수적으로 cap로만 사용)")
+    st.divider()
+    config["time_exit_enable"] = st.checkbox("시간초과 정리(기회비용)", value=bool(config.get("time_exit_enable", True)))
+    t1, t2 = st.columns(2)
+    config["time_exit_bars"] = t1.number_input("N봉 경과", 1, 200, int(config.get("time_exit_bars", 12) or 12), step=1)
+    config["time_exit_target_frac"] = t2.number_input("목표의 X%", 0.05, 0.95, float(config.get("time_exit_target_frac", 0.5) or 0.5), step=0.05)
 with st.sidebar.expander("추가 방어(서킷브레이커/일일 손실 한도)"):
     config["circuit_breaker_enable"] = st.checkbox("서킷브레이커 사용(연속 손실 시 자동매매 OFF)", value=bool(config.get("circuit_breaker_enable", True)))
     config["circuit_breaker_after"] = st.number_input("연속 손실 N번 → OFF", 3, 50, int(config.get("circuit_breaker_after", 12)), step=1)
