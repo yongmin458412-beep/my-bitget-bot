@@ -558,9 +558,9 @@ MODE_RULES = {
     # - 안전모드: 진입비중↓, 레버↓, 확신도↑일 때만 진입
     # - 공격모드: 진입비중/레버 "중간", 확신도 "중간"이어도 진입
     # - 하이리스크/하이리턴: 진입비중↑, 레버↑, 확신도↑일 때만 진입
-    "안전모드": {"min_conf": 88, "entry_pct_min": 2, "entry_pct_max": 7, "lev_min": 2, "lev_max": 6},
-    "공격모드": {"min_conf": 80, "entry_pct_min": 7, "entry_pct_max": 22, "lev_min": 4, "lev_max": 12},
-    "하이리스크/하이리턴": {"min_conf": 88, "entry_pct_min": 18, "entry_pct_max": 40, "lev_min": 12, "lev_max": 25},
+    "안전모드": {"min_conf": 85, "entry_pct_min": 2, "entry_pct_max": 7, "lev_min": 2, "lev_max": 6},
+    "공격모드": {"min_conf": 75, "entry_pct_min": 7, "entry_pct_max": 22, "lev_min": 4, "lev_max": 12},
+    "하이리스크/하이리턴": {"min_conf": 72, "entry_pct_min": 18, "entry_pct_max": 40, "lev_min": 12, "lev_max": 25},
 }
 
 
@@ -631,11 +631,11 @@ def default_settings() -> Dict[str, Any]:
         # 강제 Exit 정책 사용 시 기본은 "포지션이 있을 때 신규 스캔/진입을 쉬고" 청산 모니터링에 집중한다.
         "exit_trailing_protect_pause_scan_while_in_position": False,
         "exit_trailing_protect_sl_roi": 15.0,                 # 기본 손절: -15%
-        "exit_trailing_protect_be_roi": 10.0,                 # 1단계: +10% → 본전(진입가) 보호
-        "exit_trailing_protect_partial_roi": 30.0,            # 2단계: +30% → 50% 익절(부분청산)
+        "exit_trailing_protect_be_roi": 8.0,                  # 1단계: +8% → 본전(진입가) 보호
+        "exit_trailing_protect_partial_roi": 40.0,            # 2단계: +40% → 50% 익절(부분청산)
         "exit_trailing_protect_partial_close_pct": 50.0,      # 부분청산 비율(%)
-        "exit_trailing_protect_trail_start_roi": 50.0,        # 3단계: +50% 이후부터 추적손절 활성
-        "exit_trailing_protect_trail_dd_roi": 10.0,           # 최고점 대비 -10%면 전량 청산
+        "exit_trailing_protect_trail_start_roi": 60.0,        # 3단계: +60% 이후부터 추적손절 활성
+        "exit_trailing_protect_trail_dd_roi": 12.0,           # 최고점 대비 -12%면 전량 청산
         # ✅ Time-based Exit(요구): 진입 후 일정 시간이 지났는데 "목표 수익의 X%"도 못 가면 기회비용 정리
         # - AI 재호출 없이 룰 기반으로만 종료(비용 절감)
         "time_exit_enable": True,
@@ -704,7 +704,7 @@ def default_settings() -> Dict[str, Any]:
         "no_trade_weekend": False,
 
         # 연속손실 보호
-        "loss_pause_enable": True, "loss_pause_after": 3, "loss_pause_minutes": 30,
+        "loss_pause_enable": True, "loss_pause_after": 5, "loss_pause_minutes": 15,
         # ✅ 추가 방어(사용자 선택): 서킷브레이커/일일 손실 한도
         # - loss_pause: "잠깐 쉼" (기존)
         # - circuit_breaker: "자동매매 OFF" (강제 정지)
@@ -727,20 +727,20 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 진입 필터 강화(요구): 거래량(스파이크) + 이격도(Disparity) 조건
         # - 횡보 박스(거래량 없음)에서 RSI 해소만 보고 진입하는 실수를 줄이기 위해 AI 호출 자체를 제한한다.
         # - /scan 강제스캔은 이 필터를 우회(사용자 의도)한다.
-        "ai_call_require_volume_spike": True,
-        "ai_call_volume_spike_mul": 1.5,
+        "ai_call_require_volume_spike": False,
+        "ai_call_volume_spike_mul": 1.3,
         "ai_call_volume_spike_period": 20,
-        "ai_call_require_disparity": True,
+        "ai_call_require_disparity": False,
         "ai_call_disparity_ma_period": 20,
-        "ai_call_disparity_max_abs_pct": 4.0,
+        "ai_call_disparity_max_abs_pct": 6.0,
         # ✅ 진입이 너무 안 되는 경우를 대비한 완화 옵션
-        # - 0이면 모드별 기본값(안전 25 / 공격 23 / 하이리스크 20)을 사용
+        # - 0이면 모드별 기본값(안전 20 / 공격 17 / 하이리스크 15)을 사용
         "ai_call_adx_threshold": 0,
         # - True면 volume/disparity 조건 미달 시 "AI 호출 자체"를 막음(비용↓, 보수↑)
         # - False면 AI는 호출하되(캐시/봉당 1회), 결과에 따라 entry를 줄이거나 hold를 기대(진입 기회↑)
         "ai_call_filters_block_ai": False,
         # ✅ AI가 buy/sell을 유지할 수 있는 최소 확신 바닥값(그 이하면 강제 hold)
-        "ai_decision_min_conf_floor": 60,
+        "ai_decision_min_conf_floor": 55,
 
         # 🌍 외부 시황 통합
         "use_external_context": True,
@@ -784,19 +784,19 @@ def default_settings() -> Dict[str, Any]:
         "max_open_positions_total": 5,
         "max_open_positions_low_conf": 2,
         # "낮은 확신" 기준(%) - 이 값 미만이면 low-conf로 카운트
-        # - 기본: 92 (하이리스크/하이리턴 min_conf=88 기준, 88~91을 low로 보고 2개까지만 허용)
-        "low_conf_position_threshold": 92,
+        # - 기본: 80 (하이리스크/하이리턴 min_conf=72 기준, 72~79를 low로 보고 2개까지만 허용)
+        "low_conf_position_threshold": 80,
         # ✅ 확신/시그널/필터에 따라 진입 비중 자동 조절(완화)
         "entry_size_scale_by_signal_enable": True,
         # ✅ 소프트 진입(요구): 확신도가 min_conf에 살짝 못 미쳐도, 아주 작게/보수적으로 진입해 기회를 만든다.
         # - 안전모드는 기본 OFF(0 gap)로 유지
         "soft_entry_enable": True,
-        "soft_entry_conf_gap_safe": 0,
-        "soft_entry_conf_gap_attack": 8,
-        "soft_entry_conf_gap_highrisk": 6,
+        "soft_entry_conf_gap_safe": 5,
+        "soft_entry_conf_gap_attack": 12,
+        "soft_entry_conf_gap_highrisk": 15,
         # 소프트 진입일 때 진입비중/레버를 더 줄이는 계수
-        "soft_entry_entry_pct_mult": 0.55,
-        "soft_entry_leverage_mult": 0.75,
+        "soft_entry_entry_pct_mult": 0.70,
+        "soft_entry_leverage_mult": 0.85,
         # 소프트 진입일 때 허용하는 최소 진입비중(% of free) / 최소 레버리지
         "soft_entry_entry_pct_floor": 2.0,
         "soft_entry_leverage_floor": 2,
@@ -6538,10 +6538,10 @@ def _swing_stop_price_pct(df: pd.DataFrame, decision: str, lookback: int = 40, b
 
 def _rr_min_by_mode(mode: str) -> float:
     if mode == "안전모드":
-        return 1.8
+        return 2.0
     if mode == "공격모드":
-        return 2.1
-    return 2.6
+        return 2.5
+    return 3.0
 
 
 def _rr_min_by_style(style: str) -> float:
@@ -6754,9 +6754,10 @@ def ai_decide_trade(
   - sell(숏): sl_price는 price보다 높게, tp_price는 price보다 낮게
 [생존(중요)]
 - 이 시스템은 손실 확대/과매매가 감지되면 자동매매를 강제 종료한다.
-- 확신이 애매하면 'hold'를 선택해라. (무리한 진입 금지)
 - 영어 금지. 쉬운 한글.
 - 반드시 JSON만 출력.
+- 하이리스크/하이리턴 모드: 추세가 있으면 적극적으로 진입해라. 과도한 hold는 기회 손실이다.
+- 안전모드: 확신이 애매하면 'hold'를 선택해라. (무리한 진입 금지)
 """
 
     user = f"""
@@ -11367,11 +11368,11 @@ def telegram_thread(ex):
                             adx_th = float(cfg.get("ai_call_adx_threshold", 0) or 0)
                             if adx_th <= 0:
                                 if str(mode) == "안전모드":
-                                    adx_th = 25.0
-                                elif str(mode) == "공격모드":
-                                    adx_th = 23.0
-                                else:
                                     adx_th = 20.0
+                                elif str(mode) == "공격모드":
+                                    adx_th = 17.0
+                                else:
+                                    adx_th = 15.0
 
                             trend_txt = str(stt.get("추세", "") or "")
                             macd_txt = str(stt.get("MACD", "") or "")
@@ -11404,8 +11405,11 @@ def telegram_thread(ex):
                             elif (
                                 (("상승" in trend_txt) or ("하락" in trend_txt))
                                 and (vol_spike or rsi50_cross or ("골든" in macd_txt) or ("데드" in macd_txt))
-                                and (adxv >= max(18.0, adx_th - 5.0))
+                                and (adxv >= max(12.0, adx_th - 5.0))
                             ):
+                                call_ai = True
+                            # 추세 신호 단독으로도 AI 호출 허용(하이리스크 기회 포착)
+                            elif (("상승" in trend_txt) or ("하락" in trend_txt)) and adxv >= max(10.0, adx_th - 8.0):
                                 call_ai = True
                         except Exception:
                             call_ai = False
