@@ -688,7 +688,7 @@ def default_settings() -> Dict[str, Any]:
         # - ROI(퍼센트) 손절은 n회 연속 조건일 때만 실행(순간 위꼬리/툭 찍고 복구 방지)
         "sl_confirm_enable": True,
         "sl_confirm_n": 2,
-        "sl_confirm_window_sec": 6.0,
+        "sl_confirm_window_sec": 600.0,  # ✅ 6초→600초: 메인 루프 주기(수 분)가 6초보다 길어 손절 확인이 누적되지 않던 문제 수정
         # ✅ 청산 후 재진입 쿨다운(과매매/수수료/AI호출 낭비 방지)
         # - "bars"는 현재 단기 timeframe 기준 봉 개수(예: 5m에서 2 bars = 10분)
         "cooldown_after_exit_tp_bars": 1,
@@ -9488,6 +9488,9 @@ def telegram_thread(ex):
                         cur_px = get_last_price(ex, sym) or entry
                         lev_live = _pos_leverage(p)
                         upnl = float(p.get("unrealizedPnl") or 0.0)
+                        # ✅ percentage 없을 때 가격 기반 ROI 폴백(거래소 지연/미제공 대응)
+                        if p.get("percentage") is None and float(entry or 0) > 0 and float(cur_px or 0) > 0:
+                            roi = float(estimate_roi_from_price(float(entry), float(cur_px), str(side), float(lev_live or 1)))
 
                         tgt = active_targets.get(
                             sym,
@@ -10517,7 +10520,7 @@ def telegram_thread(ex):
                             except Exception:
                                 n_need = 2
                             try:
-                                win_sec = float(cfg.get("sl_confirm_window_sec", 6.0) or 6.0)
+                                win_sec = float(cfg.get("sl_confirm_window_sec", 600.0) or 600.0)
                             except Exception:
                                 win_sec = 6.0
                             now_ep = time.time()
@@ -13602,7 +13605,7 @@ with st.sidebar.expander("손절 확인(휩쏘 방지)"):
     config["sl_confirm_enable"] = st.checkbox("ROI 손절은 확인 후 실행", value=bool(config.get("sl_confirm_enable", True)))
     c_slc1, c_slc2 = st.columns(2)
     config["sl_confirm_n"] = c_slc1.number_input("확인 횟수", 1, 5, int(config.get("sl_confirm_n", 2)), step=1)
-    config["sl_confirm_window_sec"] = c_slc2.number_input("시간창(초)", 1.0, 60.0, float(config.get("sl_confirm_window_sec", 6.0) or 6.0), step=0.5)
+    config["sl_confirm_window_sec"] = c_slc2.number_input("시간창(초)", 30.0, 3600.0, float(config.get("sl_confirm_window_sec", 600.0) or 600.0), step=30.0)
     st.caption("※ SR(지지/저항) 가격 이탈 손절은 즉시 실행됩니다.")
 with st.sidebar.expander("청산 후 재진입 쿨다운(과매매 방지)"):
     cd1, cd2, cd3 = st.columns(3)
