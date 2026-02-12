@@ -639,8 +639,10 @@ def default_settings() -> Dict[str, Any]:
         # ✅ Time-based Exit(요구): 진입 후 일정 시간이 지났는데 "목표 수익의 X%"도 못 가면 기회비용 정리
         # - AI 재호출 없이 룰 기반으로만 종료(비용 절감)
         "time_exit_enable": True,
-        "time_exit_bars": 12,            # 5m 기준 12 bars = 1시간
-        "time_exit_target_frac": 0.5,    # 목표 수익의 50% 미만이면 정리
+        "time_exit_bars": 24,            # 5m 기준 24 bars = 2시간
+        "time_exit_target_frac": 0.3,    # 목표 수익의 30% 미만이면 정리
+        "time_exit_partial_enable": True,  # 전량 청산 대신 50% 부분 청산
+        "time_exit_partial_close_pct": 50.0,  # 시간 초과 시 부분 청산 비율(%)
 
         # ✅ Fail-safe(요구: "수익을 못 내거나 전부 잃으면 AI는 꺼진다")
         # - 실제로 "수익 보장"은 불가능하므로, 현실적인 안전장치로 자동매매를 강제 종료한다.
@@ -648,10 +650,10 @@ def default_settings() -> Dict[str, Any]:
         # - 2) 일정 횟수 거래 후에도 당일 실현손익이 0 이하이면 OFF(과매매/손실 누적 방지)
         "fail_safe_enable": True,
         "fail_safe_drawdown_enable": True,
-        "fail_safe_drawdown_from_peak_pct": 30.0,   # peak equity 대비 -30%면 OFF
-        "fail_safe_profit_guard_enable": False,     # 기본 OFF(너무 빡빡하면 금방 멈춤) → 원하면 ON
-        "fail_safe_profit_guard_min_trades": 10,
-        "fail_safe_profit_guard_min_pnl_usdt": 0.0, # 0 이하(=수익 못 냄)면 OFF
+        "fail_safe_drawdown_from_peak_pct": 18.0,   # peak equity 대비 -18%면 OFF (기존 30% → 강화)
+        "fail_safe_profit_guard_enable": True,      # ON: 연속 손실 누적 방지
+        "fail_safe_profit_guard_min_trades": 6,     # 6회 거래 후에도
+        "fail_safe_profit_guard_min_pnl_usdt": -30.0, # -30 USDT 이하 손실이면 OFF
 
         # ✅ 진입 고정(요구사항): 레버 20배 고정 + 잔고 20% 진입
         # - 기존 모드/AI의 entry_pct/leverage 출력은 "표시용"으로만 남기고, 실제 주문은 아래 값을 사용
@@ -693,8 +695,10 @@ def default_settings() -> Dict[str, Any]:
         "cooldown_after_exit_sl_bars": 3,
         "cooldown_after_exit_protect_bars": 2,
         "use_dca": True,
-        "dca_trigger": -20.0,
-        "dca_max_count": 1,
+        "dca_trigger": -32.0,
+        "dca_max_count": 2,
+        "dca_daily_pnl_limit_enable": True,   # 당일 손익이 기준 이하면 DCA 금지
+        "dca_daily_pnl_limit_usdt": -20.0,    # 당일 -20 USDT 이하면 DCA 스킵
         # ✅ 추매 규모(기본=기존 % 방식 유지)
         # - dca_add_usdt > 0 이면 "USDT(마진)" 기준으로 추매 금액을 고정(사용자 요구)
         # - 0이면 기존처럼 원진입 대비 %로 계산
@@ -860,9 +864,9 @@ def default_settings() -> Dict[str, Any]:
 
         # ✅ 사용자 요구: 스윙 순환매 기본 ON
         "swing_recycle_enable": True,
-        "swing_recycle_cooldown_min": 20,
-        "swing_recycle_max_count": 2,
-        "swing_recycle_reentry_roi": 0.8,
+        "swing_recycle_cooldown_min": 10,
+        "swing_recycle_max_count": 3,
+        "swing_recycle_reentry_roi": 2.5,
 
         # ✅ 외부 시황 위험 시 신규진입 감산(완전 금지 X)
         "entry_risk_reduce_enable": True,
@@ -1477,12 +1481,46 @@ def get_past_mistakes_text(max_items: int = 5) -> str:
     if df.empty or "PnL_Percent" not in df.columns:
         return "과거 매매 기록 없음."
     try:
-        worst = df.sort_values("PnL_Percent", ascending=True).head(max_items)
         lines = []
-        for _, r in worst.iterrows():
-            lines.append(
-                f"- {r.get('Coin','?')} {r.get('Side','?')} {float(r.get('PnL_Percent',0)):.2f}% 손실 | 이유: {str(r.get('Reason',''))[:40]}"
-            )
+
+        # 1) 전체 승률 및 최근 20회 승률
+        try:
+            pnl_col = df["PnL_Percent"].astype(float)
+            total = len(df)
+            wins = int((pnl_col > 0).sum())
+            wr_all = wins / max(1, total) * 100.0
+            recent = df.tail(20)
+            pnl_recent = recent["PnL_Percent"].astype(float)
+            wr_recent = float((pnl_recent > 0).sum()) / max(1, len(recent)) * 100.0
+            avg_win = float(pnl_col[pnl_col > 0].mean()) if (pnl_col > 0).any() else 0.0
+            avg_loss = float(pnl_col[pnl_col < 0].mean()) if (pnl_col < 0).any() else 0.0
+            lines.append(f"[성과 요약] 전체 승률 {wr_all:.1f}% ({wins}/{total}) | 최근20회 승률 {wr_recent:.1f}% | 평균수익 {avg_win:.2f}% | 평균손실 {avg_loss:.2f}%")
+        except Exception:
+            pass
+
+        # 2) 최악 손실 상위 N개
+        try:
+            worst = df.sort_values("PnL_Percent", ascending=True).head(max_items)
+            lines.append("[최악 손실]")
+            for _, r in worst.iterrows():
+                lines.append(
+                    f"- {r.get('Coin','?')} {r.get('Side','?')} {float(r.get('PnL_Percent',0)):.2f}% 손실 | 이유: {str(r.get('Reason',''))[:40]}"
+                )
+        except Exception:
+            pass
+
+        # 3) 최고 수익 상위 3개 (성공 패턴 학습)
+        try:
+            best = df[df["PnL_Percent"].astype(float) > 0].sort_values("PnL_Percent", ascending=False).head(3)
+            if not best.empty:
+                lines.append("[최고 수익 패턴 - 이런 진입을 우선시해라]")
+                for _, r in best.iterrows():
+                    lines.append(
+                        f"- {r.get('Coin','?')} {r.get('Side','?')} +{float(r.get('PnL_Percent',0)):.2f}% 수익 | {str(r.get('Reason',''))[:40]}"
+                    )
+        except Exception:
+            pass
+
         return "\n".join(lines) if lines else "큰 손실 기록 없음."
     except Exception:
         return "기록 조회 실패"
@@ -6330,10 +6368,14 @@ def external_risk_multiplier(ext: Dict[str, Any], cfg: Dict[str, Any]) -> float:
     try:
         fg = (ext or {}).get("fear_greed") or {}
         v = int(fg.get("value", -1)) if fg else -1
-        if 0 <= v <= 25:  # 극공포
-            mul *= 0.85
-        elif v >= 75:  # 극탐욕
-            mul *= 0.85
+        if 0 <= v <= 15:  # 극공포: 진입 크기 0 (진입 금지 신호)
+            mul *= 0.0
+        elif 0 <= v <= 25:  # 공포
+            mul *= 0.70
+        elif v >= 80:  # 극탐욕: 포지션 크기 0.7배로 제한
+            mul *= 0.70
+        elif v >= 75:  # 탐욕
+            mul *= 0.80
     except Exception:
         pass
     try:
@@ -6729,10 +6771,28 @@ def ai_decide_trade(
     except Exception:
         soft_entry_hint = ""
 
+    # ✅ 최근 승률 기반 AI 전략 힌트 생성
+    winrate_hint = ""
+    try:
+        df_log = read_trade_log()
+        if not df_log.empty and "PnL_Percent" in df_log.columns:
+            recent20 = df_log.tail(20)
+            pnl_r = recent20["PnL_Percent"].astype(float)
+            wr = float((pnl_r > 0).sum()) / max(1, len(recent20)) * 100.0
+            if wr < 40:
+                winrate_hint = f"\n[전략 조정] 최근 승률 {wr:.0f}%(저조) → 확신도 높은 진입만 허용, RR 3.0 이상 셋업 우선"
+            elif wr > 65:
+                winrate_hint = f"\n[전략 조정] 최근 승률 {wr:.0f}%(양호) → 추세 추종 적극 진입, 눌림목/돌파 모두 허용"
+            else:
+                winrate_hint = f"\n[전략 조정] 최근 승률 {wr:.0f}%(보통) → 강한 추세 + 명확한 해소 신호에서만 진입"
+    except Exception:
+        winrate_hint = ""
+
     sys = f"""
 	너는 '워뇨띠 스타일(눌림목/해소 타이밍) + 손익비' 기반의 자동매매 트레이더 AI다.
+{winrate_hint}
 
-	[과거 실수(요약)]
+	[과거 실수 & 성과 요약]
 {past_mistakes}
 
 {ext_hdr}
@@ -8685,9 +8745,21 @@ def _try_scalp_to_swing_dca(ex, sym: str, side: str, cur_px: float, tgt: Dict[st
         # 추매는 스윙 전환 시점에만 허용(스캘핑 기본 추매X)
         trade_state = rt.setdefault("trades", {}).setdefault(sym, {"dca_count": 0, "partial_tp_done": [], "recycle_count": 0})
         dca_count = int(trade_state.get("dca_count", 0))
-        dca_max = max(0, int(cfg.get("dca_max_count", 1)))
+        dca_max = max(0, int(cfg.get("dca_max_count", 2)))
         if dca_count >= max(1, dca_max):
             return False
+
+        # ✅ 당일 손익 제한: 오늘 손실이 기준 이하면 DCA 금지
+        try:
+            if bool(cfg.get("dca_daily_pnl_limit_enable", True)):
+                daily_limit = float(cfg.get("dca_daily_pnl_limit_usdt", -20.0) or -20.0)
+                day_summary = _trade_day_summary(_day_df_filter(read_trade_log(), today_kst_str()))
+                day_pnl = float(day_summary.get("total_pnl_usdt", 0.0) or 0.0)
+                if day_pnl <= daily_limit:
+                    mon_add_event(mon, "DCA_SKIP", sym, f"당일 손익 제한({day_pnl:.2f} USDT ≤ {daily_limit:.2f})", {})
+                    return False
+        except Exception:
+            pass
 
         free, _ = safe_fetch_balance(ex)
         base_entry = float(tgt.get("entry_usdt", 0.0))
@@ -10426,7 +10498,13 @@ def telegram_thread(ex):
                                             tgt["force_take_detail"] = f"{bars_need}봉(≈{int((bars_need*tf_sec)/60)}분) 경과, 목표의 {int(frac_need*100)}%({thr:.1f}%) 미만"
                                             tgt["time_exit_hit"] = True
                                             tgt["time_exit_kst"] = now_kst_str()
-                                            hard_take = True
+                                            # 부분청산 옵션: 전량 청산 대신 일부만 정리
+                                            if bool(cfg.get("time_exit_partial_enable", True)) and float(roi) >= 0:
+                                                partial_pct = float(cfg.get("time_exit_partial_close_pct", 50.0) or 50.0)
+                                                tgt["force_partial_close_pct"] = partial_pct
+                                                tgt["force_take_reason"] = f"시간초과 부분청산({int(partial_pct)}%)"
+                                            else:
+                                                hard_take = True
                         except Exception:
                             pass
 
@@ -11128,6 +11206,14 @@ def telegram_thread(ex):
                     # 2) 신규 진입 스캔
                     risk_mul = external_risk_multiplier(ext, cfg)
                     mon["entry_risk_multiplier"] = risk_mul
+                    # ✅ 극공포(공포탐욕 0~15): 신규 진입 전면 금지
+                    if entry_allowed_global and float(risk_mul) <= 0.0:
+                        entry_allowed_global = False
+                        try:
+                            fg_v = int(((ext or {}).get("fear_greed") or {}).get("value", -1))
+                            mon_add_event(mon, "ENTRY_BLOCK_FEAR", "", f"극공포 지수({fg_v}) → 신규 진입 금지", {"fear_greed": fg_v})
+                        except Exception:
+                            pass
                     free_usdt = 0.0
                     total_usdt = 0.0
                     if entry_allowed_global:
