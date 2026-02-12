@@ -739,6 +739,8 @@ def default_settings() -> Dict[str, Any]:
         # - True면 volume/disparity 조건 미달 시 "AI 호출 자체"를 막음(비용↓, 보수↑)
         # - False면 AI는 호출하되(캐시/봉당 1회), 결과에 따라 entry를 줄이거나 hold를 기대(진입 기회↑)
         "ai_call_filters_block_ai": False,
+        # ✅ AI가 buy/sell을 유지할 수 있는 최소 확신 바닥값(그 이하면 강제 hold)
+        "ai_decision_min_conf_floor": 60,
 
         # 🌍 외부 시황 통합
         "use_external_context": True,
@@ -786,6 +788,18 @@ def default_settings() -> Dict[str, Any]:
         "low_conf_position_threshold": 92,
         # ✅ 확신/시그널/필터에 따라 진입 비중 자동 조절(완화)
         "entry_size_scale_by_signal_enable": True,
+        # ✅ 소프트 진입(요구): 확신도가 min_conf에 살짝 못 미쳐도, 아주 작게/보수적으로 진입해 기회를 만든다.
+        # - 안전모드는 기본 OFF(0 gap)로 유지
+        "soft_entry_enable": True,
+        "soft_entry_conf_gap_safe": 0,
+        "soft_entry_conf_gap_attack": 8,
+        "soft_entry_conf_gap_highrisk": 6,
+        # 소프트 진입일 때 진입비중/레버를 더 줄이는 계수
+        "soft_entry_entry_pct_mult": 0.55,
+        "soft_entry_leverage_mult": 0.75,
+        # 소프트 진입일 때 허용하는 최소 진입비중(% of free) / 최소 레버리지
+        "soft_entry_entry_pct_floor": 2.0,
+        "soft_entry_leverage_floor": 2,
         # ✅ 스타일 AI 보조(선택): 레짐 전환/표시에서 불필요한 OpenAI 호출을 줄이기 위해 분리 옵션 제공
         # - style_auto_enable=True여도, 아래 옵션이 OFF면 스타일은 "룰 기반"만 사용
         # - 사용자가 원할 때만 ON (비용/지연/요금제 429 방지)
@@ -6821,8 +6835,18 @@ JSON 형식:
 
         out["reason_easy"] = str(out.get("reason_easy", ""))[:500]
 
-        if out["decision"] in ["buy", "sell"] and out["confidence"] < rule["min_conf"]:
-            out["decision"] = "hold"
+        # ✅ 이전에는 min_conf 미만이면 강제로 hold로 바꿨지만,
+        # 사용자는 "조건이 애매해도 소액/보수적으로 진입"을 원하므로 여기서는 decision을 유지한다.
+        # (실제 주문은 스캔 루프에서 soft-entry/포지션 제한으로 제어)
+        try:
+            if out["decision"] in ["buy", "sell"] and out["confidence"] < int(rule["min_conf"]):
+                out["below_min_conf"] = True
+                # 너무 낮은 확신(바닥값)은 강제 hold
+                floor0 = int(cfg.get("ai_decision_min_conf_floor", 60) or 60)
+                if int(out["confidence"]) < int(floor0):
+                    out["decision"] = "hold"
+        except Exception:
+            pass
 
         return out
 
@@ -11579,8 +11603,41 @@ def telegram_thread(ex):
                         )
                         monitor_write_throttled(mon, 1.0)
 
-                        # 진입
-                        if decision in ["buy", "sell"] and conf >= int(rule["min_conf"]):
+                        # 진입(STRICT + SOFT)
+                        min_conf_strict = int(rule.get("min_conf", 0) or 0)
+                        min_conf_soft = int(min_conf_strict)
+                        is_soft_entry = False
+                        try:
+                            if decision in ["buy", "sell"] and bool(cfg.get("soft_entry_enable", True)):
+                                if str(mode) == "안전모드":
+                                    gap = int(cfg.get("soft_entry_conf_gap_safe", 0) or 0)
+                                elif str(mode) == "공격모드":
+                                    gap = int(cfg.get("soft_entry_conf_gap_attack", 8) or 8)
+                                else:
+                                    gap = int(cfg.get("soft_entry_conf_gap_highrisk", 6) or 6)
+                                min_conf_soft = int(max(0, int(min_conf_strict) - int(max(0, gap))))
+                        except Exception:
+                            min_conf_soft = int(min_conf_strict)
+
+                        # ✅ buy/sell인데 확신도가 낮아 진입을 못 하면, 스킵 사유를 남겨 원인 파악을 쉽게 한다.
+                        try:
+                            if decision in ["buy", "sell"] and int(conf) < int(min_conf_soft):
+                                cs["skip_reason"] = f"확신도 부족({int(conf)}% < {int(min_conf_soft)}%)"
+                                mon_add_scan(
+                                    mon,
+                                    stage="trade_skipped",
+                                    symbol=sym,
+                                    tf=str(cfg.get("timeframe", "5m")),
+                                    signal=str(decision),
+                                    score=conf,
+                                    message=str(cs.get("skip_reason", ""))[:140],
+                                    extra={"min_conf_strict": int(min_conf_strict), "min_conf_soft": int(min_conf_soft)},
+                                )
+                        except Exception:
+                            pass
+
+                        if decision in ["buy", "sell"] and conf >= int(min_conf_soft):
+                            is_soft_entry = bool(int(conf) < int(min_conf_strict))
                             # ✅ 강제스캔(scan_only) 또는 auto_trade OFF/정지/주말이면 신규진입 금지
                             if (not entry_allowed_global) or (forced_ai and force_scan_only):
                                 try:
@@ -11832,6 +11889,14 @@ def telegram_thread(ex):
                             # - 반대로 조건이 잘 맞고(conf 높음) 강한 시그널이면 비중을 약간 키운다(모드 범위 내)
                             try:
                                 if bool(cfg.get("entry_size_scale_by_signal_enable", True)):
+                                    # soft-entry면 entry_pct 하한을 더 낮게 허용(작게 진입)
+                                    entry_floor = float(rule["entry_pct_min"])
+                                    try:
+                                        if bool(is_soft_entry):
+                                            entry_floor = float(cfg.get("soft_entry_entry_pct_floor", 2.0) or 2.0)
+                                    except Exception:
+                                        entry_floor = float(rule["entry_pct_min"])
+
                                     sig_pull = bool(stt.get("_pullback_candidate", False))
                                     sig_rsi = bool(stt.get("_rsi_resolve_long", False)) or bool(stt.get("_rsi_resolve_short", False))
                                     conf0 = int(conf)
@@ -11852,12 +11917,32 @@ def telegram_thread(ex):
                                     pre_factor = 0.75 if (isinstance(filter_msgs, list) and filter_msgs) else 1.0
 
                                     f = float(clamp(float(conf_factor) * float(sig_factor) * float(pre_factor), 0.35, 1.35))
-                                    entry_pct_scaled = float(clamp(float(entry_pct) * f, float(rule["entry_pct_min"]), float(rule["entry_pct_max"])))
+                                    entry_pct_scaled = float(clamp(float(entry_pct) * f, float(entry_floor), float(rule["entry_pct_max"])))
                                     if abs(entry_pct_scaled - float(entry_pct)) > 1e-9:
                                         entry_pct = entry_pct_scaled
                                         ai2["entry_pct"] = float(entry_pct)
                                         ai2["entry_pct_scale_factor"] = float(f)
                                         ai2["entry_pct_scale_note"] = f"conf={conf0} pull={int(sig_pull)} rsi={int(sig_rsi)} warn={int(bool(filter_msgs))}"
+                            except Exception:
+                                pass
+
+                            # ✅ soft-entry: 확신이 살짝 부족하면 "아주 작게/보수적으로" 진입(비중↓/레버↓)
+                            try:
+                                if bool(is_soft_entry) and bool(cfg.get("soft_entry_enable", True)):
+                                    if not bool(cfg.get("fixed_entry_pct_enable", False)):
+                                        mult_e = float(cfg.get("soft_entry_entry_pct_mult", 0.55) or 0.55)
+                                        floor_e = float(cfg.get("soft_entry_entry_pct_floor", 2.0) or 2.0)
+                                        entry_pct = float(max(float(floor_e), float(entry_pct) * float(clamp(mult_e, 0.1, 1.0))))
+                                        ai2["entry_pct"] = float(entry_pct)
+                                        ai2["entry_tier"] = "SOFT"
+                                    if not bool(cfg.get("fixed_leverage_enable", False)):
+                                        mult_l = float(cfg.get("soft_entry_leverage_mult", 0.75) or 0.75)
+                                        floor_l = int(cfg.get("soft_entry_leverage_floor", 2) or 2)
+                                        lev2 = int(round(float(lev) * float(clamp(mult_l, 0.1, 1.0))))
+                                        lev2 = int(max(int(floor_l), min(int(lev), int(lev2))))
+                                        lev = int(max(1, lev2))
+                                        ai2["leverage"] = int(lev)
+                                        ai2["entry_tier"] = "SOFT"
                             except Exception:
                                 pass
 
@@ -11935,7 +12020,7 @@ def telegram_thread(ex):
                             except Exception:
                                 pass
 
-                            ok = market_order_safe(ex, sym, decision, qty)
+                            ok, err_order = market_order_safe_ex(ex, sym, decision, qty)
                             if ok:
                                 trade_id = uuid.uuid4().hex[:10]
                                 mon_add_scan(
@@ -11956,6 +12041,25 @@ def telegram_thread(ex):
                                         message=f"{decision} style={style} conf={conf}",
                                         payload={"qty": qty, "entry_usdt": entry_usdt, "lev": lev, "style": style, "tp": tpp, "sl": slp},
                                     )
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    msg0 = f"주문 실패: {str(err_order or '')}".strip()
+                                    if len(msg0) > 160:
+                                        msg0 = msg0[:160] + "..."
+                                    cs["skip_reason"] = msg0
+                                    mon_add_scan(
+                                        mon,
+                                        stage="trade_skipped",
+                                        symbol=sym,
+                                        tf=str(cfg.get("timeframe", "5m")),
+                                        signal=str(decision),
+                                        score=conf,
+                                        message=msg0,
+                                        extra={"qty": qty, "entry_usdt": entry_usdt, "lev": lev, "style": style},
+                                    )
+                                    mon_add_event(mon, "ORDER_FAIL", sym, "ENTRY 주문 실패", {"err": str(err_order or ""), "qty": qty, "entry_usdt": entry_usdt, "lev": lev, "style": style})
                                 except Exception:
                                     pass
 
@@ -12032,6 +12136,7 @@ def telegram_thread(ex):
                                     "entry_pct": entry_pct,
                                     "entry_confidence": int(conf),
                                     "entry_prefilter_note": " / ".join(filter_msgs)[:180] if isinstance(filter_msgs, list) and filter_msgs else "",
+                                    "entry_tier": "SOFT" if bool(is_soft_entry) else "STRICT",
                                     "lev": lev,
                                     "entry_price": float(px),
                                     "entry_snapshot": {
