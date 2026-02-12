@@ -629,7 +629,7 @@ def default_settings() -> Dict[str, Any]:
         "exit_trailing_protect_check_sec": 1.0,
         # 포지션 보유 중에는 스캔/AI 호출로 루프가 길어져 청산 타이밍을 놓칠 수 있어,
         # 강제 Exit 정책 사용 시 기본은 "포지션이 있을 때 신규 스캔/진입을 쉬고" 청산 모니터링에 집중한다.
-        "exit_trailing_protect_pause_scan_while_in_position": True,
+        "exit_trailing_protect_pause_scan_while_in_position": False,
         "exit_trailing_protect_sl_roi": 15.0,                 # 기본 손절: -15%
         "exit_trailing_protect_be_roi": 10.0,                 # 1단계: +10% → 본전(진입가) 보호
         "exit_trailing_protect_partial_roi": 30.0,            # 2단계: +30% → 50% 익절(부분청산)
@@ -733,6 +733,12 @@ def default_settings() -> Dict[str, Any]:
         "ai_call_require_disparity": True,
         "ai_call_disparity_ma_period": 20,
         "ai_call_disparity_max_abs_pct": 4.0,
+        # ✅ 진입이 너무 안 되는 경우를 대비한 완화 옵션
+        # - 0이면 모드별 기본값(안전 25 / 공격 23 / 하이리스크 20)을 사용
+        "ai_call_adx_threshold": 0,
+        # - True면 volume/disparity 조건 미달 시 "AI 호출 자체"를 막음(비용↓, 보수↑)
+        # - False면 AI는 호출하되(캐시/봉당 1회), 결과에 따라 entry를 줄이거나 hold를 기대(진입 기회↑)
+        "ai_call_filters_block_ai": False,
 
         # 🌍 외부 시황 통합
         "use_external_context": True,
@@ -772,6 +778,14 @@ def default_settings() -> Dict[str, Any]:
         # - ON이면 auto 레짐에서 "스윙(단기+장기 정렬)"일 때만 신규 진입
         # - OFF(기본)이면 스캘핑 진입도 허용하되, 모드의 레버/진입비중 범위는 유지
         "highrisk_entry_requires_swing": False,
+        # ✅ 포지션 제한(요구): 총 포지션 5개까지 + 낮은 확신 포지션은 최대 2개
+        "max_open_positions_total": 5,
+        "max_open_positions_low_conf": 2,
+        # "낮은 확신" 기준(%) - 이 값 미만이면 low-conf로 카운트
+        # - 기본: 92 (하이리스크/하이리턴 min_conf=88 기준, 88~91을 low로 보고 2개까지만 허용)
+        "low_conf_position_threshold": 92,
+        # ✅ 확신/시그널/필터에 따라 진입 비중 자동 조절(완화)
+        "entry_size_scale_by_signal_enable": True,
         # ✅ 스타일 AI 보조(선택): 레짐 전환/표시에서 불필요한 OpenAI 호출을 줄이기 위해 분리 옵션 제공
         # - style_auto_enable=True여도, 아래 옵션이 OFF면 스타일은 "룰 기반"만 사용
         # - 사용자가 원할 때만 ON (비용/지연/요금제 429 방지)
@@ -9118,7 +9132,7 @@ def telegram_thread(ex):
                                 pass
                             free, total = safe_fetch_balance(ex)
                             # 포지션 요약
-                            pos_lines = []
+                            pos_blocks: List[str] = []
                             ps = safe_fetch_positions(ex, TARGET_COINS)
                             act = [p for p in ps if float(p.get("contracts") or 0) > 0]
                             if act:
@@ -9137,20 +9151,19 @@ def telegram_thread(ex):
                                     except Exception:
                                         style, tp0, sl0, rr0 = "", 0.0, 0.0, 0.0
                                     emo = "🟢" if roi >= 0 else "🔴"
-                                    pos_lines.append(
-                                        f"{emo} {sym} {('롱' if side=='long' else '숏')} x{lev} | 수익률 {roi:.2f}% | 손익 {upnl:.2f} USDT"
-                                        f" | 방식:{style or '-'} | 목표익절 +{tp0:.2f}% / 목표손절 -{sl0:.2f}% / 손익비 {rr0:.2f}"
+                                    pos_blocks.append(
+                                        "\n".join(
+                                            [
+                                                f"{emo} {sym} {('롱' if side=='long' else '숏')} x{lev}",
+                                                f"  - 수익률: {roi:.2f}% | 손익: {upnl:.2f} USDT",
+                                                f"  - 방식: {style or '-'}",
+                                                f"  - 목표(익절/손절): +{tp0:.2f}% / -{sl0:.2f}% (RR {rr0:.2f})",
+                                            ]
+                                        )
                                     )
                             else:
-                                pos_lines.append("⚪ 무포지션(관망)")
-
-                            # 최근 이벤트(지난 interval)
-                            evs = mon_recent_events(mon, within_min=interval)
-                            ev_lines = []
-                            for e in evs[-12:]:
-                                ev_lines.append(f"- {e.get('time_kst','')} {e.get('type','')} {e.get('symbol','')} {str(e.get('message',''))[:60]}")
-                            if not ev_lines:
-                                ev_lines = ["- (이벤트 없음)"]
+                                pos_blocks.append("⚪ 무포지션(관망)")
+                            pos_txt = "\n\n".join([x for x in pos_blocks if str(x or "").strip()])
 
                             # 외부 시황 요약
                             fg = (ext or {}).get("fear_greed") or {}
@@ -9161,8 +9174,6 @@ def telegram_thread(ex):
                             ev_soon_line = " / ".join([f"{x.get('country','')} {x.get('title','')[:18]}" for x in ev_soon[:2]]) if ev_soon else "없음"
                             regime_mode = str(cfg.get("regime_mode", "auto")).lower().strip()
                             regime_txt = "AUTO" if regime_mode == "auto" else ("SCALPING" if regime_mode.startswith("scal") else "SWING")
-                            last_scan_kst = mon.get("last_scan_kst", "-")
-                            last_hb_kst = mon.get("last_heartbeat_kst", "-")
                             realized = float(rt.get("daily_realized_pnl", 0.0) or 0.0)
 
                             txt = "\n".join(
@@ -9173,14 +9184,12 @@ def telegram_thread(ex):
                                     f"- 레짐: {regime_txt}",
                                     f"- 잔고: {total:.2f} USDT (가용 {free:.2f})",
                                     f"- 리얼손익(오늘): {realized:.2f} USDT",
-                                    f"- 보유포지션:",
-                                    *[f"  {x}" for x in pos_lines],
-                                    f"- 최근 이벤트({interval}분):",
-                                    *ev_lines,
-                                    f"- 마지막 스캔: {last_scan_kst}",
-                                    f"- 마지막 하트비트: {last_hb_kst}",
-                                    f"- 외부시황: {fg_line}",
-                                    f"- 이벤트 임박: {ev_soon_line}",
+                                    "",
+                                    "📊 포지션",
+                                    pos_txt,
+                                    "",
+                                    f"🌍 외부시황: {fg_line}",
+                                    f"🚨 이벤트 임박: {ev_soon_line}",
                                 ]
                             )
                             tgt = cfg.get("tg_route_events_to", "channel")
@@ -11103,6 +11112,19 @@ def telegram_thread(ex):
                         except Exception:
                             pass
                     active_syms = set(pos_by_sym.keys())
+                    # ✅ 포지션 제한(총/낮은 확신) - 신규 진입에서 사용
+                    try:
+                        max_pos_total = int(cfg.get("max_open_positions_total", 5) or 5)
+                    except Exception:
+                        max_pos_total = 5
+                    try:
+                        max_pos_low_conf = int(cfg.get("max_open_positions_low_conf", 2) or 2)
+                    except Exception:
+                        max_pos_low_conf = 2
+                    try:
+                        low_conf_th = int(cfg.get("low_conf_position_threshold", 92) or 92)
+                    except Exception:
+                        low_conf_th = 92
 
                     scan_cycle_start = time.time()
                     ccxt_timeout_epoch_scan_start = float(getattr(ex, "_wonyoti_ccxt_timeout_epoch", 0) or 0)
@@ -11112,9 +11134,12 @@ def telegram_thread(ex):
                     skip_scan_loop = False
                     try:
                         if bool(cfg.get("exit_trailing_protect_enable", False)) and bool(cfg.get("exit_trailing_protect_pause_scan_while_in_position", True)):
-                            if active_syms and (not bool(force_scan_pending)):
+                            # 포지션을 더 열 수 있으면(최대 갯수 미만) 스캔은 계속 돌려 신규 진입 기회를 유지
+                            # - 스캔 자체는 가볍고(대상 코인 5개), AI는 봉당 1회 캐시로 비용을 제어
+                            max_pos_total = int(cfg.get("max_open_positions_total", 5) or 5)
+                            if active_syms and (len(active_syms) >= max(1, max_pos_total)) and (not bool(force_scan_pending)):
                                 skip_scan_loop = True
-                                mon_add_scan(mon, stage="scan_skipped", symbol="*", tf=str(cfg.get("timeframe", "")), message="포지션 모니터링 우선(강제 Exit)")
+                                mon_add_scan(mon, stage="scan_skipped", symbol="*", tf=str(cfg.get("timeframe", "")), message="포지션 가득(최대치) → 스캔 잠시 중단")
                     except Exception:
                         skip_scan_loop = False
 
@@ -11280,16 +11305,62 @@ def telegram_thread(ex):
                         except Exception as e:
                             mon_add_scan(mon, stage="support_resistance", symbol=sym, tf=str(cfg.get("sr_timeframe", "")), message=f"SR 실패: {e}"[:140])
 
-                        # AI 호출 필터(기존 유지)
+                        # AI 호출 필터(완화 + 모드/추세 기반)
+                        # - "해소 신호가 없으면 AI 자체를 안 부른다"가 너무 보수적이라 무포지션이 길어질 수 있음
+                        # - 강한 시그널(눌림목/RSI해소/밴드이탈)은 우선 호출
+                        # - 그 외에는 ADX/거래량/모멘텀을 조합해 "추세 지속" 가능성이 있을 때 호출
                         call_ai = False
-                        if bool(stt.get("_pullback_candidate", False)):
-                            call_ai = True
-                        elif bool(stt.get("_rsi_resolve_long", False)) or bool(stt.get("_rsi_resolve_short", False)):
-                            call_ai = True
-                        else:
+                        try:
+                            sig_pullback = bool(stt.get("_pullback_candidate", False))
+                            sig_rsi_resolve = bool(stt.get("_rsi_resolve_long", False)) or bool(stt.get("_rsi_resolve_short", False))
                             adxv = float(last.get("ADX", 0)) if "ADX" in df.columns else 0.0
-                            if adxv >= 25:
+
+                            # 모드별 ADX 임계(진입이 너무 안 되는 문제 완화)
+                            adx_th = float(cfg.get("ai_call_adx_threshold", 0) or 0)
+                            if adx_th <= 0:
+                                if str(mode) == "안전모드":
+                                    adx_th = 25.0
+                                elif str(mode) == "공격모드":
+                                    adx_th = 23.0
+                                else:
+                                    adx_th = 20.0
+
+                            trend_txt = str(stt.get("추세", "") or "")
+                            macd_txt = str(stt.get("MACD", "") or "")
+                            bb_txt = str(stt.get("BB", "") or "")
+
+                            vol_spike = False
+                            try:
+                                vol_spike = ("VOL_SPIKE" in df.columns) and int(last.get("VOL_SPIKE", 0) or 0) == 1
+                            except Exception:
+                                vol_spike = False
+
+                            rsi50_cross = False
+                            try:
+                                if "RSI" in df.columns and len(df) >= 3:
+                                    rsi_prev = float(df["RSI"].iloc[-2])
+                                    rsi_now = float(df["RSI"].iloc[-1])
+                                    rsi50_cross = (rsi_prev < 50 <= rsi_now) or (rsi_prev > 50 >= rsi_now)
+                            except Exception:
+                                rsi50_cross = False
+
+                            # 강한 시그널 우선
+                            if sig_pullback or sig_rsi_resolve:
                                 call_ai = True
+                            elif ("상단 돌파" in bb_txt) or ("하단 이탈" in bb_txt):
+                                call_ai = True
+                            # ADX 추세강도 기반
+                            elif adxv >= adx_th:
+                                call_ai = True
+                            # 추세 지속/모멘텀(거래량/RSI50/ MACD) 기반
+                            elif (
+                                (("상승" in trend_txt) or ("하락" in trend_txt))
+                                and (vol_spike or rsi50_cross or ("골든" in macd_txt) or ("데드" in macd_txt))
+                                and (adxv >= max(18.0, adx_th - 5.0))
+                            ):
+                                call_ai = True
+                        except Exception:
+                            call_ai = False
 
                         # ✅ 추가 필터(요구): 거래량 스파이크 + 이격도(Disparity) 체크
                         # - call_ai=True라도, 조건을 만족하지 않으면 AI 호출을 막아 비용/휩쏘 진입을 줄인다.
@@ -11339,15 +11410,26 @@ def telegram_thread(ex):
                                     tf=str(cfg.get("timeframe", "5m")),
                                     signal="vol/disparity",
                                     score="",
-                                    message="PASS" if not filter_msgs else ("BLOCK: " + " / ".join(filter_msgs))[:180],
+                                    message=(
+                                        "PASS"
+                                        if not filter_msgs
+                                        else (
+                                            (("BLOCK: " if bool(cfg.get("ai_call_filters_block_ai", False)) else "WARN: ") + " / ".join(filter_msgs))[:180]
+                                        )
+                                    ),
                                     extra={"vol_ratio": vol_ratio, "disparity_pct": disparity_pct},
                                 )
                             except Exception:
                                 pass
-                        if call_ai and filter_msgs:
+                        if call_ai and filter_msgs and bool(cfg.get("ai_call_filters_block_ai", False)):
                             call_ai = False
                             try:
                                 cs["skip_reason"] = " / ".join(filter_msgs)[:160]
+                            except Exception:
+                                pass
+                        elif call_ai and filter_msgs:
+                            try:
+                                cs["prefilter_note"] = " / ".join(filter_msgs)[:160]
                             except Exception:
                                 pass
 
@@ -11525,6 +11607,46 @@ def telegram_thread(ex):
                                 except Exception:
                                     pass
                                 continue
+                            # ✅ 포지션 제한: 총 포지션 수 / 낮은 확신 포지션 수
+                            try:
+                                if len(active_syms) >= max(1, int(max_pos_total)):
+                                    cs["skip_reason"] = f"포지션 제한({len(active_syms)}/{int(max_pos_total)})"
+                                    mon_add_scan(
+                                        mon,
+                                        stage="trade_skipped",
+                                        symbol=sym,
+                                        tf=str(cfg.get("timeframe", "5m")),
+                                        signal=str(decision),
+                                        score=conf,
+                                        message="max_open_positions_total",
+                                        extra={"active": len(active_syms), "max": int(max_pos_total)},
+                                    )
+                                    continue
+                            except Exception:
+                                pass
+                            try:
+                                low_open = 0
+                                if int(max_pos_low_conf) > 0 and int(low_conf_th) > 0:
+                                    for s0 in active_syms:
+                                        c0 = (active_targets.get(s0, {}) or {}).get("entry_confidence", None)
+                                        c0i = int(_as_int(c0, 0)) if c0 is not None else 0
+                                        if c0i and c0i < int(low_conf_th):
+                                            low_open += 1
+                                    if low_open >= int(max_pos_low_conf) and int(conf) < int(low_conf_th):
+                                        cs["skip_reason"] = f"낮은 확신 포지션 한도({low_open}/{int(max_pos_low_conf)}). {int(low_conf_th)}%+만 추가"
+                                        mon_add_scan(
+                                            mon,
+                                            stage="trade_skipped",
+                                            symbol=sym,
+                                            tf=str(cfg.get("timeframe", "5m")),
+                                            signal=str(decision),
+                                            score=conf,
+                                            message="max_open_positions_low_conf",
+                                            extra={"low_open": low_open, "max_low": int(max_pos_low_conf), "threshold": int(low_conf_th)},
+                                        )
+                                        continue
+                            except Exception:
+                                pass
                             px = float(last["close"])
 
                             # ✅ 스타일 결정 (단기/장기 추세로 스캘핑/스윙)
@@ -11705,6 +11827,40 @@ def telegram_thread(ex):
                             except Exception:
                                 kelly_cap_pct = None
 
+                            # ✅ 진입 조건 완화: "시그널/필터/확신도"에 따라 진입비중 자동 조절
+                            # - 진입조건이 완벽하지 않거나(거래량/이격도 경고 등) 확신이 낮으면 비중을 자동으로 줄여 과매매/손실을 완화
+                            # - 반대로 조건이 잘 맞고(conf 높음) 강한 시그널이면 비중을 약간 키운다(모드 범위 내)
+                            try:
+                                if bool(cfg.get("entry_size_scale_by_signal_enable", True)):
+                                    sig_pull = bool(stt.get("_pullback_candidate", False))
+                                    sig_rsi = bool(stt.get("_rsi_resolve_long", False)) or bool(stt.get("_rsi_resolve_short", False))
+                                    conf0 = int(conf)
+                                    base_min_conf = int(rule.get("min_conf", 0) or 0)
+
+                                    # 확신도 기반
+                                    if conf0 >= int(low_conf_th):
+                                        conf_factor = 1.15
+                                    elif conf0 >= int(base_min_conf + 4):
+                                        conf_factor = 1.0
+                                    else:
+                                        conf_factor = 0.85
+
+                                    # 시그널 강도 기반
+                                    sig_factor = 1.10 if sig_pull else (1.0 if sig_rsi else 0.85)
+
+                                    # 필터 경고(거래량/이격도) 기반: 경고가 있으면 보수적으로
+                                    pre_factor = 0.75 if (isinstance(filter_msgs, list) and filter_msgs) else 1.0
+
+                                    f = float(clamp(float(conf_factor) * float(sig_factor) * float(pre_factor), 0.35, 1.35))
+                                    entry_pct_scaled = float(clamp(float(entry_pct) * f, float(rule["entry_pct_min"]), float(rule["entry_pct_max"])))
+                                    if abs(entry_pct_scaled - float(entry_pct)) > 1e-9:
+                                        entry_pct = entry_pct_scaled
+                                        ai2["entry_pct"] = float(entry_pct)
+                                        ai2["entry_pct_scale_factor"] = float(f)
+                                        ai2["entry_pct_scale_note"] = f"conf={conf0} pull={int(sig_pull)} rsi={int(sig_rsi)} warn={int(bool(filter_msgs))}"
+                            except Exception:
+                                pass
+
                             # ✅ 외부시황 위험 감산은 스윙에서만 적용
                             entry_risk_mul = float(risk_mul) if str(style) == "스윙" else 1.0
                             entry_usdt = free_usdt * (entry_pct / 100.0) * entry_risk_mul
@@ -11874,6 +12030,8 @@ def telegram_thread(ex):
                                     "tp": tpp,
                                     "entry_usdt": entry_usdt,
                                     "entry_pct": entry_pct,
+                                    "entry_confidence": int(conf),
+                                    "entry_prefilter_note": " / ".join(filter_msgs)[:180] if isinstance(filter_msgs, list) and filter_msgs else "",
                                     "lev": lev,
                                     "entry_price": float(px),
                                     "entry_snapshot": {
@@ -11919,6 +12077,10 @@ def telegram_thread(ex):
 
                                 rt.setdefault("open_targets", {})[sym] = active_targets[sym]
                                 save_runtime(rt)
+                                try:
+                                    active_syms.add(sym)
+                                except Exception:
+                                    pass
 
                                 # 상세일지
                                 save_trade_detail(
