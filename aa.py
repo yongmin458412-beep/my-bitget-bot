@@ -7624,6 +7624,42 @@ def _tg_fmt_usdt(v: Any, digits: int = 2, signed: bool = True) -> str:
         return "-"
 
 
+def _tg_pct_compact(v: Any) -> str:
+    try:
+        x = float(v)
+        if not math.isfinite(x):
+            return "-"
+        if abs(x - round(x)) < 1e-9:
+            return str(int(round(x)))
+        s = f"{x:.1f}"
+        return s.rstrip("0").rstrip(".")
+    except Exception:
+        return "-"
+
+
+def _tg_trailing_protect_policy_line(cfg: Optional[Dict[str, Any]] = None) -> str:
+    try:
+        cfg = cfg or load_settings()
+    except Exception:
+        cfg = cfg or {}
+    try:
+        if not bool((cfg or {}).get("exit_trailing_protect_enable", False)):
+            return ""
+    except Exception:
+        return ""
+    sl_fixed = _as_float((cfg or {}).get("exit_trailing_protect_sl_roi", 15.0), 15.0)
+    be_roi = _as_float((cfg or {}).get("exit_trailing_protect_be_roi", 10.0), 10.0)
+    part_roi = _as_float((cfg or {}).get("exit_trailing_protect_partial_roi", 30.0), 30.0)
+    part_pct = _as_float((cfg or {}).get("exit_trailing_protect_partial_close_pct", 50.0), 50.0)
+    trail_start = _as_float((cfg or {}).get("exit_trailing_protect_trail_start_roi", 50.0), 50.0)
+    trail_dd = _as_float((cfg or {}).get("exit_trailing_protect_trail_dd_roi", 10.0), 10.0)
+    return (
+        f"수익보존(기본손절 -{_tg_pct_compact(abs(sl_fixed))}% | 본절 +{_tg_pct_compact(be_roi)}% | "
+        f"부분익절 +{_tg_pct_compact(part_roi)}%({_tg_pct_compact(part_pct)}%) | "
+        f"추적손절 +{_tg_pct_compact(trail_start)}%후 최고점-{_tg_pct_compact(trail_dd)}%)"
+    )
+
+
 def _tg_style_easy(style: str) -> str:
     s = str(style or "").strip()
     if s == "스캘핑":
@@ -7708,6 +7744,7 @@ def tg_msg_entry_simple(
     bal_after_free: Optional[float],
     one_line: str,
     trade_id: str,
+    exit_policy_line: str = "",
 ) -> str:
     try:
         entry_usdt_f = float(entry_usdt)
@@ -7743,6 +7780,8 @@ def tg_msg_entry_simple(
     q = _tg_quote_block(one_line)
     if not q:
         q = "  └ -"
+    target_label = "목표손익비(익절/손절)" if not str(exit_policy_line or "").strip() else "AI목표(참고)"
+    extra_exit = f"- 청산규칙: {exit_policy_line}\n" if str(exit_policy_line or "").strip() else ""
     return (
         "🎯 진입\n"
         f"- 코인: {symbol}\n"
@@ -7751,7 +7790,8 @@ def tg_msg_entry_simple(
         f"- 레버리지: x{lev}\n"
         "\n"
         f"- 진입금액(마진): {entry_usdt_f:.2f} USDT{pct_txt}\n"
-        f"- 목표손익비(익절/손절): 익절 {tp_txt} / 손절 {sl_txt}\n"
+        f"- {target_label}: 익절 {tp_txt} / 손절 {sl_txt}\n"
+        f"{extra_exit}"
         f"- 진입전 사용가능 금액: {bf_txt} USDT\n"
         f"- 진입후 사용가능 금액: {af_txt} USDT\n"
         "\n"
@@ -9252,6 +9292,10 @@ def telegram_thread(ex):
                             except Exception:
                                 pass
                             free, total = safe_fetch_balance(ex)
+                            try:
+                                pol0 = _tg_trailing_protect_policy_line(cfg)
+                            except Exception:
+                                pol0 = ""
                             # 포지션 요약
                             pos_blocks: List[str] = []
                             ps = safe_fetch_positions(ex, TARGET_COINS)
@@ -9272,13 +9316,17 @@ def telegram_thread(ex):
                                     except Exception:
                                         style, tp0, sl0, rr0 = "", 0.0, 0.0, 0.0
                                     emo = "🟢" if roi >= 0 else "🔴"
+                                    tp_line = f"  - 목표(익절/손절): +{tp0:.2f}% / -{sl0:.2f}% (RR {rr0:.2f})"
+                                    if str(pol0).strip():
+                                        tp_line = f"  - AI목표(참고): 익절 +{tp0:.2f}% / 손절 -{sl0:.2f}% (RR {rr0:.2f})"
                                     pos_blocks.append(
                                         "\n".join(
                                             [
                                                 f"{emo} {sym} {('롱' if side=='long' else '숏')} x{lev}",
                                                 f"  - 수익률: {roi:.2f}% | 손익: {upnl:.2f} USDT",
                                                 f"  - 방식: {style or '-'}",
-                                                f"  - 목표(익절/손절): +{tp0:.2f}% / -{sl0:.2f}% (RR {rr0:.2f})",
+                                                tp_line,
+                                                (f"  - 청산규칙: {pol0}" if str(pol0).strip() else ""),
                                             ]
                                         )
                                     )
@@ -11166,8 +11214,13 @@ def telegram_thread(ex):
                                 "upnl": upnl,
                                 "lev": lev_live,
                                 "style": style_now,
-                                "tp": tp,
-                                "sl": sl,
+                                # ✅ 표시용 목표(tp/sl)는 "진입 당시 목표"(AI/룰)를 유지
+                                "tp": _as_float(tgt.get("tp", tp), 0.0),
+                                "sl": _as_float(tgt.get("sl", sl), 0.0),
+                                # ✅ 실제 청산은 '수익보존' 정책이 우선일 수 있어, 혼동 방지용으로 함께 저장
+                                "exit_policy": ("TRAIL_PROTECT" if bool(forced_exit) else "TARGET"),
+                                "exit_rule": (_tg_trailing_protect_policy_line(cfg) if bool(forced_exit) else ""),
+                                "exit_sl_roi": float(abs(float(sl))) if bool(forced_exit) else float(abs(float(_as_float(tgt.get("sl", sl), 0.0)))),
                                 "trade_id": trade_id,
                             }
                         )
@@ -11198,6 +11251,9 @@ def telegram_thread(ex):
                                         "style": style_now,
                                         "tp": tp,
                                         "sl": sl,
+                                        "exit_policy": ("TRAIL_PROTECT" if bool(cfg.get("exit_trailing_protect_enable", False)) else "TARGET"),
+                                        "exit_rule": (_tg_trailing_protect_policy_line(cfg) if bool(cfg.get("exit_trailing_protect_enable", False)) else ""),
+                                        "exit_sl_roi": float(abs(_as_float(cfg.get("exit_trailing_protect_sl_roi", 15.0), 15.0))) if bool(cfg.get("exit_trailing_protect_enable", False)) else float(abs(sl)),
                                         "trade_id": trade_id,
                                     }
                                 )
@@ -12457,6 +12513,7 @@ def telegram_thread(ex):
                                             bal_after_free=ba_free,
                                             one_line=one_line0,
                                             trade_id=str(trade_id),
+                                            exit_policy_line=_tg_trailing_protect_policy_line(cfg),
                                         )
                                     else:
                                         # ✅ 기존(상세) 메시지 유지
@@ -12479,6 +12536,13 @@ def telegram_thread(ex):
                                             f"- 장기추세({htf_tf}): 🧭 {htf_trend}\n"
                                             f"- 외부리스크 감산: x{entry_risk_mul:.2f} ({'스윙만 적용' if str(style)=='스윙' else '스캘핑=미적용'})\n"
                                         )
+                                        # ✅ 수익보존 Exit 정책이 ON이면, 실제 청산 규칙을 함께 표시(혼동 방지)
+                                        try:
+                                            pol = _tg_trailing_protect_policy_line(cfg)
+                                        except Exception:
+                                            pol = ""
+                                        if pol:
+                                            msg += f"- 청산규칙: {pol}\n"
                                         if sl_price is not None and tp_price is not None:
                                             src_txt = ""
                                             try:
