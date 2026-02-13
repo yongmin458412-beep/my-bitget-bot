@@ -672,6 +672,10 @@ def default_settings() -> Dict[str, Any]:
         # - ON이면 기존 TP/SL/SR/부분익절/트레일링(기존)보다 아래 정책이 우선한다.
         "exit_trailing_protect_enable": True,
         "exit_trailing_protect_check_sec": 1.0,
+        # ✅ AI 목표(TP/SL)를 1순위로 적용(요구)
+        # - 강제 Exit(수익보존) 정책을 켠 상태에서도, AI가 잡은 TP/SL(ROI%)을 우선 트리거로 사용한다.
+        # - 단, 본절/부분익절/추적손절(수익보존)은 안전망으로 계속 동작한다.
+        "exit_trailing_protect_ai_targets_priority": True,
         # 포지션 보유 중에는 스캔/AI 호출로 루프가 길어져 청산 타이밍을 놓칠 수 있어,
         # 강제 Exit 정책 사용 시 기본은 "포지션이 있을 때 신규 스캔/진입을 쉬고" 청산 모니터링에 집중한다.
         "exit_trailing_protect_pause_scan_while_in_position": False,
@@ -5333,6 +5337,55 @@ def pivot_levels(df: pd.DataFrame, order: int = 6, max_levels: int = 12) -> Tupl
     return supports, resistances
 
 
+def volume_profile_nodes(df: pd.DataFrame, bins: int = 60, top_n: int = 8) -> List[float]:
+    """
+    간이 매물대(Volume Profile) 노드 추정.
+    - OHLCV의 typical price(hlc3) 기준으로 구간(bins)별 거래량을 누적해 상위 top_n 가격대를 반환.
+    - 외부 라이브러리 없이 numpy/pandas로만 계산(가벼운 근사치).
+    """
+    if df is None or df.empty:
+        return []
+    try:
+        if "high" not in df.columns or "low" not in df.columns or "close" not in df.columns or "vol" not in df.columns:
+            return []
+        prices = ((df["high"].astype(float) + df["low"].astype(float) + df["close"].astype(float)) / 3.0).astype(float)
+        vols = df["vol"].astype(float)
+        prices = prices.replace([np.inf, -np.inf], np.nan).dropna()
+        if prices.empty:
+            return []
+        # vols도 prices 인덱스에 맞춤
+        vols = vols.loc[prices.index].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        if int(bins) < 10:
+            bins = 10
+        if int(bins) > 240:
+            bins = 240
+        top_n = int(max(1, min(int(top_n), 20)))
+
+        mn = float(prices.min())
+        mx = float(prices.max())
+        if not (math.isfinite(mn) and math.isfinite(mx)) or mx <= mn:
+            return []
+        edges = np.linspace(mn, mx, int(bins) + 1)
+        idx = np.digitize(prices.values, edges) - 1
+        idx = np.clip(idx, 0, int(bins) - 1)
+        vol_by_bin = np.bincount(idx, weights=vols.values, minlength=int(bins)).astype(float)
+        if len(vol_by_bin) <= 0:
+            return []
+        top_idx = np.argsort(vol_by_bin)[::-1][:top_n]
+        nodes = []
+        for i in top_idx:
+            try:
+                i2 = int(i)
+                nodes.append(float((edges[i2] + edges[i2 + 1]) / 2.0))
+            except Exception:
+                continue
+        nodes = [x for x in nodes if math.isfinite(float(x))]
+        nodes = sorted(list(set([float(round(x, 8)) for x in nodes])))
+        return nodes[:top_n]
+    except Exception:
+        return []
+
+
 def sr_stop_take(
     entry_price: float,
     side: str,
@@ -7378,9 +7431,11 @@ def ai_decide_trade(
 	[중요]
 	- sl_pct / tp_pct는 ROI%(레버 반영 수익률)로 출력한다.
 	- 변동성(atr_price_pct)이 작으면 손절을 너무 타이트하게 잡지 마라.
-- sr_context(지지/저항) 정보를 참고해, 가능하면 sl_price/tp_price(가격)를 함께 지정해라.
-  - buy(롱): sl_price는 price보다 낮게, tp_price는 price보다 높게
-  - sell(숏): sl_price는 price보다 높게, tp_price는 price보다 낮게
+	- sr_context(지지/저항) 정보를 참고해, 가능하면 sl_price/tp_price(가격)를 함께 지정해라.
+	  - buy(롱): sl_price는 price보다 낮게, tp_price는 price보다 높게
+	  - sell(숏): sl_price는 price보다 높게, tp_price는 price보다 낮게
+	- sr_context.volume_nodes(매물대/거래량 집중 구간)가 있으면, TP/SL은 "매물 많은 강한 레벨"을 우선으로 잡아라.
+	- 목표 TP/SL은 '수익보존(트레일링)'과 결합될 수 있게, 너무 비현실적으로 멀거나 가깝게 잡지 마라.
 [생존(중요)]
 - 이 시스템은 손실 확대/과매매가 감지되면 자동매매를 강제 종료한다.
 - 영어 금지. 쉬운 한글.
@@ -8222,8 +8277,13 @@ def _tg_trailing_protect_policy_line(cfg: Optional[Dict[str, Any]] = None) -> st
     part_pct = _as_float((cfg or {}).get("exit_trailing_protect_partial_close_pct", 50.0), 50.0)
     trail_start = _as_float((cfg or {}).get("exit_trailing_protect_trail_start_roi", 50.0), 50.0)
     trail_dd = _as_float((cfg or {}).get("exit_trailing_protect_trail_dd_roi", 10.0), 10.0)
+    try:
+        ai_prio = bool((cfg or {}).get("exit_trailing_protect_ai_targets_priority", False))
+    except Exception:
+        ai_prio = False
+    prefix = "AI목표우선 + " if ai_prio else ""
     return (
-        f"수익보존(기본손절 -{_tg_pct_compact(abs(sl_fixed))}% | 본절 +{_tg_pct_compact(be_roi)}% | "
+        f"{prefix}수익보존(기본손절 -{_tg_pct_compact(abs(sl_fixed))}% | 본절 +{_tg_pct_compact(be_roi)}% | "
         f"부분익절 +{_tg_pct_compact(part_roi)}%({_tg_pct_compact(part_pct)}%) | "
         f"추적손절 +{_tg_pct_compact(trail_start)}%후 최고점-{_tg_pct_compact(trail_dd)}%)"
     )
@@ -8366,7 +8426,10 @@ def tg_msg_entry_simple(
     q = _tg_quote_block(one_line)
     if not q:
         q = "  └ -"
-    target_label = "목표손익비(익절/손절)" if not str(exit_policy_line or "").strip() else "AI목표(참고)"
+    if not str(exit_policy_line or "").strip():
+        target_label = "목표손익비(익절/손절)"
+    else:
+        target_label = "AI목표(우선)" if ("AI목표우선" in str(exit_policy_line or "")) else "AI목표(참고)"
     extra_exit = f"- 청산규칙: {exit_policy_line}\n" if str(exit_policy_line or "").strip() else ""
     return (
         "🎯 진입\n"
@@ -9904,7 +9967,12 @@ def telegram_thread(ex):
                                     emo = "🟢" if roi >= 0 else "🔴"
                                     tp_line = f"  - 목표(익절/손절): +{tp0:.2f}% / -{sl0:.2f}% (RR {rr0:.2f})"
                                     if str(pol0).strip():
-                                        tp_line = f"  - AI목표(참고): 익절 +{tp0:.2f}% / 손절 -{sl0:.2f}% (RR {rr0:.2f})"
+                                        try:
+                                            ai_prio = bool(cfg.get("exit_trailing_protect_ai_targets_priority", False))
+                                        except Exception:
+                                            ai_prio = False
+                                        lab = "AI목표(우선)" if ai_prio else "AI목표(참고)"
+                                        tp_line = f"  - {lab}: 익절 +{tp0:.2f}% / 손절 -{sl0:.2f}% (RR {rr0:.2f})"
                                     pos_blocks.append(
                                         "\n".join(
                                             [
@@ -10949,6 +11017,18 @@ def telegram_thread(ex):
                             tp = min(tp, float(cfg.get("scalp_tp_roi_max", 6.0)))
                             sl = min(sl, float(cfg.get("scalp_sl_roi_max", 5.0)))
 
+                        # ✅ forced_exit(수익보존)에서도 "AI 목표(TP/SL)"를 우선 적용할 수 있도록(요구)
+                        tp_from_ai = False
+                        sl_from_ai = False
+                        try:
+                            tp_plan_roi = float(abs(float(tp)))
+                        except Exception:
+                            tp_plan_roi = 0.0
+                        try:
+                            sl_plan_roi = float(abs(float(sl)))
+                        except Exception:
+                            sl_plan_roi = 0.0
+
                         # =================================================
                         # ✅ 강제 수익 보존(Trailing Protect) Exit 정책
                         # - 진입(AI)은 유지하되, 청산은 AI를 배제하고 아래 규칙을 우선 적용
@@ -10979,6 +11059,17 @@ def telegram_thread(ex):
                                 # 강제 정책에서는 기존 TP/SL 목표는 "표시용"으로만 두고, Exit는 고정 기준을 사용
                                 sl = float(abs(sl_fixed))
                                 tp = 999999.0
+                                try:
+                                    if bool(cfg.get("exit_trailing_protect_ai_targets_priority", True)):
+                                        if tp_plan_roi > 0 and math.isfinite(float(tp_plan_roi)):
+                                            tp = float(tp_plan_roi)
+                                            tp_from_ai = True
+                                        if sl_plan_roi > 0 and math.isfinite(float(sl_plan_roi)):
+                                            sl = float(min(abs(float(sl_fixed)), float(sl_plan_roi)))
+                                            sl_from_ai = True
+                                except Exception:
+                                    tp_from_ai = False
+                                    sl_from_ai = False
 
                                 # 1) 본전 보호(진입가): +be_roi% 넘으면 SL을 진입가로 고정
                                 try:
@@ -11216,7 +11307,7 @@ def telegram_thread(ex):
                             elif bool(hit_sl_by_price):
                                 reason_ko = "손절(지지/저항 이탈)"
                             else:
-                                reason_ko = "손절(목표 손절)"
+                                reason_ko = "손절(AI목표)" if bool(sl_from_ai) else "손절(목표 손절)"
                             # ✅ 차트 근거(룰 기반) 스냅샷: "왜 정리했는지"를 명확히 남긴다(AI 호출 없음)
                             entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
                             snap_now = {}
@@ -11560,7 +11651,12 @@ def telegram_thread(ex):
                             if force_take_reason:
                                 take_reason_ko = force_take_reason
                             else:
-                                take_reason_ko = "익절(저항/목표 도달)" if bool(hit_tp_by_price) else ("익절(강제)" if bool(hard_take) else "익절(목표 익절)")
+                                if bool(hit_tp_by_price):
+                                    take_reason_ko = "익절(저항/목표 도달)"
+                                elif bool(hard_take):
+                                    take_reason_ko = "익절(강제)"
+                                else:
+                                    take_reason_ko = "익절(AI목표)" if bool(tp_from_ai) else "익절(목표 익절)"
                             is_loss_take = (float(pnl_usdt_snapshot) < 0.0) or (float(roi) < 0.0)
                             # ✅ 차트 근거(룰 기반) 스냅샷: "왜 익절했는지"를 명확히 남긴다(AI 호출 없음)
                             entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
@@ -11583,7 +11679,10 @@ def telegram_thread(ex):
                             elif bool(hit_tp_by_price):
                                 base_reason = f"저항/목표가에 닿아서 익절했어요{tp_line_txt}"
                             else:
-                                base_reason = f"목표익절(+{abs(float(tp)):.1f}%)에 닿아서 익절했어요"
+                                if bool(tp_from_ai):
+                                    base_reason = f"AI목표익절(+{abs(float(tp)):.1f}%)에 닿아서 익절했어요"
+                                else:
+                                    base_reason = f"목표익절(+{abs(float(tp)):.1f}%)에 닿아서 익절했어요"
                             one_rule = build_exit_one_line(base_reason=base_reason, entry_snap=entry_snap, now_snap=snap_now)
                             ok, err_close = close_position_market_ex(ex, sym, side, contracts)
                             if ok:
@@ -12109,6 +12208,14 @@ def telegram_thread(ex):
                                 "supports": supports[:8],
                                 "resistances": resistances[:8],
                             }
+                            # ✅ 매물대(간이 Volume Profile) 노드(매물 집중 구간)도 같이 제공(AI 목표가/트레일링 기준 참고)
+                            try:
+                                vp_nodes = volume_profile_nodes(df, bins=60, top_n=8)
+                            except Exception:
+                                vp_nodes = []
+                            if vp_nodes:
+                                sr_ctx["volume_nodes"] = vp_nodes[:8]
+                                cs["volume_nodes"] = vp_nodes[:8]
                             mon_add_scan(
                                 mon,
                                 stage="support_resistance",
