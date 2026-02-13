@@ -685,6 +685,13 @@ def default_settings() -> Dict[str, Any]:
         "exit_trailing_protect_partial_close_pct": 50.0,      # 부분청산 비율(%)
         "exit_trailing_protect_trail_start_roi": 50.0,        # 3단계: +50% 이후부터 추적손절 활성
         "exit_trailing_protect_trail_dd_roi": 10.0,           # 최고점 대비 -10%면 전량 청산
+
+        # ✅ 스윙 진입금(총자산 %)을 공포/탐욕(FNG)에 따라 자동 조정(요구)
+        # - 하이리스크/하이리턴 + 스윙일 때, "너무 작게(예: 4%)" 들어가는 문제를 방지
+        # - 기본: FNG 0/100에서 min, 50에서 max(삼각형 형태)
+        "swing_fng_entry_pct_enable": True,
+        "swing_fng_entry_pct_min": 8.0,
+        "swing_fng_entry_pct_max": 15.0,
         # ✅ Time-based Exit(요구): 진입 후 일정 시간이 지났는데 "목표 수익의 X%"도 못 가면 기회비용 정리
         # - AI 재호출 없이 룰 기반으로만 종료(비용 절감)
         "time_exit_enable": True,
@@ -6961,7 +6968,7 @@ def build_external_context(cfg: Dict[str, Any], rt: Optional[Dict[str, Any]] = N
     return ext
 
 
-def external_risk_multiplier(ext: Dict[str, Any], cfg: Dict[str, Any]) -> float:
+def external_risk_multiplier(ext: Dict[str, Any], cfg: Dict[str, Any], include_fng: bool = True) -> float:
     """
     외부 시황이 위험하면 신규 진입을 "감산/보수"로 조정(완전 금지 X).
     """
@@ -6974,19 +6981,20 @@ def external_risk_multiplier(ext: Dict[str, Any], cfg: Dict[str, Any]) -> float:
             mul *= float(cfg.get("entry_risk_reduce_factor", 0.65))
     except Exception:
         pass
-    try:
-        fg = (ext or {}).get("fear_greed") or {}
-        v = int(fg.get("value", -1)) if fg else -1
-        if 0 <= v <= 15:  # 극공포: 진입 크기 0 (진입 금지 신호)
-            mul *= 0.0
-        elif 0 <= v <= 25:  # 공포
-            mul *= 0.70
-        elif v >= 80:  # 극탐욕: 포지션 크기 0.7배로 제한
-            mul *= 0.70
-        elif v >= 75:  # 탐욕
-            mul *= 0.80
-    except Exception:
-        pass
+    if bool(include_fng):
+        try:
+            fg = (ext or {}).get("fear_greed") or {}
+            v = int(fg.get("value", -1)) if fg else -1
+            if 0 <= v <= 15:  # 극공포: 진입 크기 0 (진입 금지 신호)
+                mul *= 0.0
+            elif 0 <= v <= 25:  # 공포
+                mul *= 0.70
+            elif v >= 80:  # 극탐욕: 포지션 크기 0.7배로 제한
+                mul *= 0.70
+            elif v >= 75:  # 탐욕
+                mul *= 0.80
+        except Exception:
+            pass
     try:
         brief = (ext or {}).get("daily_btc_brief") or {}
         risk = str(brief.get("risk", "")).strip()
@@ -6995,6 +7003,47 @@ def external_risk_multiplier(ext: Dict[str, Any], cfg: Dict[str, Any]) -> float:
     except Exception:
         pass
     return float(clamp(mul, 0.2, 1.0))
+
+
+def swing_entry_pct_total_by_fng(ext: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[float]:
+    """
+    스윙 진입금(총자산 %)을 공포/탐욕(FNG) 지수로 8~15% 범위에서 자동 설정.
+    - 기본: v=50에서 최대, v=0/100에서 최소(삼각형)
+    """
+    try:
+        if not bool(cfg.get("swing_fng_entry_pct_enable", True)):
+            return None
+    except Exception:
+        return None
+    try:
+        fg = (ext or {}).get("fear_greed") or {}
+        v0 = fg.get("value", None)
+        if v0 is None or str(v0).strip() == "":
+            return None
+        v = float(v0)
+        if not math.isfinite(v):
+            return None
+        v = float(clamp(v, 0.0, 100.0))
+    except Exception:
+        return None
+    try:
+        pmin = float(cfg.get("swing_fng_entry_pct_min", 8.0) or 8.0)
+        pmax = float(cfg.get("swing_fng_entry_pct_max", 15.0) or 15.0)
+        if not (math.isfinite(pmin) and math.isfinite(pmax)):
+            return None
+        if pmax < pmin:
+            pmin, pmax = pmax, pmin
+        pmin = float(clamp(pmin, 0.5, 95.0))
+        pmax = float(clamp(pmax, pmin, 95.0))
+    except Exception:
+        pmin, pmax = 8.0, 15.0
+    try:
+        # factor: 1 at 50, 0 at 0/100
+        factor = 1.0 - (abs(float(v) - 50.0) / 50.0)
+        factor = float(clamp(factor, 0.0, 1.0))
+        return float(pmin + (pmax - pmin) * factor)
+    except Exception:
+        return None
 
 
 # =========================================================
@@ -13045,7 +13094,14 @@ def telegram_thread(ex):
                                 pass
 
                             # ✅ 외부시황 위험 감산은 스윙에서만 적용
+                            # - 스윙 진입금(FNG 기반)을 별도로 쓰는 경우에는 FNG 감산을 중복 적용하지 않도록,
+                            #   여기서는 "이벤트/브리핑" 요인만 반영한 multiplier를 사용한다.
                             entry_risk_mul = float(risk_mul) if str(style) == "스윙" else 1.0
+                            try:
+                                if str(style) == "스윙" and bool(cfg.get("swing_fng_entry_pct_enable", True)):
+                                    entry_risk_mul = float(external_risk_multiplier(ext, cfg, include_fng=False))
+                            except Exception:
+                                entry_risk_mul = entry_risk_mul
                             entry_usdt = free_usdt * (entry_pct / 100.0) * entry_risk_mul
 
                             # ✅ (요구) 하이리스크/하이리턴 모드에서만: 총자산 20% 진입 + 레버 20x 고정
@@ -13061,10 +13117,34 @@ def telegram_thread(ex):
 
                                     pct_total = float(cfg.get("highrisk_fixed_entry_pct_total", 20.0) or 20.0)
                                     pct_total = float(clamp(pct_total, 0.5, 95.0))
+                                    try:
+                                        # ✅ 요구: 스윙이면 공포/탐욕 지수(FNG)에 따라 총자산 8~15% 진입
+                                        if str(style) == "스윙":
+                                            pct_fng = swing_entry_pct_total_by_fng(ext, cfg)
+                                            if pct_fng is not None:
+                                                pct_total = float(pct_fng)
+                                                ai2["entry_pct_total_fng"] = float(pct_fng)
+                                                ai2["entry_pct_total_source"] = "FNG_SWING"
+                                    except Exception:
+                                        pass
                                     base_eq = float(total_usdt) if float(total_usdt) > 0 else float(free_usdt)
                                     entry_usdt_target = float(base_eq) * (float(pct_total) / 100.0)
-                                    # 스윙의 외부시황 위험감산은 그대로 반영
-                                    entry_usdt = float(entry_usdt_target) * float(entry_risk_mul)
+                                    # 스윙: 외부 리스크(이벤트/브리핑) 감산만 반영(공포/탐욕은 pct_total로 이미 반영)
+                                    try:
+                                        if str(style) == "스윙" and bool(cfg.get("swing_fng_entry_pct_enable", True)):
+                                            # 최종 pct_total은 8~15% 범위 내로 고정
+                                            pmin = float(cfg.get("swing_fng_entry_pct_min", 8.0) or 8.0)
+                                            pmax = float(cfg.get("swing_fng_entry_pct_max", 15.0) or 15.0)
+                                            pmin = float(clamp(pmin, 0.5, 95.0))
+                                            pmax = float(clamp(pmax, pmin, 95.0))
+                                            # 감산 적용 후에도 8~15를 유지(너무 작게 들어가는 문제 방지)
+                                            pct_eff = float(clamp(float(pct_total) * float(entry_risk_mul), float(pmin), float(pmax)))
+                                            entry_usdt = float(base_eq) * (float(pct_eff) / 100.0)
+                                            ai2["entry_pct_total_effective"] = float(pct_eff)
+                                        else:
+                                            entry_usdt = float(entry_usdt_target) * float(entry_risk_mul)
+                                    except Exception:
+                                        entry_usdt = float(entry_usdt_target) * float(entry_risk_mul)
                                     # free를 넘으면 주문 실패 → free 내로 제한
                                     entry_usdt = float(min(entry_usdt, float(free_usdt) * 0.99))
                                     ai2["entry_usdt_target_total"] = float(entry_usdt_target)
