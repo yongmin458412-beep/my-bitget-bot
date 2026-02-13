@@ -8319,15 +8319,32 @@ def tg_msg_entry_simple(
         entry_usdt_f = float(entry_usdt)
     except Exception:
         entry_usdt_f = 0.0
-    pct = None
+    pct_free = None
+    pct_total = None
     try:
         if bal_before_free is not None and float(bal_before_free) > 0:
-            pct = (float(entry_usdt_f) / float(bal_before_free)) * 100.0
-        elif entry_pct_plan is not None:
-            pct = float(entry_pct_plan)
+            pct_free = (float(entry_usdt_f) / float(bal_before_free)) * 100.0
     except Exception:
-        pct = None
-    pct_txt = f" ({pct:.1f}%)" if pct is not None and math.isfinite(float(pct)) else ""
+        pct_free = None
+    try:
+        if bal_before_total is not None and float(bal_before_total) > 0:
+            pct_total = (float(entry_usdt_f) / float(bal_before_total)) * 100.0
+    except Exception:
+        pct_total = None
+    pct_txt = ""
+    try:
+        if pct_free is not None and math.isfinite(float(pct_free)) and pct_total is not None and math.isfinite(float(pct_total)):
+            pct_txt = f" (가용 {float(pct_free):.1f}% / 총자산 {float(pct_total):.1f}%)"
+        elif pct_free is not None and math.isfinite(float(pct_free)):
+            pct_txt = f" (가용 {float(pct_free):.1f}%)"
+        elif pct_total is not None and math.isfinite(float(pct_total)):
+            pct_txt = f" (총자산 {float(pct_total):.1f}%)"
+        elif entry_pct_plan is not None:
+            pct0 = float(entry_pct_plan)
+            if math.isfinite(float(pct0)):
+                pct_txt = f" ({pct0:.1f}%)"
+    except Exception:
+        pct_txt = ""
     try:
         tp_v = float(tp_pct_roi) if tp_pct_roi is not None else None
     except Exception:
