@@ -619,6 +619,20 @@ def default_settings() -> Dict[str, Any]:
         # 지표 ON/OFF
         "use_rsi": True, "use_bb": True, "use_cci": True, "use_vol": True, "use_ma": True,
         "use_macd": True, "use_stoch": True, "use_mfi": True, "use_willr": True, "use_adx": True,
+        # ✅ 추가: 스퀴즈 모멘텀(Squeeze Momentum) - 초단기/추세 전환 포착용
+        "use_sqz": True,
+        "sqz_bb_length": 20,
+        "sqz_bb_mult": 2.0,
+        "sqz_kc_length": 20,
+        "sqz_kc_mult": 1.5,
+        "sqz_mom_length": 20,
+        # SQZ 모멘텀을 "가격 대비 %"로 환산한 기준(너무 크면 신호가 안 나고, 너무 작으면 과다신호)
+        "sqz_mom_threshold_pct": 0.05,
+        # SQZ를 최우선으로 반영(요구: 80% 이상 의존)
+        "sqz_dependency_enable": True,
+        "sqz_dependency_weight": 0.80,      # 0~1 (기본 0.80)
+        "sqz_dependency_gate_entry": True,  # SQZ가 중립이면 진입 억제
+        "sqz_dependency_override_ai": True, # SQZ가 반대면 AI buy/sell을 hold로 강제
 
         # 방어/전략
         "use_trailing_stop": True,
@@ -677,6 +691,10 @@ def default_settings() -> Dict[str, Any]:
         "max_risk_per_trade_enable": True,
         "max_risk_per_trade_pct": 2.5,
         "max_risk_per_trade_usdt": 0.0,
+        # ✅ 모드별 최대손실(%) 오버라이드: 진입금이 너무 낮아지는 문제 완화(특히 하이리스크)
+        "max_risk_per_trade_pct_safe": 2.5,
+        "max_risk_per_trade_pct_attack": 3.5,
+        "max_risk_per_trade_pct_highrisk": 5.0,
         # ✅ (선택) Kelly sizing: AI confidence(확신도) + 손익비(rr)로 entry_pct 상한을 계산(기본 OFF)
         # - 과대진입을 줄이는 용도로만 사용(기본은 min(AI entry_pct, Kelly cap))
         "kelly_sizing_enable": False,
@@ -5642,6 +5660,47 @@ def render_tradingview(symbol_ccxt: str, interval: str = "5", height: int = 560)
 # =========================================================
 # ✅ 11) 지표 계산 (기존 유지)
 # =========================================================
+def _rolling_linreg_last(series: pd.Series, length: int) -> pd.Series:
+    """
+    TradingView의 linreg(src, length, 0)와 유사하게,
+    각 롤링 윈도우에서 회귀직선의 '마지막 시점 값'을 반환.
+    (Squeeze Momentum 계산용)
+    """
+    try:
+        n = int(length)
+    except Exception:
+        n = 20
+    n = max(2, n)
+    # x = 0..n-1
+    x = np.arange(n, dtype=float)
+    x_mean = float((n - 1) / 2.0)
+    denom = float(np.sum((x - x_mean) ** 2)) if n >= 2 else 0.0
+
+    def _calc(y: np.ndarray) -> float:
+        try:
+            yy = np.asarray(y, dtype=float)
+            if yy.size != n:
+                return float("nan")
+            y_mean = float(np.mean(yy))
+            if denom <= 0:
+                return float(yy[-1])
+            num = float(np.sum((x - x_mean) * (yy - y_mean)))
+            slope = num / denom
+            intercept = y_mean - slope * x_mean
+            return float(intercept + slope * float(n - 1))
+        except Exception:
+            return float("nan")
+
+    try:
+        return series.rolling(n).apply(_calc, raw=True)
+    except Exception:
+        # rolling/apply가 실패하면 NaN series 반환
+        try:
+            return pd.Series([np.nan] * len(series), index=series.index)
+        except Exception:
+            return pd.Series(dtype=float)
+
+
 def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Optional[pd.Series]]:
     status: Dict[str, Any] = {}
     if df is None or df.empty or len(df) < 120:
@@ -5798,6 +5857,61 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
         except Exception as e:
             status["_VOL_ERROR"] = str(e)[:160]
 
+    # ✅ Squeeze Momentum (LazyBear 유사) - pandas/numpy로 직접 계산(추가 의존성 없음)
+    # - 스퀴즈(변동성 압축) 이후 모멘텀 방향/세기를 주요 진입/필터로 사용
+    if cfg.get("use_sqz", True):
+        try:
+            bb_len = int(cfg.get("sqz_bb_length", 20) or 20)
+            bb_mult = float(cfg.get("sqz_bb_mult", 2.0) or 2.0)
+            kc_len = int(cfg.get("sqz_kc_length", 20) or 20)
+            kc_mult = float(cfg.get("sqz_kc_mult", 1.5) or 1.5)
+            mom_len = int(cfg.get("sqz_mom_length", kc_len) or kc_len)
+
+            bb_len = max(5, bb_len)
+            kc_len = max(5, kc_len)
+            mom_len = max(5, mom_len)
+
+            # Bollinger Bands
+            bb_mid = close.rolling(bb_len).mean()
+            bb_std0 = close.rolling(bb_len).std(ddof=0)
+            bb_upper0 = bb_mid + bb_mult * bb_std0
+            bb_lower0 = bb_mid - bb_mult * bb_std0
+
+            # Keltner Channels (TR 기반)
+            prev_close = close.shift(1)
+            tr = pd.concat(
+                [
+                    (high - low).abs(),
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs(),
+                ],
+                axis=1,
+            ).max(axis=1)
+            range_ma = tr.rolling(kc_len).mean()
+            kc_mid = close.rolling(kc_len).mean()
+            kc_upper0 = kc_mid + kc_mult * range_ma
+            kc_lower0 = kc_mid - kc_mult * range_ma
+
+            sqz_on = (bb_lower0 > kc_lower0) & (bb_upper0 < kc_upper0)
+
+            # Momentum source
+            hh = high.rolling(mom_len).max()
+            ll = low.rolling(mom_len).min()
+            m1 = (hh + ll) / 2.0
+            m2 = (m1 + close.rolling(mom_len).mean()) / 2.0
+            src = close - m2
+
+            sqz_mom = _rolling_linreg_last(src, mom_len)
+            df["SQZ_ON"] = sqz_on.astype(int)
+            df["SQZ_MOM"] = sqz_mom
+            # 가격 대비 % (모멘텀 강도 비교용)
+            try:
+                df["SQZ_MOM_PCT"] = (sqz_mom.astype(float) / close.astype(float)) * 100.0
+            except Exception:
+                df["SQZ_MOM_PCT"] = np.nan
+        except Exception as e:
+            status["_SQZ_ERROR"] = str(e)[:160]
+
     if pta is not None:
         try:
             df["ATR_ref"] = pta.atr(df["high"], df["low"], df["close"], length=14)
@@ -5890,6 +6004,51 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
     if cfg.get("use_vol", True) and "VOL_SPIKE" in df2.columns:
         used.append("거래량")
         status["거래량"] = "🔥 거래량 급증" if int(last.get("VOL_SPIKE", 0)) == 1 else "⚪ 보통"
+
+    # Squeeze Momentum (SQZ)
+    if cfg.get("use_sqz", True) and "SQZ_MOM_PCT" in df2.columns:
+        used.append("스퀴즈모멘텀(SQZ)")
+        try:
+            mom_pct_now = float(last.get("SQZ_MOM_PCT", 0.0) or 0.0)
+        except Exception:
+            mom_pct_now = 0.0
+        try:
+            mom_pct_prev = float(prev.get("SQZ_MOM_PCT", 0.0) or 0.0)
+        except Exception:
+            mom_pct_prev = mom_pct_now
+        slope = float(mom_pct_now - mom_pct_prev)
+        try:
+            thr = float(cfg.get("sqz_mom_threshold_pct", 0.05) or 0.05)
+        except Exception:
+            thr = 0.05
+        thr = max(0.001, float(abs(thr)))
+        bias = 0
+        if mom_pct_now >= thr:
+            bias = 1
+        elif mom_pct_now <= -thr:
+            bias = -1
+        strength = float(min(1.0, abs(mom_pct_now) / (thr * 4.0))) if thr > 0 else 0.0
+        sqz_on_now = False
+        try:
+            if "SQZ_ON" in df2.columns:
+                sqz_on_now = int(last.get("SQZ_ON", 0) or 0) == 1
+        except Exception:
+            sqz_on_now = False
+        arrow = "↗" if slope > 0 else ("↘" if slope < 0 else "→")
+        if sqz_on_now:
+            status["SQZ"] = f"🟡 압축중 | 모멘텀 {mom_pct_now:+.2f}% {arrow}"
+        else:
+            if bias == 1:
+                status["SQZ"] = f"🟢 상승 모멘텀 {mom_pct_now:+.2f}% {arrow}"
+            elif bias == -1:
+                status["SQZ"] = f"🔴 하락 모멘텀 {mom_pct_now:+.2f}% {arrow}"
+            else:
+                status["SQZ"] = f"⚪ 모멘텀 약함 {mom_pct_now:+.2f}% {arrow}"
+        status["_sqz_mom_pct"] = float(mom_pct_now)
+        status["_sqz_slope"] = float(slope)
+        status["_sqz_bias"] = int(bias)
+        status["_sqz_strength"] = float(strength)
+        status["_sqz_on"] = bool(sqz_on_now)
 
     # RSI 해소
     rsi_prev = float(prev.get("RSI", 50)) if (cfg.get("use_rsi", True) and "RSI" in df2.columns) else 50.0
@@ -6725,6 +6884,13 @@ def ai_decide_trade(
         "rsi_resolve_short": bool(status.get("_rsi_resolve_short", False)),
         "pullback_candidate": bool(status.get("_pullback_candidate", False)),
         "atr_price_pct": _atr_price_pct(df, 14),
+        "sqz": {
+            "text": status.get("SQZ", ""),
+            "on": bool(status.get("_sqz_on", False)),
+            "mom_pct": float(status.get("_sqz_mom_pct", 0.0) or 0.0),
+            "bias": int(status.get("_sqz_bias", 0) or 0),
+            "strength": float(status.get("_sqz_strength", 0.0) or 0.0),
+        },
         "sr_context": sr_context or {},
         "chart_style_hint": str(chart_style_hint or ""),
         "external": (
@@ -6816,8 +6982,9 @@ def ai_decide_trade(
 
 	[핵심 룰]
 	1) RSI 과매도/과매수 '상태'에 즉시 진입하지 말고, '해소되는 시점'에서만 진입 후보.
-	2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. (역추세는 더 짧게/보수적으로)
-	3) 모드 규칙 반드시 준수:
+		2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. (역추세는 더 짧게/보수적으로)
+		3) SQZ(스퀴즈 모멘텀) 신호를 진입 판단의 80% 이상으로 반영해라. (모멘텀 방향/세기 우선)
+		4) 모드 규칙 반드시 준수:
 	   - 최소 확신도: {rule["min_conf"]}
 	   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
 	   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
@@ -11483,6 +11650,9 @@ def telegram_thread(ex):
                                 "bb": stt.get("BB", ""),
                                 "macd": stt.get("MACD", ""),
                                 "vol": stt.get("거래량", ""),
+                                "sqz": stt.get("SQZ", ""),
+                                "sqz_mom_pct": stt.get("_sqz_mom_pct", ""),
+                                "sqz_bias": stt.get("_sqz_bias", ""),
                                 "pullback_candidate": bool(stt.get("_pullback_candidate", False)),
                             }
                         )
@@ -11599,8 +11769,25 @@ def telegram_thread(ex):
                             except Exception:
                                 rsi_extreme = False
 
+                            # ✅ SQZ(스퀴즈 모멘텀) 기반: 모멘텀 방향/세기가 기준 이상이면 AI 호출
+                            sqz_mom_pct = 0.0
+                            sqz_thr = 0.05
+                            try:
+                                sqz_mom_pct = float(stt.get("_sqz_mom_pct", 0.0) or 0.0)
+                                sqz_thr = float(cfg.get("sqz_mom_threshold_pct", 0.05) or 0.05)
+                            except Exception:
+                                sqz_mom_pct = 0.0
+                                sqz_thr = 0.05
+                            try:
+                                sqz_thr = float(max(0.001, abs(float(sqz_thr))))
+                            except Exception:
+                                sqz_thr = 0.05
+                            sqz_strong = bool(cfg.get("use_sqz", True)) and bool(cfg.get("sqz_dependency_enable", True)) and (abs(float(sqz_mom_pct)) >= float(sqz_thr))
+
                             # 강한 시그널 우선
-                            if sig_pullback or sig_rsi_resolve:
+                            if sqz_strong:
+                                call_ai = True
+                            elif sig_pullback or sig_rsi_resolve:
                                 call_ai = True
                             elif ("상단 돌파" in bb_txt) or ("하단 이탈" in bb_txt):
                                 call_ai = True
@@ -11820,6 +12007,47 @@ def telegram_thread(ex):
                         decision = ai.get("decision", "hold")
                         conf = int(ai.get("confidence", 0))
                         mon_add_scan(mon, stage="ai_result", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=conf, message=str(ai.get("reason_easy", ""))[:80])
+                        # ✅ SQZ 의존도(요구: 80%+): SQZ 모멘텀이 반대/중립이면 진입을 강하게 억제
+                        sqz_skip_reason = ""
+                        try:
+                            raw_decision = str(decision or "hold")
+                            raw_conf = int(conf)
+                            if raw_decision in ["buy", "sell"] and bool(cfg.get("use_sqz", True)) and bool(cfg.get("sqz_dependency_enable", True)):
+                                w = float(cfg.get("sqz_dependency_weight", 0.80) or 0.80)
+                                w = float(clamp(w, 0.0, 1.0))
+                                gate = bool(cfg.get("sqz_dependency_gate_entry", True))
+                                override = bool(cfg.get("sqz_dependency_override_ai", True))
+                                bias = int(stt.get("_sqz_bias", 0) or 0)
+                                mom_pct = float(stt.get("_sqz_mom_pct", 0.0) or 0.0)
+                                aligned = (bias == 1 and raw_decision == "buy") or (bias == -1 and raw_decision == "sell")
+                                opposed = (bias == 1 and raw_decision == "sell") or (bias == -1 and raw_decision == "buy")
+
+                                if opposed:
+                                    conf = int(round(float(conf) * max(0.0, 1.0 - w)))
+                                    if override:
+                                        decision = "hold"
+                                        sqz_skip_reason = f"SQZ 반대 모멘텀({mom_pct:+.2f}%)"
+                                elif bias == 0 and gate:
+                                    conf = int(round(float(conf) * max(0.0, 1.0 - w)))
+                                    decision = "hold"
+                                    sqz_skip_reason = f"SQZ 중립 모멘텀({mom_pct:+.2f}%)"
+                                elif aligned:
+                                    # 정방향이면 confidence 소폭 보정(최대 100)
+                                    conf = int(min(100, int(conf) + int(round(10.0 * w))))
+
+                                if sqz_skip_reason:
+                                    mon_add_scan(
+                                        mon,
+                                        stage="trade_skipped",
+                                        symbol=sym,
+                                        tf=str(cfg.get("timeframe", "5m")),
+                                        signal=str(raw_decision),
+                                        score=int(raw_conf),
+                                        message=sqz_skip_reason,
+                                        extra={"sqz_mom_pct": mom_pct, "sqz_bias": bias, "w": w},
+                                    )
+                        except Exception:
+                            sqz_skip_reason = ""
                         # 강제스캔 요약 라인(요구사항: /scan 결과는 짧게)
                         try:
                             if force_scan_pending and ((not force_scan_syms_set) or (sym in force_scan_syms_set)):
@@ -11840,7 +12068,7 @@ def telegram_thread(ex):
                                 "ai_used": ", ".join(ai.get("used_indicators", [])),
                                 "ai_reason_easy": ai.get("reason_easy", ""),
                                 "min_conf_required": int(rule["min_conf"]),
-                                "skip_reason": "",
+                                "skip_reason": sqz_skip_reason,
                             }
                         )
                         monitor_write_throttled(mon, 1.0)
@@ -12158,7 +12386,32 @@ def telegram_thread(ex):
                                     # 필터 경고(거래량/이격도) 기반: 경고가 있으면 보수적으로
                                     pre_factor = 0.75 if (isinstance(filter_msgs, list) and filter_msgs) else 1.0
 
-                                    f = float(clamp(float(conf_factor) * float(sig_factor) * float(pre_factor), 0.35, 1.35))
+                                    # ✅ SQZ 모멘텀 정방향이면 진입비중을 더 키우고(진입금↑),
+                                    #    중립이면 약간 보수적으로(요구: SQZ 의존도 80%+)
+                                    sqz_factor = 1.0
+                                    try:
+                                        if bool(cfg.get("use_sqz", True)) and bool(cfg.get("sqz_dependency_enable", True)):
+                                            bias0 = int(stt.get("_sqz_bias", 0) or 0)
+                                            str0 = float(stt.get("_sqz_strength", 0.0) or 0.0)
+                                            w0 = float(cfg.get("sqz_dependency_weight", 0.80) or 0.80)
+                                            w0 = float(clamp(w0, 0.0, 1.0))
+                                            if bias0 != 0:
+                                                sqz_factor = 1.0 + min(0.35, 0.25 * float(str0) * max(0.8, float(w0)))
+                                            else:
+                                                sqz_factor = 0.90
+                                    except Exception:
+                                        sqz_factor = 1.0
+
+                                    f_max = 1.35
+                                    try:
+                                        if str(mode) == "공격모드":
+                                            f_max = 1.45
+                                        elif str(mode) == "하이리스크/하이리턴":
+                                            f_max = 1.60
+                                    except Exception:
+                                        f_max = 1.35
+
+                                    f = float(clamp(float(conf_factor) * float(sig_factor) * float(pre_factor) * float(sqz_factor), 0.35, float(f_max)))
                                     entry_pct_scaled = float(clamp(float(entry_pct) * f, float(entry_floor), float(rule["entry_pct_max"])))
                                     if abs(entry_pct_scaled - float(entry_pct)) > 1e-9:
                                         entry_pct = entry_pct_scaled
@@ -12205,7 +12458,28 @@ def telegram_thread(ex):
                                         pass
                                     # max loss 계산(퍼센트/USDT 중 더 엄격한 쪽)
                                     base_eq = float(total_usdt) if float(total_usdt) > 0 else float(free_usdt)
-                                    lim_pct = float(cfg.get("max_risk_per_trade_pct", 2.5) or 0.0)
+                                    # ✅ 모드별 리스크캡(진입금이 너무 낮아지는 문제 완화)
+                                    lim_pct_base = float(cfg.get("max_risk_per_trade_pct", 2.5) or 0.0)
+                                    lim_pct = float(lim_pct_base)
+                                    try:
+                                        if str(mode) == "안전모드":
+                                            lim_pct = float(cfg.get("max_risk_per_trade_pct_safe", lim_pct_base) or lim_pct_base)
+                                        elif str(mode) == "공격모드":
+                                            lim_pct = float(cfg.get("max_risk_per_trade_pct_attack", lim_pct_base) or lim_pct_base)
+                                        else:
+                                            lim_pct = float(cfg.get("max_risk_per_trade_pct_highrisk", lim_pct_base) or lim_pct_base)
+                                    except Exception:
+                                        lim_pct = float(lim_pct_base)
+                                    # SQZ 정방향+강한 모멘텀(하이리스크)일 때는 리스크캡을 약간 완화(진입금↑)
+                                    try:
+                                        if bool(cfg.get("use_sqz", True)) and bool(cfg.get("sqz_dependency_enable", True)):
+                                            bias0 = int(stt.get("_sqz_bias", 0) or 0)
+                                            str0 = float(stt.get("_sqz_strength", 0.0) or 0.0)
+                                            aligned0 = (bias0 == 1 and str(decision) == "buy") or (bias0 == -1 and str(decision) == "sell")
+                                            if aligned0 and float(str0) >= 0.6 and str(mode) == "하이리스크/하이리턴":
+                                                lim_pct = float(lim_pct) * (1.0 + min(0.25, 0.15 * float(str0)))
+                                    except Exception:
+                                        pass
                                     lim_usdt = float(cfg.get("max_risk_per_trade_usdt", 0.0) or 0.0)
                                     max_loss_pct = (base_eq * abs(lim_pct) / 100.0) if lim_pct > 0 else float("inf")
                                     max_loss_abs = abs(lim_usdt) if lim_usdt > 0 else float("inf")
@@ -13677,6 +13951,11 @@ with st.sidebar.expander("진입 사이징/레버(고정/ATR/리스크캡/Kelly)
     config["max_risk_per_trade_pct"] = r1.number_input("최대손실(%)", 0.1, 20.0, float(config.get("max_risk_per_trade_pct", 2.5) or 2.5), step=0.1)
     config["max_risk_per_trade_usdt"] = r2.number_input("최대손실(USDT)", 0.0, 100000000.0, float(config.get("max_risk_per_trade_usdt", 0.0) or 0.0), step=10.0)
     st.caption("※ 퍼센트/USDT 중 더 엄격한 기준으로 '진입금(마진)'을 자동 감산합니다.")
+    st.caption("※ 모드별로 진입금이 너무 낮다면, 아래 오버라이드를 올려주세요(특히 하이리스크).")
+    mr1, mr2, mr3 = st.columns(3)
+    config["max_risk_per_trade_pct_safe"] = mr1.number_input("안전(%)", 0.1, 50.0, float(config.get("max_risk_per_trade_pct_safe", 2.5) or 2.5), step=0.1)
+    config["max_risk_per_trade_pct_attack"] = mr2.number_input("공격(%)", 0.1, 50.0, float(config.get("max_risk_per_trade_pct_attack", 3.5) or 3.5), step=0.1)
+    config["max_risk_per_trade_pct_highrisk"] = mr3.number_input("하이리스크(%)", 0.1, 50.0, float(config.get("max_risk_per_trade_pct_highrisk", 5.0) or 5.0), step=0.1)
     st.divider()
     config["kelly_sizing_enable"] = st.checkbox("Kelly cap(선택)", value=bool(config.get("kelly_sizing_enable", False)))
     k1, k2 = st.columns(2)
@@ -13787,7 +14066,7 @@ config["export_excel_enable"] = st.sidebar.checkbox("Excel(xlsx) 저장", value=
 config["export_gsheet_enable"] = st.sidebar.checkbox("Google Sheets 저장", value=bool(config.get("export_gsheet_enable", True)))
 
 st.sidebar.divider()
-st.sidebar.subheader("📊 보조지표 (10종) ON/OFF")
+st.sidebar.subheader("📊 보조지표 (11종) ON/OFF")
 colA, colB = st.sidebar.columns(2)
 config["use_rsi"] = colA.checkbox("RSI", value=bool(config.get("use_rsi", True)))
 config["use_bb"] = colB.checkbox("볼린저", value=bool(config.get("use_bb", True)))
@@ -13799,6 +14078,7 @@ config["use_mfi"] = colA.checkbox("MFI", value=bool(config.get("use_mfi", True))
 config["use_willr"] = colB.checkbox("윌리엄%R", value=bool(config.get("use_willr", True)))
 config["use_adx"] = colA.checkbox("ADX", value=bool(config.get("use_adx", True)))
 config["use_vol"] = colB.checkbox("거래량", value=bool(config.get("use_vol", True)))
+config["use_sqz"] = colA.checkbox("SQZ(스퀴즈)", value=bool(config.get("use_sqz", True)))
 
 st.sidebar.divider()
 st.sidebar.subheader("지표 파라미터")
@@ -13814,6 +14094,21 @@ config["bb_std"] = b2.number_input("BB 승수", 1.0, 5.0, float(config.get("bb_s
 m1, m2 = st.sidebar.columns(2)
 config["ma_fast"] = m1.number_input("MA 단기", 3, 50, int(config.get("ma_fast", 7)))
 config["ma_slow"] = m2.number_input("MA 장기", 50, 300, int(config.get("ma_slow", 99)))
+
+with st.sidebar.expander("🔥 스퀴즈 모멘텀(SQZ) 설정"):
+    config["sqz_dependency_enable"] = st.checkbox("SQZ 의존(진입 필터)", value=bool(config.get("sqz_dependency_enable", True)))
+    config["sqz_dependency_gate_entry"] = st.checkbox("SQZ 중립이면 진입 억제", value=bool(config.get("sqz_dependency_gate_entry", True)))
+    config["sqz_dependency_override_ai"] = st.checkbox("SQZ 반대면 AI 신호 무시", value=bool(config.get("sqz_dependency_override_ai", True)))
+    config["sqz_dependency_weight"] = st.slider("SQZ 의존도(가중치)", 0.5, 1.0, float(config.get("sqz_dependency_weight", 0.80) or 0.80), step=0.05)
+    c_sq1, c_sq2 = st.columns(2)
+    config["sqz_mom_threshold_pct"] = c_sq1.number_input("모멘텀 기준(%)", 0.005, 1.0, float(config.get("sqz_mom_threshold_pct", 0.05) or 0.05), step=0.01)
+    config["sqz_bb_length"] = c_sq2.number_input("BB 길이", 5, 80, int(config.get("sqz_bb_length", 20) or 20), step=1)
+    c_sq3, c_sq4 = st.columns(2)
+    config["sqz_bb_mult"] = c_sq3.number_input("BB 배수", 0.5, 6.0, float(config.get("sqz_bb_mult", 2.0) or 2.0), step=0.1)
+    config["sqz_kc_length"] = c_sq4.number_input("KC 길이", 5, 80, int(config.get("sqz_kc_length", 20) or 20), step=1)
+    c_sq5, c_sq6 = st.columns(2)
+    config["sqz_kc_mult"] = c_sq5.number_input("KC 배수", 0.5, 6.0, float(config.get("sqz_kc_mult", 1.5) or 1.5), step=0.1)
+    config["sqz_mom_length"] = c_sq6.number_input("모멘텀 길이", 5, 120, int(config.get("sqz_mom_length", 20) or 20), step=1)
 
 st.sidebar.divider()
 st.sidebar.subheader("🔍 긴급 점검")
@@ -14006,6 +14301,7 @@ with right:
                     "MACD": stt.get("MACD", "-"),
                     "ADX": stt.get("ADX", "-"),
                     "거래량": stt.get("거래량", "-"),
+                    "SQZ": stt.get("SQZ", "-"),
                     "눌림목후보(해소)": "✅" if stt.get("_pullback_candidate") else "—",
                     "지표엔진": stt.get("_backend", "-"),
                 }
@@ -14231,6 +14527,7 @@ with t1:
                     "ADX": cs.get("adx", ""),
                     "BB": cs.get("bb", ""),
                     "MACD": cs.get("macd", ""),
+                    "SQZ": cs.get("sqz", ""),
                     "눌림목후보": "✅" if cs.get("pullback_candidate") else "—",
                     "AI호출": "✅" if cs.get("ai_called") else "—",
                     "AI결론": str(cs.get("ai_decision", "-")).upper(),
