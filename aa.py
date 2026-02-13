@@ -634,6 +634,37 @@ def default_settings() -> Dict[str, Any]:
         "sqz_dependency_gate_entry": True,  # SQZ가 중립이면 진입 억제
         "sqz_dependency_override_ai": True, # SQZ가 반대면 AI buy/sell을 hold로 강제
 
+        # ✅ (추가) 주력 지표(요구): Lorentzian / KNN / Logistic / SQZ / RSI
+        # - 5개 중 3개 이상이 같은 방향으로 수렴할 때만 진입(비용/휩쏘 방지)
+        # - 스캔 단계에서 먼저 계산하고, 진입 시에만 AI를 호출해 TP/SL/SR를 유도리 있게 설계
+        "entry_convergence_enable": True,
+        "entry_convergence_min_votes": 3,
+        # ML 시그널 계산(외부 라이브러리 없이 numpy/pandas로만)
+        "ml_enable": True,
+        "ml_lookback": 220,          # 학습(과거 N샘플)
+        "ml_horizon": 1,             # 라벨(미래 h봉): close[t+h] > close[t]
+        "ml_feature_ma_period": 20,
+        "ml_feature_vol_ma_period": 20,
+        "ml_min_train_samples": 80,
+        # KNN
+        "ml_knn_k": 15,
+        "ml_knn_prob_long": 0.56,
+        "ml_knn_prob_short": 0.44,
+        # Lorentzian KNN
+        "ml_lor_k": 15,
+        "ml_lor_prob_long": 0.56,
+        "ml_lor_prob_short": 0.44,
+        # Logistic regression(간이 GD)
+        "ml_logit_steps": 120,
+        "ml_logit_lr": 0.15,
+        "ml_logit_l2": 0.01,
+        "ml_logit_prob_long": 0.56,
+        "ml_logit_prob_short": 0.44,
+        # RSI 방향(중립 구간은 0)
+        "ml_rsi_neutral_band": 3.0,  # 50±3 구간은 중립
+        # 캐시(같은 봉에서는 ML도 1회만 계산)
+        "ml_cache_enable": True,
+
         # 방어/전략
         "use_trailing_stop": True,
         # ✅ (핵심) 강제 청산 정책: "수익을 손실로 마감"하지 않기
@@ -675,6 +706,13 @@ def default_settings() -> Dict[str, Any]:
         "fixed_leverage": 20,
         "fixed_entry_pct_enable": False,
         "fixed_entry_pct": 20.0,
+        # ✅ (추가) 하이리스크/하이리턴 모드에서만 고정 진입(요구)
+        # - entry_usdt = 총자산(total) * 20%
+        # - leverage = 20x
+        # - 다른 모드에서는 AI/룰 기반(기존)
+        "highrisk_fixed_size_enable": True,
+        "highrisk_fixed_entry_pct_total": 20.0,
+        "highrisk_fixed_leverage": 20,
         # cross/isolated 선택(거래소/계정 설정에 따라 실패할 수 있으니 safe 적용)
         "margin_mode": "cross",  # "cross"|"isolated"
         # ✅ ATR 기반 레버리지(요구): 변동성이 크면 레버↓, 변동성이 작으면 레버↑
@@ -6068,6 +6106,348 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
 
 
 # =========================================================
+# ✅ 11.2) (추가) ML/주력 지표 시그널 (Lorentzian / KNN / Logistic / SQZ / RSI)
+# - 외부 라이브러리 없이 numpy/pandas로만 계산
+# - 같은 봉에서는 캐시 재사용(비용/지연 감소)
+# =========================================================
+_ML_SIGNAL_CACHE_LOCK = threading.RLock()
+_ML_SIGNAL_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _ml_sigmoid(z: np.ndarray) -> np.ndarray:
+    try:
+        z2 = np.clip(z, -20.0, 20.0)
+    except Exception:
+        z2 = z
+    try:
+        return 1.0 / (1.0 + np.exp(-z2))
+    except Exception:
+        # 마지막 방어
+        try:
+            return 1.0 / (1.0 + np.exp(-np.asarray(z2, dtype=float)))
+        except Exception:
+            return np.asarray([0.5] * int(len(z))) if hasattr(z, "__len__") else np.asarray([0.5])
+
+
+def _ml_zscore_fit(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    try:
+        mu = np.nanmean(X, axis=0)
+        sd = np.nanstd(X, axis=0, ddof=0)
+        sd = np.where(sd <= 1e-9, 1.0, sd)
+        return mu.astype(float), sd.astype(float)
+    except Exception:
+        d = int(X.shape[1]) if getattr(X, "ndim", 0) == 2 else 1
+        return np.zeros(d, dtype=float), np.ones(d, dtype=float)
+
+
+def _ml_zscore_apply(X: np.ndarray, mu: np.ndarray, sd: np.ndarray) -> np.ndarray:
+    try:
+        return (X - mu) / sd
+    except Exception:
+        try:
+            return (np.asarray(X, dtype=float) - np.asarray(mu, dtype=float)) / np.asarray(sd, dtype=float)
+        except Exception:
+            return np.asarray(X, dtype=float)
+
+
+def _ml_knn_prob(X: np.ndarray, y: np.ndarray, x: np.ndarray, k: int = 15, metric: str = "euclid") -> float:
+    """
+    y: 0/1
+    metric:
+      - euclid: L2
+      - lorentz: sum(log(1+|diff|))
+    """
+    try:
+        n = int(X.shape[0])
+        if n <= 5:
+            return 0.5
+        kk = int(max(3, min(int(k), n)))
+        diff = X - x.reshape(1, -1)
+        if str(metric) == "lorentz":
+            dist = np.sum(np.log1p(np.abs(diff)), axis=1)
+        else:
+            dist = np.sqrt(np.sum(diff * diff, axis=1))
+        # k nearest
+        idx = np.argpartition(dist, kk - 1)[:kk]
+        yy = y[idx]
+        # prob long = mean(1)
+        p = float(np.mean(yy))
+        if not math.isfinite(p):
+            return 0.5
+        return float(clamp(p, 0.0, 1.0))
+    except Exception:
+        return 0.5
+
+
+def _ml_logit_prob(X: np.ndarray, y: np.ndarray, x: np.ndarray, steps: int = 120, lr: float = 0.15, l2: float = 0.01) -> float:
+    """
+    간이 Logistic Regression:
+    - 경량 GD(steps 제한)
+    - L2 정규화(과적합/발산 방지)
+    """
+    try:
+        n, d = int(X.shape[0]), int(X.shape[1])
+        if n <= 30 or d <= 0:
+            return 0.5
+        st = int(max(20, min(int(steps), 400)))
+        lr0 = float(clamp(float(lr), 0.01, 0.6))
+        l2_0 = float(clamp(float(l2), 0.0, 0.2))
+
+        Xb = np.concatenate([np.ones((n, 1), dtype=float), X.astype(float)], axis=1)
+        w = np.zeros((d + 1,), dtype=float)
+
+        yy = y.astype(float)
+        for _ in range(st):
+            z = Xb @ w
+            p = _ml_sigmoid(z)
+            grad = (Xb.T @ (p - yy)) / float(n)
+            # L2 (bias 제외)
+            grad[1:] = grad[1:] + l2_0 * w[1:]
+            w = w - lr0 * grad
+
+        xb = np.concatenate([np.ones((1,), dtype=float), x.astype(float)], axis=0)
+        p1 = float(_ml_sigmoid(np.asarray([float(xb @ w)])).reshape(-1)[0])
+        if not math.isfinite(p1):
+            return 0.5
+        return float(clamp(p1, 0.0, 1.0))
+    except Exception:
+        return 0.5
+
+
+def ml_signals_and_convergence(
+    df: pd.DataFrame,
+    status: Dict[str, Any],
+    cfg: Dict[str, Any],
+    cache_key: str = "",
+) -> Dict[str, Any]:
+    """
+    반환:
+      - rsi_sig, sqz_sig, knn_sig, lor_sig, logit_sig (-1/0/1)
+      - knn_prob, lor_prob, logit_prob (0..1)
+      - votes_long, votes_short, votes_max, dir("buy"/"sell"/"hold"), detail
+    """
+    try:
+        if bool(cfg.get("ml_cache_enable", True)) and cache_key:
+            with _ML_SIGNAL_CACHE_LOCK:
+                cached = _ML_SIGNAL_CACHE.get(cache_key)
+                if isinstance(cached, dict) and cached:
+                    return dict(cached)
+    except Exception:
+        pass
+
+    out: Dict[str, Any] = {
+        "rsi_sig": 0,
+        "sqz_sig": 0,
+        "knn_sig": 0,
+        "lor_sig": 0,
+        "logit_sig": 0,
+        "knn_prob": 0.5,
+        "lor_prob": 0.5,
+        "logit_prob": 0.5,
+        "votes_long": 0,
+        "votes_short": 0,
+        "votes_max": 0,
+        "dir": "hold",
+        "detail": "",
+    }
+
+    try:
+        if (df is None) or df.empty or len(df) < 80:
+            return out
+    except Exception:
+        return out
+
+    # RSI sig
+    rsi_now = None
+    try:
+        if "RSI" in df.columns:
+            v = df["RSI"].iloc[-1]
+            rsi_now = float(v) if (v is not None and pd.notna(v)) else None
+    except Exception:
+        rsi_now = None
+    try:
+        band = float(cfg.get("ml_rsi_neutral_band", 3.0) or 3.0)
+    except Exception:
+        band = 3.0
+    band = float(max(0.0, abs(band)))
+    if rsi_now is not None:
+        if float(rsi_now) >= 50.0 + band:
+            out["rsi_sig"] = 1
+        elif float(rsi_now) <= 50.0 - band:
+            out["rsi_sig"] = -1
+        else:
+            out["rsi_sig"] = 0
+
+    # SQZ sig
+    try:
+        bias = int(status.get("_sqz_bias", 0) or 0)
+        if bias in [-1, 0, 1]:
+            out["sqz_sig"] = int(bias)
+        else:
+            out["sqz_sig"] = 0
+    except Exception:
+        out["sqz_sig"] = 0
+
+    if not bool(cfg.get("ml_enable", True)):
+        # convergence는 RSI/SQZ만으로도 계산 가능
+        pass
+    else:
+        try:
+            close = pd.to_numeric(df["close"], errors="coerce")
+            vol = pd.to_numeric(df["vol"], errors="coerce") if "vol" in df.columns else pd.Series([np.nan] * len(df), index=df.index)
+
+            ma_p = int(cfg.get("ml_feature_ma_period", 20) or 20)
+            ma_p = max(5, ma_p)
+            vma_p = int(cfg.get("ml_feature_vol_ma_period", 20) or 20)
+            vma_p = max(5, vma_p)
+
+            ret1 = close.pct_change(1) * 100.0
+            ret3 = close.pct_change(3) * 100.0
+            ma = close.rolling(ma_p).mean()
+            disp = (close - ma) / ma * 100.0
+            vma = vol.rolling(vma_p).mean()
+            vol_ratio = vol / vma
+
+            rsi = pd.to_numeric(df["RSI"], errors="coerce") if "RSI" in df.columns else pd.Series([np.nan] * len(df), index=df.index)
+            rsi_norm = (rsi - 50.0) / 50.0
+            sqz = pd.to_numeric(df["SQZ_MOM_PCT"], errors="coerce") if "SQZ_MOM_PCT" in df.columns else pd.Series([0.0] * len(df), index=df.index)
+
+            feat = pd.DataFrame(
+                {
+                    "ret1": ret1,
+                    "ret3": ret3,
+                    "rsi_norm": rsi_norm,
+                    "sqz": sqz,
+                    "vol_ratio": vol_ratio - 1.0,
+                    "disp": disp,
+                }
+            )
+            feat = feat.replace([np.inf, -np.inf], np.nan)
+
+            # 현재 피처(x_cur)
+            if feat.iloc[-1].isna().any():
+                return out
+            x_cur = feat.iloc[-1].astype(float).values
+
+            # 라벨(y): 미래 h봉 후 상승이면 1, 아니면 0
+            h = int(cfg.get("ml_horizon", 1) or 1)
+            h = max(1, min(h, 10))
+            y = (close.shift(-h) > close).astype(float)
+
+            train_df = feat.copy()
+            train_df["y"] = y
+            train_df = train_df.dropna()
+            if train_df.empty:
+                return out
+
+            lookback = int(cfg.get("ml_lookback", 220) or 220)
+            lookback = max(60, min(lookback, 1200))
+            if len(train_df) > lookback:
+                train_df = train_df.iloc[-lookback:]
+
+            min_n = int(cfg.get("ml_min_train_samples", 80) or 80)
+            if len(train_df) < min_n:
+                return out
+
+            y_train = train_df["y"].astype(float).values
+            X_train_raw = train_df.drop(columns=["y"]).astype(float).values
+
+            # 스케일링
+            mu, sd = _ml_zscore_fit(X_train_raw)
+            X_train = _ml_zscore_apply(X_train_raw, mu, sd)
+            x1 = _ml_zscore_apply(x_cur.reshape(1, -1), mu, sd).reshape(-1)
+
+            # KNN(Euclid)
+            k_knn = int(cfg.get("ml_knn_k", 15) or 15)
+            p_knn = _ml_knn_prob(X_train, y_train, x1, k=k_knn, metric="euclid")
+            out["knn_prob"] = float(p_knn)
+            pl = float(cfg.get("ml_knn_prob_long", 0.56) or 0.56)
+            ps = float(cfg.get("ml_knn_prob_short", 0.44) or 0.44)
+            if p_knn >= pl:
+                out["knn_sig"] = 1
+            elif p_knn <= ps:
+                out["knn_sig"] = -1
+
+            # Lorentzian KNN
+            k_lor = int(cfg.get("ml_lor_k", 15) or 15)
+            p_lor = _ml_knn_prob(X_train, y_train, x1, k=k_lor, metric="lorentz")
+            out["lor_prob"] = float(p_lor)
+            pl2 = float(cfg.get("ml_lor_prob_long", 0.56) or 0.56)
+            ps2 = float(cfg.get("ml_lor_prob_short", 0.44) or 0.44)
+            if p_lor >= pl2:
+                out["lor_sig"] = 1
+            elif p_lor <= ps2:
+                out["lor_sig"] = -1
+
+            # Logistic regression
+            st = int(cfg.get("ml_logit_steps", 120) or 120)
+            lr0 = float(cfg.get("ml_logit_lr", 0.15) or 0.15)
+            l2 = float(cfg.get("ml_logit_l2", 0.01) or 0.01)
+            p_log = _ml_logit_prob(X_train, y_train, x1, steps=st, lr=lr0, l2=l2)
+            out["logit_prob"] = float(p_log)
+            pl3 = float(cfg.get("ml_logit_prob_long", 0.56) or 0.56)
+            ps3 = float(cfg.get("ml_logit_prob_short", 0.44) or 0.44)
+            if p_log >= pl3:
+                out["logit_sig"] = 1
+            elif p_log <= ps3:
+                out["logit_sig"] = -1
+        except Exception:
+            pass
+
+    # votes
+    sigs = {
+        "RSI": int(out.get("rsi_sig", 0) or 0),
+        "SQZ": int(out.get("sqz_sig", 0) or 0),
+        "KNN": int(out.get("knn_sig", 0) or 0),
+        "LOR": int(out.get("lor_sig", 0) or 0),
+        "LOGIT": int(out.get("logit_sig", 0) or 0),
+    }
+    v_long = sum(1 for v in sigs.values() if int(v) == 1)
+    v_short = sum(1 for v in sigs.values() if int(v) == -1)
+    out["votes_long"] = int(v_long)
+    out["votes_short"] = int(v_short)
+    out["votes_max"] = int(max(v_long, v_short))
+    try:
+        need = int(cfg.get("entry_convergence_min_votes", 3) or 3)
+    except Exception:
+        need = 3
+    if v_long >= need and v_long > v_short:
+        out["dir"] = "buy"
+    elif v_short >= need and v_short > v_long:
+        out["dir"] = "sell"
+    else:
+        out["dir"] = "hold"
+    # detail
+    try:
+        def _sg(x: int) -> str:
+            return "롱" if x == 1 else ("숏" if x == -1 else "중립")
+
+        out["detail"] = (
+            f"RSI:{_sg(int(out.get('rsi_sig',0)))} | SQZ:{_sg(int(out.get('sqz_sig',0)))} | "
+            f"KNN:{_sg(int(out.get('knn_sig',0)))}({float(out.get('knn_prob',0.5)):.2f}) | "
+            f"LOR:{_sg(int(out.get('lor_sig',0)))}({float(out.get('lor_prob',0.5)):.2f}) | "
+            f"LOGIT:{_sg(int(out.get('logit_sig',0)))}({float(out.get('logit_prob',0.5)):.2f}) | "
+            f"VOTE L{v_long}/S{v_short}"
+        )[:240]
+    except Exception:
+        out["detail"] = ""
+
+    # cache store + prune
+    try:
+        if bool(cfg.get("ml_cache_enable", True)) and cache_key:
+            with _ML_SIGNAL_CACHE_LOCK:
+                _ML_SIGNAL_CACHE[cache_key] = dict(out)
+                if len(_ML_SIGNAL_CACHE) > 400:
+                    # 오래된 것 절반 정리(순서 보장 X → key 정렬로 대충)
+                    for k in list(_ML_SIGNAL_CACHE.keys())[:200]:
+                        _ML_SIGNAL_CACHE.pop(k, None)
+    except Exception:
+        pass
+
+    return out
+
+
+# =========================================================
 # ✅ 12) 외부 시황 통합(거시/심리/레짐/뉴스) - 캐시/한글화/안정성 강화
 # =========================================================
 _ext_cache = TTLCache(maxsize=12, ttl=60) if TTLCache else None
@@ -6891,6 +7271,7 @@ def ai_decide_trade(
             "bias": int(status.get("_sqz_bias", 0) or 0),
             "strength": float(status.get("_sqz_strength", 0.0) or 0.0),
         },
+        "ml_signals": status.get("_ml_signals", {}) if isinstance(status.get("_ml_signals", {}), dict) else {},
         "sr_context": sr_context or {},
         "chart_style_hint": str(chart_style_hint or ""),
         "external": (
@@ -6980,15 +7361,19 @@ def ai_decide_trade(
 
 {ext_hdr}
 
-	[핵심 룰]
-	1) RSI 과매도/과매수 '상태'에 즉시 진입하지 말고, '해소되는 시점'에서만 진입 후보.
-		2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. (역추세는 더 짧게/보수적으로)
-		3) SQZ(스퀴즈 모멘텀) 신호를 진입 판단의 80% 이상으로 반영해라. (모멘텀 방향/세기 우선)
-		4) 모드 규칙 반드시 준수:
-	   - 최소 확신도: {rule["min_conf"]}
-	   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
-	   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
-	{soft_entry_hint}
+		[핵심 룰]
+		1) RSI 과매도/과매수 '상태'에 즉시 진입하지 말고, '해소되는 시점'에서만 진입 후보.
+			2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. (역추세는 더 짧게/보수적으로)
+			3) SQZ(스퀴즈 모멘텀) 신호를 진입 판단의 80% 이상으로 반영해라. (모멘텀 방향/세기 우선)
+			4) ml_signals(주력 지표 수렴: Lorentzian/KNN/Logistic/SQZ/RSI)를 반드시 따른다.
+			   - ml_signals.dir이 "buy"면 decision은 buy만 가능(반대 방향 금지)
+			   - ml_signals.dir이 "sell"면 decision은 sell만 가능(반대 방향 금지)
+			   - ml_signals.dir이 "hold"면 hold
+			5) 모드 규칙 반드시 준수:
+		   - 최소 확신도: {rule["min_conf"]}
+		   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
+		   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
+		{soft_entry_hint}
 
 	[중요]
 	- sl_pct / tp_pct는 ROI%(레버 반영 수익률)로 출력한다.
@@ -11357,9 +11742,21 @@ def telegram_thread(ex):
                                     bb_free_s = f"{float(bb_free):.2f}" if bb_free is not None else "-"
                                 except Exception:
                                     bb_free_s = "-"
+                                # ✅ 손실인데 '익절'로 보이는 혼동 방지:
+                                # - 시간초과 정리/강제 정리 등은 ROI/PnL이 음수면 '정리'로 표기
+                                title_txt = "🎉 익절(강제)" if bool(hard_take) else "🎉 익절"
+                                try:
+                                    if bool(is_loss_take):
+                                        r0 = str(tgt.get("force_take_reason", "") or take_reason_ko or "").strip()
+                                        if "시간초과" in r0:
+                                            title_txt = "⏳ 시간초과 정리(강제)" if bool(hard_take) else "⏳ 시간초과 정리"
+                                        else:
+                                            title_txt = "🩸 정리(강제)" if bool(hard_take) else "🩸 정리"
+                                except Exception:
+                                    title_txt = title_txt
                                 if _tg_simple_enabled(cfg):
                                     msg = tg_msg_exit_simple(
-                                        title="🎉 익절(강제)" if bool(hard_take) else "🎉 익절",
+                                        title=str(title_txt),
                                         symbol=str(sym),
                                         style=str(style_now),
                                         side=str(side),
@@ -11376,7 +11773,7 @@ def telegram_thread(ex):
                                     )
                                 else:
                                     msg = (
-                                        f"🎉 익절\n- 코인: {sym}\n- 스타일: {style_now}\n- 수익률: {roi:+.2f}% (손익 {pnl_usdt_snapshot:+.2f} USDT)\n"
+                                        f"{title_txt}\n- 코인: {sym}\n- 스타일: {style_now}\n- 수익률: {roi:+.2f}% (손익 {pnl_usdt_snapshot:+.2f} USDT)\n"
                                         f"- 진입가→청산가: {float(entry):.6g} → {float(exit_px):.6g}\n"
                                         f"- 청산수량(contracts): {contracts}\n"
                                         f"- 진입금: {float(tgt.get('entry_usdt',0)):.2f} USDT (잔고 {float(tgt.get('entry_pct',0)):.1f}%)\n"
@@ -11708,6 +12105,44 @@ def telegram_thread(ex):
                         except Exception as e:
                             mon_add_scan(mon, stage="support_resistance", symbol=sym, tf=str(cfg.get("sr_timeframe", "")), message=f"SR 실패: {e}"[:140])
 
+                        # ✅ 주력 지표(요구): Lorentzian / KNN / Logistic / SQZ / RSI
+                        # - 3개 이상 수렴할 때만 진입(그 전엔 AI 호출도 막아 비용 절감)
+                        ml_cache_key = ""
+                        try:
+                            if bool(cfg.get("ml_cache_enable", True)) and int(short_last_bar_ms or 0) > 0:
+                                ml_cache_key = f"{sym}|{int(short_last_bar_ms)}"
+                        except Exception:
+                            ml_cache_key = ""
+                        ml = ml_signals_and_convergence(df, stt, cfg, cache_key=str(ml_cache_key or ""))
+                        try:
+                            cs["ml_dir"] = str(ml.get("dir", "hold"))
+                            cs["ml_votes"] = int(ml.get("votes_max", 0) or 0)
+                            cs["ml_detail"] = str(ml.get("detail", ""))[:240]
+                            cs["ml_knn_prob"] = float(ml.get("knn_prob", 0.5) or 0.5)
+                            cs["ml_lor_prob"] = float(ml.get("lor_prob", 0.5) or 0.5)
+                            cs["ml_logit_prob"] = float(ml.get("logit_prob", 0.5) or 0.5)
+                            cs["ml_rsi_sig"] = int(ml.get("rsi_sig", 0) or 0)
+                            cs["ml_sqz_sig"] = int(ml.get("sqz_sig", 0) or 0)
+                            cs["ml_knn_sig"] = int(ml.get("knn_sig", 0) or 0)
+                            cs["ml_lor_sig"] = int(ml.get("lor_sig", 0) or 0)
+                            cs["ml_logit_sig"] = int(ml.get("logit_sig", 0) or 0)
+                        except Exception:
+                            pass
+                        try:
+                            stt["ML"] = str(ml.get("detail", ""))[:240]
+                            stt["_ml_signals"] = dict(ml) if isinstance(ml, dict) else {}
+                        except Exception:
+                            pass
+                        mon_add_scan(
+                            mon,
+                            stage="ml_signal",
+                            symbol=sym,
+                            tf=str(cfg.get("timeframe", "5m")),
+                            signal=str(ml.get("dir", "hold")),
+                            score=int(ml.get("votes_max", 0) or 0),
+                            message=str(ml.get("detail", ""))[:120],
+                        )
+
                         # AI 호출 필터(완화 + 모드/추세 기반)
                         # - "해소 신호가 없으면 AI 자체를 안 부른다"가 너무 보수적이라 무포지션이 길어질 수 있음
                         # - 강한 시그널(눌림목/RSI해소/밴드이탈)은 우선 호출
@@ -11812,6 +12247,24 @@ def telegram_thread(ex):
                                 call_ai = True
                         except Exception:
                             call_ai = False
+
+                        # ✅ (필수) 3-of-5 수렴 게이트: 진입/AI 호출은 이 조건을 최우선으로 적용
+                        # - legacy call_ai 로직은 "참고"로만 남기고, 실제로는 수렴 조건이 우선한다.
+                        try:
+                            if bool(cfg.get("entry_convergence_enable", True)):
+                                need = int(cfg.get("entry_convergence_min_votes", 3) or 3)
+                                ml_dir = str(ml.get("dir", "hold") or "hold")
+                                ml_votes = int(ml.get("votes_max", 0) or 0)
+                                if (ml_dir in ["buy", "sell"]) and (ml_votes >= int(need)):
+                                    call_ai = True
+                                else:
+                                    call_ai = False
+                                    try:
+                                        cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need})"
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
 
                         # ✅ 추가 필터(요구): 거래량 스파이크 + 이격도(Disparity) 체크
                         # - call_ai=True라도, 조건을 만족하지 않으면 AI 호출을 막아 비용/휩쏘 진입을 줄인다.
@@ -12007,6 +12460,32 @@ def telegram_thread(ex):
                         decision = ai.get("decision", "hold")
                         conf = int(ai.get("confidence", 0))
                         mon_add_scan(mon, stage="ai_result", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=conf, message=str(ai.get("reason_easy", ""))[:80])
+
+                        # ✅ 주력 지표 수렴(3-of-5)과 AI 방향이 다르면 진입하지 않음(비용/과오류 방지)
+                        try:
+                            if bool(cfg.get("entry_convergence_enable", True)):
+                                ml_dir = str(ml.get("dir", "hold") or "hold")
+                                if (ml_dir in ["buy", "sell"]) and (str(decision) in ["buy", "sell"]) and (str(decision) != ml_dir):
+                                    raw = str(decision)
+                                    decision = "hold"
+                                    conf = int(max(0, int(round(float(conf) * 0.25))))
+                                    try:
+                                        cs["skip_reason"] = f"지표 수렴({ml_dir}) vs AI({raw}) 불일치"
+                                    except Exception:
+                                        pass
+                                    mon_add_scan(
+                                        mon,
+                                        stage="trade_skipped",
+                                        symbol=sym,
+                                        tf=str(cfg.get("timeframe", "5m")),
+                                        signal=raw,
+                                        score=int(ai.get("confidence", 0) or 0),
+                                        message=str(cs.get("skip_reason", ""))[:140],
+                                        extra={"ml_dir": ml_dir, "ml_votes": int(ml.get("votes_max", 0) or 0)},
+                                    )
+                        except Exception:
+                            pass
+
                         # ✅ SQZ 의존도(요구: 80%+): SQZ 모멘텀이 반대/중립이면 진입을 강하게 억제
                         sqz_skip_reason = ""
                         try:
@@ -12444,6 +12923,38 @@ def telegram_thread(ex):
                             # ✅ 외부시황 위험 감산은 스윙에서만 적용
                             entry_risk_mul = float(risk_mul) if str(style) == "스윙" else 1.0
                             entry_usdt = free_usdt * (entry_pct / 100.0) * entry_risk_mul
+
+                            # ✅ (요구) 하이리스크/하이리턴 모드에서만: 총자산 20% 진입 + 레버 20x 고정
+                            # - 스캘핑/스윙 스타일 캡보다 우선(사용자 요구)
+                            try:
+                                if str(mode) == "하이리스크/하이리턴" and bool(cfg.get("highrisk_fixed_size_enable", True)):
+                                    lev_fix = int(cfg.get("highrisk_fixed_leverage", 20) or 20)
+                                    lev_fix = int(clamp(lev_fix, 1, 125))
+                                    lev = int(lev_fix)
+                                    ai2["leverage"] = int(lev)
+                                    ai2["leverage_source"] = "HIGHRISK_FIXED"
+                                    lev_src = "HIGHRISK_FIXED"
+
+                                    pct_total = float(cfg.get("highrisk_fixed_entry_pct_total", 20.0) or 20.0)
+                                    pct_total = float(clamp(pct_total, 0.5, 95.0))
+                                    base_eq = float(total_usdt) if float(total_usdt) > 0 else float(free_usdt)
+                                    entry_usdt_target = float(base_eq) * (float(pct_total) / 100.0)
+                                    # 스윙의 외부시황 위험감산은 그대로 반영
+                                    entry_usdt = float(entry_usdt_target) * float(entry_risk_mul)
+                                    # free를 넘으면 주문 실패 → free 내로 제한
+                                    entry_usdt = float(min(entry_usdt, float(free_usdt) * 0.99))
+                                    ai2["entry_usdt_target_total"] = float(entry_usdt_target)
+                                    ai2["entry_usdt"] = float(entry_usdt)
+                                    ai2["entry_pct_total"] = float(pct_total)
+                                    entry_pct_src = "HIGHRISK_FIXED"
+                                    try:
+                                        # 표시용: free 대비 %로도 환산(텔레그램/일지에 "(몇%)" 표시용)
+                                        entry_pct = float(entry_usdt / float(free_usdt) * 100.0) if float(free_usdt) > 0 else float(entry_pct)
+                                        ai2["entry_pct"] = float(entry_pct)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
 
                             # ✅ Max Risk Per Trade(요구): 손절(ROI%) 기준으로 1회 최대 손실을 2~3%로 제한
                             try:
@@ -14528,6 +15039,9 @@ with t1:
                     "BB": cs.get("bb", ""),
                     "MACD": cs.get("macd", ""),
                     "SQZ": cs.get("sqz", ""),
+                    "수렴(ML)": str(cs.get("ml_dir", ""))[:10],
+                    "표(ML)": cs.get("ml_votes", ""),
+                    "ML상세": (cs.get("ml_detail", "") or "")[:120],
                     "눌림목후보": "✅" if cs.get("pullback_candidate") else "—",
                     "AI호출": "✅" if cs.get("ai_called") else "—",
                     "AI결론": str(cs.get("ai_decision", "-")).upper(),
@@ -14578,6 +15092,12 @@ with t1:
                 if last is None:
                     st.warning("지표 계산 실패")
                 else:
+                    # 수동 분석에서도 주력 지표 수렴(ML) 정보를 AI에 제공
+                    try:
+                        ml0 = ml_signals_and_convergence(df2, stt, config, cache_key="")
+                        stt["_ml_signals"] = dict(ml0) if isinstance(ml0, dict) else {}
+                    except Exception:
+                        pass
                     ai = ai_decide_trade(df2, stt, symbol, config.get("trade_mode", "안전모드"), config, external=ext_now)
                     # 스타일 힌트
                     htf_trend = get_htf_trend_cached(exchange, symbol, "1h", int(config.get("ma_fast", 7)), int(config.get("ma_slow", 99)), int(config.get("trend_filter_cache_sec", 60)))
