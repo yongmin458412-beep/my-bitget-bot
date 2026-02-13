@@ -570,7 +570,7 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 7,
+        "settings_schema_version": 8,
         "openai_api_key": "",
         # ✅ 사용자 기본값 프리셋(요청): 하이리스크/하이리턴 + 자동매매 ON
         "auto_trade": True,
@@ -631,11 +631,11 @@ def default_settings() -> Dict[str, Any]:
         # 강제 Exit 정책 사용 시 기본은 "포지션이 있을 때 신규 스캔/진입을 쉬고" 청산 모니터링에 집중한다.
         "exit_trailing_protect_pause_scan_while_in_position": False,
         "exit_trailing_protect_sl_roi": 15.0,                 # 기본 손절: -15%
-        "exit_trailing_protect_be_roi": 8.0,                  # 1단계: +8% → 본전(진입가) 보호
-        "exit_trailing_protect_partial_roi": 40.0,            # 2단계: +40% → 50% 익절(부분청산)
+        "exit_trailing_protect_be_roi": 10.0,                 # 1단계: +10% → 본전(진입가) 보호
+        "exit_trailing_protect_partial_roi": 30.0,            # 2단계: +30% → 50% 익절(부분청산)
         "exit_trailing_protect_partial_close_pct": 50.0,      # 부분청산 비율(%)
-        "exit_trailing_protect_trail_start_roi": 60.0,        # 3단계: +60% 이후부터 추적손절 활성
-        "exit_trailing_protect_trail_dd_roi": 12.0,           # 최고점 대비 -12%면 전량 청산
+        "exit_trailing_protect_trail_start_roi": 50.0,        # 3단계: +50% 이후부터 추적손절 활성
+        "exit_trailing_protect_trail_dd_roi": 10.0,           # 최고점 대비 -10%면 전량 청산
         # ✅ Time-based Exit(요구): 진입 후 일정 시간이 지났는데 "목표 수익의 X%"도 못 가면 기회비용 정리
         # - AI 재호출 없이 룰 기반으로만 종료(비용 절감)
         "time_exit_enable": True,
@@ -1053,6 +1053,23 @@ def load_settings() -> Dict[str, Any]:
             try:
                 cfg["fixed_entry_pct_enable"] = False
                 changed = True
+            except Exception:
+                pass
+        # v8: 강제 수익보존(Exit 정책) 기본값을 요청 사양(10/30/50/10)으로 정렬
+        # - 사용자가 이전 기본값을 그대로 쓰고 있던 경우에만 업데이트(커스텀 보호)
+        if saved_ver < 8:
+            try:
+                be0 = float(cfg.get("exit_trailing_protect_be_roi", 0.0) or 0.0)
+                part0 = float(cfg.get("exit_trailing_protect_partial_roi", 0.0) or 0.0)
+                ts0 = float(cfg.get("exit_trailing_protect_trail_start_roi", 0.0) or 0.0)
+                dd0 = float(cfg.get("exit_trailing_protect_trail_dd_roi", 0.0) or 0.0)
+                # 이전 기본값(8/40/60/12) or 누락(0)인 경우만 교체
+                if (be0 in [0.0, 8.0]) and (part0 in [0.0, 40.0]) and (ts0 in [0.0, 60.0]) and (dd0 in [0.0, 12.0]):
+                    cfg["exit_trailing_protect_be_roi"] = 10.0
+                    cfg["exit_trailing_protect_partial_roi"] = 30.0
+                    cfg["exit_trailing_protect_trail_start_roi"] = 50.0
+                    cfg["exit_trailing_protect_trail_dd_roi"] = 10.0
+                    changed = True
             except Exception:
                 pass
         cfg["settings_schema_version"] = base_ver
@@ -9345,10 +9362,32 @@ def telegram_thread(ex):
                             regime_txt = "AUTO" if regime_mode == "auto" else ("SCALPING" if regime_mode.startswith("scal") else "SWING")
                             realized = float(rt.get("daily_realized_pnl", 0.0) or 0.0)
 
+                            # 신규진입 가능 여부(자동매매 ON인데 진입을 안 하면 즉시 확인)
+                            entry_ok_txt = "가능"
+                            try:
+                                pu = float(rt.get("pause_until", 0) or 0.0)
+                            except Exception:
+                                pu = 0.0
+                            try:
+                                weekend_block2 = bool(cfg.get("no_trade_weekend", False)) and (now_kst().weekday() in [5, 6])
+                            except Exception:
+                                weekend_block2 = False
+                            try:
+                                paused_now2 = bool(cfg.get("loss_pause_enable", True)) and (time.time() < float(pu))
+                            except Exception:
+                                paused_now2 = False
+                            if not bool(cfg.get("auto_trade", False)):
+                                entry_ok_txt = "불가(auto_trade=OFF)"
+                            elif weekend_block2:
+                                entry_ok_txt = "불가(주말)"
+                            elif paused_now2 and pu > 0:
+                                entry_ok_txt = f"불가(정지 ~{_epoch_to_kst_str(float(pu))[11:16]})"
+
                             txt = "\n".join(
                                 [
                                     f"🕒 {interval}분 상황보고",
                                     f"- 자동매매: {'ON' if cfg.get('auto_trade') else 'OFF'}",
+                                    f"- 신규진입: {entry_ok_txt}",
                                     f"- 모드: {mode}",
                                     f"- 레짐: {regime_txt}",
                                     f"- 잔고: {total:.2f} USDT (가용 {free:.2f})",
@@ -11518,10 +11557,20 @@ def telegram_thread(ex):
                                     adx_th = 17.0
                                 else:
                                     adx_th = 15.0
+                            # 추세 신호만으로도 AI를 부를 때 필요한 최소 ADX(너무 보수적이면 무포지션이 길어짐)
+                            trend_min_adx = float(cfg.get("ai_call_trend_min_adx", 0) or 0)
+                            if trend_min_adx <= 0:
+                                if str(mode) == "안전모드":
+                                    trend_min_adx = 12.0
+                                elif str(mode) == "공격모드":
+                                    trend_min_adx = 8.0
+                                else:
+                                    trend_min_adx = 6.0
 
                             trend_txt = str(stt.get("추세", "") or "")
                             macd_txt = str(stt.get("MACD", "") or "")
                             bb_txt = str(stt.get("BB", "") or "")
+                            macd_cross = ("골든" in macd_txt) or ("데드" in macd_txt)
 
                             vol_spike = False
                             try:
@@ -11538,6 +11587,18 @@ def telegram_thread(ex):
                             except Exception:
                                 rsi50_cross = False
 
+                            rsi_extreme = False
+                            try:
+                                if "RSI" in df.columns:
+                                    rsi_now2 = float(last.get("RSI", 50))
+                                    rsi_buy0 = float(cfg.get("rsi_buy", 30) or 30)
+                                    rsi_sell0 = float(cfg.get("rsi_sell", 70) or 70)
+                                    mrg = float(cfg.get("ai_call_rsi_extreme_margin", 5.0) or 5.0)
+                                    # 과매도/과매수 근처(해소 전)도 "기회"로 보고 AI 호출(안전모드는 제외)
+                                    rsi_extreme = (rsi_now2 <= (rsi_buy0 + mrg)) or (rsi_now2 >= (rsi_sell0 - mrg))
+                            except Exception:
+                                rsi_extreme = False
+
                             # 강한 시그널 우선
                             if sig_pullback or sig_rsi_resolve:
                                 call_ai = True
@@ -11546,15 +11607,21 @@ def telegram_thread(ex):
                             # ADX 추세강도 기반
                             elif adxv >= adx_th:
                                 call_ai = True
+                            # MACD 교차는 추세 전환/지속 후보(특히 공격/하이리스크에서 기회 포착)
+                            elif (str(mode) != "안전모드") and macd_cross and (adxv >= max(6.0, float(trend_min_adx) - 3.0)):
+                                call_ai = True
+                            # RSI가 과매도/과매수 근처면(해소 전)도 AI를 부를 수 있게 완화(공격/하이리스크)
+                            elif (str(mode) != "안전모드") and rsi_extreme:
+                                call_ai = True
                             # 추세 지속/모멘텀(거래량/RSI50/ MACD) 기반
                             elif (
                                 (("상승" in trend_txt) or ("하락" in trend_txt))
-                                and (vol_spike or rsi50_cross or ("골든" in macd_txt) or ("데드" in macd_txt))
+                                and (vol_spike or rsi50_cross or macd_cross)
                                 and (adxv >= max(12.0, adx_th - 5.0))
                             ):
                                 call_ai = True
                             # 추세 신호 단독으로도 AI 호출 허용(하이리스크 기회 포착)
-                            elif (("상승" in trend_txt) or ("하락" in trend_txt)) and adxv >= max(10.0, adx_th - 8.0):
+                            elif (("상승" in trend_txt) or ("하락" in trend_txt)) and adxv >= max(float(trend_min_adx), adx_th - 8.0):
                                 call_ai = True
                         except Exception:
                             call_ai = False
@@ -11664,7 +11731,9 @@ def telegram_thread(ex):
 
                         if not call_ai:
                             cs["ai_called"] = False
-                            cs["skip_reason"] = "횡보/해소 신호 없음(휩쏘 위험)"
+                            # pre-filter(거래량/이격도)에서 이미 skip_reason을 남겼다면 덮어쓰지 않음
+                            if not str(cs.get("skip_reason", "") or "").strip():
+                                cs["skip_reason"] = "횡보/해소 신호 없음(휩쏘 위험)"
                             monitor_write_throttled(mon, 1.0)
                             mon_add_scan(mon, stage="trade_skipped", symbol=sym, tf=str(cfg.get("timeframe", "5m")), message="call_ai=False")
                             continue
