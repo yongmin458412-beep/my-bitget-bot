@@ -5814,6 +5814,9 @@ def sr_prices_for_style(
         "buffer_atr_mult": 0.0,
         "rr_min": 0.0,
         "atr": 0.0,
+        "supports": [],
+        "resistances": [],
+        "volume_nodes": [],
     }
     if not sym:
         return out
@@ -5840,6 +5843,8 @@ def sr_prices_for_style(
         out["atr"] = float(atr)
         supports, resistances = pivot_levels(hdf, order=max(3, piv))
         vp_nodes = volume_profile_nodes(hdf, bins=60, top_n=8)
+        out["supports"] = list(supports or [])
+        out["resistances"] = list(resistances or [])
         out["volume_nodes"] = list(vp_nodes or [])
         buf = (atr * buf_mul) if atr > 0 else float(entry_price) * 0.0015
 
@@ -5861,6 +5866,82 @@ def sr_prices_for_style(
         out["sl_source"] = str(picked.get("sl_source", "") or "")
         out["tp_source"] = str(picked.get("tp_source", "") or "")
         out["ok"] = bool(out["sl_price"] is not None and out["tp_price"] is not None)
+        return out
+    except Exception:
+        return out
+
+
+def plan_swing_management_levels(
+    *,
+    entry_price: float,
+    side: str,
+    tp_price: Optional[float],
+    sl_price: Optional[float],
+    supports: Optional[List[float]] = None,
+    resistances: Optional[List[float]] = None,
+    volume_nodes: Optional[List[float]] = None,
+) -> Dict[str, Any]:
+    out = {
+        "partial_tp1_price": None,
+        "partial_tp2_price": None,
+        "dca_price": None,
+    }
+    try:
+        ep = float(entry_price)
+        if ep <= 0:
+            return out
+        s = str(side or "").lower().strip()
+        tp = float(tp_price) if tp_price is not None and math.isfinite(float(tp_price)) else None
+        sl = float(sl_price) if sl_price is not None and math.isfinite(float(sl_price)) else None
+        sups = [float(x) for x in (supports or []) if x is not None and math.isfinite(float(x))]
+        ress = [float(x) for x in (resistances or []) if x is not None and math.isfinite(float(x))]
+        vps = [float(x) for x in (volume_nodes or []) if x is not None and math.isfinite(float(x))]
+
+        def _nearest(arr: List[float], x: float) -> Optional[float]:
+            if not arr:
+                return None
+            return min(arr, key=lambda z: abs(float(z) - float(x)))
+
+        if s in ["buy", "long"]:
+            if tp is not None and tp > ep:
+                up_levels = sorted(set([x for x in (ress + vps) if ep < x < tp]))
+                t1 = ep + (tp - ep) * 0.38
+                t2 = ep + (tp - ep) * 0.72
+                p1 = _nearest(up_levels, t1) if up_levels else t1
+                p2 = _nearest(up_levels, t2) if up_levels else t2
+                if p1 is not None and p2 is not None:
+                    if float(p1) > float(p2):
+                        p1, p2 = p2, p1
+                    if abs(float(p2) - float(p1)) < (abs(tp - ep) * 0.08):
+                        p2 = ep + (tp - ep) * 0.80
+                    out["partial_tp1_price"] = float(clamp(float(p1), ep * 1.0001, tp * 0.9990))
+                    out["partial_tp2_price"] = float(clamp(float(p2), ep * 1.0002, tp * 0.9995))
+            if sl is not None and sl < ep:
+                dn_levels = sorted(set([x for x in (sups + vps) if sl < x < ep]))
+                td = ep - (ep - sl) * 0.62
+                dd = _nearest(dn_levels, td) if dn_levels else td
+                if dd is not None:
+                    out["dca_price"] = float(clamp(float(dd), sl * 1.001, ep * 0.999))
+        else:
+            if tp is not None and tp < ep:
+                dn_levels = sorted(set([x for x in (sups + vps) if tp < x < ep]), reverse=True)
+                t1 = ep - (ep - tp) * 0.38
+                t2 = ep - (ep - tp) * 0.72
+                p1 = _nearest(dn_levels, t1) if dn_levels else t1
+                p2 = _nearest(dn_levels, t2) if dn_levels else t2
+                if p1 is not None and p2 is not None:
+                    if float(p1) < float(p2):
+                        p1, p2 = p2, p1
+                    if abs(float(p2) - float(p1)) < (abs(ep - tp) * 0.08):
+                        p2 = ep - (ep - tp) * 0.80
+                    out["partial_tp1_price"] = float(clamp(float(p1), tp * 1.001, ep * 0.9999))
+                    out["partial_tp2_price"] = float(clamp(float(p2), tp * 1.0005, ep * 0.9998))
+            if sl is not None and sl > ep:
+                up_levels = sorted(set([x for x in (ress + vps) if ep < x < sl]))
+                td = ep + (sl - ep) * 0.62
+                dd = _nearest(up_levels, td) if up_levels else td
+                if dd is not None:
+                    out["dca_price"] = float(clamp(float(dd), ep * 1.001, sl * 0.999))
         return out
     except Exception:
         return out
@@ -9223,11 +9304,7 @@ def tg_msg_entry_simple(
     q = _tg_quote_block(one_line)
     if not q:
         q = "  └ -"
-    if not str(exit_policy_line or "").strip():
-        target_label = "목표손익비(익절/손절)"
-    else:
-        target_label = "AI목표(우선)" if ("AI목표우선" in str(exit_policy_line or "")) else "AI목표(참고)"
-    extra_exit = f"- 청산규칙: {exit_policy_line}\n" if str(exit_policy_line or "").strip() else ""
+    target_label = "목표손익비(익절/손절)"
     return (
         "🎯 진입\n"
         f"- 코인: {symbol}\n"
@@ -9237,7 +9314,6 @@ def tg_msg_entry_simple(
         "\n"
         f"- 진입금액(마진): {entry_usdt_f:.2f} USDT{pct_txt}\n"
         f"- {target_label}: 익절 {tp_txt} / 손절 {sl_txt}\n"
-        f"{extra_exit}"
         f"- 진입전 사용가능 금액: {bf_txt} USDT\n"
         f"- 진입후 사용가능 금액: {af_txt} USDT\n"
         "\n"
@@ -9904,6 +9980,33 @@ def _price_from_roi_target(entry_price: float, side: str, roi_pct: float, levera
         return None
 
 
+def _plot_text_sanitize(text: Any, *, has_kr_font: bool, max_len: int = 220) -> str:
+    try:
+        s = str(text or "").replace("\n", " ").strip()
+    except Exception:
+        return ""
+    if not s:
+        return ""
+    if not has_kr_font:
+        s = re.sub(r"[^\x20-\x7E]+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > int(max_len):
+        return s[: int(max_len)] + "…"
+    return s
+
+
+def _style_plot_label(style: str, has_kr_font: bool) -> str:
+    s = str(style or "").strip()
+    if has_kr_font:
+        return s or "-"
+    if s == "스캘핑":
+        return "SCALP"
+    if s == "스윙":
+        return "SWING"
+    s2 = _plot_text_sanitize(s, has_kr_font=False, max_len=24)
+    return s2 or "STYLE"
+
+
 def build_trade_event_image(
     ex,
     sym: str,
@@ -9916,6 +10019,9 @@ def build_trade_event_image(
     exit_price: Optional[float] = None,
     sl_price: Optional[float] = None,
     tp_price: Optional[float] = None,
+    partial_tp1_price: Optional[float] = None,
+    partial_tp2_price: Optional[float] = None,
+    dca_price: Optional[float] = None,
     sl_roi_pct: Optional[float] = None,
     tp_roi_pct: Optional[float] = None,
     leverage: Optional[float] = None,
@@ -9954,6 +10060,9 @@ def build_trade_event_image(
         now_px = float(d["close"].iloc[-1])
         sl_line = float(sl_price) if (sl_price is not None and math.isfinite(float(sl_price))) else None
         tp_line = float(tp_price) if (tp_price is not None and math.isfinite(float(tp_price))) else None
+        pt1_line = float(partial_tp1_price) if (partial_tp1_price is not None and math.isfinite(float(partial_tp1_price))) else None
+        pt2_line = float(partial_tp2_price) if (partial_tp2_price is not None and math.isfinite(float(partial_tp2_price))) else None
+        dca_line = float(dca_price) if (dca_price is not None and math.isfinite(float(dca_price))) else None
         lev_line = float(leverage) if (leverage is not None and math.isfinite(float(leverage))) else None
         ep = float(entry_price) if (entry_price is not None and math.isfinite(float(entry_price))) else None
         if sl_line is None and ep is not None and sl_roi_pct is not None and lev_line is not None and lev_line > 0:
@@ -10001,6 +10110,12 @@ def build_trade_event_image(
             ax.axhline(float(sl_line), color="#ff4d4f", linewidth=1.8, linestyle="--", alpha=0.98)
         if tp_line is not None:
             ax.axhline(float(tp_line), color="#00d084", linewidth=1.8, linestyle="--", alpha=0.98)
+        if pt1_line is not None:
+            ax.axhline(float(pt1_line), color="#2dd4bf", linewidth=1.2, linestyle="-.", alpha=0.90)
+        if pt2_line is not None:
+            ax.axhline(float(pt2_line), color="#14b8a6", linewidth=1.2, linestyle="-.", alpha=0.90)
+        if dca_line is not None:
+            ax.axhline(float(dca_line), color="#f59e0b", linewidth=1.2, linestyle=":", alpha=0.95)
 
         if mtransforms is not None:
             try:
@@ -10031,6 +10146,45 @@ def build_trade_event_image(
                         color="#fecaca",
                         bbox={"boxstyle": "round,pad=0.20", "facecolor": "#2a0b11", "edgecolor": "#7f1d1d", "alpha": 0.90},
                     )
+                if pt1_line is not None:
+                    lbl = f"분할익절1 {float(pt1_line):.6g}" if has_kr_font else f"PT1 {float(pt1_line):.6g}"
+                    ax.text(
+                        0.995,
+                        float(pt1_line),
+                        lbl,
+                        transform=trans,
+                        va="center",
+                        ha="right",
+                        fontsize=8.0,
+                        color="#99f6e4",
+                        bbox={"boxstyle": "round,pad=0.18", "facecolor": "#032c2a", "edgecolor": "#115e59", "alpha": 0.88},
+                    )
+                if pt2_line is not None:
+                    lbl = f"분할익절2 {float(pt2_line):.6g}" if has_kr_font else f"PT2 {float(pt2_line):.6g}"
+                    ax.text(
+                        0.995,
+                        float(pt2_line),
+                        lbl,
+                        transform=trans,
+                        va="center",
+                        ha="right",
+                        fontsize=8.0,
+                        color="#ccfbf1",
+                        bbox={"boxstyle": "round,pad=0.18", "facecolor": "#042f2e", "edgecolor": "#0f766e", "alpha": 0.88},
+                    )
+                if dca_line is not None:
+                    lbl = f"추매라인 {float(dca_line):.6g}" if has_kr_font else f"DCA {float(dca_line):.6g}"
+                    ax.text(
+                        0.995,
+                        float(dca_line),
+                        lbl,
+                        transform=trans,
+                        va="center",
+                        ha="right",
+                        fontsize=8.0,
+                        color="#fde68a",
+                        bbox={"boxstyle": "round,pad=0.18", "facecolor": "#2d1b05", "edgecolor": "#92400e", "alpha": 0.88},
+                    )
             except Exception:
                 pass
 
@@ -10040,7 +10194,8 @@ def build_trade_event_image(
         evt_map_en = {"ENTRY": "ENTRY", "TP": "TAKE", "SL": "STOP", "PROTECT": "PROTECT", "TAKE_FORCE": "TAKE_FORCE"}
         evt_key = str(event_type or "").upper().strip()
         evt_txt = evt_map_ko.get(evt_key, evt_key) if has_kr_font else evt_map_en.get(evt_key, evt_key)
-        ttl = f"{evt_txt} | {sym_s} | {style} {side_s} | TF {tf}"
+        style_txt = _style_plot_label(style, has_kr_font)
+        ttl = f"{evt_txt} | {sym_s} | {style_txt} {side_s} | TF {tf}"
         ax.set_title(ttl, color="white", fontsize=11, pad=10)
         ax.tick_params(colors="#cfd8dc", labelsize=8)
         for spine in ax.spines.values():
@@ -10048,16 +10203,15 @@ def build_trade_event_image(
             spine.set_linewidth(0.8)
 
         ind_txt = ", ".join([str(x) for x in (used_indicators or []) if str(x).strip()])[:120]
-        pat_txt = str(pattern_hint or "").strip()[:140]
+        ind_txt = _plot_text_sanitize(ind_txt, has_kr_font=has_kr_font, max_len=140)
+        pat_txt = _plot_text_sanitize(pattern_hint, has_kr_font=has_kr_font, max_len=180)
         mtf_txt = ""
         try:
             if isinstance(mtf_pattern, dict) and bool(mtf_pattern):
-                mtf_txt = str(mtf_pattern.get("summary", "") or "").strip()
+                mtf_txt = _plot_text_sanitize(str(mtf_pattern.get("summary", "") or ""), has_kr_font=has_kr_font, max_len=200)
         except Exception:
             mtf_txt = ""
-        one = str(one_line or "").strip().replace("\n", " ")
-        if len(one) > 180:
-            one = one[:180] + "…"
+        one = _plot_text_sanitize(one_line, has_kr_font=has_kr_font, max_len=200)
         info_lines = []
         if ep is not None:
             info_lines.append(f"진입가 {float(ep):.6g}" if has_kr_font else f"Entry {float(ep):.6g}")
@@ -10065,6 +10219,12 @@ def build_trade_event_image(
             info_lines.append(f"목표익절 {float(tp_line):.6g}" if has_kr_font else f"TP target {float(tp_line):.6g}")
         if sl_line is not None:
             info_lines.append(f"목표손절 {float(sl_line):.6g}" if has_kr_font else f"SL target {float(sl_line):.6g}")
+        if pt1_line is not None:
+            info_lines.append(f"분할익절1 {float(pt1_line):.6g}" if has_kr_font else f"Partial TP1 {float(pt1_line):.6g}")
+        if pt2_line is not None:
+            info_lines.append(f"분할익절2 {float(pt2_line):.6g}" if has_kr_font else f"Partial TP2 {float(pt2_line):.6g}")
+        if dca_line is not None:
+            info_lines.append(f"추매라인 {float(dca_line):.6g}" if has_kr_font else f"DCA line {float(dca_line):.6g}")
         if tp_roi_pct is not None and math.isfinite(float(tp_roi_pct)):
             info_lines.append(f"목표익절 ROI +{float(abs(tp_roi_pct)):.2f}%" if has_kr_font else f"TP ROI +{float(abs(tp_roi_pct)):.2f}%")
         if sl_roi_pct is not None and math.isfinite(float(sl_roi_pct)):
@@ -11327,10 +11487,6 @@ def telegram_thread(ex):
                             except Exception:
                                 pass
                             free, total = safe_fetch_balance(ex)
-                            try:
-                                pol0 = _tg_trailing_protect_policy_line(cfg)
-                            except Exception:
-                                pol0 = ""
                             # 포지션 요약
                             pos_blocks: List[str] = []
                             ps = safe_fetch_positions(ex, TARGET_COINS)
@@ -11350,8 +11506,6 @@ def telegram_thread(ex):
                                     tgt0 = _resolve_open_target_for_symbol(sym, active_targets, rt_open_targets)
                                     style = str((tgt0 or {}).get("style", ""))
                                     block = _fmt_pos_block(sym, side, lev, roi, upnl, style=style, tgt=tgt0)
-                                    if str(pol0).strip():
-                                        block += f"\n- 청산규칙: {pol0}"
                                     pos_blocks.append(block)
                             else:
                                 pos_blocks.append("⚪ 무포지션(관망)")
@@ -11952,13 +12106,38 @@ def telegram_thread(ex):
                         if (not forced_exit) and (not ai_exit_only) and style_now == "스윙" and cfg.get("swing_partial_tp_enable", True) and contracts > 0:
                             trade_state = rt.setdefault("trades", {}).setdefault(sym, {"dca_count": 0, "partial_tp_done": [], "recycle_count": 0})
                             done = set(trade_state.get("partial_tp_done", []) or [])
-                            # TP 기반 트리거
-                            levels = _swing_partial_tp_levels(tp, cfg)
+                            # ✅ 스윙 분할익절:
+                            # - 우선순위: 진입 시점에 지정된 SR/매물대 2개 가격 라인(TP1/TP2)
+                            # - 없으면 기존 ROI 비율 트리거로 fallback
+                            levels_exec: List[Tuple[str, float, str, float]] = []
+                            try:
+                                p1 = _as_float(tgt.get("partial_tp1_price", None), float("nan"))
+                                p2 = _as_float(tgt.get("partial_tp2_price", None), float("nan"))
+                                if math.isfinite(p1):
+                                    levels_exec.append(("TP1", float(cfg.get("swing_partial_tp1_close_pct", 33)) / 100.0, "price", float(p1)))
+                                if math.isfinite(p2):
+                                    levels_exec.append(("TP2", float(cfg.get("swing_partial_tp2_close_pct", 33)) / 100.0, "price", float(p2)))
+                            except Exception:
+                                levels_exec = []
+                            if not levels_exec:
+                                for trig_roi, close_frac, label in _swing_partial_tp_levels(tp, cfg):
+                                    levels_exec.append((str(label), float(close_frac), "roi", float(trig_roi)))
                             contracts_left = contracts
-                            for trig_roi, close_frac, label in levels:
+                            for label, close_frac, trig_kind, trig_v in levels_exec:
                                 if label in done:
                                     continue
-                                if roi >= float(trig_roi) and contracts_left > 0:
+                                if contracts_left <= 0:
+                                    continue
+                                hit_partial = False
+                                if str(trig_kind) == "price":
+                                    if side == "long" and float(cur_px) >= float(trig_v):
+                                        hit_partial = True
+                                    elif side == "short" and float(cur_px) <= float(trig_v):
+                                        hit_partial = True
+                                else:
+                                    if float(roi) >= float(trig_v):
+                                        hit_partial = True
+                                if hit_partial:
                                     # ✅ (추가) 부분익절 청산수량을 USDT(마진)로 지정 가능
                                     close_usdt_cfg = 0.0
                                     try:
@@ -12008,14 +12187,15 @@ def telegram_thread(ex):
                                         save_runtime(rt)
                                         contracts_left = max(0.0, contracts_left - close_qty)
                                         close_txt = f"{float(close_usdt_cfg):.2f}USDT" if close_mode == "usdt" else f"{close_frac*100:.0f}%"
-                                        mon_add_event(mon, "PARTIAL_TP", sym, f"{label} 부분익절({close_txt})", {"roi": roi, "qty": close_qty, "margin_usdt_est": close_margin_est, "mode": close_mode})
+                                        trig_note = f"{label}@{float(trig_v):.6g}" if str(trig_kind) == "price" else f"{label}@ROI{float(trig_v):.2f}%"
+                                        mon_add_event(mon, "PARTIAL_TP", sym, f"{label} 부분익절({close_txt})", {"roi": roi, "qty": close_qty, "margin_usdt_est": close_margin_est, "mode": close_mode, "trigger": trig_note})
                                         try:
                                             gsheet_log_trade(
                                                 stage="PARTIAL_TP",
                                                 symbol=sym,
                                                 trade_id=trade_id,
                                                 message=f"{label} close_qty={close_qty}",
-                                                payload={"label": label, "roi": roi, "qty": close_qty, "contracts_left": contracts_left, "margin_usdt_est": close_margin_est, "mode": close_mode},
+                                                payload={"label": label, "roi": roi, "qty": close_qty, "contracts_left": contracts_left, "margin_usdt_est": close_margin_est, "mode": close_mode, "trigger": trig_note},
                                             )
                                         except Exception:
                                             pass
@@ -12339,7 +12519,21 @@ def telegram_thread(ex):
                             trade_state = rt.setdefault("trades", {}).setdefault(sym, {"dca_count": 0, "partial_tp_done": [], "recycle_count": 0})
                             dca_count = int(trade_state.get("dca_count", 0))
 
-                            if roi <= dca_trig and dca_count < dca_max:
+                            dca_ready = False
+                            dca_trigger_note = ""
+                            try:
+                                dca_price_line = _as_float(tgt.get("dca_price", None), float("nan"))
+                            except Exception:
+                                dca_price_line = float("nan")
+                            if math.isfinite(dca_price_line) and str(style_now) == "스윙":
+                                if (side == "long" and float(cur_px) <= float(dca_price_line)) or (side == "short" and float(cur_px) >= float(dca_price_line)):
+                                    dca_ready = True
+                                    dca_trigger_note = f"추매라인({float(dca_price_line):.6g}) 도달"
+                            elif roi <= dca_trig:
+                                dca_ready = True
+                                dca_trigger_note = f"ROI {roi:.2f}% <= {dca_trig:.2f}%"
+
+                            if dca_ready and dca_count < dca_max:
                                 free, _ = safe_fetch_balance(ex)
                                 base_entry = float(tgt.get("entry_usdt", 0.0))
                                 # ✅ (추가) USDT 기준 추매(마진) 우선, 없으면 기존 % 방식 유지
@@ -12377,7 +12571,8 @@ def telegram_thread(ex):
                                                 f"- 포지션: {_tg_dir_easy(side)}\n"
                                                 "\n"
                                                 f"- 추가금액(마진): {float(add_usdt):.2f} USDT\n"
-                                                f"- 지금 수익률: {_tg_fmt_pct(roi)} (기준 {float(dca_trig):+.1f}%)\n"
+                                                f"- 트리거: {dca_trigger_note}\n"
+                                                f"- 지금 수익률: {_tg_fmt_pct(roi)}\n"
                                                 f"{why_line}"
                                                 "\n"
                                                 f"- ID: {trade_id or '-'}"
@@ -12385,7 +12580,7 @@ def telegram_thread(ex):
                                         else:
                                             msg = (
                                                 f"💧 물타기(DCA)\n- 코인: {sym}\n- 스타일: {style_now}\n- 추가금(마진): {float(add_usdt):.2f} USDT (추정 {float(margin_est):.2f})\n"
-                                                f"- 추가수량: {qty}\n- 레버: x{lev}\n- 이유: 손실 {roi:.2f}% (기준 {dca_trig}%)\n- 일지ID: {trade_id or '-'}"
+                                                f"- 추가수량: {qty}\n- 레버: x{lev}\n- 트리거: {dca_trigger_note}\n- 일지ID: {trade_id or '-'}"
                                             )
                                         tg_send(
                                             msg,
@@ -12393,14 +12588,14 @@ def telegram_thread(ex):
                                             cfg=cfg,
                                             silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
                                         )
-                                        mon_add_event(mon, "DCA", sym, f"DCA {add_usdt:.2f} USDT", {"roi": roi})
+                                        mon_add_event(mon, "DCA", sym, f"DCA {add_usdt:.2f} USDT", {"roi": roi, "trigger": dca_trigger_note})
                                         try:
                                             gsheet_log_trade(
                                                 stage="DCA",
                                                 symbol=sym,
                                                 trade_id=trade_id,
                                                 message=f"add_usdt={add_usdt:.2f}",
-                                                payload={"roi": roi, "add_usdt": add_usdt, "qty": qty, "lev": lev, "dca_count": dca_count + 1},
+                                                payload={"roi": roi, "add_usdt": add_usdt, "qty": qty, "lev": lev, "dca_count": dca_count + 1, "trigger": dca_trigger_note},
                                             )
                                         except Exception:
                                             pass
@@ -13063,6 +13258,9 @@ def telegram_thread(ex):
                                             exit_price=float(exit_px),
                                             sl_price=(float(tgt.get("sl_price")) if tgt.get("sl_price") is not None else None),
                                             tp_price=(float(tgt.get("tp_price")) if tgt.get("tp_price") is not None else None),
+                                            partial_tp1_price=(float(tgt.get("partial_tp1_price")) if tgt.get("partial_tp1_price") is not None else None),
+                                            partial_tp2_price=(float(tgt.get("partial_tp2_price")) if tgt.get("partial_tp2_price") is not None else None),
+                                            dca_price=(float(tgt.get("dca_price")) if tgt.get("dca_price") is not None else None),
                                             sl_roi_pct=(float(tgt.get("sl")) if tgt.get("sl") is not None else None),
                                             tp_roi_pct=(float(tgt.get("tp")) if tgt.get("tp") is not None else None),
                                             leverage=(float(tgt.get("lev")) if tgt.get("lev") is not None else None),
@@ -13438,6 +13636,9 @@ def telegram_thread(ex):
                                             exit_price=float(exit_px),
                                             sl_price=(float(tgt.get("sl_price")) if tgt.get("sl_price") is not None else None),
                                             tp_price=(float(tgt.get("tp_price")) if tgt.get("tp_price") is not None else None),
+                                            partial_tp1_price=(float(tgt.get("partial_tp1_price")) if tgt.get("partial_tp1_price") is not None else None),
+                                            partial_tp2_price=(float(tgt.get("partial_tp2_price")) if tgt.get("partial_tp2_price") is not None else None),
+                                            dca_price=(float(tgt.get("dca_price")) if tgt.get("dca_price") is not None else None),
                                             sl_roi_pct=(float(tgt.get("sl")) if tgt.get("sl") is not None else None),
                                             tp_roi_pct=(float(tgt.get("tp")) if tgt.get("tp") is not None else None),
                                             leverage=(float(tgt.get("lev")) if tgt.get("lev") is not None else None),
@@ -14985,6 +15186,29 @@ def telegram_thread(ex):
                                 except Exception:
                                     pass
 
+                                # ✅ 스윙 전용: 첫 진입 시 분할익절 2개 + 추매라인 1개를 SR/매물대 기반으로 지정
+                                partial_tp1_price = None
+                                partial_tp2_price = None
+                                dca_price = None
+                                try:
+                                    if str(style) == "스윙":
+                                        swing_levels = plan_swing_management_levels(
+                                            entry_price=float(px),
+                                            side=str(decision),
+                                            tp_price=(float(tp_price) if tp_price is not None else None),
+                                            sl_price=(float(sl_price) if sl_price is not None else None),
+                                            supports=list((sr_used or {}).get("supports", []) or []),
+                                            resistances=list((sr_used or {}).get("resistances", []) or []),
+                                            volume_nodes=list((sr_used or {}).get("volume_nodes", []) or []),
+                                        )
+                                        partial_tp1_price = swing_levels.get("partial_tp1_price", None)
+                                        partial_tp2_price = swing_levels.get("partial_tp2_price", None)
+                                        dca_price = swing_levels.get("dca_price", None)
+                                except Exception:
+                                    partial_tp1_price = None
+                                    partial_tp2_price = None
+                                    dca_price = None
+
                                 # 목표 저장
                                 # ✅ 진입 시점 차트 스냅샷(손절/익절/본절/추매/순환매 근거용)
                                 entry_rsi = None
@@ -15034,6 +15258,9 @@ def telegram_thread(ex):
                                     "sl_price_source": sl_price_source,
                                     "tp_price_source": tp_price_source,
                                     "sr_used": {"tf": sr_used.get("tf", ""), "lookback": sr_used.get("lookback", 0), "pivot_order": sr_used.get("pivot_order", 0), "buffer_atr_mult": sr_used.get("buffer_atr_mult", 0.0), "rr_min": sr_used.get("rr_min", 0.0)},
+                                    "partial_tp1_price": partial_tp1_price,
+                                    "partial_tp2_price": partial_tp2_price,
+                                    "dca_price": dca_price,
                                     "sl_price_ai": ai_sl_price,
                                     "tp_price_ai": ai_tp_price,
                                     "style": style,
@@ -15084,6 +15311,9 @@ def telegram_thread(ex):
                                         "sl_price_source": sl_price_source,
                                         "tp_price_source": tp_price_source,
                                         "sr_used": {"tf": sr_used.get("tf", ""), "lookback": sr_used.get("lookback", 0), "pivot_order": sr_used.get("pivot_order", 0), "buffer_atr_mult": sr_used.get("buffer_atr_mult", 0.0), "rr_min": sr_used.get("rr_min", 0.0)},
+                                        "partial_tp1_price": partial_tp1_price,
+                                        "partial_tp2_price": partial_tp2_price,
+                                        "dca_price": dca_price,
                                         "used_indicators": ai2.get("used_indicators", []),
                                         "reason_easy": ai2.get("reason_easy", ""),
                                         "raw_status": stt,
@@ -15210,8 +15440,24 @@ def telegram_thread(ex):
                                             bal_after_free=ba_free,
                                             one_line=one_line0,
                                             trade_id=str(trade_id),
-                                            exit_policy_line=_tg_trailing_protect_policy_line(cfg),
                                         )
+                                        try:
+                                            if str(style) == "스윙":
+                                                t0 = active_targets.get(sym, {}) if isinstance(active_targets.get(sym, {}), dict) else {}
+                                                p1 = _as_float(t0.get("partial_tp1_price", None), float("nan"))
+                                                p2 = _as_float(t0.get("partial_tp2_price", None), float("nan"))
+                                                dp = _as_float(t0.get("dca_price", None), float("nan"))
+                                                lines_extra: List[str] = []
+                                                if math.isfinite(p1) or math.isfinite(p2):
+                                                    s1 = f"{p1:.6g}" if math.isfinite(p1) else "-"
+                                                    s2 = f"{p2:.6g}" if math.isfinite(p2) else "-"
+                                                    lines_extra.append(f"- 분할익절 라인: 1차 {s1} / 2차 {s2}")
+                                                if math.isfinite(dp):
+                                                    lines_extra.append(f"- 추매 라인: {dp:.6g}")
+                                                if lines_extra:
+                                                    msg += "\n" + "\n".join(lines_extra)
+                                        except Exception:
+                                            pass
                                     else:
                                         # ✅ 기존(상세) 메시지 유지
                                         try:
@@ -15233,13 +15479,6 @@ def telegram_thread(ex):
                                             f"- 장기추세({htf_tf}): 🧭 {htf_trend}\n"
                                             f"- 외부리스크 감산: x{entry_risk_mul:.2f} ({'스윙만 적용' if str(style)=='스윙' else '스캘핑=미적용'})\n"
                                         )
-                                        # ✅ 수익보존 Exit 정책이 ON이면, 실제 청산 규칙을 함께 표시(혼동 방지)
-                                        try:
-                                            pol = _tg_trailing_protect_policy_line(cfg)
-                                        except Exception:
-                                            pol = ""
-                                        if pol:
-                                            msg += f"- 청산규칙: {pol}\n"
                                         if sl_price is not None and tp_price is not None:
                                             src_txt = ""
                                             try:
@@ -15247,6 +15486,19 @@ def telegram_thread(ex):
                                             except Exception:
                                                 src_txt = ""
                                             msg += f"- SR기준가: TP {tp_price:.6g} / SL {sl_price:.6g}{src_txt}\n"
+                                        try:
+                                            if str(style) == "스윙":
+                                                p1 = _as_float((active_targets.get(sym, {}) or {}).get("partial_tp1_price", None), float("nan"))
+                                                p2 = _as_float((active_targets.get(sym, {}) or {}).get("partial_tp2_price", None), float("nan"))
+                                                dp = _as_float((active_targets.get(sym, {}) or {}).get("dca_price", None), float("nan"))
+                                                if math.isfinite(p1) or math.isfinite(p2):
+                                                    s1 = f"{p1:.6g}" if math.isfinite(p1) else "-"
+                                                    s2 = f"{p2:.6g}" if math.isfinite(p2) else "-"
+                                                    msg += f"- 분할익절 라인: 1차 {s1} / 2차 {s2}\n"
+                                                if math.isfinite(dp):
+                                                    msg += f"- 추매 라인: {dp:.6g}\n"
+                                        except Exception:
+                                            pass
                                         msg += f"- 확신도: {conf}% (기준 {rule['min_conf']}%)\n- 일지ID: {trade_id}\n"
                                         if cfg.get("tg_send_entry_reason", False):
                                             # 요구사항: 텔레그램에는 '긴 근거'를 보내지 않고, /log <id>로 조회
@@ -15283,6 +15535,9 @@ def telegram_thread(ex):
                                                 entry_price=float(px),
                                                 sl_price=(float(sl_price) if sl_price is not None else None),
                                                 tp_price=(float(tp_price) if tp_price is not None else None),
+                                                partial_tp1_price=(float(aft.get("partial_tp1_price")) if aft.get("partial_tp1_price") is not None else None),
+                                                partial_tp2_price=(float(aft.get("partial_tp2_price")) if aft.get("partial_tp2_price") is not None else None),
+                                                dca_price=(float(aft.get("dca_price")) if aft.get("dca_price") is not None else None),
                                                 sl_roi_pct=float(abs(slp)) if (slp is not None) else None,
                                                 tp_roi_pct=float(abs(tpp)) if (tpp is not None) else None,
                                                 leverage=float(lev) if (lev is not None) else None,
