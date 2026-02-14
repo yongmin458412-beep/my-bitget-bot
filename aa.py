@@ -9038,6 +9038,29 @@ def tg_send_photo(photo_path: str, caption: str = "", target: str = "default", c
             continue
 
 
+def tg_send_photo_chat(chat_id: Any, photo_path: str, caption: str = "", *, silent: bool = False):
+    if not tg_token:
+        return
+    if chat_id is None:
+        return
+    path = str(photo_path or "").strip()
+    if (not path) or (not os.path.exists(path)):
+        return
+    cid = str(chat_id).strip()
+    if not cid:
+        return
+    try:
+        data: Dict[str, Any] = {"chat_id": cid, "__file_path": path}
+        cap = str(caption or "").strip()
+        if cap:
+            data["caption"] = cap[:1000]
+        if bool(silent):
+            data["disable_notification"] = True
+        tg_enqueue("sendPhoto", data, priority="normal")
+    except Exception:
+        pass
+
+
 def tg_send_menu(cfg: Optional[Dict[str, Any]] = None):
     if not tg_token:
         return
@@ -9750,6 +9773,97 @@ def _fmt_pos_block(
     )
 
 
+def tg_send_position_chart_images(
+    ex,
+    positions: List[Dict[str, Any]],
+    active_targets: Dict[str, Dict[str, Any]],
+    rt_open_targets: Dict[str, Dict[str, Any]],
+    cfg: Dict[str, Any],
+    *,
+    route_mode: str = "channel",
+    admin_uid: Optional[int] = None,
+    fallback_chat_id: Optional[int] = None,
+) -> None:
+    if not positions:
+        return
+    try:
+        free_now, total_now = safe_fetch_balance(ex)
+    except Exception:
+        free_now, total_now = 0.0, 0.0
+    for p in positions[:8]:
+        try:
+            sym = str(p.get("symbol", "") or "")
+            if not sym:
+                continue
+            side = position_side_normalize(p)
+            roi = float(position_roi_percent(p))
+            upnl = float(p.get("unrealizedPnl") or 0.0)
+            lev_live = _as_float(p.get("leverage", None), float("nan"))
+            tgt0 = _resolve_open_target_for_symbol(sym, active_targets, rt_open_targets)
+            style = str((tgt0 or {}).get("style", "") or "").strip() or "포지션"
+            entry_px = _as_float((tgt0 or {}).get("entry_price", None), float("nan"))
+            if not math.isfinite(entry_px) or entry_px <= 0:
+                entry_px = _as_float(p.get("entryPrice", None), float("nan"))
+            lev0 = _as_float((tgt0 or {}).get("lev", None), float("nan"))
+            lev_use = lev_live if math.isfinite(lev_live) else lev0
+            one_line = str((tgt0 or {}).get("reason", "") or (tgt0 or {}).get("style_reason", "") or "").strip()
+            img_path = build_trade_event_image(
+                ex,
+                sym,
+                cfg,
+                event_type="POSITION",
+                side=str(side),
+                style=str(style),
+                entry_price=(float(entry_px) if math.isfinite(entry_px) and entry_px > 0 else None),
+                sl_price=(_as_float((tgt0 or {}).get("sl_price", None), float("nan")) if (tgt0 or {}).get("sl_price", None) is not None else None),
+                tp_price=(_as_float((tgt0 or {}).get("tp_price", None), float("nan")) if (tgt0 or {}).get("tp_price", None) is not None else None),
+                partial_tp1_price=(_as_float((tgt0 or {}).get("partial_tp1_price", None), float("nan")) if (tgt0 or {}).get("partial_tp1_price", None) is not None else None),
+                partial_tp2_price=(_as_float((tgt0 or {}).get("partial_tp2_price", None), float("nan")) if (tgt0 or {}).get("partial_tp2_price", None) is not None else None),
+                dca_price=(_as_float((tgt0 or {}).get("dca_price", None), float("nan")) if (tgt0 or {}).get("dca_price", None) is not None else None),
+                sl_roi_pct=(_as_float((tgt0 or {}).get("sl", None), float("nan")) if (tgt0 or {}).get("sl", None) is not None else None),
+                tp_roi_pct=(_as_float((tgt0 or {}).get("tp", None), float("nan")) if (tgt0 or {}).get("tp", None) is not None else None),
+                leverage=(float(lev_use) if math.isfinite(lev_use) else None),
+                roi_pct=float(roi),
+                pnl_usdt=float(upnl),
+                remain_free=(float(free_now) if math.isfinite(float(free_now)) and float(free_now) > 0 else None),
+                remain_total=(float(total_now) if math.isfinite(float(total_now)) and float(total_now) > 0 else None),
+                one_line=one_line,
+                used_indicators=[],
+                pattern_hint="",
+                mtf_pattern={},
+                trade_id=str((tgt0 or {}).get("trade_id", "") or ""),
+            )
+            if not img_path:
+                continue
+            cap = (
+                "📷 포지션 차트\n"
+                f"- {sym} | {_tg_style_easy(style)} | {_tg_dir_easy(side)}\n"
+                f"- 현재: {_tg_fmt_pct(roi)} ({_tg_fmt_usdt(upnl)} USDT)"
+            )
+            how = str(route_mode or "channel").lower().strip()
+            if how == "both":
+                tg_send_photo(img_path, caption=cap, target="channel", cfg=cfg, silent=False)
+                if admin_uid is not None:
+                    tg_send_photo_chat(admin_uid, img_path, caption=cap, silent=False)
+                elif TG_ADMIN_IDS:
+                    tg_send_photo(img_path, caption=cap, target="admin", cfg=cfg, silent=False)
+                elif fallback_chat_id is not None:
+                    tg_send_photo_chat(fallback_chat_id, img_path, caption=cap, silent=False)
+            elif how == "admin":
+                if admin_uid is not None:
+                    tg_send_photo_chat(admin_uid, img_path, caption=cap, silent=False)
+                elif TG_ADMIN_IDS:
+                    tg_send_photo(img_path, caption=cap, target="admin", cfg=cfg, silent=False)
+                elif fallback_chat_id is not None:
+                    tg_send_photo_chat(fallback_chat_id, img_path, caption=cap, silent=False)
+                else:
+                    tg_send_photo(img_path, caption=cap, target=cfg.get("tg_route_queries_to", "group"), cfg=cfg, silent=False)
+            else:
+                tg_send_photo(img_path, caption=cap, target="channel", cfg=cfg, silent=False)
+        except Exception:
+            continue
+
+
 def _style_for_entry(
     symbol: str,
     decision: str,
@@ -10190,8 +10304,8 @@ def build_trade_event_image(
 
         sym_s = str(sym or "")
         side_s = ("롱" if str(side).lower() in ["buy", "long"] else "숏") if has_kr_font else ("LONG" if str(side).lower() in ["buy", "long"] else "SHORT")
-        evt_map_ko = {"ENTRY": "진입", "TP": "익절", "SL": "손절", "PROTECT": "수익보호", "TAKE_FORCE": "강제익절"}
-        evt_map_en = {"ENTRY": "ENTRY", "TP": "TAKE", "SL": "STOP", "PROTECT": "PROTECT", "TAKE_FORCE": "TAKE_FORCE"}
+        evt_map_ko = {"ENTRY": "진입", "TP": "익절", "SL": "손절", "PROTECT": "수익보호", "TAKE_FORCE": "강제익절", "POSITION": "포지션"}
+        evt_map_en = {"ENTRY": "ENTRY", "TP": "TAKE", "SL": "STOP", "PROTECT": "PROTECT", "TAKE_FORCE": "TAKE_FORCE", "POSITION": "POSITION"}
         evt_key = str(event_type or "").upper().strip()
         evt_txt = evt_map_ko.get(evt_key, evt_key) if has_kr_font else evt_map_en.get(evt_key, evt_key)
         style_txt = _style_plot_label(style, has_kr_font)
@@ -15792,6 +15906,19 @@ def telegram_thread(ex):
                                         style = str((tgt0 or {}).get("style", ""))
                                         blocks.append(_fmt_pos_block(sym, side, lev, roi, upnl, style=style, tgt=tgt0))
                                     _reply_admin_dm("📊 포지션\n\n" + "\n\n".join(blocks))
+                                    try:
+                                        tg_send_position_chart_images(
+                                            ex,
+                                            act,
+                                            active_targets,
+                                            rt_open_targets,
+                                            cfg,
+                                            route_mode=str(cfg.get("tg_admin_replies_to", "channel") or "channel"),
+                                            admin_uid=(int(uid) if uid is not None else None),
+                                            fallback_chat_id=(int(chat_id) if chat_id is not None else None),
+                                        )
+                                    except Exception:
+                                        pass
 
                         # /scan (관리자) - 강제스캔(스캔만, 주문X)
                         elif low.startswith("/scan") or txt == "스캔":
@@ -16069,6 +16196,19 @@ def telegram_thread(ex):
                                         style = str((tgt0 or {}).get("style", ""))
                                         blocks.append(_fmt_pos_block(sym, side, lev, roi, upnl, style=style, tgt=tgt0))
                                     _cb_reply("📊 포지션\n\n" + "\n\n".join(blocks))
+                                    try:
+                                        tg_send_position_chart_images(
+                                            ex,
+                                            act,
+                                            active_targets,
+                                            rt_open_targets,
+                                            cfg,
+                                            route_mode=str(cfg.get("tg_admin_replies_to", "channel") or "channel"),
+                                            admin_uid=(int(uid) if uid is not None else None),
+                                            fallback_chat_id=(int(cb_chat_id) if cb_chat_id is not None else None),
+                                        )
+                                    except Exception:
+                                        pass
 
                         elif data == "log":
                             if not is_admin:
