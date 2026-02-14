@@ -666,6 +666,15 @@ def default_settings() -> Dict[str, Any]:
         "sqz_dependency_override_ai": True, # SQZ가 반대면 AI buy/sell을 hold로 강제
         # ✅ SQZ 최우선 진입(요구): SQZ "막 시작(fire)" 신호에서만 진입 허용
         "sqz_priority_entry_strict": True,
+        # ✅ 하드차단 대신 소프트 감점(요청)
+        # - strict 조건 미충족 시 진입 금지 대신 확신/진입금/레버를 감점한다.
+        "sqz_soft_penalty_enable": True,
+        "sqz_soft_penalty_conf_mult": 0.72,
+        "sqz_soft_penalty_entry_mult": 0.60,
+        "sqz_soft_penalty_lev_mult": 0.85,
+        "fresh_soft_penalty_conf_mult": 0.84,
+        "fresh_soft_penalty_entry_mult": 0.75,
+        "fresh_soft_penalty_lev_mult": 0.90,
 
         # ✅ (추가) 주력 지표(요구): Lorentzian / KNN / Logistic / SQZ / RSI
         # - 5개 중 3개 이상이 같은 방향으로 수렴할 때만 진입(비용/휩쏘 방지)
@@ -10041,32 +10050,41 @@ def _resolve_open_target_for_symbol(
     rt_open_targets: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     sym_s = str(sym or "")
-    srcs = []
-    if isinstance(active_targets, dict):
-        srcs.append(active_targets)
-    if isinstance(rt_open_targets, dict):
-        srcs.append(rt_open_targets)
-    for src in srcs:
+    nk = _norm_symbol_key(sym_s)
+
+    def _pick(src: Optional[Dict[str, Dict[str, Any]]]) -> Dict[str, Any]:
+        if not isinstance(src, dict) or not src:
+            return {}
         try:
-            t = src.get(sym_s, None)
-            if isinstance(t, dict) and t:
-                return t
+            t0 = src.get(sym_s, None)
+            if isinstance(t0, dict) and t0:
+                return dict(t0)
         except Exception:
             pass
-    nk = _norm_symbol_key(sym_s)
-    if not nk:
-        return {}
-    for src in srcs:
+        if not nk:
+            return {}
         try:
             for k, v in src.items():
-                if not isinstance(v, dict):
+                if not isinstance(v, dict) or not v:
                     continue
                 kk = _norm_symbol_key(k)
                 if kk and (kk == nk or kk.endswith(nk) or nk.endswith(kk)):
-                    return v
+                    return dict(v)
         except Exception:
-            continue
-    return {}
+            return {}
+        return {}
+
+    # runtime(open_targets) -> active_targets 순으로 merge
+    # - runtime에만 있는 TP/SL 필드를 유지하고
+    # - active의 최신 값으로 덮어쓴다.
+    merged: Dict[str, Any] = {}
+    rt_t = _pick(rt_open_targets)
+    if rt_t:
+        merged.update(rt_t)
+    ac_t = _pick(active_targets)
+    if ac_t:
+        merged.update(ac_t)
+    return merged
 
 
 def _fmt_pos_block(
@@ -10182,6 +10200,33 @@ def tg_send_position_chart_images(
             lev0 = _as_float((tgt0 or {}).get("lev", None), float("nan"))
             lev_use = lev_live if math.isfinite(lev_live) else lev0
             one_line = str((tgt0 or {}).get("reason", "") or (tgt0 or {}).get("style_reason", "") or "").strip()
+
+            def _num_or_none(v: Any) -> Optional[float]:
+                try:
+                    vv = float(v)
+                    if math.isfinite(vv):
+                        return float(vv)
+                except Exception:
+                    return None
+                return None
+
+            sl_price0 = _num_or_none((tgt0 or {}).get("sl_price", None))
+            tp_price0 = _num_or_none((tgt0 or {}).get("tp_price", None))
+            pt1_price0 = _num_or_none((tgt0 or {}).get("partial_tp1_price", None))
+            pt2_price0 = _num_or_none((tgt0 or {}).get("partial_tp2_price", None))
+            dca_price0 = _num_or_none((tgt0 or {}).get("dca_price", None))
+            sl_roi0 = _num_or_none((tgt0 or {}).get("sl", None))
+            tp_roi0 = _num_or_none((tgt0 or {}).get("tp", None))
+            if (math.isfinite(entry_px) and entry_px > 0) and (math.isfinite(lev_use) and float(lev_use) > 0):
+                if sl_roi0 is None and sl_price0 is not None:
+                    sl_roi0 = abs(float(estimate_roi_from_price(float(entry_px), float(sl_price0), str(side), float(lev_use))))
+                if tp_roi0 is None and tp_price0 is not None:
+                    tp_roi0 = abs(float(estimate_roi_from_price(float(entry_px), float(tp_price0), str(side), float(lev_use))))
+                if sl_price0 is None and sl_roi0 is not None:
+                    sl_price0 = _price_from_roi_target(float(entry_px), str(side), float(sl_roi0), float(lev_use), "sl")
+                if tp_price0 is None and tp_roi0 is not None:
+                    tp_price0 = _price_from_roi_target(float(entry_px), str(side), float(tp_roi0), float(lev_use), "tp")
+
             img_path = build_trade_event_image(
                 ex,
                 sym,
@@ -10190,13 +10235,13 @@ def tg_send_position_chart_images(
                 side=str(side),
                 style=str(style),
                 entry_price=(float(entry_px) if math.isfinite(entry_px) and entry_px > 0 else None),
-                sl_price=(_as_float((tgt0 or {}).get("sl_price", None), float("nan")) if (tgt0 or {}).get("sl_price", None) is not None else None),
-                tp_price=(_as_float((tgt0 or {}).get("tp_price", None), float("nan")) if (tgt0 or {}).get("tp_price", None) is not None else None),
-                partial_tp1_price=(_as_float((tgt0 or {}).get("partial_tp1_price", None), float("nan")) if (tgt0 or {}).get("partial_tp1_price", None) is not None else None),
-                partial_tp2_price=(_as_float((tgt0 or {}).get("partial_tp2_price", None), float("nan")) if (tgt0 or {}).get("partial_tp2_price", None) is not None else None),
-                dca_price=(_as_float((tgt0 or {}).get("dca_price", None), float("nan")) if (tgt0 or {}).get("dca_price", None) is not None else None),
-                sl_roi_pct=(_as_float((tgt0 or {}).get("sl", None), float("nan")) if (tgt0 or {}).get("sl", None) is not None else None),
-                tp_roi_pct=(_as_float((tgt0 or {}).get("tp", None), float("nan")) if (tgt0 or {}).get("tp", None) is not None else None),
+                sl_price=sl_price0,
+                tp_price=tp_price0,
+                partial_tp1_price=pt1_price0,
+                partial_tp2_price=pt2_price0,
+                dca_price=dca_price0,
+                sl_roi_pct=sl_roi0,
+                tp_roi_pct=tp_roi0,
                 leverage=(float(lev_use) if math.isfinite(lev_use) else None),
                 roi_pct=float(roi),
                 pnl_usdt=float(upnl),
@@ -15053,8 +15098,13 @@ def telegram_thread(ex):
                         except Exception:
                             call_ai = False
 
+                        soft_penalty_conf_mul = 1.0
+                        soft_penalty_entry_mul = 1.0
+                        soft_penalty_lev_mul = 1.0
+                        soft_penalty_tags: List[str] = []
+
                         # ✅ (필수) 3-of-N 수렴 게이트: 진입/AI 호출은 이 조건을 최우선으로 적용
-                        # - legacy call_ai 로직은 "참고"로만 남기고, 실제로는 수렴 조건이 우선한다.
+                        # - hard block 대신 soft penalty를 우선 적용(요청)
                         try:
                             if bool(cfg.get("entry_convergence_enable", True)):
                                 need = int(cfg.get("entry_convergence_min_votes", 3) or 3)
@@ -15088,17 +15138,38 @@ def telegram_thread(ex):
                                     else:
                                         sqz_ok = False
 
-                                if (ml_dir in ["buy", "sell"]) and (ml_votes >= int(need)) and fresh_ok and sqz_ok:
+                                if (ml_dir in ["buy", "sell"]) and (ml_votes >= int(need)):
                                     call_ai = True
+                                    soft_mode = bool(cfg.get("sqz_soft_penalty_enable", True))
+                                    if not fresh_ok:
+                                        if soft_mode:
+                                            f_conf = float(clamp(float(cfg.get("fresh_soft_penalty_conf_mult", 0.84) or 0.84), 0.10, 1.0))
+                                            f_entry = float(clamp(float(cfg.get("fresh_soft_penalty_entry_mult", 0.75) or 0.75), 0.10, 1.0))
+                                            f_lev = float(clamp(float(cfg.get("fresh_soft_penalty_lev_mult", 0.90) or 0.90), 0.10, 1.0))
+                                            soft_penalty_conf_mul *= f_conf
+                                            soft_penalty_entry_mul *= f_entry
+                                            soft_penalty_lev_mul *= f_lev
+                                            soft_penalty_tags.append("초기신호아님")
+                                        else:
+                                            call_ai = False
+                                            cs["skip_reason"] = "초기 신호 아님(시작 구간 대기)"
+                                    if call_ai and sqz_priority and (not sqz_ok):
+                                        if soft_mode:
+                                            w_soft = float(clamp(float(cfg.get("sqz_dependency_weight", 0.80) or 0.80), 0.0, 1.0))
+                                            p_conf = float(clamp(float(cfg.get("sqz_soft_penalty_conf_mult", max(0.25, 1.0 - (w_soft * 0.45))) or max(0.25, 1.0 - (w_soft * 0.45))), 0.10, 1.0))
+                                            p_entry = float(clamp(float(cfg.get("sqz_soft_penalty_entry_mult", max(0.20, 1.0 - (w_soft * 0.60))) or max(0.20, 1.0 - (w_soft * 0.60))), 0.10, 1.0))
+                                            p_lev = float(clamp(float(cfg.get("sqz_soft_penalty_lev_mult", max(0.35, 1.0 - (w_soft * 0.35))) or max(0.35, 1.0 - (w_soft * 0.35))), 0.10, 1.0))
+                                            soft_penalty_conf_mul *= p_conf
+                                            soft_penalty_entry_mul *= p_entry
+                                            soft_penalty_lev_mul *= p_lev
+                                            soft_penalty_tags.append("SQZ시작대기")
+                                        else:
+                                            call_ai = False
+                                            cs["skip_reason"] = "SQZ 시작 신호 아님(최우선 SQZ 대기)"
                                 else:
                                     call_ai = False
                                     try:
-                                        if sqz_priority and (not sqz_ok):
-                                            cs["skip_reason"] = "SQZ 시작 신호 아님(최우선 SQZ 대기)"
-                                        elif ml_dir not in ["buy", "sell"] or ml_votes < int(need):
-                                            cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need})"
-                                        else:
-                                            cs["skip_reason"] = "초기 신호 아님(시작 구간 대기)"
+                                        cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need})"
                                     except Exception:
                                         pass
                         except Exception:
@@ -15347,6 +15418,7 @@ def telegram_thread(ex):
                                 w = float(clamp(w, 0.0, 1.0))
                                 gate = bool(cfg.get("sqz_dependency_gate_entry", True))
                                 override = bool(cfg.get("sqz_dependency_override_ai", True))
+                                soft_mode = bool(cfg.get("sqz_soft_penalty_enable", True))
                                 bias = int(stt.get("_sqz_bias", 0) or 0)
                                 mom_pct = float(stt.get("_sqz_mom_pct", 0.0) or 0.0)
                                 slope = float(stt.get("_sqz_slope", 0.0) or 0.0)
@@ -15360,12 +15432,25 @@ def telegram_thread(ex):
                                     allow_buy = bool(raw_decision == "buy" and sqz_fire_up)
                                     allow_sell = bool(raw_decision == "sell" and sqz_fire_down)
                                     if not (allow_buy or allow_sell):
-                                        conf = int(round(float(conf) * max(0.0, 1.0 - w)))
-                                        decision = "hold"
-                                        if sqz_on:
-                                            sqz_skip_reason = f"SQZ 압축중(시작 전 대기, mom {mom_pct:+.2f}%)"
+                                        if soft_mode:
+                                            pen_conf = float(clamp(float(cfg.get("sqz_soft_penalty_conf_mult", max(0.25, 1.0 - (w * 0.45))) or max(0.25, 1.0 - (w * 0.45))), 0.10, 1.0))
+                                            pen_entry = float(clamp(float(cfg.get("sqz_soft_penalty_entry_mult", max(0.20, 1.0 - (w * 0.60))) or max(0.20, 1.0 - (w * 0.60))), 0.10, 1.0))
+                                            pen_lev = float(clamp(float(cfg.get("sqz_soft_penalty_lev_mult", max(0.35, 1.0 - (w * 0.35))) or max(0.35, 1.0 - (w * 0.35))), 0.10, 1.0))
+                                            soft_penalty_conf_mul *= pen_conf
+                                            soft_penalty_entry_mul *= pen_entry
+                                            soft_penalty_lev_mul *= pen_lev
+                                            soft_penalty_tags.append("SQZ시작대기")
+                                            if sqz_on:
+                                                sqz_skip_reason = f"SQZ 압축중(소프트감점, mom {mom_pct:+.2f}%)"
+                                            else:
+                                                sqz_skip_reason = f"SQZ 시작 대기(소프트감점, mom {mom_pct:+.2f}%)"
                                         else:
-                                            sqz_skip_reason = f"SQZ 시작 신호 아님(최우선, mom {mom_pct:+.2f}%)"
+                                            conf = int(round(float(conf) * max(0.0, 1.0 - w)))
+                                            decision = "hold"
+                                            if sqz_on:
+                                                sqz_skip_reason = f"SQZ 압축중(시작 전 대기, mom {mom_pct:+.2f}%)"
+                                            else:
+                                                sqz_skip_reason = f"SQZ 시작 신호 아님(최우선, mom {mom_pct:+.2f}%)"
                                     else:
                                         conf = int(min(100, int(conf) + int(round(12.0 * w))))
                                 else:
@@ -15373,14 +15458,34 @@ def telegram_thread(ex):
                                     opposed = (bias == 1 and raw_decision == "sell") or (bias == -1 and raw_decision == "buy")
 
                                     if opposed:
-                                        conf = int(round(float(conf) * max(0.0, 1.0 - w)))
-                                        if override:
-                                            decision = "hold"
-                                            sqz_skip_reason = f"SQZ 반대 모멘텀({mom_pct:+.2f}%)"
+                                        if soft_mode:
+                                            pen_conf = float(clamp(max(0.20, 1.0 - (w * 0.55)), 0.10, 1.0))
+                                            pen_entry = float(clamp(max(0.18, 1.0 - (w * 0.65)), 0.10, 1.0))
+                                            pen_lev = float(clamp(max(0.30, 1.0 - (w * 0.35)), 0.10, 1.0))
+                                            soft_penalty_conf_mul *= pen_conf
+                                            soft_penalty_entry_mul *= pen_entry
+                                            soft_penalty_lev_mul *= pen_lev
+                                            soft_penalty_tags.append("SQZ반대")
+                                            sqz_skip_reason = f"SQZ 반대 모멘텀(소프트감점, {mom_pct:+.2f}%)"
+                                        else:
+                                            conf = int(round(float(conf) * max(0.0, 1.0 - w)))
+                                            if override:
+                                                decision = "hold"
+                                                sqz_skip_reason = f"SQZ 반대 모멘텀({mom_pct:+.2f}%)"
                                     elif bias == 0 and gate:
-                                        conf = int(round(float(conf) * max(0.0, 1.0 - w)))
-                                        decision = "hold"
-                                        sqz_skip_reason = f"SQZ 중립 모멘텀({mom_pct:+.2f}%)"
+                                        if soft_mode:
+                                            pen_conf = float(clamp(max(0.30, 1.0 - (w * 0.45)), 0.10, 1.0))
+                                            pen_entry = float(clamp(max(0.25, 1.0 - (w * 0.55)), 0.10, 1.0))
+                                            pen_lev = float(clamp(max(0.40, 1.0 - (w * 0.30)), 0.10, 1.0))
+                                            soft_penalty_conf_mul *= pen_conf
+                                            soft_penalty_entry_mul *= pen_entry
+                                            soft_penalty_lev_mul *= pen_lev
+                                            soft_penalty_tags.append("SQZ중립")
+                                            sqz_skip_reason = f"SQZ 중립(소프트감점, {mom_pct:+.2f}%)"
+                                        else:
+                                            conf = int(round(float(conf) * max(0.0, 1.0 - w)))
+                                            decision = "hold"
+                                            sqz_skip_reason = f"SQZ 중립 모멘텀({mom_pct:+.2f}%)"
                                     elif aligned:
                                         # 정방향이어도 모멘텀 기울기/세기가 꺾였으면 진입 억제
                                         weak_or_turn = (
@@ -15388,9 +15493,19 @@ def telegram_thread(ex):
                                             or (raw_decision == "sell" and (slope >= 0 or mom_pct > -sqz_thr))
                                         )
                                         if weak_or_turn and gate:
-                                            conf = int(round(float(conf) * max(0.0, 1.0 - w)))
-                                            decision = "hold"
-                                            sqz_skip_reason = f"SQZ 둔화/반전({mom_pct:+.2f}%, slope {slope:+.3f})"
+                                            if soft_mode:
+                                                pen_conf = float(clamp(max(0.35, 1.0 - (w * 0.40)), 0.10, 1.0))
+                                                pen_entry = float(clamp(max(0.30, 1.0 - (w * 0.50)), 0.10, 1.0))
+                                                pen_lev = float(clamp(max(0.45, 1.0 - (w * 0.25)), 0.10, 1.0))
+                                                soft_penalty_conf_mul *= pen_conf
+                                                soft_penalty_entry_mul *= pen_entry
+                                                soft_penalty_lev_mul *= pen_lev
+                                                soft_penalty_tags.append("SQZ둔화")
+                                                sqz_skip_reason = f"SQZ 둔화/반전(소프트감점, {mom_pct:+.2f}%, slope {slope:+.3f})"
+                                            else:
+                                                conf = int(round(float(conf) * max(0.0, 1.0 - w)))
+                                                decision = "hold"
+                                                sqz_skip_reason = f"SQZ 둔화/반전({mom_pct:+.2f}%, slope {slope:+.3f})"
                                         else:
                                             conf = int(min(100, int(conf) + int(round(10.0 * w))))
 
@@ -15440,7 +15555,26 @@ def telegram_thread(ex):
                         except Exception:
                             pattern_skip_reason = ""
 
-                        skip_reason_merged = " / ".join([x for x in [sqz_skip_reason, pattern_skip_reason] if str(x).strip()])
+                        soft_penalty_note = ""
+                        try:
+                            soft_penalty_conf_mul = float(clamp(float(soft_penalty_conf_mul), 0.05, 1.0))
+                            soft_penalty_entry_mul = float(clamp(float(soft_penalty_entry_mul), 0.10, 1.0))
+                            soft_penalty_lev_mul = float(clamp(float(soft_penalty_lev_mul), 0.10, 1.0))
+                            if decision in ["buy", "sell"] and soft_penalty_conf_mul < 0.999:
+                                conf = int(clamp(int(round(float(conf) * soft_penalty_conf_mul)), 0, 100))
+                            uniq_tags: List[str] = []
+                            for t0 in (soft_penalty_tags or []):
+                                t1 = str(t0 or "").strip()
+                                if t1 and (t1 not in uniq_tags):
+                                    uniq_tags.append(t1)
+                            if uniq_tags:
+                                soft_penalty_note = (
+                                    f"소프트감점[{','.join(uniq_tags)}]"
+                                    f"(conf x{soft_penalty_conf_mul:.2f}, size x{soft_penalty_entry_mul:.2f}, lev x{soft_penalty_lev_mul:.2f})"
+                                )
+                        except Exception:
+                            soft_penalty_note = ""
+                        skip_reason_merged = " / ".join([x for x in [sqz_skip_reason, pattern_skip_reason, soft_penalty_note] if str(x).strip()])
                         # 강제스캔 요약 라인(요구사항: /scan 결과는 짧게)
                         try:
                             if force_scan_pending and ((not force_scan_syms_set) or (sym in force_scan_syms_set)):
@@ -15464,6 +15598,10 @@ def telegram_thread(ex):
                                 "pattern_bias": int(stt.get("_pattern_bias", 0) or 0),
                                 "pattern_strength": float(stt.get("_pattern_strength", 0.0) or 0.0),
                                 "min_conf_required": int(rule["min_conf"]),
+                                "soft_penalty_conf_mul": float(soft_penalty_conf_mul),
+                                "soft_penalty_entry_mul": float(soft_penalty_entry_mul),
+                                "soft_penalty_lev_mul": float(soft_penalty_lev_mul),
+                                "soft_penalty_note": soft_penalty_note,
                                 "skip_reason": skip_reason_merged,
                             }
                         )
@@ -15951,6 +16089,23 @@ def telegram_thread(ex):
                                             ai2["entry_usdt_risk_cap"] = float(entry_usdt)
                                             ai2["risk_cap_usdt"] = float(max_loss)
                                             ai2["risk_sl_for_risk"] = float(sl_for_risk)
+                            except Exception:
+                                pass
+
+                            # ✅ 소프트 감점 최종 반영: hard block 대신 size/leverage 감산
+                            try:
+                                if decision in ["buy", "sell"]:
+                                    sp_entry = float(clamp(float(soft_penalty_entry_mul), 0.10, 1.0))
+                                    sp_lev = float(clamp(float(soft_penalty_lev_mul), 0.10, 1.0))
+                                    if sp_entry < 0.999:
+                                        entry_usdt = float(max(0.0, float(entry_usdt) * sp_entry))
+                                    # fixed_leverage는 사용자 고정값 존중
+                                    if (sp_lev < 0.999) and (not bool(cfg.get("fixed_leverage_enable", False))):
+                                        lev_new = int(max(1, math.floor(float(lev) * sp_lev)))
+                                        if lev_new < int(lev):
+                                            lev = int(lev_new)
+                                    ai2["soft_penalty_entry_mul"] = float(sp_entry)
+                                    ai2["soft_penalty_lev_mul"] = float(sp_lev)
                             except Exception:
                                 pass
 
