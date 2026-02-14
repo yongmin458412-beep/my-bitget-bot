@@ -670,6 +670,11 @@ def default_settings() -> Dict[str, Any]:
         # - 스캔 단계에서 먼저 계산하고, 진입 시에만 AI를 호출해 TP/SL/SR를 유도리 있게 설계
         "entry_convergence_enable": True,
         "entry_convergence_min_votes": 3,
+        # ✅ 신규: "시그널이 막 시작된 시점"에서만 AI 호출 허용
+        # - MACD/MA 골든·데드 크로스 시작
+        # - SQZ fire 시작
+        # - RSI 해소/임계 진입 시작
+        "entry_require_fresh_start_signal": True,
         # ML 시그널 계산(외부 라이브러리 없이 numpy/pandas로만)
         "ml_enable": True,
         "ml_lookback": 220,          # 학습(과거 N샘플)
@@ -7171,18 +7176,78 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
         except Exception:
             pass
 
-    # RSI 해소
+    # RSI 해소/임계 진입(초기 신호)
     rsi_prev = float(prev.get("RSI", 50)) if (cfg.get("use_rsi", True) and "RSI" in df2.columns) else 50.0
     rsi_now = float(last.get("RSI", 50)) if (cfg.get("use_rsi", True) and "RSI" in df2.columns) else 50.0
     rsi_resolve_long = (rsi_prev < rsi_buy) and (rsi_now >= rsi_buy)
     rsi_resolve_short = (rsi_prev > rsi_sell) and (rsi_now <= rsi_sell)
+    rsi_enter_overbought = (rsi_prev < rsi_sell) and (rsi_now >= rsi_sell)
+    rsi_enter_oversold = (rsi_prev > rsi_buy) and (rsi_now <= rsi_buy)
+
+    # MACD/MA 크로스(초기 신호)
+    macd_cross_up = False
+    macd_cross_down = False
+    try:
+        if all(c in df2.columns for c in ["MACD", "MACD_signal"]):
+            m_prev = float(prev.get("MACD", 0.0) or 0.0)
+            s_prev = float(prev.get("MACD_signal", 0.0) or 0.0)
+            m_now = float(last.get("MACD", 0.0) or 0.0)
+            s_now = float(last.get("MACD_signal", 0.0) or 0.0)
+            macd_cross_up = bool((m_prev <= s_prev) and (m_now > s_now))
+            macd_cross_down = bool((m_prev >= s_prev) and (m_now < s_now))
+    except Exception:
+        macd_cross_up = False
+        macd_cross_down = False
+
+    ma_cross_up = False
+    ma_cross_down = False
+    try:
+        if all(c in df2.columns for c in ["MA_fast", "MA_slow"]):
+            f_prev = float(prev.get("MA_fast", 0.0) or 0.0)
+            s_prev = float(prev.get("MA_slow", 0.0) or 0.0)
+            f_now = float(last.get("MA_fast", 0.0) or 0.0)
+            s_now = float(last.get("MA_slow", 0.0) or 0.0)
+            ma_cross_up = bool((f_prev <= s_prev) and (f_now > s_now))
+            ma_cross_down = bool((f_prev >= s_prev) and (f_now < s_now))
+    except Exception:
+        ma_cross_up = False
+        ma_cross_down = False
+
+    # SQZ fire(압축 해제 직후의 초기 모멘텀)
+    sqz_fire_up = False
+    sqz_fire_down = False
+    try:
+        if "SQZ_ON" in df2.columns and "SQZ_MOM_PCT" in df2.columns:
+            sqz_on_prev = int(prev.get("SQZ_ON", 0) or 0) == 1
+            sqz_on_now = int(last.get("SQZ_ON", 0) or 0) == 1
+            sqz_m_prev = float(prev.get("SQZ_MOM_PCT", 0.0) or 0.0)
+            sqz_m_now = float(last.get("SQZ_MOM_PCT", 0.0) or 0.0)
+            sqz_thr = float(max(0.001, abs(float(cfg.get("sqz_mom_threshold_pct", 0.05) or 0.05))))
+            sqz_fire_up = bool(sqz_on_prev and (not sqz_on_now) and (sqz_m_now >= sqz_thr) and (sqz_m_now > sqz_m_prev))
+            sqz_fire_down = bool(sqz_on_prev and (not sqz_on_now) and (sqz_m_now <= -sqz_thr) and (sqz_m_now < sqz_m_prev))
+    except Exception:
+        sqz_fire_up = False
+        sqz_fire_down = False
 
     adx_now = float(last.get("ADX", 0)) if (cfg.get("use_adx", True) and "ADX" in df2.columns) else 0.0
     pullback_candidate = (trend == "상승추세") and rsi_resolve_long and (adx_now >= 18)
 
+    fresh_long = bool(rsi_resolve_long or rsi_enter_overbought or macd_cross_up or ma_cross_up or sqz_fire_up)
+    fresh_short = bool(rsi_resolve_short or rsi_enter_oversold or macd_cross_down or ma_cross_down or sqz_fire_down)
+
     status["_used_indicators"] = used
     status["_rsi_resolve_long"] = bool(rsi_resolve_long)
     status["_rsi_resolve_short"] = bool(rsi_resolve_short)
+    status["_rsi_enter_overbought"] = bool(rsi_enter_overbought)
+    status["_rsi_enter_oversold"] = bool(rsi_enter_oversold)
+    status["_macd_cross_up"] = bool(macd_cross_up)
+    status["_macd_cross_down"] = bool(macd_cross_down)
+    status["_ma_cross_up"] = bool(ma_cross_up)
+    status["_ma_cross_down"] = bool(ma_cross_down)
+    status["_sqz_fire_up"] = bool(sqz_fire_up)
+    status["_sqz_fire_down"] = bool(sqz_fire_down)
+    status["_fresh_long_trigger"] = bool(fresh_long)
+    status["_fresh_short_trigger"] = bool(fresh_short)
     status["_pullback_candidate"] = bool(pullback_candidate)
 
     return df2, status, last
@@ -7321,6 +7386,8 @@ def ml_signals_and_convergence(
     out: Dict[str, Any] = {
         "rsi_sig": 0,
         "sqz_sig": 0,
+        "macd_sig": 0,
+        "ma_sig": 0,
         "pattern_sig": 0,
         "knn_sig": 0,
         "lor_sig": 0,
@@ -7341,36 +7408,69 @@ def ml_signals_and_convergence(
     except Exception:
         return out
 
-    # RSI sig
+    # RSI sig (초기 시그널 우선)
     rsi_now = None
+    rsi_prev = None
     try:
-        if "RSI" in df.columns:
-            v = df["RSI"].iloc[-1]
-            rsi_now = float(v) if (v is not None and pd.notna(v)) else None
+        if "RSI" in df.columns and len(df) >= 2:
+            v0 = df["RSI"].iloc[-2]
+            v1 = df["RSI"].iloc[-1]
+            rsi_prev = float(v0) if (v0 is not None and pd.notna(v0)) else None
+            rsi_now = float(v1) if (v1 is not None and pd.notna(v1)) else None
     except Exception:
         rsi_now = None
+        rsi_prev = None
     try:
-        band = float(cfg.get("ml_rsi_neutral_band", 3.0) or 3.0)
+        rsi_cross_50_up = bool((rsi_prev is not None) and (rsi_now is not None) and (float(rsi_prev) < 50.0 <= float(rsi_now)))
+        rsi_cross_50_down = bool((rsi_prev is not None) and (rsi_now is not None) and (float(rsi_prev) > 50.0 >= float(rsi_now)))
     except Exception:
-        band = 3.0
-    band = float(max(0.0, abs(band)))
-    if rsi_now is not None:
-        if float(rsi_now) >= 50.0 + band:
-            out["rsi_sig"] = 1
-        elif float(rsi_now) <= 50.0 - band:
-            out["rsi_sig"] = -1
-        else:
-            out["rsi_sig"] = 0
+        rsi_cross_50_up = False
+        rsi_cross_50_down = False
+    rsi_long_fresh = bool(status.get("_rsi_resolve_long", False) or status.get("_rsi_enter_overbought", False) or rsi_cross_50_up)
+    rsi_short_fresh = bool(status.get("_rsi_resolve_short", False) or status.get("_rsi_enter_oversold", False) or rsi_cross_50_down)
+    if rsi_long_fresh and (not rsi_short_fresh):
+        out["rsi_sig"] = 1
+    elif rsi_short_fresh and (not rsi_long_fresh):
+        out["rsi_sig"] = -1
+    else:
+        out["rsi_sig"] = 0
 
-    # SQZ sig
+    # SQZ sig (압축 해제 직후 fire 우선)
     try:
-        bias = int(status.get("_sqz_bias", 0) or 0)
-        if bias in [-1, 0, 1]:
-            out["sqz_sig"] = int(bias)
+        fire_up = bool(status.get("_sqz_fire_up", False))
+        fire_down = bool(status.get("_sqz_fire_down", False))
+        if fire_up and (not fire_down):
+            out["sqz_sig"] = 1
+        elif fire_down and (not fire_up):
+            out["sqz_sig"] = -1
         else:
-            out["sqz_sig"] = 0
+            bias = int(status.get("_sqz_bias", 0) or 0)
+            slope = float(status.get("_sqz_slope", 0.0) or 0.0)
+            on_now = bool(status.get("_sqz_on", False))
+            if (not on_now) and bias == 1 and slope > 0:
+                out["sqz_sig"] = 1
+            elif (not on_now) and bias == -1 and slope < 0:
+                out["sqz_sig"] = -1
+            else:
+                out["sqz_sig"] = 0
     except Exception:
         out["sqz_sig"] = 0
+
+    # MACD/MA fresh-cross sig
+    try:
+        if bool(status.get("_macd_cross_up", False)):
+            out["macd_sig"] = 1
+        elif bool(status.get("_macd_cross_down", False)):
+            out["macd_sig"] = -1
+    except Exception:
+        out["macd_sig"] = 0
+    try:
+        if bool(status.get("_ma_cross_up", False)):
+            out["ma_sig"] = 1
+        elif bool(status.get("_ma_cross_down", False)):
+            out["ma_sig"] = -1
+    except Exception:
+        out["ma_sig"] = 0
 
     try:
         if bool(cfg.get("use_chart_patterns", True)):
@@ -7491,6 +7591,8 @@ def ml_signals_and_convergence(
     sigs = {
         "RSI": int(out.get("rsi_sig", 0) or 0),
         "SQZ": int(out.get("sqz_sig", 0) or 0),
+        "MACD": int(out.get("macd_sig", 0) or 0),
+        "MA": int(out.get("ma_sig", 0) or 0),
         "KNN": int(out.get("knn_sig", 0) or 0),
         "LOR": int(out.get("lor_sig", 0) or 0),
         "LOGIT": int(out.get("logit_sig", 0) or 0),
@@ -7519,6 +7621,7 @@ def ml_signals_and_convergence(
 
         out["detail"] = (
             f"RSI:{_sg(int(out.get('rsi_sig',0)))} | SQZ:{_sg(int(out.get('sqz_sig',0)))} | "
+            f"MACD:{_sg(int(out.get('macd_sig',0)))} | MA:{_sg(int(out.get('ma_sig',0)))} | "
             f"PATTERN:{_sg(int(out.get('pattern_sig',0)))} | "
             f"KNN:{_sg(int(out.get('knn_sig',0)))}({float(out.get('knn_prob',0.5)):.2f}) | "
             f"LOR:{_sg(int(out.get('lor_sig',0)))}({float(out.get('lor_prob',0.5)):.2f}) | "
@@ -10635,9 +10738,9 @@ def build_trade_event_image(
                 nrows=4,
                 ncols=1,
                 sharex=True,
-                figsize=(13.2, 8.8),
+                figsize=(13.2, 8.3),
                 dpi=120,
-                gridspec_kw={"height_ratios": [5.0, 1.35, 1.55, 1.35], "hspace": 0.05},
+                gridspec_kw={"height_ratios": [7.2, 0.82, 0.92, 0.82], "hspace": 0.04},
             )
             ax = axes[0]
             ax_rsi = axes[1]
@@ -14955,12 +15058,26 @@ def telegram_thread(ex):
                                 need = int(cfg.get("entry_convergence_min_votes", 3) or 3)
                                 ml_dir = str(ml.get("dir", "hold") or "hold")
                                 ml_votes = int(ml.get("votes_max", 0) or 0)
-                                if (ml_dir in ["buy", "sell"]) and (ml_votes >= int(need)):
+                                need_fresh = bool(cfg.get("entry_require_fresh_start_signal", True))
+                                fresh_long = bool(stt.get("_fresh_long_trigger", False))
+                                fresh_short = bool(stt.get("_fresh_short_trigger", False))
+                                fresh_ok = True
+                                if need_fresh:
+                                    if ml_dir == "buy":
+                                        fresh_ok = bool(fresh_long)
+                                    elif ml_dir == "sell":
+                                        fresh_ok = bool(fresh_short)
+                                    else:
+                                        fresh_ok = False
+                                if (ml_dir in ["buy", "sell"]) and (ml_votes >= int(need)) and fresh_ok:
                                     call_ai = True
                                 else:
                                     call_ai = False
                                     try:
-                                        cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need})"
+                                        if ml_dir not in ["buy", "sell"] or ml_votes < int(need):
+                                            cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need})"
+                                        else:
+                                            cs["skip_reason"] = "초기 신호 아님(시작 구간 대기)"
                                     except Exception:
                                         pass
                         except Exception:
