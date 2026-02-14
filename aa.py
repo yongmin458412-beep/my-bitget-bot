@@ -664,6 +664,8 @@ def default_settings() -> Dict[str, Any]:
         "sqz_dependency_weight": 0.80,      # 0~1 (기본 0.80)
         "sqz_dependency_gate_entry": True,  # SQZ가 중립이면 진입 억제
         "sqz_dependency_override_ai": True, # SQZ가 반대면 AI buy/sell을 hold로 강제
+        # ✅ SQZ 최우선 진입(요구): SQZ "막 시작(fire)" 신호에서만 진입 허용
+        "sqz_priority_entry_strict": True,
 
         # ✅ (추가) 주력 지표(요구): Lorentzian / KNN / Logistic / SQZ / RSI
         # - 5개 중 3개 이상이 같은 방향으로 수렴할 때만 진입(비용/휩쏘 방지)
@@ -15069,12 +15071,31 @@ def telegram_thread(ex):
                                         fresh_ok = bool(fresh_short)
                                     else:
                                         fresh_ok = False
-                                if (ml_dir in ["buy", "sell"]) and (ml_votes >= int(need)) and fresh_ok:
+                                sqz_priority = (
+                                    bool(cfg.get("use_sqz", True))
+                                    and bool(cfg.get("sqz_dependency_enable", True))
+                                    and bool(cfg.get("sqz_priority_entry_strict", True))
+                                    and float(cfg.get("sqz_dependency_weight", 0.80) or 0.80) >= 0.80
+                                )
+                                sqz_ok = True
+                                if sqz_priority:
+                                    sqz_fire_buy = bool(stt.get("_sqz_fire_up", False))
+                                    sqz_fire_sell = bool(stt.get("_sqz_fire_down", False))
+                                    if ml_dir == "buy":
+                                        sqz_ok = bool(sqz_fire_buy)
+                                    elif ml_dir == "sell":
+                                        sqz_ok = bool(sqz_fire_sell)
+                                    else:
+                                        sqz_ok = False
+
+                                if (ml_dir in ["buy", "sell"]) and (ml_votes >= int(need)) and fresh_ok and sqz_ok:
                                     call_ai = True
                                 else:
                                     call_ai = False
                                     try:
-                                        if ml_dir not in ["buy", "sell"] or ml_votes < int(need):
+                                        if sqz_priority and (not sqz_ok):
+                                            cs["skip_reason"] = "SQZ 시작 신호 아님(최우선 SQZ 대기)"
+                                        elif ml_dir not in ["buy", "sell"] or ml_votes < int(need):
                                             cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need})"
                                         else:
                                             cs["skip_reason"] = "초기 신호 아님(시작 구간 대기)"
@@ -15328,21 +15349,50 @@ def telegram_thread(ex):
                                 override = bool(cfg.get("sqz_dependency_override_ai", True))
                                 bias = int(stt.get("_sqz_bias", 0) or 0)
                                 mom_pct = float(stt.get("_sqz_mom_pct", 0.0) or 0.0)
-                                aligned = (bias == 1 and raw_decision == "buy") or (bias == -1 and raw_decision == "sell")
-                                opposed = (bias == 1 and raw_decision == "sell") or (bias == -1 and raw_decision == "buy")
+                                slope = float(stt.get("_sqz_slope", 0.0) or 0.0)
+                                sqz_on = bool(stt.get("_sqz_on", False))
+                                sqz_fire_up = bool(stt.get("_sqz_fire_up", False))
+                                sqz_fire_down = bool(stt.get("_sqz_fire_down", False))
+                                sqz_thr = float(max(0.001, abs(float(cfg.get("sqz_mom_threshold_pct", 0.05) or 0.05))))
+                                strict_sqz = bool(cfg.get("sqz_priority_entry_strict", True)) and (w >= 0.80)
 
-                                if opposed:
-                                    conf = int(round(float(conf) * max(0.0, 1.0 - w)))
-                                    if override:
+                                if strict_sqz:
+                                    allow_buy = bool(raw_decision == "buy" and sqz_fire_up)
+                                    allow_sell = bool(raw_decision == "sell" and sqz_fire_down)
+                                    if not (allow_buy or allow_sell):
+                                        conf = int(round(float(conf) * max(0.0, 1.0 - w)))
                                         decision = "hold"
-                                        sqz_skip_reason = f"SQZ 반대 모멘텀({mom_pct:+.2f}%)"
-                                elif bias == 0 and gate:
-                                    conf = int(round(float(conf) * max(0.0, 1.0 - w)))
-                                    decision = "hold"
-                                    sqz_skip_reason = f"SQZ 중립 모멘텀({mom_pct:+.2f}%)"
-                                elif aligned:
-                                    # 정방향이면 confidence 소폭 보정(최대 100)
-                                    conf = int(min(100, int(conf) + int(round(10.0 * w))))
+                                        if sqz_on:
+                                            sqz_skip_reason = f"SQZ 압축중(시작 전 대기, mom {mom_pct:+.2f}%)"
+                                        else:
+                                            sqz_skip_reason = f"SQZ 시작 신호 아님(최우선, mom {mom_pct:+.2f}%)"
+                                    else:
+                                        conf = int(min(100, int(conf) + int(round(12.0 * w))))
+                                else:
+                                    aligned = (bias == 1 and raw_decision == "buy") or (bias == -1 and raw_decision == "sell")
+                                    opposed = (bias == 1 and raw_decision == "sell") or (bias == -1 and raw_decision == "buy")
+
+                                    if opposed:
+                                        conf = int(round(float(conf) * max(0.0, 1.0 - w)))
+                                        if override:
+                                            decision = "hold"
+                                            sqz_skip_reason = f"SQZ 반대 모멘텀({mom_pct:+.2f}%)"
+                                    elif bias == 0 and gate:
+                                        conf = int(round(float(conf) * max(0.0, 1.0 - w)))
+                                        decision = "hold"
+                                        sqz_skip_reason = f"SQZ 중립 모멘텀({mom_pct:+.2f}%)"
+                                    elif aligned:
+                                        # 정방향이어도 모멘텀 기울기/세기가 꺾였으면 진입 억제
+                                        weak_or_turn = (
+                                            (raw_decision == "buy" and (slope <= 0 or mom_pct < sqz_thr))
+                                            or (raw_decision == "sell" and (slope >= 0 or mom_pct > -sqz_thr))
+                                        )
+                                        if weak_or_turn and gate:
+                                            conf = int(round(float(conf) * max(0.0, 1.0 - w)))
+                                            decision = "hold"
+                                            sqz_skip_reason = f"SQZ 둔화/반전({mom_pct:+.2f}%, slope {slope:+.3f})"
+                                        else:
+                                            conf = int(min(100, int(conf) + int(round(10.0 * w))))
 
                                 if sqz_skip_reason:
                                     mon_add_scan(
@@ -15353,7 +15403,7 @@ def telegram_thread(ex):
                                         signal=str(raw_decision),
                                         score=int(raw_conf),
                                         message=sqz_skip_reason,
-                                        extra={"sqz_mom_pct": mom_pct, "sqz_bias": bias, "w": w},
+                                        extra={"sqz_mom_pct": mom_pct, "sqz_bias": bias, "sqz_slope": slope, "sqz_on": sqz_on, "w": w, "strict_sqz": strict_sqz},
                                     )
                         except Exception:
                             sqz_skip_reason = ""
