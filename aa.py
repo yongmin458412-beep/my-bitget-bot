@@ -592,7 +592,7 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 11,
+        "settings_schema_version": 12,
         "openai_api_key": "",
         # ✅ 사용자 기본값 프리셋(요청): 하이리스크/하이리턴 + 자동매매 ON
         "auto_trade": True,
@@ -953,6 +953,23 @@ def default_settings() -> Dict[str, Any]:
         # 소프트 진입일 때 허용하는 최소 진입비중(% of free) / 최소 레버리지
         "soft_entry_entry_pct_floor": 2.0,
         "soft_entry_leverage_floor": 2,
+        # ✅ 관망 장기화 시 진입 기준을 "조금만" 완화(과도한 진입 방지)
+        # - 무포지션 상태에서 마지막 진입 이후 시간이 길어질수록 min_conf를 소폭 완화
+        # - 또한 수렴표(3-of-N)의 N을 최대 1만 낮춰 AI 호출 기회를 확보
+        "entry_relax_enable": True,
+        "entry_relax_after_min": 90,
+        "entry_relax_step_min": 45,
+        "entry_relax_conf_per_step": 1.0,
+        "entry_relax_max_conf_bonus": 4.0,
+        "entry_relax_reduce_votes_enable": True,
+        "entry_relax_votes_reduce_after_min": 180,
+        "entry_relax_votes_reduce": 1,
+
+        # ✅ 무포지션(관망) 상태 분석 리포트
+        "tg_enable_watch_report": True,
+        "tg_watch_report_interval_min": 20,
+        "tg_watch_report_min_idle_min": 30,
+        "tg_watch_report_silent": True,
         # ✅ 스타일 AI 보조(선택): 레짐 전환/표시에서 불필요한 OpenAI 호출을 줄이기 위해 분리 옵션 제공
         # - style_auto_enable=True여도, 아래 옵션이 OFF면 스타일은 "룰 기반"만 사용
         # - 사용자가 원할 때만 ON (비용/지연/요금제 429 방지)
@@ -1257,6 +1274,26 @@ def load_settings() -> Dict[str, Any]:
                     changed = True
             except Exception:
                 pass
+        # v12: 관망 리포트/진입 완화 기본값 보정(미설정 키만)
+        if saved_ver < 12:
+            try:
+                if "entry_relax_enable" not in saved:
+                    cfg["entry_relax_enable"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "tg_enable_watch_report" not in saved:
+                    cfg["tg_enable_watch_report"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "tg_watch_report_silent" not in saved:
+                    cfg["tg_watch_report_silent"] = True
+                    changed = True
+            except Exception:
+                pass
         cfg["settings_schema_version"] = base_ver
         if changed:
             try:
@@ -1298,6 +1335,9 @@ def default_runtime() -> Dict[str, Any]:
         "daily_btc_brief": {},
         "last_export_date": "",
         "open_targets": {},  # sym -> active_targets snapshot
+        # ✅ 무포지션(관망) 시간 계산용
+        "last_entry_epoch": 0.0,
+        "last_entry_kst": "",
         # ✅ Telegram /scan 강제 스캔 요청
         "force_scan": {},
         # ✅ 워커 리스(중복 스레드/워치독 복구 시 안전장치)
@@ -1321,6 +1361,15 @@ def load_runtime() -> Dict[str, Any]:
                 rt["open_targets"] = ot
         except Exception:
             pass
+        # 관망 시간 계산용 마지막 진입 시각은 날짜가 바뀌어도 보존
+        try:
+            rt["last_entry_epoch"] = float(prev_rt.get("last_entry_epoch", 0.0) or 0.0)
+        except Exception:
+            rt["last_entry_epoch"] = 0.0
+        try:
+            rt["last_entry_kst"] = str(prev_rt.get("last_entry_kst", "") or "")
+        except Exception:
+            rt["last_entry_kst"] = ""
     base = default_runtime()
     for k, v in base.items():
         if k not in rt:
@@ -9158,6 +9207,73 @@ def mon_add_scan(mon: Dict[str, Any], stage: str, symbol: str, tf: str = "", sig
         pass
 
 
+def _watch_reason_top(mon: Dict[str, Any], symbols: List[str], top_n: int = 3) -> List[Tuple[str, int]]:
+    """
+    무포지션 관망 리포트용: 코인별 skip_reason/ai_reason를 집계해 상위 사유를 반환.
+    """
+    try:
+        coins = (mon or {}).get("coins", {}) or {}
+        counts: Dict[str, int] = {}
+        for s in symbols:
+            cs = coins.get(s, {}) if isinstance(coins, dict) else {}
+            reason = str((cs or {}).get("skip_reason") or (cs or {}).get("ai_reason_easy") or "").strip()
+            if not reason:
+                continue
+            key = reason[:120]
+            counts[key] = int(counts.get(key, 0) or 0) + 1
+        ranked = sorted(counts.items(), key=lambda x: (-int(x[1]), str(x[0])))
+        return ranked[: max(1, int(top_n))]
+    except Exception:
+        return []
+
+
+def _entry_relax_state(cfg: Dict[str, Any], rt: Dict[str, Any], has_open_position: bool) -> Dict[str, Any]:
+    """
+    무포지션 관망 장기화 시, 진입 기준 완화 강도를 계산한다.
+    """
+    out = {
+        "enabled": False,
+        "idle_min": 0.0,
+        "conf_bonus": 0.0,
+        "votes_reduce": 0,
+    }
+    try:
+        if has_open_position or (not bool(cfg.get("entry_relax_enable", True))):
+            return out
+        last_entry_epoch = float((rt or {}).get("last_entry_epoch", 0.0) or 0.0)
+        if last_entry_epoch <= 0:
+            return out
+        idle_min = max(0.0, (time.time() - float(last_entry_epoch)) / 60.0)
+        after_min = float(cfg.get("entry_relax_after_min", 90) or 90)
+        if idle_min < max(1.0, after_min):
+            out["idle_min"] = float(idle_min)
+            return out
+
+        step_min = max(5.0, float(cfg.get("entry_relax_step_min", 45) or 45))
+        per_step = max(0.0, float(cfg.get("entry_relax_conf_per_step", 1.0) or 1.0))
+        max_bonus = max(0.0, float(cfg.get("entry_relax_max_conf_bonus", 4.0) or 4.0))
+        steps = int((idle_min - after_min) // step_min) + 1
+        conf_bonus = min(max_bonus, float(steps) * per_step)
+
+        votes_reduce = 0
+        if bool(cfg.get("entry_relax_reduce_votes_enable", True)):
+            vr_after = float(cfg.get("entry_relax_votes_reduce_after_min", 180) or 180)
+            if idle_min >= max(1.0, vr_after):
+                votes_reduce = max(0, int(cfg.get("entry_relax_votes_reduce", 1) or 1))
+
+        out.update(
+            {
+                "enabled": True,
+                "idle_min": float(idle_min),
+                "conf_bonus": float(conf_bonus),
+                "votes_reduce": int(votes_reduce),
+            }
+        )
+        return out
+    except Exception:
+        return out
+
+
 def mon_recent_events(mon: Dict[str, Any], within_min: int = 15) -> List[Dict[str, Any]]:
     try:
         evs = mon.get("events", []) or []
@@ -12030,6 +12146,8 @@ def telegram_thread(ex):
     next_report_ts = 0.0
     next_heartbeat_ts = 0.0  # 요구사항: 15분(900초) 고정 하트비트
     next_vision_ts = 0.0
+    next_watch_ts = 0.0
+    watch_no_pos_since_epoch = 0.0
     last_daily_brief_date = ""
     last_daily_brief_attempt_epoch = 0.0
     last_export_attempt_epoch = 0.0
@@ -12040,6 +12158,22 @@ def telegram_thread(ex):
         try:
             cfg = load_settings()
             rt = load_runtime()
+            # 신규키 도입 이후: 기존 런타임에 last_entry가 비어 있으면 monitor 이벤트에서 1회 복구
+            try:
+                if float(rt.get("last_entry_epoch", 0.0) or 0.0) <= 0.0:
+                    evs0 = mon.get("events", []) if isinstance(mon.get("events", []), list) else []
+                    for ev0 in reversed(evs0):
+                        if str((ev0 or {}).get("type", "") or "").upper() != "ENTRY":
+                            continue
+                        t0 = _parse_time_kst(str((ev0 or {}).get("time_kst", "") or ""))
+                        if t0 is None:
+                            continue
+                        rt["last_entry_epoch"] = float(t0.timestamp())
+                        rt["last_entry_kst"] = str((ev0 or {}).get("time_kst", "") or "")
+                        save_runtime(rt)
+                        break
+            except Exception:
+                pass
             # ✅ 워커 revoke/리스 체크(중복매매 방지)
             try:
                 if worker_id and (worker_id in set(_runtime_revoked_ids(rt))):
@@ -14700,7 +14834,18 @@ def telegram_thread(ex):
                                 need_exchange_refresh = False
                         except Exception:
                             pass
+                    relax_state = {"enabled": False, "idle_min": 0.0, "conf_bonus": 0.0, "votes_reduce": 0}
+                    relax_conf_bonus = 0.0
+                    relax_votes_reduce = 0
                     active_syms = set(pos_by_sym.keys())
+                    try:
+                        now_ep_watch = time.time()
+                        if active_syms:
+                            watch_no_pos_since_epoch = 0.0
+                        elif watch_no_pos_since_epoch <= 0:
+                            watch_no_pos_since_epoch = float(now_ep_watch)
+                    except Exception:
+                        pass
                     # ✅ 포지션 제한(총/낮은 확신) - 신규 진입에서 사용
                     try:
                         max_pos_total = int(cfg.get("max_open_positions_total", 5) or 5)
@@ -14714,6 +14859,18 @@ def telegram_thread(ex):
                         low_conf_th = int(cfg.get("low_conf_position_threshold", 92) or 92)
                     except Exception:
                         low_conf_th = 92
+                    relax_state = _entry_relax_state(cfg, rt, has_open_position=bool(active_syms))
+                    relax_conf_bonus = float(relax_state.get("conf_bonus", 0.0) or 0.0)
+                    relax_votes_reduce = int(relax_state.get("votes_reduce", 0) or 0)
+                    try:
+                        mon["entry_relax_state"] = {
+                            "enabled": bool(relax_state.get("enabled", False)),
+                            "idle_min": round(float(relax_state.get("idle_min", 0.0) or 0.0), 1),
+                            "conf_bonus": round(float(relax_conf_bonus), 2),
+                            "votes_reduce": int(relax_votes_reduce),
+                        }
+                    except Exception:
+                        pass
 
                     scan_cycle_start = time.time()
                     ccxt_timeout_epoch_scan_start = float(getattr(ex, "_wonyoti_ccxt_timeout_epoch", 0) or 0)
@@ -15107,7 +15264,14 @@ def telegram_thread(ex):
                         # - hard block 대신 soft penalty를 우선 적용(요청)
                         try:
                             if bool(cfg.get("entry_convergence_enable", True)):
-                                need = int(cfg.get("entry_convergence_min_votes", 3) or 3)
+                                need_base = int(cfg.get("entry_convergence_min_votes", 3) or 3)
+                                need = int(need_base)
+                                try:
+                                    if int(relax_votes_reduce) > 0:
+                                        # 관망이 길어진 경우에만 3-of-N 기준을 최대 1단계 완화
+                                        need = int(max(2, int(need_base) - int(relax_votes_reduce)))
+                                except Exception:
+                                    need = int(need_base)
                                 ml_dir = str(ml.get("dir", "hold") or "hold")
                                 ml_votes = int(ml.get("votes_max", 0) or 0)
                                 need_fresh = bool(cfg.get("entry_require_fresh_start_signal", True))
@@ -15169,7 +15333,10 @@ def telegram_thread(ex):
                                 else:
                                     call_ai = False
                                     try:
-                                        cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need})"
+                                        if need != need_base:
+                                            cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need}) [완화]"
+                                        else:
+                                            cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need})"
                                     except Exception:
                                         pass
                         except Exception:
@@ -15610,6 +15777,7 @@ def telegram_thread(ex):
                         # 진입(STRICT + SOFT)
                         min_conf_strict = int(rule.get("min_conf", 0) or 0)
                         min_conf_soft = int(min_conf_strict)
+                        min_conf_effective = int(min_conf_strict)
                         is_soft_entry = False
                         try:
                             if decision in ["buy", "sell"] and bool(cfg.get("soft_entry_enable", True)):
@@ -15622,11 +15790,28 @@ def telegram_thread(ex):
                                 min_conf_soft = int(max(0, int(min_conf_strict) - int(max(0, gap))))
                         except Exception:
                             min_conf_soft = int(min_conf_strict)
+                        try:
+                            if decision in ["buy", "sell"] and float(relax_conf_bonus or 0.0) > 0:
+                                # 관망이 길어진 경우 conf 기준을 소폭 완화(과도한 진입 방지 위해 상한 제한)
+                                min_conf_effective = int(max(0, int(round(float(min_conf_soft) - float(relax_conf_bonus)))))
+                            else:
+                                min_conf_effective = int(min_conf_soft)
+                        except Exception:
+                            min_conf_effective = int(min_conf_soft)
+                        try:
+                            cs["min_conf_soft"] = int(min_conf_soft)
+                            cs["min_conf_effective"] = int(min_conf_effective)
+                            cs["entry_relax_conf_bonus"] = float(relax_conf_bonus)
+                        except Exception:
+                            pass
 
                         # ✅ buy/sell인데 확신도가 낮아 진입을 못 하면, 스킵 사유를 남겨 원인 파악을 쉽게 한다.
                         try:
-                            if decision in ["buy", "sell"] and int(conf) < int(min_conf_soft):
-                                cs["skip_reason"] = f"확신도 부족({int(conf)}% < {int(min_conf_soft)}%)"
+                            if decision in ["buy", "sell"] and int(conf) < int(min_conf_effective):
+                                if int(min_conf_effective) != int(min_conf_soft):
+                                    cs["skip_reason"] = f"확신도 부족({int(conf)}% < {int(min_conf_effective)}%, 완화적용)"
+                                else:
+                                    cs["skip_reason"] = f"확신도 부족({int(conf)}% < {int(min_conf_effective)}%)"
                                 mon_add_scan(
                                     mon,
                                     stage="trade_skipped",
@@ -15635,12 +15820,17 @@ def telegram_thread(ex):
                                     signal=str(decision),
                                     score=conf,
                                     message=str(cs.get("skip_reason", ""))[:140],
-                                    extra={"min_conf_strict": int(min_conf_strict), "min_conf_soft": int(min_conf_soft)},
+                                    extra={
+                                        "min_conf_strict": int(min_conf_strict),
+                                        "min_conf_soft": int(min_conf_soft),
+                                        "min_conf_effective": int(min_conf_effective),
+                                        "relax_conf_bonus": float(relax_conf_bonus),
+                                    },
                                 )
                         except Exception:
                             pass
 
-                        if decision in ["buy", "sell"] and conf >= int(min_conf_soft):
+                        if decision in ["buy", "sell"] and conf >= int(min_conf_effective):
                             is_soft_entry = bool(int(conf) < int(min_conf_strict))
                             # ✅ 강제스캔(scan_only) 또는 auto_trade OFF/정지/주말이면 신규진입 금지
                             if (not entry_allowed_global) or (forced_ai and force_scan_only):
@@ -16364,6 +16554,8 @@ def telegram_thread(ex):
                                     pass
 
                                 rt.setdefault("open_targets", {})[sym] = active_targets[sym]
+                                rt["last_entry_epoch"] = float(time.time())
+                                rt["last_entry_kst"] = now_kst_str()
                                 save_runtime(rt)
                                 try:
                                     active_syms.add(sym)
@@ -16674,6 +16866,66 @@ def telegram_thread(ex):
                     if "scan_cycle_start" in locals():
                         mon["scan_cycle_sec"] = float(time.time() - float(scan_cycle_start))
                         mon["last_scan_cycle_kst"] = now_kst_str()
+                except Exception:
+                    pass
+
+                # ✅ 무포지션(관망) 상태에서도 "분석 중"인지 주기적으로 텔레그램 안내
+                try:
+                    if tg_token and bool(cfg.get("tg_enable_watch_report", True)):
+                        if next_watch_ts <= 0:
+                            next_watch_ts = time.time() + 30
+                        if time.time() >= next_watch_ts:
+                            interval_min = max(5, int(cfg.get("tg_watch_report_interval_min", 20) or 20))
+                            min_idle_min = max(0, int(cfg.get("tg_watch_report_min_idle_min", 30) or 30))
+                            idle_relax = float(relax_state.get("idle_min", 0.0) or 0.0)
+                            idle_no_pos = 0.0
+                            try:
+                                if (not active_syms) and float(watch_no_pos_since_epoch or 0.0) > 0:
+                                    idle_no_pos = max(0.0, (time.time() - float(watch_no_pos_since_epoch)) / 60.0)
+                            except Exception:
+                                idle_no_pos = 0.0
+                            idle_min = max(float(idle_relax), float(idle_no_pos))
+
+                            if (not active_syms) and (idle_min >= float(min_idle_min)) and (not bool(force_scan_pending)):
+                                scan_lag_sec = max(0.0, time.time() - float(mon.get("last_scan_epoch", 0) or 0))
+                                scan_cycle_sec = float(mon.get("scan_cycle_sec", 0.0) or 0.0)
+                                stale_thresh = max(90.0, float(scan_cycle_sec) * 4.0) if scan_cycle_sec > 0 else 90.0
+                                analyzing = bool(scan_lag_sec <= stale_thresh)
+
+                                lines = [
+                                    "👀 관망 리포트",
+                                    f"- 상태: {'차트분석 진행중' if analyzing else '스캔 지연(점검 필요)'}",
+                                    f"- 무포지션 시간: {int(round(idle_min))}분",
+                                    f"- 모드: {mode}",
+                                    f"- 마지막 스캔: {str(mon.get('last_scan_kst', '-') or '-')}",
+                                ]
+                                if bool(relax_state.get("enabled", False)):
+                                    lines.append(
+                                        f"- 진입완화: conf 기준 -{float(relax_conf_bonus):.1f}%p"
+                                        + (f", 수렴표 -{int(relax_votes_reduce)}" if int(relax_votes_reduce) > 0 else "")
+                                    )
+
+                                top_reasons = _watch_reason_top(mon, list(TARGET_COINS), top_n=3)
+                                if top_reasons:
+                                    lines.append("- 관망 사유 TOP")
+                                    for reason, cnt in top_reasons:
+                                        lines.append(f"  · {reason[:55]} x{int(cnt)}")
+
+                                coins_now = mon.get("coins", {}) if isinstance(mon.get("coins", {}), dict) else {}
+                                for sym0 in TARGET_COINS[:3]:
+                                    cs0 = coins_now.get(sym0, {}) if isinstance(coins_now, dict) else {}
+                                    lines.append(
+                                        f"- {sym0}: {str(cs0.get('ai_decision','-')).upper()}({cs0.get('ai_confidence','-')}%)"
+                                        f" / {str(cs0.get('skip_reason') or cs0.get('ai_reason_easy') or '-')[:40]}"
+                                    )
+
+                                tg_send(
+                                    "\n".join(lines),
+                                    target=cfg.get("tg_route_events_to", "channel"),
+                                    cfg=cfg,
+                                    silent=bool(cfg.get("tg_watch_report_silent", True)),
+                                )
+                            next_watch_ts = time.time() + (float(interval_min) * 60.0)
                 except Exception:
                     pass
 
@@ -17655,6 +17907,26 @@ with st.sidebar.expander("진입 전 AI 호출 필터(거래량/이격도)"):
     d1, d2 = st.columns(2)
     config["ai_call_disparity_max_abs_pct"] = d1.number_input("최대 |이격도|%", 0.5, 30.0, float(config.get("ai_call_disparity_max_abs_pct", 4.0) or 4.0), step=0.5)
     config["ai_call_disparity_ma_period"] = d2.number_input("이격도 MA 기간", 5, 120, int(config.get("ai_call_disparity_ma_period", 20) or 20), step=1)
+with st.sidebar.expander("관망 장기화 시 진입 완화(소폭)"):
+    config["entry_relax_enable"] = st.checkbox(
+        "무포지션 오래 지속 시 완화",
+        value=bool(config.get("entry_relax_enable", True)),
+        help="관망이 길어질 때 min_conf 기준을 조금 낮춰 진입 기회를 늘립니다.",
+    )
+    r1, r2 = st.columns(2)
+    config["entry_relax_after_min"] = r1.number_input("완화 시작(분)", 10, 600, int(config.get("entry_relax_after_min", 90) or 90), step=5)
+    config["entry_relax_step_min"] = r2.number_input("완화 간격(분)", 5, 240, int(config.get("entry_relax_step_min", 45) or 45), step=5)
+    r3, r4 = st.columns(2)
+    config["entry_relax_conf_per_step"] = r3.number_input("단계당 conf 완화", 0.0, 5.0, float(config.get("entry_relax_conf_per_step", 1.0) or 1.0), step=0.1)
+    config["entry_relax_max_conf_bonus"] = r4.number_input("최대 conf 완화", 0.0, 15.0, float(config.get("entry_relax_max_conf_bonus", 4.0) or 4.0), step=0.5)
+    config["entry_relax_reduce_votes_enable"] = st.checkbox(
+        "수렴표(N) 1단계 완화",
+        value=bool(config.get("entry_relax_reduce_votes_enable", True)),
+        help="예: 3-of-N을 2-of-N으로 낮춰 AI 호출 기회를 약간 늘립니다.",
+    )
+    r5, r6 = st.columns(2)
+    config["entry_relax_votes_reduce_after_min"] = r5.number_input("N완화 시작(분)", 30, 1200, int(config.get("entry_relax_votes_reduce_after_min", 180) or 180), step=10)
+    config["entry_relax_votes_reduce"] = r6.number_input("N완화 단계", 0, 2, int(config.get("entry_relax_votes_reduce", 1) or 1), step=1)
 
 st.sidebar.subheader("⏱️ 주기 리포트")
 config["tg_enable_heartbeat_report"] = st.sidebar.checkbox(
@@ -17688,6 +17960,18 @@ config["tg_periodic_report_silent"] = st.sidebar.checkbox(
 )
 config["tg_enable_hourly_vision_report"] = st.sidebar.checkbox("1시간 AI시야 리포트(채널)", value=bool(config.get("tg_enable_hourly_vision_report", False)))
 config["vision_report_interval_min"] = st.sidebar.number_input("AI시야 리포트 주기(분)", 10, 240, int(config.get("vision_report_interval_min", 60)))
+config["tg_enable_watch_report"] = st.sidebar.checkbox(
+    "무포지션 관망 리포트",
+    value=bool(config.get("tg_enable_watch_report", True)),
+    help="진입이 없을 때도 차트 분석이 진행 중인지와 관망 사유를 주기적으로 보냅니다.",
+)
+wr1, wr2 = st.sidebar.columns(2)
+config["tg_watch_report_interval_min"] = wr1.number_input("관망 리포트 주기(분)", 5, 240, int(config.get("tg_watch_report_interval_min", 20) or 20))
+config["tg_watch_report_min_idle_min"] = wr2.number_input("관망 리포트 시작(분)", 0, 600, int(config.get("tg_watch_report_min_idle_min", 30) or 30))
+config["tg_watch_report_silent"] = st.sidebar.checkbox(
+    "관망 리포트는 무음(알림X)",
+    value=bool(config.get("tg_watch_report_silent", True)),
+)
 
 st.sidebar.subheader("🔔 알림(푸시) 제어")
 config["tg_notify_entry_exit_only"] = st.sidebar.checkbox(
