@@ -4503,6 +4503,269 @@ def gsheet_status_snapshot() -> Dict[str, Any]:
         return {"enabled": bool(gsheet_is_enabled()), "last_err": str(_GSHEET_CACHE.get("last_err", "") if isinstance(_GSHEET_CACHE, dict) else "")}
 
 
+def _col_name_1based(n: int) -> str:
+    n = int(max(1, int(n)))
+    out = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def _ws_get_values_preview(ws: Any, max_rows: int = 120, max_cols: int = 16) -> List[List[str]]:
+    if ws is None:
+        return []
+    rows = int(max(2, int(max_rows)))
+    cols = int(max(1, int(max_cols)))
+    rng = f"A1:{_col_name_1based(cols)}{rows}"
+    try:
+        vals = ws.get(rng)
+        if isinstance(vals, list) and vals:
+            return vals
+    except Exception:
+        pass
+    try:
+        vals2 = ws.get_all_values()
+        if isinstance(vals2, list):
+            return vals2[:rows]
+    except Exception:
+        pass
+    return []
+
+
+def _sheet_values_to_df(values: List[List[Any]]) -> pd.DataFrame:
+    if not values or not isinstance(values, list):
+        return pd.DataFrame()
+    try:
+        header = [str(x or "").strip() for x in (values[0] or [])]
+    except Exception:
+        return pd.DataFrame()
+    header = [h if h else f"col_{i+1}" for i, h in enumerate(header)]
+    rows = []
+    for r in values[1:]:
+        rr = list(r or [])
+        if len(rr) < len(header):
+            rr += [""] * (len(header) - len(rr))
+        rows.append(rr[: len(header)])
+    if not rows:
+        return pd.DataFrame(columns=header)
+    return pd.DataFrame(rows, columns=header)
+
+
+def _to_float_unsafe(v: Any) -> float:
+    try:
+        s = str(v or "").strip()
+        if not s:
+            return float("nan")
+        s = s.replace(",", "").replace("%", "").replace("USDT", "").strip()
+        if not s:
+            return float("nan")
+        return float(s)
+    except Exception:
+        return float("nan")
+
+
+def _render_gsheet_table_image(
+    title: str,
+    df_show: pd.DataFrame,
+    *,
+    tag: str = "sheet",
+    subtitle: str = "",
+) -> Optional[str]:
+    if plt is None or df_show is None or df_show.empty:
+        return None
+    try:
+        has_kr_font = _ensure_trade_image_font()
+        dfx = df_show.copy().fillna("")
+        cols = [str(c or "") for c in dfx.columns.tolist()]
+        rows = [[str(x or "") for x in row] for row in dfx.values.tolist()]
+        nrows = int(len(rows))
+        h = float(clamp(2.6 + (0.42 * float(nrows + 1)), 3.5, 15.0))
+        fig, ax = plt.subplots(figsize=(13.4, h), dpi=125)
+        fig.patch.set_facecolor("#0e1117")
+        ax.set_facecolor("#11161c")
+        ax.axis("off")
+
+        ttl = _plot_text_sanitize(str(title or "").strip(), has_kr_font=has_kr_font, max_len=120)
+        if ttl:
+            ax.set_title(ttl, fontsize=12, color="#f8fafc", pad=10)
+        if subtitle:
+            stxt = _plot_text_sanitize(str(subtitle), has_kr_font=has_kr_font, max_len=180)
+            if stxt:
+                ax.text(0.5, 0.985, stxt, transform=ax.transAxes, ha="center", va="top", fontsize=8.2, color="#94a3b8")
+
+        tbl = ax.table(
+            cellText=rows,
+            colLabels=cols,
+            cellLoc="center",
+            colLoc="center",
+            loc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8.1 if nrows <= 18 else 7.6)
+        tbl.scale(1.0, 1.20)
+
+        for (r, c), cell in tbl.get_celld().items():
+            cell.set_edgecolor("#334155")
+            cell.set_linewidth(0.55)
+            if r == 0:
+                cell.set_facecolor("#1f2937")
+                cell.get_text().set_color("#f8fafc")
+                cell.get_text().set_weight("bold")
+            else:
+                cell.set_facecolor("#0f172a" if (r % 2 == 1) else "#111827")
+                cell.get_text().set_color("#e2e8f0")
+                try:
+                    col_name = cols[c] if c < len(cols) else ""
+                    txt = str(rows[r - 1][c] if c < len(rows[r - 1]) else "")
+                    if ("손익" in col_name) or ("PnL" in col_name):
+                        vv = _to_float_unsafe(txt)
+                        if math.isfinite(vv):
+                            if vv > 0:
+                                cell.get_text().set_color("#86efac")
+                            elif vv < 0:
+                                cell.get_text().set_color("#fda4af")
+                except Exception:
+                    pass
+
+        ts = now_kst().strftime("%Y%m%d_%H%M%S")
+        fname = f"{ts}_gsheet_{re.sub(r'[^A-Za-z0-9]+', '_', str(tag or 'sheet'))[:24]}_{uuid.uuid4().hex[:6]}.png"
+        out_path = os.path.join(EVENT_IMAGE_DIR, fname)
+        fig.tight_layout(pad=0.9)
+        fig.savefig(out_path, dpi=130, bbox_inches="tight")
+        plt.close(fig)
+        _cleanup_event_images()
+        return out_path
+    except Exception:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return None
+
+
+def gsheet_build_journal_snapshot(kind: str = "today", timeout_sec: int = 22) -> Dict[str, Any]:
+    """
+    텔레그램 버튼용:
+    - kind: today | daily | monthly | trades
+    - Google Sheets trades_only 시트 기반으로 표 이미지를 생성
+    """
+    k = str(kind or "today").lower().strip()
+    if not gsheet_is_enabled():
+        return {"ok": False, "error": "GSHEET_ENABLED=false"}
+    if gsheet_mode() == "legacy":
+        return {"ok": False, "error": "legacy 모드에서는 미지원(trades_only 필요)"}
+    if plt is None:
+        return {"ok": False, "error": "matplotlib 미설치"}
+
+    def _do():
+        sh = _gsheet_connect_spreadsheet()
+        if sh is None:
+            raise RuntimeError(str(_GSHEET_CACHE.get("last_err", "") or "gsheet_connect_failed"))
+        sheets = _gsheet_prepare_trades_only_sheets(sh)
+        if not sheets:
+            raise RuntimeError("gsheet_prepare_failed")
+        ws_trade = sheets.get("ws_trade")
+        ws_daily = sheets.get("ws_daily")
+        if ws_trade is None or ws_daily is None:
+            raise RuntimeError("ws_trade/ws_daily_missing")
+
+        vals_trade = _ws_get_values_preview(ws_trade, max_rows=90, max_cols=18)
+        vals_daily = _ws_get_values_preview(ws_daily, max_rows=370, max_cols=10)
+        df_trade = _sheet_values_to_df(vals_trade)
+        df_daily = _sheet_values_to_df(vals_daily)
+
+        if k == "trades":
+            if df_trade.empty:
+                return {"ok": False, "error": "매매일지 시트가 비어있습니다."}
+            keep = [c for c in ["시간(KST)", "코인", "방향", "손익(USDT)", "수익률(%)", "한줄평", "일지ID"] if c in df_trade.columns]
+            show = df_trade[keep].head(14).copy() if keep else df_trade.head(14).copy()
+            img = _render_gsheet_table_image("구글시트 최근 매매일지", show, tag="log_trades", subtitle=f"rows={len(show)}")
+            if not img:
+                return {"ok": False, "error": "이미지 생성 실패"}
+            return {"ok": True, "image": img, "caption": "📜 구글시트 최근 매매일지", "rows": len(show)}
+
+        if df_daily.empty:
+            return {"ok": False, "error": "일별 요약 시트가 비어있습니다."}
+
+        date_col = "날짜(KST)" if "날짜(KST)" in df_daily.columns else (df_daily.columns[0] if len(df_daily.columns) else "")
+        trades_col = "거래수" if "거래수" in df_daily.columns else ""
+        pnl_col = "총손익(USDT)" if "총손익(USDT)" in df_daily.columns else ""
+        wr_col = "승률(%)" if "승률(%)" in df_daily.columns else ""
+        avg_col = "평균수익률(%)" if "평균수익률(%)" in df_daily.columns else ""
+        pf_col = "PF" if "PF" in df_daily.columns else ""
+
+        if k == "today":
+            today = today_kst_str()
+            one = df_daily[df_daily[date_col].astype(str).str.startswith(today)].head(1).copy() if date_col else pd.DataFrame()
+            if one.empty:
+                rt = load_runtime()
+                one = pd.DataFrame(
+                    [
+                        {
+                            "날짜(KST)": today,
+                            "거래수": int(rt.get("daily_trade_count", 0) or 0),
+                            "승률(%)": round((float(rt.get("daily_win_count", 0) or 0) / max(1, int(rt.get("daily_trade_count", 0) or 0))) * 100.0, 2),
+                            "총손익(USDT)": round(float(rt.get("daily_realized_pnl", 0.0) or 0.0), 4),
+                            "평균수익률(%)": 0.0,
+                            "PF": "-",
+                        }
+                    ]
+                )
+            keep = [c for c in ["날짜(KST)", "거래수", "승률(%)", "총손익(USDT)", "평균수익률(%)", "PF"] if c in one.columns]
+            show = one[keep].copy() if keep else one.copy()
+            img = _render_gsheet_table_image(f"금일 손익 ({today})", show, tag="log_today")
+            if not img:
+                return {"ok": False, "error": "이미지 생성 실패"}
+            return {"ok": True, "image": img, "caption": f"📌 금일 손익 ({today})", "rows": len(show)}
+
+        if k == "monthly":
+            dfm = df_daily.copy()
+            if not date_col:
+                return {"ok": False, "error": "일별 날짜 컬럼 없음"}
+            dfm["월"] = dfm[date_col].astype(str).str.slice(0, 7)
+            if trades_col:
+                dfm["_trades"] = pd.to_numeric(dfm[trades_col], errors="coerce").fillna(0.0)
+            else:
+                dfm["_trades"] = 0.0
+            if pnl_col:
+                dfm["_pnl"] = dfm[pnl_col].map(_to_float_unsafe).fillna(0.0)
+            else:
+                dfm["_pnl"] = 0.0
+            if wr_col:
+                dfm["_wr"] = dfm[wr_col].map(_to_float_unsafe).fillna(0.0)
+            else:
+                dfm["_wr"] = 0.0
+            grp = (
+                dfm.groupby("월", dropna=False)
+                .agg({"_trades": "sum", "_pnl": "sum", "_wr": "mean"})
+                .reset_index()
+                .sort_values("월", ascending=False)
+                .head(12)
+                .copy()
+            )
+            grp.rename(columns={"_trades": "거래수", "_pnl": "총손익(USDT)", "_wr": "평균승률(%)"}, inplace=True)
+            grp["거래수"] = grp["거래수"].astype(int)
+            grp["총손익(USDT)"] = grp["총손익(USDT)"].map(lambda x: f"{float(x):+.2f}")
+            grp["평균승률(%)"] = grp["평균승률(%)"].map(lambda x: f"{float(x):.2f}")
+            img = _render_gsheet_table_image("월별 손익 요약", grp, tag="log_monthly", subtitle="최근 12개월")
+            if not img:
+                return {"ok": False, "error": "이미지 생성 실패"}
+            return {"ok": True, "image": img, "caption": "📆 월별 손익 요약", "rows": len(grp)}
+
+        keep = [c for c in [date_col, trades_col, wr_col, pnl_col, avg_col, pf_col] if c]
+        show = df_daily[keep].head(20).copy() if keep else df_daily.head(20).copy()
+        img = _render_gsheet_table_image("일별 손익 요약", show, tag="log_daily", subtitle=f"rows={len(show)}")
+        if not img:
+            return {"ok": False, "error": "이미지 생성 실패"}
+        return {"ok": True, "image": img, "caption": "🗓️ 일별 손익 요약", "rows": len(show)}
+
+    try:
+        return _call_with_timeout(_do, timeout_sec=max(12, int(timeout_sec)))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def gsheet_test_append_row(timeout_sec: int = 20) -> Dict[str, Any]:
     """
     수동 진단용:
@@ -9076,7 +9339,7 @@ def tg_send_menu(cfg: Optional[Dict[str, Any]] = None):
         "inline_keyboard": [
             [{"text": "📡 상태", "callback_data": "status"}, {"text": "👁️ AI시야", "callback_data": "vision"}],
             [{"text": "📊 포지션", "callback_data": "position"}, {"text": "💰 잔고", "callback_data": "balance"}],
-            [{"text": "📜 일지(최근)", "callback_data": "log"}, {"text": "🧾 일지상세", "callback_data": "log_detail_help"}],
+            [{"text": "📜 매매일지", "callback_data": "log"}, {"text": "🧾 일지상세", "callback_data": "log_detail_help"}],
             [{"text": "🔎 강제스캔", "callback_data": "scan"}, {"text": "🎚️ /mode", "callback_data": "mode_help"}],
             [{"text": "📎 시트", "callback_data": "gsheet"}, {"text": "🛑 전량청산", "callback_data": "close_all"}],
         ]
@@ -9093,7 +9356,7 @@ def tg_send_menu(cfg: Optional[Dict[str, Any]] = None):
                 "sendMessage",
                 {
                     "chat_id": cid,
-                    "text": "✅ /menu\n/status /positions /scan /mode auto|scalping|swing /log <id> /gsheet\n(일지상세: '일지상세 <ID>')",
+                    "text": "✅ /menu\n/status /positions /scan /mode auto|scalping|swing /log <id> /gsheet\n(매매일지 버튼에서 금일/일별/월별 표 확인 가능)",
                     "reply_markup": json.dumps(kb, ensure_ascii=False),
                 },
                 priority="high",
@@ -16480,6 +16743,85 @@ def telegram_thread(ex):
                                 else:
                                     tg_send(m, target=cfg.get("tg_route_queries_to", "group"), cfg=cfg)
 
+                        def _cb_reply_kb(m: str, kb_obj: Dict[str, Any]):
+                            try:
+                                markup = json.dumps(kb_obj, ensure_ascii=False)
+                            except Exception:
+                                _cb_reply(m)
+                                return
+                            how = str(cfg.get("tg_admin_replies_to", "channel") or "channel").lower().strip()
+
+                            def _send_to_chat(chat_id_val: Any):
+                                try:
+                                    if chat_id_val is None:
+                                        return
+                                    cid = str(chat_id_val).strip()
+                                    if not cid:
+                                        return
+                                    tg_enqueue("sendMessage", {"chat_id": cid, "text": m, "reply_markup": markup}, priority="high")
+                                except Exception:
+                                    pass
+
+                            if how == "channel":
+                                ids = _tg_chat_id_by_target("channel", cfg)
+                                if ids:
+                                    for cid in ids:
+                                        _send_to_chat(cid)
+                                else:
+                                    _cb_reply(m)
+                                return
+
+                            if how == "both":
+                                ids = _tg_chat_id_by_target("channel", cfg)
+                                for cid in ids:
+                                    _send_to_chat(cid)
+                                if uid is not None:
+                                    _send_to_chat(uid)
+                                elif TG_ADMIN_IDS:
+                                    for cid in tg_admin_chat_ids():
+                                        _send_to_chat(cid)
+                                elif cb_chat_id is not None:
+                                    _send_to_chat(cb_chat_id)
+                                return
+
+                            if uid is not None:
+                                _send_to_chat(uid)
+                            elif TG_ADMIN_IDS:
+                                for cid in tg_admin_chat_ids():
+                                    _send_to_chat(cid)
+                            elif cb_chat_id is not None:
+                                _send_to_chat(cb_chat_id)
+                            else:
+                                ids = _tg_chat_id_by_target(cfg.get("tg_route_queries_to", "group"), cfg)
+                                for cid in ids:
+                                    _send_to_chat(cid)
+
+                        def _cb_send_photo(path: str, caption: str = ""):
+                            p = str(path or "").strip()
+                            if (not p) or (not os.path.exists(p)):
+                                return
+                            how = str(cfg.get("tg_admin_replies_to", "channel") or "channel").lower().strip()
+                            if how == "channel":
+                                tg_send_photo(p, caption=caption, target="channel", cfg=cfg, silent=False)
+                                return
+                            if how == "both":
+                                tg_send_photo(p, caption=caption, target="channel", cfg=cfg, silent=False)
+                                if uid is not None:
+                                    tg_send_photo_chat(uid, p, caption=caption, silent=False)
+                                elif TG_ADMIN_IDS:
+                                    tg_send_photo(p, caption=caption, target="admin", cfg=cfg, silent=False)
+                                elif cb_chat_id is not None:
+                                    tg_send_photo_chat(cb_chat_id, p, caption=caption, silent=False)
+                                return
+                            if uid is not None:
+                                tg_send_photo_chat(uid, p, caption=caption, silent=False)
+                            elif TG_ADMIN_IDS:
+                                tg_send_photo(p, caption=caption, target="admin", cfg=cfg, silent=False)
+                            elif cb_chat_id is not None:
+                                tg_send_photo_chat(cb_chat_id, p, caption=caption, silent=False)
+                            else:
+                                tg_send_photo(p, caption=caption, target=cfg.get("tg_route_queries_to", "group"), cfg=cfg, silent=False)
+
                         if data == "status":
                             # 누구나
                             cfg_live = load_settings()
@@ -16563,6 +16905,22 @@ def telegram_thread(ex):
                             if not is_admin:
                                 _cb_reply("⛔️ 관리자만 사용할 수 있는 버튼입니다.")
                             else:
+                                kb_log = {
+                                    "inline_keyboard": [
+                                        [{"text": "📌 금일 손익", "callback_data": "log_today"}, {"text": "🗓️ 일별 손익", "callback_data": "log_daily"}],
+                                        [{"text": "📆 월별 손익", "callback_data": "log_monthly"}, {"text": "📋 최근 거래표", "callback_data": "log_trades"}],
+                                        [{"text": "🧾 일지상세 도움", "callback_data": "log_detail_help"}, {"text": "📜 최근 텍스트", "callback_data": "log_recent"}],
+                                    ]
+                                }
+                                _cb_reply_kb(
+                                    "📜 매매일지 메뉴\n- 버튼을 누르면 구글시트 표를 이미지로 보냅니다.",
+                                    kb_log,
+                                )
+
+                        elif data == "log_recent":
+                            if not is_admin:
+                                _cb_reply("⛔️ 관리자만 사용할 수 있는 버튼입니다.")
+                            else:
                                 df_log = read_trade_log()
                                 if df_log.empty:
                                     _cb_reply("📜 일지 없음")
@@ -16578,11 +16936,32 @@ def telegram_thread(ex):
                                         )
                                     _cb_reply("\n".join(msg))
 
+                        elif data in ["log_today", "log_daily", "log_monthly", "log_trades"]:
+                            if not is_admin:
+                                _cb_reply("⛔️ 관리자만 사용할 수 있는 버튼입니다.")
+                            else:
+                                kind_map = {
+                                    "log_today": "today",
+                                    "log_daily": "daily",
+                                    "log_monthly": "monthly",
+                                    "log_trades": "trades",
+                                }
+                                kind = kind_map.get(data, "today")
+                                res = gsheet_build_journal_snapshot(kind=kind, timeout_sec=26)
+                                if not bool(res.get("ok", False)):
+                                    _cb_reply(f"⚠️ 구글시트 표 조회 실패\n- {str(res.get('error','unknown'))[:220]}")
+                                else:
+                                    img = str(res.get("image", "") or "")
+                                    cap = str(res.get("caption", "📎 구글시트 표") or "📎 구글시트 표")
+                                    rows = int(res.get("rows", 0) or 0)
+                                    _cb_reply(f"{cap}\n- 행 수: {rows}")
+                                    _cb_send_photo(img, caption=cap)
+
                         elif data == "log_detail_help":
                             if not is_admin:
                                 _cb_reply("⛔️ 관리자만 사용할 수 있는 버튼입니다.")
                             else:
-                                _cb_reply("🧾 일지 조회\n- /log : 최근 요약\n- /log <ID> : 상세\n- (호환) 일지상세 <ID>")
+                                _cb_reply("🧾 일지 조회\n- /log : 매매일지 메뉴\n- /log <ID> : 상세\n- (호환) 일지상세 <ID>")
 
                         elif data == "scan":
                             if not is_admin:
