@@ -570,7 +570,7 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 8,
+        "settings_schema_version": 9,
         "openai_api_key": "",
         # ✅ 사용자 기본값 프리셋(요청): 하이리스크/하이리턴 + 자동매매 ON
         "auto_trade": True,
@@ -1146,6 +1146,14 @@ def load_settings() -> Dict[str, Any]:
                     cfg["exit_trailing_protect_partial_roi"] = 30.0
                     cfg["exit_trailing_protect_trail_start_roi"] = 50.0
                     cfg["exit_trailing_protect_trail_dd_roi"] = 10.0
+                    changed = True
+            except Exception:
+                pass
+        # v9: 리부트 후에도 "신규진입 스타일 AI 호출" 체크가 유지되도록 기본값 정렬
+        if saved_ver < 9:
+            try:
+                if bool(cfg.get("style_entry_ai_enable", False)) is False:
+                    cfg["style_entry_ai_enable"] = True
                     changed = True
             except Exception:
                 pass
@@ -14806,8 +14814,8 @@ config["highrisk_entry_requires_swing"] = st.sidebar.checkbox(
 config["style_auto_enable"] = st.sidebar.checkbox("스캘핑/스윙 자동 선택/전환", value=bool(config.get("style_auto_enable", True)))
 config["style_entry_ai_enable"] = st.sidebar.checkbox(
     "🤖 신규진입 스타일 선택에 AI 사용(비용↑)",
-    value=bool(config.get("style_entry_ai_enable", False)),
-    help="신규 진입 시 스캘핑/스윙 선택을 OpenAI로 한 번 더 보조합니다. 기본은 룰 기반(비용/429 방지).",
+    value=bool(config.get("style_entry_ai_enable", True)),
+    help="신규 진입 시 스캘핑/스윙 선택을 OpenAI로 한 번 더 보조합니다. 기본 ON.",
 )
 config["style_switch_ai_enable"] = st.sidebar.checkbox(
     "🤖 포지션 스타일 전환에 AI 사용(비용↑)",
