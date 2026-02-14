@@ -685,6 +685,15 @@ def default_settings() -> Dict[str, Any]:
         "exit_trailing_protect_partial_close_pct": 50.0,      # 부분청산 비율(%)
         "exit_trailing_protect_trail_start_roi": 50.0,        # 3단계: +50% 이후부터 추적손절 활성
         "exit_trailing_protect_trail_dd_roi": 10.0,           # 최고점 대비 -10%면 전량 청산
+        # ✅ 본절(BE) 라인 터치 시 즉시청산 대신 "한 번 더 판단" (요구)
+        # - confirm_n회 연속 터치 + 차트 불리 판정일 때만 본절청산
+        # - 차트가 유리하면 홀딩하고 다시 기회를 본다.
+        "be_recheck_enable": True,
+        "be_recheck_confirm_n": 2,
+        "be_recheck_window_sec": 180.0,
+        "be_recheck_hold_score_min": 2,
+        "be_recheck_hold_cooldown_sec": 20.0,
+        "be_recheck_retry_sec": 3.0,
 
         # ✅ 스윙 진입금(총자산 %)을 공포/탐욕(FNG)에 따라 자동 조정(요구)
         # - 하이리스크/하이리턴 + 스윙일 때, "너무 작게(예: 4%)" 들어가는 문제를 방지
@@ -9065,6 +9074,109 @@ def build_exit_one_line(
     return base
 
 
+def be_recheck_should_hold(
+    side: str,
+    entry_snap: Optional[Dict[str, Any]],
+    now_snap: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """
+    본절(BE) 라인 터치 시 즉시 청산하지 않고, 차트 상태를 한 번 더 평가한다.
+    - hold=True: 본절 터치여도 홀딩
+    - hold=False: 본절 청산 진행
+    """
+    if not isinstance(now_snap, dict):
+        return False, "차트확인 실패"
+
+    side0 = str(side or "").lower().strip()
+    trend_s = _trend_clean_for_reason(now_snap.get("trend_short", ""))
+    trend_l = _trend_clean_for_reason(now_snap.get("trend_long", ""))
+    macd = str(now_snap.get("macd_state", "") or "").strip()
+    rsi_state = str(now_snap.get("rsi_state", "") or "").strip()
+    adx_v = _as_float(now_snap.get("adx", 0.0), 0.0)
+
+    score = 0
+    tags: List[str] = []
+
+    if side0 == "long":
+        if "상승" in trend_s:
+            score += 2
+            tags.append("단기상승")
+        elif "하락" in trend_s:
+            score -= 2
+            tags.append("단기하락")
+        if "상승" in trend_l:
+            score += 1
+            tags.append("장기상승")
+        elif "하락" in trend_l:
+            score -= 1
+            tags.append("장기하락")
+        if macd == "골든":
+            score += 1
+            tags.append("MACD골든")
+        elif macd == "데드":
+            score -= 1
+            tags.append("MACD데드")
+        if rsi_state == "과매도":
+            score += 1
+            tags.append("RSI과매도")
+        elif rsi_state == "과매수":
+            score -= 1
+            tags.append("RSI과매수")
+    else:
+        if "하락" in trend_s:
+            score += 2
+            tags.append("단기하락")
+        elif "상승" in trend_s:
+            score -= 2
+            tags.append("단기상승")
+        if "하락" in trend_l:
+            score += 1
+            tags.append("장기하락")
+        elif "상승" in trend_l:
+            score -= 1
+            tags.append("장기상승")
+        if macd == "데드":
+            score += 1
+            tags.append("MACD데드")
+        elif macd == "골든":
+            score -= 1
+            tags.append("MACD골든")
+        if rsi_state == "과매수":
+            score += 1
+            tags.append("RSI과매수")
+        elif rsi_state == "과매도":
+            score -= 1
+            tags.append("RSI과매도")
+
+    if adx_v >= 22:
+        # 추세 강도 높을 때는 현재 포지션 방향 유리/불리 판정을 조금 더 강하게 반영
+        if score > 0:
+            score += 1
+            tags.append(f"ADX강({adx_v:.0f})")
+        elif score < 0:
+            score -= 1
+            tags.append(f"ADX역({adx_v:.0f})")
+
+    try:
+        hold_min = int(cfg.get("be_recheck_hold_score_min", 2) or 2)
+    except Exception:
+        hold_min = 2
+    hold = bool(score >= hold_min)
+
+    # entry 대비 RSI 변화 간단 보조 설명
+    try:
+        if isinstance(entry_snap, dict) and entry_snap.get("rsi", None) is not None and now_snap.get("rsi", None) is not None:
+            r0 = float(entry_snap.get("rsi", 0.0))
+            r1 = float(now_snap.get("rsi", 0.0))
+            tags.append(f"RSI {r0:.0f}→{r1:.0f}")
+    except Exception:
+        pass
+
+    note = f"점수 {score:+d}/{int(hold_min)} | " + ", ".join(tags[:5]) if tags else f"점수 {score:+d}/{int(hold_min)}"
+    return hold, note[:220]
+
+
 def _maybe_switch_style_for_open_position(
     ex,
     sym: str,
@@ -11193,15 +11305,120 @@ def telegram_thread(ex):
                                 except Exception:
                                     pass
 
-                                # BE 트리거: 가격이 진입가(본전)로 되돌아오면 전량 청산(수익을 손실로 마감 방지)
+                                # BE 트리거: 가격이 진입가(본전)로 되돌아오면
+                                # - 즉시청산하지 않고, 차트 상태를 한 번 더 판단해 홀딩/청산 결정(요구)
                                 try:
                                     if bool(tgt.get("forced_be_armed", False)):
                                         be_price = float(tgt.get("forced_be_price", 0.0) or tgt.get("be_arm_price", 0.0) or 0.0)
                                         if be_price > 0:
+                                            be_touch = False
                                             if (str(side) == "long" and float(cur_px) <= float(be_price)) or (str(side) == "short" and float(cur_px) >= float(be_price)):
-                                                tgt["sl_price"] = float(be_price)
-                                                tgt["sl_price_source"] = "BE"
-                                                hit_sl_by_price = True
+                                                be_touch = True
+                                            if be_touch:
+                                                if not bool(cfg.get("be_recheck_enable", True)):
+                                                    tgt["sl_price"] = float(be_price)
+                                                    tgt["sl_price_source"] = "BE"
+                                                    hit_sl_by_price = True
+                                                else:
+                                                    now_ep = time.time()
+                                                    hold_until = float(tgt.get("be_recheck_hold_until_epoch", 0) or 0.0)
+                                                    if now_ep < hold_until:
+                                                        # 직전 재판단에서 "잠깐 홀딩"이 결정된 구간
+                                                        hit_sl_by_price = False
+                                                    else:
+                                                        try:
+                                                            entry_snap_be = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
+                                                        except Exception:
+                                                            entry_snap_be = None
+                                                        try:
+                                                            now_snap_be = chart_snapshot_for_reason(ex, sym, cfg)
+                                                        except Exception:
+                                                            now_snap_be = {}
+
+                                                        hold_decision, hold_note = be_recheck_should_hold(
+                                                            str(side),
+                                                            entry_snap_be if isinstance(entry_snap_be, dict) else None,
+                                                            now_snap_be if isinstance(now_snap_be, dict) else None,
+                                                            cfg,
+                                                        )
+                                                        tgt["be_recheck_last_note"] = str(hold_note or "")
+                                                        tgt["be_recheck_last_kst"] = now_kst_str()
+                                                        try:
+                                                            tgt["be_recheck_last_ind"] = _fmt_indicator_line_for_reason(
+                                                                entry_snap_be if isinstance(entry_snap_be, dict) else None,
+                                                                now_snap_be if isinstance(now_snap_be, dict) else None,
+                                                            )
+                                                        except Exception:
+                                                            pass
+
+                                                        if hold_decision:
+                                                            # 차트가 아직 유리하면 본절 터치여도 청산하지 않고 홀딩
+                                                            try:
+                                                                hold_cd = float(cfg.get("be_recheck_hold_cooldown_sec", 20.0) or 20.0)
+                                                            except Exception:
+                                                                hold_cd = 20.0
+                                                            tgt["be_recheck_touch_count"] = 0
+                                                            tgt["be_recheck_hold_until_epoch"] = now_ep + max(1.0, hold_cd)
+                                                            tgt["be_recheck_last_decision"] = "HOLD"
+                                                            hit_sl_by_price = False
+                                                            try:
+                                                                mon_add_event(
+                                                                    mon,
+                                                                    "BE_HOLD",
+                                                                    sym,
+                                                                    f"본절 재판단 홀딩 | {str(hold_note)[:120]}",
+                                                                    {"trade_id": trade_id, "price": cur_px, "be_price": be_price},
+                                                                )
+                                                            except Exception:
+                                                                pass
+                                                        else:
+                                                            try:
+                                                                win_sec = float(cfg.get("be_recheck_window_sec", 180.0) or 180.0)
+                                                            except Exception:
+                                                                win_sec = 180.0
+                                                            try:
+                                                                need_n = max(1, int(cfg.get("be_recheck_confirm_n", 2) or 2))
+                                                            except Exception:
+                                                                need_n = 2
+                                                            try:
+                                                                last_ep = float(tgt.get("be_recheck_last_touch_epoch", 0) or 0.0)
+                                                            except Exception:
+                                                                last_ep = 0.0
+                                                            try:
+                                                                cnt = int(tgt.get("be_recheck_touch_count", 0) or 0)
+                                                            except Exception:
+                                                                cnt = 0
+                                                            if (now_ep - last_ep) > max(5.0, win_sec):
+                                                                cnt = 0
+                                                            cnt += 1
+                                                            tgt["be_recheck_touch_count"] = int(cnt)
+                                                            tgt["be_recheck_last_touch_epoch"] = float(now_ep)
+
+                                                            if int(cnt) >= int(need_n):
+                                                                tgt["sl_price"] = float(be_price)
+                                                                tgt["sl_price_source"] = "BE"
+                                                                tgt["be_recheck_last_decision"] = "CLOSE"
+                                                                tgt["be_recheck_close_note"] = str(hold_note or "")
+                                                                hit_sl_by_price = True
+                                                            else:
+                                                                # 첫 터치는 바로 청산하지 않고 짧게 다시 본다.
+                                                                try:
+                                                                    retry_sec = float(cfg.get("be_recheck_retry_sec", 3.0) or 3.0)
+                                                                except Exception:
+                                                                    retry_sec = 3.0
+                                                                tgt["be_recheck_hold_until_epoch"] = now_ep + max(1.0, retry_sec)
+                                                                tgt["be_recheck_last_decision"] = "PENDING"
+                                                                hit_sl_by_price = False
+                                                                try:
+                                                                    mon_add_event(
+                                                                        mon,
+                                                                        "BE_RECHECK",
+                                                                        sym,
+                                                                        f"본절 재확인 {int(cnt)}/{int(need_n)} | {str(hold_note)[:100]}",
+                                                                        {"trade_id": trade_id, "price": cur_px, "be_price": be_price},
+                                                                    )
+                                                                except Exception:
+                                                                    pass
                                 except Exception:
                                     pass
 
@@ -11390,6 +11607,7 @@ def telegram_thread(ex):
                             if is_protect:
                                 arm_roi = None
                                 arm_at = None
+                                be_close_note = ""
                                 try:
                                     v = tgt.get("be_arm_roi", None)
                                     arm_roi = float(v) if v is not None else None
@@ -11400,12 +11618,18 @@ def telegram_thread(ex):
                                     arm_at = float(v) if v is not None else None
                                 except Exception:
                                     arm_at = None
+                                try:
+                                    be_close_note = str(tgt.get("be_recheck_close_note", "") or "").strip()
+                                except Exception:
+                                    be_close_note = ""
                                 if arm_roi is not None and arm_at is not None:
                                     base_reason = f"수익이 {arm_roi:+.1f}%까지 나서(기준 {arm_at:.1f}%) 본절 라인을 올렸고, 그 라인에 닿아 정리했어요{sl_line_txt}"
                                 elif arm_roi is not None:
                                     base_reason = f"수익이 {arm_roi:+.1f}%까지 나서 본절 라인을 올렸고, 그 라인에 닿아 정리했어요{sl_line_txt}"
                                 else:
                                     base_reason = f"수익이 나서 본절 라인을 올렸고, 그 라인에 닿아 정리했어요{sl_line_txt}"
+                                if be_close_note:
+                                    base_reason = f"{base_reason} | 재판단: {be_close_note}"
                             elif bool(hit_sl_by_price):
                                 base_reason = f"지지/저항 이탈로 손절했어요{sl_line_txt}"
                             else:
