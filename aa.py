@@ -685,7 +685,8 @@ def default_settings() -> Dict[str, Any]:
         # - MACD/MA 골든·데드 크로스 시작
         # - SQZ fire 시작
         # - RSI 해소/임계 진입 시작
-        "entry_require_fresh_start_signal": True,
+        # False: 진행 중인 신호도 허용 → 진입 빈도 증가 (SQZ 게이트는 유지)
+        "entry_require_fresh_start_signal": False,
         # ML 시그널 계산(외부 라이브러리 없이 numpy/pandas로만)
         "ml_enable": True,
         "ml_lookback": 220,          # 학습(과거 N샘플)
@@ -957,12 +958,12 @@ def default_settings() -> Dict[str, Any]:
         # - 무포지션 상태에서 마지막 진입 이후 시간이 길어질수록 min_conf를 소폭 완화
         # - 또한 수렴표(3-of-N)의 N을 최대 1만 낮춰 AI 호출 기회를 확보
         "entry_relax_enable": True,
-        "entry_relax_after_min": 90,
-        "entry_relax_step_min": 45,
-        "entry_relax_conf_per_step": 1.0,
-        "entry_relax_max_conf_bonus": 4.0,
+        "entry_relax_after_min": 40,           # 90 → 40: 완화 시작 시간 단축
+        "entry_relax_step_min": 20,            # 45 → 20: 더 자주 단계 완화
+        "entry_relax_conf_per_step": 1.5,      # 1.0 → 1.5: 단계당 완화 폭 확대
+        "entry_relax_max_conf_bonus": 6.0,     # 4.0 → 6.0: 최대 완화 폭 확대
         "entry_relax_reduce_votes_enable": True,
-        "entry_relax_votes_reduce_after_min": 180,
+        "entry_relax_votes_reduce_after_min": 90,    # 180 → 90: vote 완화도 더 빨리
         "entry_relax_votes_reduce": 1,
 
         # ✅ 무포지션(관망) 상태 분석 리포트
@@ -8630,9 +8631,9 @@ def ai_decide_trade(
             if str(mode) == "안전모드":
                 gap = int(cfg.get("soft_entry_conf_gap_safe", 0) or 0)
             elif str(mode) == "공격모드":
-                gap = int(cfg.get("soft_entry_conf_gap_attack", 8) or 8)
+                gap = int(cfg.get("soft_entry_conf_gap_attack", 12) or 12)   # fallback 8 → 12 (settings 기본값 일치)
             else:
-                gap = int(cfg.get("soft_entry_conf_gap_highrisk", 6) or 6)
+                gap = int(cfg.get("soft_entry_conf_gap_highrisk", 15) or 15) # fallback 6 → 15 (settings 기본값 일치)
             gap = int(max(0, gap))
             if gap > 0:
                 min_soft = int(max(0, int(rule.get("min_conf", 0) or 0) - int(gap)))
@@ -15784,9 +15785,9 @@ def telegram_thread(ex):
                                 if str(mode) == "안전모드":
                                     gap = int(cfg.get("soft_entry_conf_gap_safe", 0) or 0)
                                 elif str(mode) == "공격모드":
-                                    gap = int(cfg.get("soft_entry_conf_gap_attack", 8) or 8)
+                                    gap = int(cfg.get("soft_entry_conf_gap_attack", 12) or 12)   # fallback 8 → 12 (settings 기본값 일치)
                                 else:
-                                    gap = int(cfg.get("soft_entry_conf_gap_highrisk", 6) or 6)
+                                    gap = int(cfg.get("soft_entry_conf_gap_highrisk", 15) or 15) # fallback 6 → 15 (settings 기본값 일치)
                                 min_conf_soft = int(max(0, int(min_conf_strict) - int(max(0, gap))))
                         except Exception:
                             min_conf_soft = int(min_conf_strict)
