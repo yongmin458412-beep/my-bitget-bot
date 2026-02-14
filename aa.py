@@ -693,8 +693,9 @@ def default_settings() -> Dict[str, Any]:
         "swing_fng_entry_pct_min": 8.0,
         "swing_fng_entry_pct_max": 15.0,
         # ✅ Time-based Exit(요구): 진입 후 일정 시간이 지났는데 "목표 수익의 X%"도 못 가면 기회비용 정리
-        # - AI 재호출 없이 룰 기반으로만 종료(비용 절감)
-        "time_exit_enable": True,
+        # - 사용자 요청: "시간초과 강제청산"은 사용하지 않음(목표 TP/SL 도달 전까지 홀딩)
+        # - 호환을 위해 설정 키는 유지(현재 로직에서는 비활성)
+        "time_exit_enable": False,
         "time_exit_bars": 24,            # 5m 기준 24 bars = 2시간
         "time_exit_target_frac": 0.3,    # 목표 수익의 30% 미만이면 정리
         "time_exit_partial_enable": True,  # 전량 청산 대신 50% 부분 청산
@@ -778,10 +779,10 @@ def default_settings() -> Dict[str, Any]:
         "loss_pause_enable": True, "loss_pause_after": 5, "loss_pause_minutes": 15,
         # ✅ 추가 방어(사용자 선택): 서킷브레이커/일일 손실 한도
         # - loss_pause: "잠깐 쉼" (기존)
-        # - circuit_breaker: "자동매매 OFF" (강제 정지)
+        # - circuit_breaker: (사용자 요청) 자동매매 OFF 하지 않음 → 경고/기록만
         # - daily_loss_limit: "하루 손실 한도" 도달 시 자동매매 OFF
-        "circuit_breaker_enable": True,
-        "circuit_breaker_after": 10,  # 연속 손실 N번이면 자동매매 OFF
+        "circuit_breaker_enable": False,
+        "circuit_breaker_after": 10,  # 연속 손실 N번이면 경고(기본 OFF)
         "daily_loss_limit_enable": False,
         "daily_loss_limit_pct": 8.0,   # day_start_equity 대비 -8%면 정지(0이면 미사용)
         "daily_loss_limit_usdt": 0.0,  # -USDT 기준(0이면 미사용)
@@ -11271,41 +11272,9 @@ def telegram_thread(ex):
                             except Exception:
                                 hard_take = False
 
-                        # ✅ Time-based Exit(요구): 일정 시간(봉 수) 안에 목표 수익의 일부도 못 가면 정리(기회비용)
-                        try:
-                            if (not hard_take) and bool(cfg.get("time_exit_enable", True)):
-                                bars_need = max(1, int(cfg.get("time_exit_bars", 12) or 12))
-                                frac_need = float(cfg.get("time_exit_target_frac", 0.5) or 0.5)
-                                frac_need = float(clamp(frac_need, 0.05, 0.95))
-                                entry_ep = float(tgt.get("entry_epoch", 0) or 0.0)
-                                if entry_ep > 0:
-                                    tf_sec = int(_timeframe_seconds(str(cfg.get("timeframe", "5m")), 300))
-                                    if (time.time() - float(entry_ep)) >= float(bars_need) * float(tf_sec):
-                                        # 목표수익(ROI%) 기준: tgt["tp"] 우선, 없으면 forced 정책의 part_roi를 사용
-                                        tp_target = _as_float(tgt.get("tp", 0.0), 0.0)
-                                        if tp_target <= 0:
-                                            tp_target = _as_float(cfg.get("exit_trailing_protect_partial_roi", 30.0), 30.0)
-                                        # forced_exit에서는 part_roi(30%)를 기준으로 너무 큰 목표를 방지(시간초과 과잉 종료 방지)
-                                        try:
-                                            if bool(forced_exit):
-                                                tp_target = float(min(tp_target, _as_float(cfg.get("exit_trailing_protect_partial_roi", 30.0), 30.0)))
-                                        except Exception:
-                                            pass
-                                        thr = float(tp_target) * float(frac_need)
-                                        if float(roi) < float(thr):
-                                            tgt["force_take_reason"] = "시간초과 정리"
-                                            tgt["force_take_detail"] = f"{bars_need}봉(≈{int((bars_need*tf_sec)/60)}분) 경과, 목표의 {int(frac_need*100)}%({thr:.1f}%) 미만"
-                                            tgt["time_exit_hit"] = True
-                                            tgt["time_exit_kst"] = now_kst_str()
-                                            # 부분청산 옵션: 전량 청산 대신 일부만 정리
-                                            if bool(cfg.get("time_exit_partial_enable", True)) and float(roi) >= 0:
-                                                partial_pct = float(cfg.get("time_exit_partial_close_pct", 50.0) or 50.0)
-                                                tgt["force_partial_close_pct"] = partial_pct
-                                                tgt["force_take_reason"] = f"시간초과 부분청산({int(partial_pct)}%)"
-                                            else:
-                                                hard_take = True
-                        except Exception:
-                            pass
+                        # 사용자 요청: "시간초과 강제청산" 비활성화
+                        # - 목표 TP/SL(및 SR 가격 트리거)이 올 때까지 홀딩한다.
+                        # - 기존 설정 키(time_exit_*)는 호환을 위해 유지하지만, 강제청산은 실행하지 않는다.
 
                         # ✅ ROI 손절은 "확인 n회"로 한 번 더 생각(휩쏘 방지)
                         roi_stop_hit = bool(float(roi) <= -abs(float(sl)))
@@ -11522,21 +11491,21 @@ def telegram_thread(ex):
                                     )
                                     mon_add_event(mon, "PAUSE", "", "loss_pause", {"consec": rt["consec_losses"]})
 
-                                # 2) 추가 기능: 서킷브레이커(연속 손실 → 자동매매 OFF)
+                                # 2) 서킷브레이커(사용자 요청): 연속 손실이어도 자동매매 OFF 하지 않음 → 경고/기록만
                                 try:
                                     if is_loss and bool(cfg.get("circuit_breaker_enable", False)) and int(rt["consec_losses"]) >= int(cfg.get("circuit_breaker_after", 12)):
-                                        if bool(cfg.get("auto_trade", False)):
-                                            cfg["auto_trade"] = False
-                                            save_settings(cfg)
-                                        rt["pause_until"] = max(float(rt.get("pause_until", 0) or 0.0), float(next_midnight_kst_epoch()))
-                                        rt["auto_trade_stop_reason"] = "CIRCUIT_BREAKER"
-                                        rt["auto_trade_stop_kst"] = now_kst_str()
-                                        tg_send(
-                                            f"⛔️ 서킷브레이커\n- 연속손실: {rt['consec_losses']}번\n- 자동매매를 껐어요(내일 0시까지).",
-                                            target=cfg.get("tg_route_events_to", "channel"),
-                                            cfg=cfg,
-                                        )
-                                        mon_add_event(mon, "AUTO_TRADE_OFF", "", "circuit_breaker", {"consec_losses": rt["consec_losses"]})
+                                        now_ep = time.time()
+                                        last_warn = float(rt.get("circuit_breaker_warn_epoch", 0) or 0.0)
+                                        # 과도한 알림/스팸 방지(5분에 1회)
+                                        if (now_ep - last_warn) >= 300.0:
+                                            rt["circuit_breaker_warn_epoch"] = now_ep
+                                            tg_send(
+                                                f"⚠️ 서킷브레이커(경고)\n- 연속손실: {rt['consec_losses']}번\n- 자동매매는 계속 ON(요청 설정)",
+                                                target=cfg.get("tg_route_events_to", "channel"),
+                                                cfg=cfg,
+                                                silent=True,
+                                            )
+                                            mon_add_event(mon, "CIRCUIT_WARN", "", "circuit_breaker", {"consec_losses": rt["consec_losses"]})
                                 except Exception:
                                     pass
 
@@ -11846,21 +11815,21 @@ def telegram_thread(ex):
                                     )
                                     mon_add_event(mon, "PAUSE", "", "loss_pause", {"consec": rt["consec_losses"]})
 
-                                # 2) 서킷브레이커(연속 손실 → 자동매매 OFF)
+                                # 2) 서킷브레이커(사용자 요청): 연속 손실이어도 자동매매 OFF 하지 않음 → 경고/기록만
                                 try:
                                     if is_loss_take and bool(cfg.get("circuit_breaker_enable", False)) and int(rt["consec_losses"]) >= int(cfg.get("circuit_breaker_after", 12)):
-                                        if bool(cfg.get("auto_trade", False)):
-                                            cfg["auto_trade"] = False
-                                            save_settings(cfg)
-                                        rt["pause_until"] = max(float(rt.get("pause_until", 0) or 0.0), float(next_midnight_kst_epoch()))
-                                        rt["auto_trade_stop_reason"] = "CIRCUIT_BREAKER"
-                                        rt["auto_trade_stop_kst"] = now_kst_str()
-                                        tg_send(
-                                            f"⛔️ 서킷브레이커\n- 연속손실: {rt['consec_losses']}번\n- 자동매매를 껐어요(내일 0시까지).",
-                                            target=cfg.get("tg_route_events_to", "channel"),
-                                            cfg=cfg,
-                                        )
-                                        mon_add_event(mon, "AUTO_TRADE_OFF", "", "circuit_breaker", {"consec_losses": rt["consec_losses"]})
+                                        now_ep = time.time()
+                                        last_warn = float(rt.get("circuit_breaker_warn_epoch", 0) or 0.0)
+                                        # 과도한 알림/스팸 방지(5분에 1회)
+                                        if (now_ep - last_warn) >= 300.0:
+                                            rt["circuit_breaker_warn_epoch"] = now_ep
+                                            tg_send(
+                                                f"⚠️ 서킷브레이커(경고)\n- 연속손실: {rt['consec_losses']}번\n- 자동매매는 계속 ON(요청 설정)",
+                                                target=cfg.get("tg_route_events_to", "channel"),
+                                                cfg=cfg,
+                                                silent=True,
+                                            )
+                                            mon_add_event(mon, "CIRCUIT_WARN", "", "circuit_breaker", {"consec_losses": rt["consec_losses"]})
                                 except Exception:
                                     pass
 
@@ -14678,10 +14647,9 @@ with st.sidebar.expander("진입 사이징/레버(고정/ATR/리스크캡/Kelly)
     config["kelly_max_entry_pct"] = k2.number_input("Kelly 상한(%)", 1.0, 100.0, float(config.get("kelly_max_entry_pct", 20.0) or 20.0), step=1.0)
     st.caption("※ 현재는 AI 확신도(confidence)를 승률(p)로 근사합니다. (보수적으로 cap로만 사용)")
     st.divider()
-    config["time_exit_enable"] = st.checkbox("시간초과 정리(기회비용)", value=bool(config.get("time_exit_enable", True)))
-    t1, t2 = st.columns(2)
-    config["time_exit_bars"] = t1.number_input("N봉 경과", 1, 200, int(config.get("time_exit_bars", 12) or 12), step=1)
-    config["time_exit_target_frac"] = t2.number_input("목표의 X%", 0.05, 0.95, float(config.get("time_exit_target_frac", 0.5) or 0.5), step=0.05)
+    # 사용자 요청: 시간초과 강제청산은 사용하지 않음(목표 TP/SL 도달 전까지 홀딩)
+    config["time_exit_enable"] = False
+    st.checkbox("시간초과 정리(기회비용) [비활성화]", value=False, disabled=True)
 
 with st.sidebar.expander("Fail-safe(자동매매 강제 종료)"):
     config["fail_safe_enable"] = st.checkbox("Fail-safe 사용", value=bool(config.get("fail_safe_enable", True)))
@@ -14717,10 +14685,10 @@ with st.sidebar.expander("Fail-safe(자동매매 강제 종료)"):
     )
 
 with st.sidebar.expander("추가 방어(서킷브레이커/일일 손실 한도)"):
-    config["circuit_breaker_enable"] = st.checkbox("서킷브레이커 사용(연속 손실 시 자동매매 OFF)", value=bool(config.get("circuit_breaker_enable", True)))
-    config["circuit_breaker_after"] = st.number_input("연속 손실 N번 → OFF", 3, 50, int(config.get("circuit_breaker_after", 12)), step=1)
+    config["circuit_breaker_enable"] = st.checkbox("서킷브레이커 경고(연속 손실 알림)", value=bool(config.get("circuit_breaker_enable", False)))
+    config["circuit_breaker_after"] = st.number_input("연속 손실 N번 → 경고", 3, 50, int(config.get("circuit_breaker_after", 12)), step=1)
     st.divider()
-    config["daily_loss_limit_enable"] = st.checkbox("일일 최대 손실 한도 사용(도달 시 자동매매 OFF)", value=bool(config.get("daily_loss_limit_enable", True)))
+    config["daily_loss_limit_enable"] = st.checkbox("일일 최대 손실 한도 사용(도달 시 자동매매 OFF)", value=bool(config.get("daily_loss_limit_enable", False)))
     dl1, dl2 = st.columns(2)
     config["daily_loss_limit_pct"] = dl1.number_input("하루 손실 한도(%)", 0.0, 100.0, float(config.get("daily_loss_limit_pct", 8.0) or 0.0), step=0.5)
     config["daily_loss_limit_usdt"] = dl2.number_input("하루 손실 한도(USDT)", 0.0, 100000000.0, float(config.get("daily_loss_limit_usdt", 0.0) or 0.0), step=10.0)
