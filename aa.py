@@ -8755,6 +8755,20 @@ def _tg_pct_compact(v: Any) -> str:
         return "-"
 
 
+def _tg_fmt_target_roi(v: Any, *, sign: str = "+", min_visible: float = 0.05) -> str:
+    try:
+        x = float(v)
+        if not math.isfinite(x):
+            return "-"
+        ax = abs(float(x))
+        if ax < float(min_visible):
+            return "-"
+        sgn = "+" if str(sign) == "+" else "-"
+        return f"{sgn}{ax:.2f}%"
+    except Exception:
+        return "-"
+
+
 def _tg_trailing_protect_policy_line(cfg: Optional[Dict[str, Any]] = None) -> str:
     try:
         cfg = cfg or load_settings()
@@ -8907,8 +8921,8 @@ def tg_msg_entry_simple(
         sl_v = float(sl_pct_roi) if sl_pct_roi is not None else None
     except Exception:
         sl_v = None
-    tp_txt = f"{tp_v:+.2f}%" if tp_v is not None and math.isfinite(float(tp_v)) else "-"
-    sl_txt = f"-{abs(float(sl_v)):.2f}%" if sl_v is not None and math.isfinite(float(sl_v)) else "-"
+    tp_txt = _tg_fmt_target_roi(tp_v, sign="+", min_visible=0.05) if tp_v is not None and math.isfinite(float(tp_v)) else "-"
+    sl_txt = _tg_fmt_target_roi(sl_v, sign="-", min_visible=0.05) if sl_v is not None and math.isfinite(float(sl_v)) else "-"
     try:
         bf_txt = f"{float(bal_before_free):.2f}" if bal_before_free is not None else "-"
     except Exception:
@@ -10604,13 +10618,16 @@ def telegram_thread(ex):
                                         style, tp0, sl0 = "", float("nan"), float("nan")
                                     tp_ok = bool(math.isfinite(tp0) and abs(float(tp0)) >= 1e-9)
                                     sl_ok = bool(math.isfinite(sl0) and abs(float(sl0)) >= 1e-9)
-                                    tp_txt = f"+{abs(float(tp0)):.2f}%" if tp_ok else "-"
-                                    sl_txt = f"-{abs(float(sl0)):.2f}%" if sl_ok else "-"
+                                    tp_txt = _tg_fmt_target_roi(tp0, sign="+", min_visible=0.05) if tp_ok else "-"
+                                    sl_txt = _tg_fmt_target_roi(sl0, sign="-", min_visible=0.05) if sl_ok else "-"
                                     rr_txt = "-"
                                     if tp_ok and sl_ok:
                                         try:
-                                            rr0 = abs(float(tp0)) / max(abs(float(sl0)), 0.01)
-                                            rr_txt = f"{float(rr0):.2f}"
+                                            tp_rr = abs(float(tp0))
+                                            sl_rr = abs(float(sl0))
+                                            if tp_rr >= 0.05 and sl_rr >= 0.05:
+                                                rr0 = tp_rr / max(sl_rr, 0.01)
+                                                rr_txt = f"{float(rr0):.2f}"
                                         except Exception:
                                             rr_txt = "-"
                                     emo = "🟢" if roi >= 0 else "🔴"
