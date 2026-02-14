@@ -570,7 +570,7 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 10,
+        "settings_schema_version": 11,
         "openai_api_key": "",
         # ✅ 사용자 기본값 프리셋(요청): 하이리스크/하이리턴 + 자동매매 ON
         "auto_trade": True,
@@ -664,6 +664,18 @@ def default_settings() -> Dict[str, Any]:
         "ml_rsi_neutral_band": 3.0,  # 50±3 구간은 중립
         # 캐시(같은 봉에서는 ML도 1회만 계산)
         "ml_cache_enable": True,
+        # 차트 패턴 감지(진입 보조): M/W, 쌍봉/쌍바닥, 삼중천정/삼중바닥, 삼각수렴, 박스, 쐐기, 헤드앤숄더
+        "use_chart_patterns": True,
+        "pattern_lookback": 220,
+        "pattern_pivot_order": 4,
+        "pattern_tolerance_pct": 0.60,
+        "pattern_min_retrace_pct": 0.35,
+        "pattern_flat_slope_pct": 0.03,
+        "pattern_breakout_buffer_pct": 0.08,
+        "pattern_call_strength_min": 0.45,
+        "pattern_gate_entry": True,
+        "pattern_gate_strength": 0.65,
+        "pattern_override_ai": True,
 
         # 방어/전략
         "use_trailing_stop": True,
@@ -1166,6 +1178,26 @@ def load_settings() -> Dict[str, Any]:
             try:
                 if bool(cfg.get("exit_ai_targets_only", False)) is False:
                     cfg["exit_ai_targets_only"] = True
+                    changed = True
+            except Exception:
+                pass
+        # v11: 차트 패턴 감지 기본값 추가(미설정 키만 보정)
+        if saved_ver < 11:
+            try:
+                if "use_chart_patterns" not in saved:
+                    cfg["use_chart_patterns"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "pattern_gate_entry" not in saved:
+                    cfg["pattern_gate_entry"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "pattern_override_ai" not in saved:
+                    cfg["pattern_override_ai"] = True
                     changed = True
             except Exception:
                 pass
@@ -5884,6 +5916,292 @@ def _rolling_linreg_last(series: pd.Series, length: int) -> pd.Series:
             return pd.Series(dtype=float)
 
 
+def _local_extrema_idx(arr: np.ndarray, order: int = 4, mode: str = "max") -> List[int]:
+    try:
+        a = np.asarray(arr, dtype=float)
+        if a.size < (order * 2 + 3):
+            return []
+        if argrelextrema is not None:
+            if str(mode) == "max":
+                idx = argrelextrema(a, np.greater_equal, order=order)[0]
+            else:
+                idx = argrelextrema(a, np.less_equal, order=order)[0]
+            return [int(i) for i in idx.tolist()]
+        out = []
+        for i in range(order, len(a) - order):
+            w = a[i - order:i + order + 1]
+            if str(mode) == "max":
+                if float(a[i]) >= float(np.max(w)):
+                    out.append(int(i))
+            else:
+                if float(a[i]) <= float(np.min(w)):
+                    out.append(int(i))
+        return out
+    except Exception:
+        return []
+
+
+def _pick_last_n_with_min_sep(indices: List[int], n_need: int, min_sep: int) -> List[int]:
+    try:
+        picks: List[int] = []
+        for idx in sorted([int(x) for x in indices], reverse=True):
+            if not picks or (int(picks[-1]) - int(idx) >= int(min_sep)):
+                picks.append(int(idx))
+            if len(picks) >= int(n_need):
+                break
+        if len(picks) < int(n_need):
+            return []
+        return list(sorted(picks))
+    except Exception:
+        return []
+
+
+def detect_chart_patterns(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "detected": [],
+        "bullish": [],
+        "bearish": [],
+        "neutral": [],
+        "bias": 0,
+        "strength": 0.0,
+        "summary": "패턴 없음",
+        "score_long": 0.0,
+        "score_short": 0.0,
+    }
+    try:
+        if df is None or df.empty or len(df) < 80:
+            return out
+        lb = int(cfg.get("pattern_lookback", 220) or 220)
+        lb = int(max(80, min(800, lb)))
+        d = df.tail(lb).copy()
+        high = pd.to_numeric(d["high"], errors="coerce").values.astype(float)
+        low = pd.to_numeric(d["low"], errors="coerce").values.astype(float)
+        close = pd.to_numeric(d["close"], errors="coerce").values.astype(float)
+        n = len(d)
+        if n < 80:
+            return out
+        order = int(cfg.get("pattern_pivot_order", 4) or 4)
+        order = int(max(2, min(12, order)))
+        tol_pct = float(cfg.get("pattern_tolerance_pct", 0.60) or 0.60)
+        tol_pct = float(max(0.05, min(3.0, abs(tol_pct)))) / 100.0
+        retrace_pct = float(cfg.get("pattern_min_retrace_pct", 0.35) or 0.35)
+        retrace_pct = float(max(0.05, min(6.0, abs(retrace_pct)))) / 100.0
+        flat_slope_pct = float(cfg.get("pattern_flat_slope_pct", 0.03) or 0.03)
+        flat_slope_pct = float(max(0.003, min(1.0, abs(flat_slope_pct))))
+        breakout_buf_pct = float(cfg.get("pattern_breakout_buffer_pct", 0.08) or 0.08)
+        breakout_buf = float(max(0.0, min(1.0, abs(breakout_buf_pct)))) / 100.0
+        min_sep = int(max(2, order))
+        last_close = float(close[-1])
+        if not math.isfinite(last_close) or last_close <= 0:
+            return out
+
+        highs_idx = _local_extrema_idx(high, order=order, mode="max")
+        lows_idx = _local_extrema_idx(low, order=order, mode="min")
+        if len(highs_idx) < 2 and len(lows_idx) < 2:
+            return out
+
+        bull_items: List[Tuple[str, float]] = []
+        bear_items: List[Tuple[str, float]] = []
+        neutral_items: List[Tuple[str, float]] = []
+        seen = set()
+
+        def _add(name: str, side: int, score: float) -> None:
+            key = str(name).strip()
+            if not key or key in seen:
+                return
+            seen.add(key)
+            s = float(max(0.05, min(2.0, score)))
+            out["detected"].append(key)
+            if side > 0:
+                bull_items.append((key, s))
+            elif side < 0:
+                bear_items.append((key, s))
+            else:
+                neutral_items.append((key, s))
+
+        p2 = _pick_last_n_with_min_sep(highs_idx, 2, min_sep)
+        if len(p2) == 2:
+            i1, i2 = int(p2[0]), int(p2[1])
+            if i2 > i1:
+                h1, h2 = float(high[i1]), float(high[i2])
+                h_avg = max((h1 + h2) * 0.5, 1e-9)
+                sim = abs(h1 - h2) / h_avg
+                valley = float(np.min(low[i1:i2 + 1]))
+                retr = max(0.0, (h_avg - valley) / h_avg)
+                if sim <= tol_pct and retr >= retrace_pct:
+                    is_break = float(close[-1]) <= float(valley) * (1.0 - breakout_buf)
+                    _add("M자형(쌍봉)", -1, 1.35 if is_break else 0.75)
+                    _add("쌍봉(Double Top)", -1, 1.25 if is_break else 0.70)
+
+        t2 = _pick_last_n_with_min_sep(lows_idx, 2, min_sep)
+        if len(t2) == 2:
+            i1, i2 = int(t2[0]), int(t2[1])
+            if i2 > i1:
+                l1, l2 = float(low[i1]), float(low[i2])
+                l_avg = max((l1 + l2) * 0.5, 1e-9)
+                sim = abs(l1 - l2) / l_avg
+                peak = float(np.max(high[i1:i2 + 1]))
+                retr = max(0.0, (peak - l_avg) / max(peak, 1e-9))
+                if sim <= tol_pct and retr >= retrace_pct:
+                    is_break = float(close[-1]) >= float(peak) * (1.0 + breakout_buf)
+                    _add("W자형(쌍바닥)", 1, 1.35 if is_break else 0.75)
+                    _add("쌍바닥(Double Bottom)", 1, 1.25 if is_break else 0.70)
+
+        p3 = _pick_last_n_with_min_sep(highs_idx, 3, min_sep)
+        if len(p3) == 3:
+            i1, i2, i3 = [int(x) for x in p3]
+            hvals = [float(high[i1]), float(high[i2]), float(high[i3])]
+            havg = max(float(np.mean(hvals)), 1e-9)
+            dev = max([abs(x - havg) / havg for x in hvals])
+            v1 = float(np.min(low[i1:i2 + 1])) if i2 > i1 else float(low[i2])
+            v2 = float(np.min(low[i2:i3 + 1])) if i3 > i2 else float(low[i3])
+            vneck = min(v1, v2)
+            retr = max(0.0, (havg - vneck) / havg)
+            if dev <= tol_pct * 1.2 and retr >= retrace_pct:
+                is_break = float(close[-1]) <= float(vneck) * (1.0 - breakout_buf)
+                _add("삼중천정(Triple Top)", -1, 1.45 if is_break else 0.80)
+
+        t3 = _pick_last_n_with_min_sep(lows_idx, 3, min_sep)
+        if len(t3) == 3:
+            i1, i2, i3 = [int(x) for x in t3]
+            lvals = [float(low[i1]), float(low[i2]), float(low[i3])]
+            lavg = max(float(np.mean(lvals)), 1e-9)
+            dev = max([abs(x - lavg) / lavg for x in lvals])
+            p1v = float(np.max(high[i1:i2 + 1])) if i2 > i1 else float(high[i2])
+            p2v = float(np.max(high[i2:i3 + 1])) if i3 > i2 else float(high[i3])
+            pneck = max(p1v, p2v)
+            retr = max(0.0, (pneck - lavg) / max(pneck, 1e-9))
+            if dev <= tol_pct * 1.2 and retr >= retrace_pct:
+                is_break = float(close[-1]) >= float(pneck) * (1.0 + breakout_buf)
+                _add("삼중바닥(Triple Bottom)", 1, 1.45 if is_break else 0.80)
+
+        if len(p3) == 3:
+            i1, i2, i3 = [int(x) for x in p3]
+            s1, hd, s2 = float(high[i1]), float(high[i2]), float(high[i3])
+            shoulder_avg = max((s1 + s2) * 0.5, 1e-9)
+            shoulder_sim = abs(s1 - s2) / shoulder_avg
+            head_up = (hd - shoulder_avg) / shoulder_avg
+            if shoulder_sim <= tol_pct * 1.7 and head_up >= max(0.002, tol_pct * 0.8):
+                n1 = float(np.min(low[i1:i2 + 1])) if i2 > i1 else float(low[i2])
+                n2 = float(np.min(low[i2:i3 + 1])) if i3 > i2 else float(low[i3])
+                neck = (n1 + n2) * 0.5
+                is_break = float(close[-1]) <= float(neck) * (1.0 - breakout_buf)
+                _add("헤드앤숄더", -1, 1.55 if is_break else 0.85)
+
+        if len(t3) == 3:
+            i1, i2, i3 = [int(x) for x in t3]
+            s1, hd, s2 = float(low[i1]), float(low[i2]), float(low[i3])
+            shoulder_avg = max((s1 + s2) * 0.5, 1e-9)
+            shoulder_sim = abs(s1 - s2) / shoulder_avg
+            head_dn = (shoulder_avg - hd) / shoulder_avg
+            if shoulder_sim <= tol_pct * 1.7 and head_dn >= max(0.002, tol_pct * 0.8):
+                n1 = float(np.max(high[i1:i2 + 1])) if i2 > i1 else float(high[i2])
+                n2 = float(np.max(high[i2:i3 + 1])) if i3 > i2 else float(high[i3])
+                neck = (n1 + n2) * 0.5
+                is_break = float(close[-1]) >= float(neck) * (1.0 + breakout_buf)
+                _add("역헤드앤숄더", 1, 1.55 if is_break else 0.85)
+
+        hi_recent = _pick_last_n_with_min_sep(highs_idx, min(6, len(highs_idx)), min_sep)
+        lo_recent = _pick_last_n_with_min_sep(lows_idx, min(6, len(lows_idx)), min_sep)
+        if len(hi_recent) >= 3 and len(lo_recent) >= 3:
+            xh = np.asarray(hi_recent, dtype=float)
+            yh = np.asarray([float(high[i]) for i in hi_recent], dtype=float)
+            xl = np.asarray(lo_recent, dtype=float)
+            yl = np.asarray([float(low[i]) for i in lo_recent], dtype=float)
+            sh, ih = np.polyfit(xh, yh, 1)
+            sl, il = np.polyfit(xl, yl, 1)
+            sh_pct = float(sh / max(last_close, 1e-9) * 100.0)
+            sl_pct = float(sl / max(last_close, 1e-9) * 100.0)
+            win = int(max(24, min(72, n // 2)))
+            old_h = high[-win:-win // 2] if win // 2 > 0 else high[-win:]
+            old_l = low[-win:-win // 2] if win // 2 > 0 else low[-win:]
+            new_h = high[-win // 2:] if win // 2 > 0 else high[-win:]
+            new_l = low[-win // 2:] if win // 2 > 0 else low[-win:]
+            width_old = float(np.max(old_h) - np.min(old_l)) if len(old_h) and len(old_l) else 0.0
+            width_new = float(np.max(new_h) - np.min(new_l)) if len(new_h) and len(new_l) else 0.0
+            squeeze_ratio = float(width_new / width_old) if width_old > 0 else 1.0
+            converging = bool(squeeze_ratio < 0.92)
+            top_now = float(sh * float(n - 1) + ih)
+            bot_now = float(sl * float(n - 1) + il)
+            up_break = float(close[-1]) >= top_now * (1.0 + breakout_buf)
+            dn_break = float(close[-1]) <= bot_now * (1.0 - breakout_buf)
+            flat = float(flat_slope_pct)
+
+            if (sh_pct < -flat) and (sl_pct > flat) and converging:
+                if up_break:
+                    _add("대칭삼각수렴 상방이탈", 1, 1.40)
+                elif dn_break:
+                    _add("대칭삼각수렴 하방이탈", -1, 1.40)
+                else:
+                    _add("대칭삼각수렴", 0, 0.55)
+
+            if abs(sh_pct) <= flat and (sl_pct > flat) and converging:
+                if up_break:
+                    _add("상승삼각수렴 상방이탈", 1, 1.45)
+                elif dn_break:
+                    _add("상승삼각수렴 하방이탈", -1, 1.10)
+                else:
+                    _add("상승삼각수렴", 1, 0.80)
+
+            if (sh_pct < -flat) and abs(sl_pct) <= flat and converging:
+                if dn_break:
+                    _add("하락삼각수렴 하방이탈", -1, 1.45)
+                elif up_break:
+                    _add("하락삼각수렴 상방이탈", 1, 1.10)
+                else:
+                    _add("하락삼각수렴", -1, 0.80)
+
+            if abs(sh_pct) <= flat and abs(sl_pct) <= flat and (0.78 <= squeeze_ratio <= 1.22):
+                rng_hi = float(np.percentile(high[-win:], 92))
+                rng_lo = float(np.percentile(low[-win:], 8))
+                if float(close[-1]) >= rng_hi * (1.0 + breakout_buf):
+                    _add("박스권 상방이탈", 1, 1.20)
+                elif float(close[-1]) <= rng_lo * (1.0 - breakout_buf):
+                    _add("박스권 하방이탈", -1, 1.20)
+                else:
+                    _add("박스권 횡보", 0, 0.45)
+
+            if (sh_pct > flat) and (sl_pct > flat) and converging:
+                if dn_break:
+                    _add("상승쐐기 하방이탈", -1, 1.35)
+                else:
+                    _add("상승쐐기", -1, 0.70)
+
+            if (sh_pct < -flat) and (sl_pct < -flat) and converging:
+                if up_break:
+                    _add("하락쐐기 상방이탈", 1, 1.35)
+                else:
+                    _add("하락쐐기", 1, 0.70)
+
+        bull_score = float(sum(x[1] for x in bull_items))
+        bear_score = float(sum(x[1] for x in bear_items))
+        diff = bull_score - bear_score
+        if diff >= 0.35:
+            out["bias"] = 1
+        elif diff <= -0.35:
+            out["bias"] = -1
+        else:
+            out["bias"] = 0
+        base_score = max(bull_score, bear_score, 0.0)
+        strength = float(min(1.0, (base_score / 3.0) + min(0.45, abs(diff) / 3.0)))
+        if out["bias"] == 0:
+            strength = float(min(strength, 0.60))
+        out["strength"] = float(strength)
+        out["score_long"] = float(bull_score)
+        out["score_short"] = float(bear_score)
+        out["bullish"] = [x[0] for x in bull_items[:8]]
+        out["bearish"] = [x[0] for x in bear_items[:8]]
+        out["neutral"] = [x[0] for x in neutral_items[:8]]
+        if not out["detected"]:
+            out["summary"] = "패턴 없음"
+        else:
+            side_txt = "롱 우세" if out["bias"] == 1 else ("숏 우세" if out["bias"] == -1 else "중립")
+            out["summary"] = f"{side_txt} | " + ", ".join(out["detected"][:3])
+        return out
+    except Exception:
+        return out
+
+
 def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Optional[pd.Series]]:
     status: Dict[str, Any] = {}
     if df is None or df.empty or len(df) < 120:
@@ -6233,6 +6551,25 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
         status["_sqz_strength"] = float(strength)
         status["_sqz_on"] = bool(sqz_on_now)
 
+    if bool(cfg.get("use_chart_patterns", True)):
+        try:
+            pat = detect_chart_patterns(df2, cfg)
+        except Exception:
+            pat = {}
+        try:
+            used.append("차트패턴")
+            status["패턴"] = str((pat or {}).get("summary", "패턴 없음"))
+            status["_pattern_bias"] = int((pat or {}).get("bias", 0) or 0)
+            status["_pattern_strength"] = float((pat or {}).get("strength", 0.0) or 0.0)
+            status["_pattern_tags"] = list((pat or {}).get("detected", []) or [])
+            status["_pattern_bullish"] = list((pat or {}).get("bullish", []) or [])
+            status["_pattern_bearish"] = list((pat or {}).get("bearish", []) or [])
+            status["_pattern_neutral"] = list((pat or {}).get("neutral", []) or [])
+            status["_pattern_score_long"] = float((pat or {}).get("score_long", 0.0) or 0.0)
+            status["_pattern_score_short"] = float((pat or {}).get("score_short", 0.0) or 0.0)
+        except Exception:
+            pass
+
     # RSI 해소
     rsi_prev = float(prev.get("RSI", 50)) if (cfg.get("use_rsi", True) and "RSI" in df2.columns) else 50.0
     rsi_now = float(last.get("RSI", 50)) if (cfg.get("use_rsi", True) and "RSI" in df2.columns) else 50.0
@@ -6367,7 +6704,7 @@ def ml_signals_and_convergence(
 ) -> Dict[str, Any]:
     """
     반환:
-      - rsi_sig, sqz_sig, knn_sig, lor_sig, logit_sig (-1/0/1)
+      - rsi_sig, sqz_sig, pattern_sig, knn_sig, lor_sig, logit_sig (-1/0/1)
       - knn_prob, lor_prob, logit_prob (0..1)
       - votes_long, votes_short, votes_max, dir("buy"/"sell"/"hold"), detail
     """
@@ -6383,6 +6720,7 @@ def ml_signals_and_convergence(
     out: Dict[str, Any] = {
         "rsi_sig": 0,
         "sqz_sig": 0,
+        "pattern_sig": 0,
         "knn_sig": 0,
         "lor_sig": 0,
         "logit_sig": 0,
@@ -6432,6 +6770,15 @@ def ml_signals_and_convergence(
             out["sqz_sig"] = 0
     except Exception:
         out["sqz_sig"] = 0
+
+    try:
+        if bool(cfg.get("use_chart_patterns", True)):
+            p_bias = int(status.get("_pattern_bias", 0) or 0)
+            p_strength = float(status.get("_pattern_strength", 0.0) or 0.0)
+            if p_bias in [-1, 1] and p_strength >= 0.20:
+                out["pattern_sig"] = int(p_bias)
+    except Exception:
+        out["pattern_sig"] = 0
 
     if not bool(cfg.get("ml_enable", True)):
         # convergence는 RSI/SQZ만으로도 계산 가능
@@ -6547,6 +6894,8 @@ def ml_signals_and_convergence(
         "LOR": int(out.get("lor_sig", 0) or 0),
         "LOGIT": int(out.get("logit_sig", 0) or 0),
     }
+    if bool(cfg.get("use_chart_patterns", True)):
+        sigs["PATTERN"] = int(out.get("pattern_sig", 0) or 0)
     v_long = sum(1 for v in sigs.values() if int(v) == 1)
     v_short = sum(1 for v in sigs.values() if int(v) == -1)
     out["votes_long"] = int(v_long)
@@ -6569,6 +6918,7 @@ def ml_signals_and_convergence(
 
         out["detail"] = (
             f"RSI:{_sg(int(out.get('rsi_sig',0)))} | SQZ:{_sg(int(out.get('sqz_sig',0)))} | "
+            f"PATTERN:{_sg(int(out.get('pattern_sig',0)))} | "
             f"KNN:{_sg(int(out.get('knn_sig',0)))}({float(out.get('knn_prob',0.5)):.2f}) | "
             f"LOR:{_sg(int(out.get('lor_sig',0)))}({float(out.get('lor_prob',0.5)):.2f}) | "
             f"LOGIT:{_sg(int(out.get('logit_sig',0)))}({float(out.get('logit_prob',0.5)):.2f}) | "
@@ -7458,6 +7808,14 @@ def ai_decide_trade(
             "bias": int(status.get("_sqz_bias", 0) or 0),
             "strength": float(status.get("_sqz_strength", 0.0) or 0.0),
         },
+        "chart_patterns": {
+            "summary": status.get("패턴", ""),
+            "bias": int(status.get("_pattern_bias", 0) or 0),
+            "strength": float(status.get("_pattern_strength", 0.0) or 0.0),
+            "detected": list(status.get("_pattern_tags", []) or []),
+            "bullish": list(status.get("_pattern_bullish", []) or []),
+            "bearish": list(status.get("_pattern_bearish", []) or []),
+        },
         "ml_signals": status.get("_ml_signals", {}) if isinstance(status.get("_ml_signals", {}), dict) else {},
         "sr_context": sr_context or {},
         "chart_style_hint": str(chart_style_hint or ""),
@@ -7548,15 +7906,17 @@ def ai_decide_trade(
 
 {ext_hdr}
 
-		[핵심 룰]
-		1) RSI 과매도/과매수 '상태'에 즉시 진입하지 말고, '해소되는 시점'에서만 진입 후보.
-			2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. (역추세는 더 짧게/보수적으로)
-			3) SQZ(스퀴즈 모멘텀) 신호를 진입 판단의 80% 이상으로 반영해라. (모멘텀 방향/세기 우선)
-			4) ml_signals(주력 지표 수렴: Lorentzian/KNN/Logistic/SQZ/RSI)를 반드시 따른다.
-			   - ml_signals.dir이 "buy"면 decision은 buy만 가능(반대 방향 금지)
-			   - ml_signals.dir이 "sell"면 decision은 sell만 가능(반대 방향 금지)
-			   - ml_signals.dir이 "hold"면 hold
-			5) 모드 규칙 반드시 준수:
+			[핵심 룰]
+			1) RSI 과매도/과매수 '상태'에 즉시 진입하지 말고, '해소되는 시점'에서만 진입 후보.
+				2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. (역추세는 더 짧게/보수적으로)
+				3) SQZ(스퀴즈 모멘텀) 신호를 진입 판단의 80% 이상으로 반영해라. (모멘텀 방향/세기 우선)
+				4) chart_patterns(M/W, 쌍봉/쌍바닥, 삼중천정/삼중바닥, 삼각수렴, 박스, 쐐기, 헤드앤숄더)을 반드시 참고해라.
+				   - pattern bias와 반대 방향이면 보수적으로 hold를 우선해라.
+				5) ml_signals(주력 지표 수렴: Lorentzian/KNN/Logistic/SQZ/RSI/패턴)을 반드시 따른다.
+				   - ml_signals.dir이 "buy"면 decision은 buy만 가능(반대 방향 금지)
+				   - ml_signals.dir이 "sell"면 decision은 sell만 가능(반대 방향 금지)
+				   - ml_signals.dir이 "hold"면 hold
+				6) 모드 규칙 반드시 준수:
 		   - 최소 확신도: {rule["min_conf"]}
 		   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
 		   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
@@ -12514,6 +12874,9 @@ def telegram_thread(ex):
                                 "sqz": stt.get("SQZ", ""),
                                 "sqz_mom_pct": stt.get("_sqz_mom_pct", ""),
                                 "sqz_bias": stt.get("_sqz_bias", ""),
+                                "pattern": stt.get("패턴", ""),
+                                "pattern_bias": stt.get("_pattern_bias", 0),
+                                "pattern_strength": stt.get("_pattern_strength", 0.0),
                                 "pullback_candidate": bool(stt.get("_pullback_candidate", False)),
                             }
                         )
@@ -12624,6 +12987,10 @@ def telegram_thread(ex):
                             sig_pullback = bool(stt.get("_pullback_candidate", False))
                             sig_rsi_resolve = bool(stt.get("_rsi_resolve_long", False)) or bool(stt.get("_rsi_resolve_short", False))
                             adxv = float(last.get("ADX", 0)) if "ADX" in df.columns else 0.0
+                            pattern_bias = int(stt.get("_pattern_bias", 0) or 0)
+                            pattern_strength = float(stt.get("_pattern_strength", 0.0) or 0.0)
+                            pattern_call_min = float(cfg.get("pattern_call_strength_min", 0.45) or 0.45)
+                            pattern_strong = bool(cfg.get("use_chart_patterns", True)) and (abs(pattern_bias) == 1) and (pattern_strength >= pattern_call_min)
 
                             # 모드별 ADX 임계(진입이 너무 안 되는 문제 완화)
                             adx_th = float(cfg.get("ai_call_adx_threshold", 0) or 0)
@@ -12692,7 +13059,9 @@ def telegram_thread(ex):
                             sqz_strong = bool(cfg.get("use_sqz", True)) and bool(cfg.get("sqz_dependency_enable", True)) and (abs(float(sqz_mom_pct)) >= float(sqz_thr))
 
                             # 강한 시그널 우선
-                            if sqz_strong:
+                            if pattern_strong:
+                                call_ai = True
+                            elif sqz_strong:
                                 call_ai = True
                             elif sig_pullback or sig_rsi_resolve:
                                 call_ai = True
@@ -12720,7 +13089,7 @@ def telegram_thread(ex):
                         except Exception:
                             call_ai = False
 
-                        # ✅ (필수) 3-of-5 수렴 게이트: 진입/AI 호출은 이 조건을 최우선으로 적용
+                        # ✅ (필수) 3-of-N 수렴 게이트: 진입/AI 호출은 이 조건을 최우선으로 적용
                         # - legacy call_ai 로직은 "참고"로만 남기고, 실제로는 수렴 조건이 우선한다.
                         try:
                             if bool(cfg.get("entry_convergence_enable", True)):
@@ -12784,7 +13153,7 @@ def telegram_thread(ex):
                                     stage="rule_filter",
                                     symbol=sym,
                                     tf=str(cfg.get("timeframe", "5m")),
-                                    signal="vol/disparity",
+                                    signal="vol/disparity/pattern",
                                     score="",
                                     message=(
                                         "PASS"
@@ -12793,7 +13162,12 @@ def telegram_thread(ex):
                                             (("BLOCK: " if bool(cfg.get("ai_call_filters_block_ai", False)) else "WARN: ") + " / ".join(filter_msgs))[:180]
                                         )
                                     ),
-                                    extra={"vol_ratio": vol_ratio, "disparity_pct": disparity_pct},
+                                    extra={
+                                        "vol_ratio": vol_ratio,
+                                        "disparity_pct": disparity_pct,
+                                        "pattern_bias": int(stt.get("_pattern_bias", 0) or 0),
+                                        "pattern_strength": float(stt.get("_pattern_strength", 0.0) or 0.0),
+                                    },
                                 )
                             except Exception:
                                 pass
@@ -12827,6 +13201,14 @@ def telegram_thread(ex):
                                 sigs.append("rsi_resolve_long")
                             if bool(stt.get("_rsi_resolve_short", False)):
                                 sigs.append("rsi_resolve_short")
+                            try:
+                                pb = int(stt.get("_pattern_bias", 0) or 0)
+                                if pb == 1:
+                                    sigs.append("pattern_long")
+                                elif pb == -1:
+                                    sigs.append("pattern_short")
+                            except Exception:
+                                pass
                             adxv2 = float(last.get("ADX", 0)) if "ADX" in df.columns else 0.0
                             mon_add_scan(
                                 mon,
@@ -12933,7 +13315,7 @@ def telegram_thread(ex):
                         conf = int(ai.get("confidence", 0))
                         mon_add_scan(mon, stage="ai_result", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=conf, message=str(ai.get("reason_easy", ""))[:80])
 
-                        # ✅ 주력 지표 수렴(3-of-5)과 AI 방향이 다르면 진입하지 않음(비용/과오류 방지)
+                        # ✅ 주력 지표 수렴(3-of-N)과 AI 방향이 다르면 진입하지 않음(비용/과오류 방지)
                         try:
                             if bool(cfg.get("entry_convergence_enable", True)):
                                 ml_dir = str(ml.get("dir", "hold") or "hold")
@@ -12999,6 +13381,40 @@ def telegram_thread(ex):
                                     )
                         except Exception:
                             sqz_skip_reason = ""
+
+                        pattern_skip_reason = ""
+                        try:
+                            raw_decision2 = str(decision or "hold")
+                            raw_conf2 = int(conf)
+                            if raw_decision2 in ["buy", "sell"] and bool(cfg.get("use_chart_patterns", True)):
+                                p_bias = int(stt.get("_pattern_bias", 0) or 0)
+                                p_strength = float(stt.get("_pattern_strength", 0.0) or 0.0)
+                                p_gate = float(cfg.get("pattern_gate_strength", 0.65) or 0.65)
+                                p_gate = float(clamp(p_gate, 0.05, 1.0))
+                                aligned = (p_bias == 1 and raw_decision2 == "buy") or (p_bias == -1 and raw_decision2 == "sell")
+                                opposed = (p_bias == 1 and raw_decision2 == "sell") or (p_bias == -1 and raw_decision2 == "buy")
+                                if aligned:
+                                    conf = int(min(100, int(conf) + int(round(8.0 * max(0.0, min(1.0, p_strength))))))
+                                elif opposed and bool(cfg.get("pattern_gate_entry", True)) and p_strength >= p_gate:
+                                    conf = int(round(float(conf) * max(0.0, 1.0 - min(0.85, 0.35 + (p_strength * 0.45)))))
+                                    if bool(cfg.get("pattern_override_ai", True)):
+                                        decision = "hold"
+                                    pattern_skip_reason = f"패턴 반대({p_strength:.2f})"
+                                if pattern_skip_reason:
+                                    mon_add_scan(
+                                        mon,
+                                        stage="trade_skipped",
+                                        symbol=sym,
+                                        tf=str(cfg.get("timeframe", "5m")),
+                                        signal=str(raw_decision2),
+                                        score=int(raw_conf2),
+                                        message=pattern_skip_reason,
+                                        extra={"pattern_bias": p_bias, "pattern_strength": p_strength},
+                                    )
+                        except Exception:
+                            pattern_skip_reason = ""
+
+                        skip_reason_merged = " / ".join([x for x in [sqz_skip_reason, pattern_skip_reason] if str(x).strip()])
                         # 강제스캔 요약 라인(요구사항: /scan 결과는 짧게)
                         try:
                             if force_scan_pending and ((not force_scan_syms_set) or (sym in force_scan_syms_set)):
@@ -13018,8 +13434,11 @@ def telegram_thread(ex):
                                 "ai_rr": float(ai.get("rr", 1.5)),
                                 "ai_used": ", ".join(ai.get("used_indicators", [])),
                                 "ai_reason_easy": ai.get("reason_easy", ""),
+                                "pattern": stt.get("패턴", ""),
+                                "pattern_bias": int(stt.get("_pattern_bias", 0) or 0),
+                                "pattern_strength": float(stt.get("_pattern_strength", 0.0) or 0.0),
                                 "min_conf_required": int(rule["min_conf"]),
-                                "skip_reason": sqz_skip_reason,
+                                "skip_reason": skip_reason_merged,
                             }
                         )
                         monitor_write_throttled(mon, 1.0)
@@ -14231,6 +14650,7 @@ def telegram_thread(ex):
                                     lines.append(
                                         f"- {sym}: {stxt}{str(cs.get('ai_decision','-')).upper()}({cs.get('ai_confidence','-')}%) "
                                         f"/ 단기 {cs.get('trend_short','-')} / 장기 {cs.get('trend_long','-')} "
+                                        f"/ 패턴 {str(cs.get('pattern','-'))[:18]} "
                                         f"/ {str(cs.get('ai_reason_easy') or cs.get('skip_reason') or '')[:30]}"
                                     )
                                 _reply_admin_dm("\n".join(lines))
@@ -14383,6 +14803,7 @@ def telegram_thread(ex):
                                     lines.append(
                                         f"- {sym}: {stxt}{str(cs.get('ai_decision','-')).upper()}({cs.get('ai_confidence','-')}%) "
                                         f"/ 단기 {cs.get('trend_short','-')} / 장기 {cs.get('trend_long','-')} "
+                                        f"/ 패턴 {str(cs.get('pattern','-'))[:18]} "
                                         f"/ {str(cs.get('ai_reason_easy') or cs.get('skip_reason') or '')[:35]}"
                                     )
                                 _cb_reply("\n".join(lines))
@@ -15084,7 +15505,7 @@ config["export_excel_enable"] = st.sidebar.checkbox("Excel(xlsx) 저장", value=
 config["export_gsheet_enable"] = st.sidebar.checkbox("Google Sheets 저장", value=bool(config.get("export_gsheet_enable", True)))
 
 st.sidebar.divider()
-st.sidebar.subheader("📊 보조지표 (11종) ON/OFF")
+st.sidebar.subheader("📊 보조지표 (12종) ON/OFF")
 colA, colB = st.sidebar.columns(2)
 config["use_rsi"] = colA.checkbox("RSI", value=bool(config.get("use_rsi", True)))
 config["use_bb"] = colB.checkbox("볼린저", value=bool(config.get("use_bb", True)))
@@ -15097,6 +15518,7 @@ config["use_willr"] = colB.checkbox("윌리엄%R", value=bool(config.get("use_wi
 config["use_adx"] = colA.checkbox("ADX", value=bool(config.get("use_adx", True)))
 config["use_vol"] = colB.checkbox("거래량", value=bool(config.get("use_vol", True)))
 config["use_sqz"] = colA.checkbox("SQZ(스퀴즈)", value=bool(config.get("use_sqz", True)))
+config["use_chart_patterns"] = colB.checkbox("차트패턴", value=bool(config.get("use_chart_patterns", True)))
 
 st.sidebar.divider()
 st.sidebar.subheader("지표 파라미터")
@@ -15127,6 +15549,22 @@ with st.sidebar.expander("🔥 스퀴즈 모멘텀(SQZ) 설정"):
     c_sq5, c_sq6 = st.columns(2)
     config["sqz_kc_mult"] = c_sq5.number_input("KC 배수", 0.5, 6.0, float(config.get("sqz_kc_mult", 1.5) or 1.5), step=0.1)
     config["sqz_mom_length"] = c_sq6.number_input("모멘텀 길이", 5, 120, int(config.get("sqz_mom_length", 20) or 20), step=1)
+
+with st.sidebar.expander("📐 차트 패턴 설정"):
+    config["pattern_gate_entry"] = st.checkbox("패턴 반대면 진입 억제", value=bool(config.get("pattern_gate_entry", True)))
+    config["pattern_override_ai"] = st.checkbox("강한 반대패턴이면 AI 신호 무시", value=bool(config.get("pattern_override_ai", True)))
+    c_pt1, c_pt2 = st.columns(2)
+    config["pattern_lookback"] = c_pt1.number_input("탐지 봉 수", 80, 800, int(config.get("pattern_lookback", 220) or 220), step=20)
+    config["pattern_pivot_order"] = c_pt2.number_input("피벗 민감도", 2, 12, int(config.get("pattern_pivot_order", 4) or 4), step=1)
+    c_pt3, c_pt4 = st.columns(2)
+    config["pattern_tolerance_pct"] = c_pt3.number_input("고점/저점 허용오차(%)", 0.05, 3.0, float(config.get("pattern_tolerance_pct", 0.60) or 0.60), step=0.05)
+    config["pattern_min_retrace_pct"] = c_pt4.number_input("최소 되돌림(%)", 0.05, 6.0, float(config.get("pattern_min_retrace_pct", 0.35) or 0.35), step=0.05)
+    c_pt5, c_pt6 = st.columns(2)
+    config["pattern_flat_slope_pct"] = c_pt5.number_input("수평기준 기울기(%/bar)", 0.003, 1.0, float(config.get("pattern_flat_slope_pct", 0.03) or 0.03), step=0.005)
+    config["pattern_breakout_buffer_pct"] = c_pt6.number_input("이탈 확인 버퍼(%)", 0.0, 1.0, float(config.get("pattern_breakout_buffer_pct", 0.08) or 0.08), step=0.01)
+    c_pt7, c_pt8 = st.columns(2)
+    config["pattern_call_strength_min"] = c_pt7.number_input("AI호출 최소강도", 0.05, 1.0, float(config.get("pattern_call_strength_min", 0.45) or 0.45), step=0.05)
+    config["pattern_gate_strength"] = c_pt8.number_input("진입차단 강도", 0.05, 1.0, float(config.get("pattern_gate_strength", 0.65) or 0.65), step=0.05)
 
 st.sidebar.divider()
 st.sidebar.subheader("🔍 긴급 점검")
@@ -15320,6 +15758,7 @@ with right:
                     "ADX": stt.get("ADX", "-"),
                     "거래량": stt.get("거래량", "-"),
                     "SQZ": stt.get("SQZ", "-"),
+                    "차트패턴": stt.get("패턴", "-"),
                     "눌림목후보(해소)": "✅" if stt.get("_pullback_candidate") else "—",
                     "지표엔진": stt.get("_backend", "-"),
                 }
@@ -15546,6 +15985,9 @@ with t1:
                     "BB": cs.get("bb", ""),
                     "MACD": cs.get("macd", ""),
                     "SQZ": cs.get("sqz", ""),
+                    "패턴": cs.get("pattern", ""),
+                    "패턴방향": cs.get("pattern_bias", ""),
+                    "패턴강도": cs.get("pattern_strength", ""),
                     "수렴(ML)": str(cs.get("ml_dir", ""))[:10],
                     "표(ML)": cs.get("ml_votes", ""),
                     "ML상세": (cs.get("ml_detail", "") or "")[:120],
