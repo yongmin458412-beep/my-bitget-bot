@@ -10470,22 +10470,54 @@ def _draw_pattern_overlay(
         pats = [str(p or "") for p in (detected_patterns or []) if str(p or "").strip()]
         ptxt = " | ".join(pats)
 
-        def _draw_points(idx_list: List[int], price_arr: np.ndarray, color: str, label: str):
+        def _draw_points(
+            idx_list: List[int],
+            price_arr: np.ndarray,
+            color: str,
+            label: str,
+            *,
+            lw: float = 2.4,
+            ms: float = 84.0,
+            neckline: str = "",
+        ):
             if not idx_list:
                 return
             xs = [float(x_num[i]) for i in idx_list if 0 <= int(i) < len(x_num)]
             ys = [float(price_arr[i]) for i in idx_list if 0 <= int(i) < len(price_arr)]
             if not xs or not ys:
                 return
-            ax.scatter(xs, ys, s=28, color=color, edgecolors="#111827", linewidths=0.4, zorder=9, alpha=0.95)
-            ax.plot(xs, ys, color=color, linewidth=1.2, alpha=0.45, zorder=8)
+            try:
+                ax.plot(xs, ys, color="#0b1220", linewidth=float(max(1.0, lw + 1.2)), alpha=0.55, zorder=9)
+            except Exception:
+                pass
+            ax.plot(xs, ys, color=color, linewidth=float(max(1.2, lw)), alpha=0.92, zorder=10)
+            ax.scatter(xs, ys, s=float(max(28.0, ms)), color=color, edgecolors="#ffffff", linewidths=1.0, zorder=11, alpha=0.98)
+            ax.scatter(xs, ys, s=float(max(10.0, ms * 0.22)), color="#111827", edgecolors="none", zorder=12, alpha=0.85)
+
+            if len(idx_list) >= 2 and str(neckline or "") in ["up", "down"]:
+                try:
+                    i0 = int(min(idx_list))
+                    i1 = int(max(idx_list))
+                    if i1 > i0:
+                        if neckline == "up":
+                            ref = high[max(0, i0): min(len(high), i1 + 1)]
+                            lv = float(np.nanmax(ref)) if len(ref) else float("nan")
+                            ncol = "#4ade80"
+                        else:
+                            ref = low[max(0, i0): min(len(low), i1 + 1)]
+                            lv = float(np.nanmin(ref)) if len(ref) else float("nan")
+                            ncol = "#f87171"
+                        if math.isfinite(lv):
+                            ax.axhline(lv, color=ncol, linewidth=1.8, linestyle="--", alpha=0.32, zorder=7)
+                except Exception:
+                    pass
             try:
                 ax.text(
                     xs[-1],
                     ys[-1],
                     label,
                     color=color,
-                    fontsize=8.2,
+                    fontsize=9.2,
                     ha="left",
                     va="bottom",
                     bbox={"boxstyle": "round,pad=0.15", "facecolor": "#0b1220", "edgecolor": color, "alpha": 0.75},
@@ -10495,17 +10527,17 @@ def _draw_pattern_overlay(
 
         # M/W/헤드앤숄더 류 위치 표시
         if ("쌍바닥" in ptxt) or ("Double Bottom" in ptxt):
-            _draw_points(sorted(lo_idx)[-2:], low, "#22c55e", "W")
+            _draw_points(sorted(lo_idx)[-2:], low, "#22c55e", "W", lw=3.6, ms=104, neckline="up")
         if ("쌍봉" in ptxt) or ("Double Top" in ptxt):
-            _draw_points(sorted(hi_idx)[-2:], high, "#ef4444", "M")
+            _draw_points(sorted(hi_idx)[-2:], high, "#ef4444", "M", lw=3.6, ms=104, neckline="down")
         if ("삼중바닥" in ptxt) or ("Triple Bottom" in ptxt):
-            _draw_points(sorted(lo_idx)[-3:], low, "#10b981", "3B")
+            _draw_points(sorted(lo_idx)[-3:], low, "#10b981", "3B", lw=3.0, ms=96, neckline="up")
         if ("삼중천정" in ptxt) or ("Triple Top" in ptxt):
-            _draw_points(sorted(hi_idx)[-3:], high, "#f97316", "3T")
+            _draw_points(sorted(hi_idx)[-3:], high, "#f97316", "3T", lw=3.0, ms=96, neckline="down")
         if ("헤드앤숄더" in ptxt) and ("역헤드앤숄더" not in ptxt):
-            _draw_points(sorted(hi_idx)[-3:], high, "#fb7185", "H&S")
+            _draw_points(sorted(hi_idx)[-3:], high, "#fb7185", "H&S", lw=2.7, ms=90, neckline="down")
         if "역헤드앤숄더" in ptxt:
-            _draw_points(sorted(lo_idx)[-3:], low, "#34d399", "iH&S")
+            _draw_points(sorted(lo_idx)[-3:], low, "#34d399", "iH&S", lw=2.7, ms=90, neckline="up")
 
         # 삼각/쐐기/박스 위치(최근 피벗 추세선 근사)
         if ("삼각" in ptxt) or ("쐐기" in ptxt) or ("박스권" in ptxt):
@@ -10522,8 +10554,13 @@ def _draw_pattern_overlay(
                     xx = np.arange(max(0, len(close) - 80), len(close), dtype=float)
                     y_top = sh * xx + ih
                     y_bot = sl * xx + il
-                    ax.plot(mdates.date2num(time_vals.iloc[xx.astype(int)].dt.to_pydatetime()), y_top, color="#f59e0b", linewidth=1.0, linestyle="--", alpha=0.55)
-                    ax.plot(mdates.date2num(time_vals.iloc[xx.astype(int)].dt.to_pydatetime()), y_bot, color="#38bdf8", linewidth=1.0, linestyle="--", alpha=0.55)
+                    xplot = mdates.date2num(time_vals.iloc[xx.astype(int)].dt.to_pydatetime())
+                    ax.plot(xplot, y_top, color="#f59e0b", linewidth=2.0, linestyle="--", alpha=0.86, zorder=8)
+                    ax.plot(xplot, y_bot, color="#38bdf8", linewidth=2.0, linestyle="--", alpha=0.86, zorder=8)
+                    try:
+                        ax.fill_between(xplot, y_bot, y_top, color="#1e293b", alpha=0.10, zorder=6)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -10538,7 +10575,7 @@ def _draw_pattern_overlay(
                     transform=ax.transAxes,
                     ha="right",
                     va="top",
-                    fontsize=8.0,
+                    fontsize=8.6,
                     color="#e2e8f0",
                     bbox={"boxstyle": "round,pad=0.2", "facecolor": "#111827", "edgecolor": "#374151", "alpha": 0.72},
                 )
