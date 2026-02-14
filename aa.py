@@ -10547,6 +10547,48 @@ def telegram_thread(ex):
                             ps = safe_fetch_positions(ex, TARGET_COINS)
                             act = [p for p in ps if float(p.get("contracts") or 0) > 0]
                             if act:
+                                rt_open_targets = {}
+                                try:
+                                    rt_open_targets = (rt.get("open_targets", {}) or {}) if isinstance(rt, dict) else {}
+                                except Exception:
+                                    rt_open_targets = {}
+
+                                def _norm_sym(s: Any) -> str:
+                                    try:
+                                        return "".join(ch for ch in str(s).upper() if ch.isalnum())
+                                    except Exception:
+                                        return ""
+
+                                def _find_target(sym0: str) -> Dict[str, Any]:
+                                    try:
+                                        t0 = active_targets.get(sym0, None)
+                                        if isinstance(t0, dict) and t0:
+                                            return t0
+                                    except Exception:
+                                        pass
+                                    try:
+                                        t1 = rt_open_targets.get(sym0, None)
+                                        if isinstance(t1, dict) and t1:
+                                            return t1
+                                    except Exception:
+                                        pass
+                                    nk = _norm_sym(sym0)
+                                    if not nk:
+                                        return {}
+                                    try:
+                                        for src in [active_targets, rt_open_targets]:
+                                            if not isinstance(src, dict):
+                                                continue
+                                            for k, v in src.items():
+                                                if not isinstance(v, dict):
+                                                    continue
+                                                kk = _norm_sym(k)
+                                                if kk and (kk == nk or kk.endswith(nk) or nk.endswith(kk)):
+                                                    return v
+                                    except Exception:
+                                        pass
+                                    return {}
+
                                 for p in act[:8]:
                                     sym = p.get("symbol", "")
                                     side = position_side_normalize(p)
@@ -10554,22 +10596,38 @@ def telegram_thread(ex):
                                     upnl = float(p.get("unrealizedPnl") or 0.0)
                                     lev = p.get("leverage", "?")
                                     try:
-                                        tgt0 = (active_targets.get(sym, {}) or {})
+                                        tgt0 = (_find_target(sym) or {})
                                         style = str(tgt0.get("style", ""))
-                                        tp0 = float(tgt0.get("tp", 0) or 0)
-                                        sl0 = float(tgt0.get("sl", 0) or 0)
-                                        rr0 = (tp0 / max(abs(sl0), 0.01)) if (tp0 and sl0) else 0.0
+                                        tp0 = float(_as_float(tgt0.get("tp", None), float("nan")))
+                                        sl0 = float(_as_float(tgt0.get("sl", None), float("nan")))
                                     except Exception:
-                                        style, tp0, sl0, rr0 = "", 0.0, 0.0, 0.0
+                                        style, tp0, sl0 = "", float("nan"), float("nan")
+                                    tp_ok = bool(math.isfinite(tp0) and abs(float(tp0)) >= 1e-9)
+                                    sl_ok = bool(math.isfinite(sl0) and abs(float(sl0)) >= 1e-9)
+                                    tp_txt = f"+{abs(float(tp0)):.2f}%" if tp_ok else "-"
+                                    sl_txt = f"-{abs(float(sl0)):.2f}%" if sl_ok else "-"
+                                    rr_txt = "-"
+                                    if tp_ok and sl_ok:
+                                        try:
+                                            rr0 = abs(float(tp0)) / max(abs(float(sl0)), 0.01)
+                                            rr_txt = f"{float(rr0):.2f}"
+                                        except Exception:
+                                            rr_txt = "-"
                                     emo = "🟢" if roi >= 0 else "🔴"
-                                    tp_line = f"  - 목표(익절/손절): +{tp0:.2f}% / -{sl0:.2f}% (RR {rr0:.2f})"
+                                    tp_line = f"  - 목표(익절/손절): 익절 {tp_txt} / 손절 {sl_txt}"
+                                    if rr_txt != "-":
+                                        tp_line += f" (RR {rr_txt})"
                                     if str(pol0).strip():
                                         try:
                                             ai_prio = bool(cfg.get("exit_trailing_protect_ai_targets_priority", False))
                                         except Exception:
                                             ai_prio = False
                                         lab = "AI목표(우선)" if ai_prio else "AI목표(참고)"
-                                        tp_line = f"  - {lab}: 익절 +{tp0:.2f}% / 손절 -{sl0:.2f}% (RR {rr0:.2f})"
+                                        tp_line = f"  - {lab}: 익절 {tp_txt} / 손절 {sl_txt}"
+                                        if rr_txt != "-":
+                                            tp_line += f" (RR {rr_txt})"
+                                    if tp_txt == "-" and sl_txt == "-":
+                                        tp_line += " (목표 미동기화)"
                                     pos_blocks.append(
                                         "\n".join(
                                             [
