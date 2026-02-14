@@ -2080,7 +2080,15 @@ def _call_with_timeout(fn, timeout_sec: int):
             _THREAD_POOL_LOCK.release()
         except Exception:
             pass
-    return fut.result(timeout=timeout_sec)
+    try:
+        return fut.result(timeout=timeout_sec)
+    except FuturesTimeoutError as e:
+        # timeout 발생 시 future를 취소 시도해 워커 누적을 완화
+        try:
+            fut.cancel()
+        except Exception:
+            pass
+        raise FuturesTimeoutError(f"timeout({int(timeout_sec)}s)") from e
 
 
 def openai_chat_create_with_fallback(
@@ -4159,6 +4167,25 @@ def gsheet_sync_trades_only(force_summary: bool = False, timeout_sec: int = 35) 
     try:
         res = _call_with_timeout(_do, timeout_sec)
         return res if isinstance(res, dict) else {"ok": True}
+    except FuturesTimeoutError:
+        detail = "TimeoutError"
+        try:
+            with _GSHEET_CACHE_LOCK:
+                _GSHEET_CACHE["last_err"] = f"GSHEET sync 실패: {detail}"
+                try:
+                    _GSHEET_CACHE["last_tb"] = traceback.format_exc()
+                except Exception:
+                    _GSHEET_CACHE["last_tb"] = ""
+                # 타임아웃 연속 시 호출 폭주 방지(짧은 쿨다운)
+                _GSHEET_CACHE["service_unavailable_until_epoch"] = max(
+                    float(_GSHEET_CACHE.get("service_unavailable_until_epoch", 0) or 0.0),
+                    time.time() + 45.0,
+                )
+                _GSHEET_CACHE["service_unavailable_kst"] = now_kst_str()
+        except Exception:
+            pass
+        _gsheet_notify_connect_issue("GSHEET_SYNC", "GSHEET sync 실패: TimeoutError", min_interval_sec=600.0)
+        return {"ok": False, "error": detail, "timeout": True}
     except Exception as e:
         # 503(Service Unavailable)은 일시 장애일 가능성이 높음 → 잠깐 쉬었다가 재시도
         detail = ""
@@ -4610,16 +4637,34 @@ def gsheet_worker_thread():
                         do_sync = True
 
                 if do_sync:
-                    res = gsheet_sync_trades_only(force_summary=bool(woke), timeout_sec=35)
+                    try:
+                        res = gsheet_sync_trades_only(force_summary=bool(woke), timeout_sec=35)
+                    except FuturesTimeoutError:
+                        res = {"ok": False, "error": "TimeoutError", "timeout": True}
+                    except Exception as e:
+                        res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
                     if not bool(res.get("ok", False)):
                         msg = str(res.get("error", "") or "GSHEET sync 실패")
                         low = msg.lower()
+                        is_timeout = bool(res.get("timeout", False)) or ("timeout" in low)
                         # 429 quota 대응
                         if ("http=429" in low) or ("quota exceeded" in low) or ("429" in low and "quota" in low):
                             with _GSHEET_CACHE_LOCK:
                                 _GSHEET_CACHE["quota_cooldown_until_epoch"] = time.time() + float(_GSHEET_QUOTA_COOLDOWN_SEC)
                                 _GSHEET_CACHE["last_429_epoch"] = time.time()
                             backoff = max(backoff, float(_GSHEET_QUOTA_COOLDOWN_SEC))
+                        # timeout 대응(네트워크 지연/일시 장애): 짧은 쿨다운 후 재시도
+                        if is_timeout:
+                            try:
+                                with _GSHEET_CACHE_LOCK:
+                                    _GSHEET_CACHE["service_unavailable_until_epoch"] = max(
+                                        float(_GSHEET_CACHE.get("service_unavailable_until_epoch", 0) or 0.0),
+                                        time.time() + 45.0,
+                                    )
+                                    _GSHEET_CACHE["service_unavailable_kst"] = now_kst_str()
+                            except Exception:
+                                pass
+                            backoff = max(backoff, 2.0)
                         # 503 service unavailable 대응(일시 장애): 조금 길게 쉬었다가 재시도
                         if ("http=503" in low) or ("[503]" in low) or ("service is currently unavailable" in low) or (" 503" in low):
                             try:
@@ -4634,6 +4679,8 @@ def gsheet_worker_thread():
                         try:
                             if ("http=503" in low) or ("[503]" in low) or ("service is currently unavailable" in low) or (" 503" in low):
                                 min_int = 1800.0
+                            elif is_timeout:
+                                min_int = 600.0
                         except Exception:
                             min_int = 180.0
                         _gsheet_notify_connect_issue("GSHEET_THREAD", msg, min_interval_sec=min_int)
