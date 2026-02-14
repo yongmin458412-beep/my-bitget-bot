@@ -9265,19 +9265,123 @@ def _fmt_pos_line(sym: str, side: str, lev: Any, roi: float, upnl: float, style:
     return f"{emo} {sym} {('롱' if side=='long' else '숏')} x{lev} | 수익률 {roi:.2f}% | 손익 {upnl:.2f} USDT{s_txt}"
 
 
-def _fmt_pos_block(sym: str, side: str, lev: Any, roi: float, upnl: float, style: str = "") -> str:
+def _norm_symbol_key(sym: Any) -> str:
+    try:
+        return "".join(ch for ch in str(sym).upper() if ch.isalnum())
+    except Exception:
+        return ""
+
+
+def _resolve_open_target_for_symbol(
+    sym: Any,
+    active_targets: Optional[Dict[str, Dict[str, Any]]] = None,
+    rt_open_targets: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    sym_s = str(sym or "")
+    srcs = []
+    if isinstance(active_targets, dict):
+        srcs.append(active_targets)
+    if isinstance(rt_open_targets, dict):
+        srcs.append(rt_open_targets)
+    for src in srcs:
+        try:
+            t = src.get(sym_s, None)
+            if isinstance(t, dict) and t:
+                return t
+        except Exception:
+            pass
+    nk = _norm_symbol_key(sym_s)
+    if not nk:
+        return {}
+    for src in srcs:
+        try:
+            for k, v in src.items():
+                if not isinstance(v, dict):
+                    continue
+                kk = _norm_symbol_key(k)
+                if kk and (kk == nk or kk.endswith(nk) or nk.endswith(kk)):
+                    return v
+        except Exception:
+            continue
+    return {}
+
+
+def _fmt_pos_block(
+    sym: str,
+    side: str,
+    lev: Any,
+    roi: float,
+    upnl: float,
+    style: str = "",
+    tgt: Optional[Dict[str, Any]] = None,
+) -> str:
     emo = "🟢" if roi >= 0 else "🔴"
     side_txt = "롱" if str(side) == "long" else "숏"
-    style_txt = str(style or "-").strip() or "-"
+    tgt = tgt if isinstance(tgt, dict) else {}
+    style_t = str(tgt.get("style", "") or "").strip()
+    style_txt = str(style_t or style or "-").strip() or "-"
     try:
         lev_txt = f"x{lev}"
     except Exception:
         lev_txt = f"x{str(lev)}"
+    tp_txt = _tg_fmt_target_roi(tgt.get("tp", None), sign="+", min_visible=0.05)
+    sl_txt = _tg_fmt_target_roi(tgt.get("sl", None), sign="-", min_visible=0.05)
+    rr_txt = "-"
+    try:
+        tp_v = float(_as_float(tgt.get("tp", None), float("nan")))
+        sl_v = float(_as_float(tgt.get("sl", None), float("nan")))
+        if math.isfinite(tp_v) and math.isfinite(sl_v) and abs(tp_v) >= 0.05 and abs(sl_v) >= 0.05:
+            rr_txt = f"{(abs(tp_v) / max(abs(sl_v), 0.01)):.2f}"
+    except Exception:
+        rr_txt = "-"
+
+    entry_line = "- 진입금액(마진): -"
+    try:
+        entry_usdt = float(_as_float(tgt.get("entry_usdt", None), float("nan")))
+    except Exception:
+        entry_usdt = float("nan")
+    if math.isfinite(entry_usdt) and entry_usdt > 0:
+        p_free = None
+        p_total = None
+        try:
+            bal_free = float(_as_float(tgt.get("bal_entry_free", None), float("nan")))
+            if math.isfinite(bal_free) and bal_free > 0:
+                p_free = (entry_usdt / bal_free) * 100.0
+        except Exception:
+            p_free = None
+        try:
+            bal_total = float(_as_float(tgt.get("bal_entry_total", None), float("nan")))
+            if math.isfinite(bal_total) and bal_total > 0:
+                p_total = (entry_usdt / bal_total) * 100.0
+        except Exception:
+            p_total = None
+        pct_parts = []
+        if p_free is not None and math.isfinite(float(p_free)):
+            pct_parts.append(f"가용 {float(p_free):.1f}%")
+        if p_total is not None and math.isfinite(float(p_total)):
+            pct_parts.append(f"총자산 {float(p_total):.1f}%")
+        if (not pct_parts):
+            try:
+                p_plan = float(_as_float(tgt.get("entry_pct", None), float("nan")))
+                if math.isfinite(p_plan) and p_plan > 0:
+                    pct_parts.append(f"계획 {p_plan:.1f}%")
+            except Exception:
+                pass
+        pct_txt = f" ({' / '.join(pct_parts)})" if pct_parts else ""
+        entry_line = f"- 진입금액(마진): {entry_usdt:.2f} USDT{pct_txt}"
+
+    target_line = f"- 목표(익절/손절): 익절 {tp_txt} / 손절 {sl_txt}"
+    if rr_txt != "-":
+        target_line += f" (RR {rr_txt})"
+    if tp_txt == "-" and sl_txt == "-":
+        target_line += " (목표 미동기화)"
     return (
         f"{emo} {sym}\n"
         f"- 방식: {style_txt}\n"
         f"- 포지션: {side_txt} | 레버리지: {lev_txt}\n"
-        f"- 수익률: {_tg_fmt_pct(roi)} (손익 {_tg_fmt_usdt(upnl)} USDT)"
+        f"- 수익률: {_tg_fmt_pct(roi)} (손익 {_tg_fmt_usdt(upnl)} USDT)\n"
+        f"{target_line}\n"
+        f"{entry_line}"
     )
 
 
@@ -10477,6 +10581,11 @@ def telegram_thread(ex):
                         pos_blocks: List[str] = []
                         ps = safe_fetch_positions(ex, TARGET_COINS)
                         act = [p for p in ps if float(p.get("contracts") or 0) > 0]
+                        rt_open_targets = {}
+                        try:
+                            rt_open_targets = (rt.get("open_targets", {}) or {}) if isinstance(rt, dict) else {}
+                        except Exception:
+                            rt_open_targets = {}
                         if act:
                             for p in act[:10]:
                                 sym = p.get("symbol", "")
@@ -10484,8 +10593,9 @@ def telegram_thread(ex):
                                 roi = float(position_roi_percent(p))
                                 upnl = float(p.get("unrealizedPnl") or 0.0)
                                 lev = p.get("leverage", "?")
-                                style = str((active_targets.get(sym, {}) or {}).get("style", ""))
-                                pos_blocks.append(_fmt_pos_block(sym, side, lev, roi, upnl, style=style))
+                                tgt0 = _resolve_open_target_for_symbol(sym, active_targets, rt_open_targets)
+                                style = str((tgt0 or {}).get("style", ""))
+                                pos_blocks.append(_fmt_pos_block(sym, side, lev, roi, upnl, style=style, tgt=tgt0))
                         else:
                             pos_blocks.append("⚪ 무포지션(관망)")
 
@@ -10566,96 +10676,18 @@ def telegram_thread(ex):
                                     rt_open_targets = (rt.get("open_targets", {}) or {}) if isinstance(rt, dict) else {}
                                 except Exception:
                                     rt_open_targets = {}
-
-                                def _norm_sym(s: Any) -> str:
-                                    try:
-                                        return "".join(ch for ch in str(s).upper() if ch.isalnum())
-                                    except Exception:
-                                        return ""
-
-                                def _find_target(sym0: str) -> Dict[str, Any]:
-                                    try:
-                                        t0 = active_targets.get(sym0, None)
-                                        if isinstance(t0, dict) and t0:
-                                            return t0
-                                    except Exception:
-                                        pass
-                                    try:
-                                        t1 = rt_open_targets.get(sym0, None)
-                                        if isinstance(t1, dict) and t1:
-                                            return t1
-                                    except Exception:
-                                        pass
-                                    nk = _norm_sym(sym0)
-                                    if not nk:
-                                        return {}
-                                    try:
-                                        for src in [active_targets, rt_open_targets]:
-                                            if not isinstance(src, dict):
-                                                continue
-                                            for k, v in src.items():
-                                                if not isinstance(v, dict):
-                                                    continue
-                                                kk = _norm_sym(k)
-                                                if kk and (kk == nk or kk.endswith(nk) or nk.endswith(kk)):
-                                                    return v
-                                    except Exception:
-                                        pass
-                                    return {}
-
                                 for p in act[:8]:
                                     sym = p.get("symbol", "")
                                     side = position_side_normalize(p)
                                     roi = float(position_roi_percent(p))
                                     upnl = float(p.get("unrealizedPnl") or 0.0)
                                     lev = p.get("leverage", "?")
-                                    try:
-                                        tgt0 = (_find_target(sym) or {})
-                                        style = str(tgt0.get("style", ""))
-                                        tp0 = float(_as_float(tgt0.get("tp", None), float("nan")))
-                                        sl0 = float(_as_float(tgt0.get("sl", None), float("nan")))
-                                    except Exception:
-                                        style, tp0, sl0 = "", float("nan"), float("nan")
-                                    tp_ok = bool(math.isfinite(tp0) and abs(float(tp0)) >= 1e-9)
-                                    sl_ok = bool(math.isfinite(sl0) and abs(float(sl0)) >= 1e-9)
-                                    tp_txt = _tg_fmt_target_roi(tp0, sign="+", min_visible=0.05) if tp_ok else "-"
-                                    sl_txt = _tg_fmt_target_roi(sl0, sign="-", min_visible=0.05) if sl_ok else "-"
-                                    rr_txt = "-"
-                                    if tp_ok and sl_ok:
-                                        try:
-                                            tp_rr = abs(float(tp0))
-                                            sl_rr = abs(float(sl0))
-                                            if tp_rr >= 0.05 and sl_rr >= 0.05:
-                                                rr0 = tp_rr / max(sl_rr, 0.01)
-                                                rr_txt = f"{float(rr0):.2f}"
-                                        except Exception:
-                                            rr_txt = "-"
-                                    emo = "🟢" if roi >= 0 else "🔴"
-                                    tp_line = f"  - 목표(익절/손절): 익절 {tp_txt} / 손절 {sl_txt}"
-                                    if rr_txt != "-":
-                                        tp_line += f" (RR {rr_txt})"
+                                    tgt0 = _resolve_open_target_for_symbol(sym, active_targets, rt_open_targets)
+                                    style = str((tgt0 or {}).get("style", ""))
+                                    block = _fmt_pos_block(sym, side, lev, roi, upnl, style=style, tgt=tgt0)
                                     if str(pol0).strip():
-                                        try:
-                                            ai_prio = bool(cfg.get("exit_trailing_protect_ai_targets_priority", False))
-                                        except Exception:
-                                            ai_prio = False
-                                        lab = "AI목표(우선)" if ai_prio else "AI목표(참고)"
-                                        tp_line = f"  - {lab}: 익절 {tp_txt} / 손절 {sl_txt}"
-                                        if rr_txt != "-":
-                                            tp_line += f" (RR {rr_txt})"
-                                    if tp_txt == "-" and sl_txt == "-":
-                                        tp_line += " (목표 미동기화)"
-                                    pos_blocks.append(
-                                        "\n".join(
-                                            [
-                                                f"{emo} {sym} {('롱' if side=='long' else '숏')} x{lev}",
-                                                f"  - 수익률: {roi:.2f}% | 손익: {upnl:.2f} USDT",
-                                                f"  - 방식: {style or '-'}",
-                                                tp_line,
-                                                (f"  - 청산규칙: {pol0}" if str(pol0).strip() else ""),
-                                            ]
-                                        )
-                                    )
+                                        block += f"\n- 청산규칙: {pol0}"
+                                    pos_blocks.append(block)
                             else:
                                 pos_blocks.append("⚪ 무포지션(관망)")
                             pos_txt = "\n\n".join([x for x in pos_blocks if str(x or "").strip()])
@@ -14629,14 +14661,20 @@ def telegram_thread(ex):
                                 if not act:
                                     _reply_admin_dm("📊 포지션\n\n- ⚪ 없음(관망)")
                                 else:
+                                    rt_open_targets = {}
+                                    try:
+                                        rt_open_targets = (rt.get("open_targets", {}) or {}) if isinstance(rt, dict) else {}
+                                    except Exception:
+                                        rt_open_targets = {}
                                     for p in act:
                                         sym = p.get("symbol", "")
                                         side = position_side_normalize(p)
                                         roi = float(position_roi_percent(p))
                                         upnl = float(p.get("unrealizedPnl") or 0.0)
                                         lev = p.get("leverage", "?")
-                                        style = str((active_targets.get(sym, {}) or {}).get("style", ""))
-                                        blocks.append(_fmt_pos_block(sym, side, lev, roi, upnl, style=style))
+                                        tgt0 = _resolve_open_target_for_symbol(sym, active_targets, rt_open_targets)
+                                        style = str((tgt0 or {}).get("style", ""))
+                                        blocks.append(_fmt_pos_block(sym, side, lev, roi, upnl, style=style, tgt=tgt0))
                                     _reply_admin_dm("📊 포지션\n\n" + "\n\n".join(blocks))
 
                         # /scan (관리자) - 강제스캔(스캔만, 주문X)
@@ -14900,14 +14938,20 @@ def telegram_thread(ex):
                                 if not act:
                                     _cb_reply("📊 포지션\n\n- ⚪ 없음(관망)")
                                 else:
+                                    rt_open_targets = {}
+                                    try:
+                                        rt_open_targets = (rt.get("open_targets", {}) or {}) if isinstance(rt, dict) else {}
+                                    except Exception:
+                                        rt_open_targets = {}
                                     for p in act:
                                         sym = p.get("symbol", "")
                                         side = position_side_normalize(p)
                                         roi = float(position_roi_percent(p))
                                         upnl = float(p.get("unrealizedPnl") or 0.0)
                                         lev = p.get("leverage", "?")
-                                        style = str((active_targets.get(sym, {}) or {}).get("style", ""))
-                                        blocks.append(_fmt_pos_block(sym, side, lev, roi, upnl, style=style))
+                                        tgt0 = _resolve_open_target_for_symbol(sym, active_targets, rt_open_targets)
+                                        style = str((tgt0 or {}).get("style", ""))
+                                        blocks.append(_fmt_pos_block(sym, side, lev, roi, upnl, style=style, tgt=tgt0))
                                     _cb_reply("📊 포지션\n\n" + "\n\n".join(blocks))
 
                         elif data == "log":
