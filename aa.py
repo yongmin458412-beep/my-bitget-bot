@@ -135,10 +135,14 @@ try:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
+    from matplotlib import font_manager as mfont
+    from matplotlib import transforms as mtransforms
     from matplotlib.patches import Rectangle
 except Exception:
     plt = None
     mdates = None
+    mfont = None
+    mtransforms = None
     Rectangle = None
 
 # =========================================================
@@ -9812,6 +9816,94 @@ def _draw_candles_simple(ax, df: pd.DataFrame) -> None:
     ax.grid(True, color="#2d3238", linestyle="--", linewidth=0.5, alpha=0.35)
 
 
+_TRADE_IMG_FONT_READY = False
+_TRADE_IMG_FONT_OK = False
+_TRADE_IMG_FONT_NAME = ""
+
+
+def _ensure_trade_image_font() -> bool:
+    global _TRADE_IMG_FONT_READY, _TRADE_IMG_FONT_OK, _TRADE_IMG_FONT_NAME
+    if plt is None:
+        return False
+    if _TRADE_IMG_FONT_READY:
+        return bool(_TRADE_IMG_FONT_OK)
+    _TRADE_IMG_FONT_READY = True
+    _TRADE_IMG_FONT_OK = False
+    _TRADE_IMG_FONT_NAME = ""
+    if mfont is None:
+        try:
+            plt.rcParams["axes.unicode_minus"] = False
+        except Exception:
+            pass
+        return False
+    preferred = [
+        "NanumGothic",
+        "Noto Sans CJK KR",
+        "NotoSansCJKkr",
+        "Malgun Gothic",
+        "AppleGothic",
+        "Apple SD Gothic Neo",
+    ]
+    found_name = ""
+    try:
+        names = [str(getattr(f, "name", "") or "") for f in (mfont.fontManager.ttflist or [])]
+        name_set = {n.lower(): n for n in names if n}
+        for cand in preferred:
+            if cand.lower() in name_set:
+                found_name = name_set[cand.lower()]
+                break
+        if not found_name:
+            hint_words = ["nanum", "notosanscjk", "malgun", "applegothic", "apple sd gothic", "noto sans kr", "noto sans cjk"]
+            for p in (mfont.findSystemFonts(fontpaths=None, fontext="ttf") or [])[:2000]:
+                n = os.path.basename(str(p)).lower()
+                if any(w in n for w in hint_words):
+                    try:
+                        mfont.fontManager.addfont(p)
+                    except Exception:
+                        continue
+            names2 = [str(getattr(f, "name", "") or "") for f in (mfont.fontManager.ttflist or [])]
+            name_set2 = {n.lower(): n for n in names2 if n}
+            for cand in preferred:
+                if cand.lower() in name_set2:
+                    found_name = name_set2[cand.lower()]
+                    break
+    except Exception:
+        found_name = ""
+    try:
+        plt.rcParams["axes.unicode_minus"] = False
+        if found_name:
+            plt.rcParams["font.family"] = [found_name]
+            _TRADE_IMG_FONT_OK = True
+            _TRADE_IMG_FONT_NAME = str(found_name)
+        else:
+            plt.rcParams["font.family"] = ["DejaVu Sans"]
+            _TRADE_IMG_FONT_OK = False
+            _TRADE_IMG_FONT_NAME = "DejaVu Sans"
+    except Exception:
+        _TRADE_IMG_FONT_OK = False
+    return bool(_TRADE_IMG_FONT_OK)
+
+
+def _price_from_roi_target(entry_price: float, side: str, roi_pct: float, leverage: float, kind: str) -> Optional[float]:
+    try:
+        px = float(entry_price)
+        lev = float(leverage)
+        roi = abs(float(roi_pct))
+        if px <= 0 or lev <= 0 or roi <= 0:
+            return None
+        move = (roi / lev) / 100.0
+        s = str(side or "").lower().strip()
+        if s in ["buy", "long"]:
+            if kind == "tp":
+                return px * (1.0 + move)
+            return px * (1.0 - move)
+        if kind == "tp":
+            return px * (1.0 - move)
+        return px * (1.0 + move)
+    except Exception:
+        return None
+
+
 def build_trade_event_image(
     ex,
     sym: str,
@@ -9824,6 +9916,9 @@ def build_trade_event_image(
     exit_price: Optional[float] = None,
     sl_price: Optional[float] = None,
     tp_price: Optional[float] = None,
+    sl_roi_pct: Optional[float] = None,
+    tp_roi_pct: Optional[float] = None,
+    leverage: Optional[float] = None,
     roi_pct: Optional[float] = None,
     pnl_usdt: Optional[float] = None,
     remain_free: Optional[float] = None,
@@ -9849,21 +9944,22 @@ def build_trade_event_image(
         if d.empty:
             return None
 
+        has_kr_font = _ensure_trade_image_font()
+
         fig, ax = plt.subplots(figsize=(12.8, 7.2), dpi=120)
         fig.patch.set_facecolor("#0e1117")
         ax.set_facecolor("#11161c")
         _draw_candles_simple(ax, d)
 
         now_px = float(d["close"].iloc[-1])
-        ax.axhline(float(now_px), color="#a0aec0", linewidth=1.0, alpha=0.35, linestyle=":")
-        if entry_price is not None and math.isfinite(float(entry_price)):
-            ax.axhline(float(entry_price), color="#00bcd4", linewidth=1.2, linestyle="-", alpha=0.95)
-        if exit_price is not None and math.isfinite(float(exit_price)):
-            ax.axhline(float(exit_price), color="#ffd166", linewidth=1.2, linestyle="-", alpha=0.95)
-        if sl_price is not None and math.isfinite(float(sl_price)):
-            ax.axhline(float(sl_price), color="#ff4d4f", linewidth=1.2, linestyle="--", alpha=0.95)
-        if tp_price is not None and math.isfinite(float(tp_price)):
-            ax.axhline(float(tp_price), color="#00d084", linewidth=1.2, linestyle="--", alpha=0.95)
+        sl_line = float(sl_price) if (sl_price is not None and math.isfinite(float(sl_price))) else None
+        tp_line = float(tp_price) if (tp_price is not None and math.isfinite(float(tp_price))) else None
+        lev_line = float(leverage) if (leverage is not None and math.isfinite(float(leverage))) else None
+        ep = float(entry_price) if (entry_price is not None and math.isfinite(float(entry_price))) else None
+        if sl_line is None and ep is not None and sl_roi_pct is not None and lev_line is not None and lev_line > 0:
+            sl_line = _price_from_roi_target(ep, str(side), float(sl_roi_pct), float(lev_line), "sl")
+        if tp_line is None and ep is not None and tp_roi_pct is not None and lev_line is not None and lev_line > 0:
+            tp_line = _price_from_roi_target(ep, str(side), float(tp_roi_pct), float(lev_line), "tp")
 
         try:
             sr_params = _sr_params_for_style(str(style), cfg)
@@ -9896,9 +9992,55 @@ def build_trade_event_image(
         except Exception:
             pass
 
+        ax.axhline(float(now_px), color="#a0aec0", linewidth=1.0, alpha=0.35, linestyle=":")
+        if ep is not None:
+            ax.axhline(float(ep), color="#00bcd4", linewidth=1.4, linestyle="-", alpha=0.98)
+        if exit_price is not None and math.isfinite(float(exit_price)):
+            ax.axhline(float(exit_price), color="#ffd166", linewidth=1.3, linestyle="-", alpha=0.98)
+        if sl_line is not None:
+            ax.axhline(float(sl_line), color="#ff4d4f", linewidth=1.8, linestyle="--", alpha=0.98)
+        if tp_line is not None:
+            ax.axhline(float(tp_line), color="#00d084", linewidth=1.8, linestyle="--", alpha=0.98)
+
+        if mtransforms is not None:
+            try:
+                trans = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
+                if tp_line is not None:
+                    lbl = f"목표익절 {float(tp_line):.6g}" if has_kr_font else f"TP {float(tp_line):.6g}"
+                    ax.text(
+                        0.995,
+                        float(tp_line),
+                        lbl,
+                        transform=trans,
+                        va="center",
+                        ha="right",
+                        fontsize=8.2,
+                        color="#a7f3d0",
+                        bbox={"boxstyle": "round,pad=0.20", "facecolor": "#06241a", "edgecolor": "#0f5132", "alpha": 0.90},
+                    )
+                if sl_line is not None:
+                    lbl = f"목표손절 {float(sl_line):.6g}" if has_kr_font else f"SL {float(sl_line):.6g}"
+                    ax.text(
+                        0.995,
+                        float(sl_line),
+                        lbl,
+                        transform=trans,
+                        va="center",
+                        ha="right",
+                        fontsize=8.2,
+                        color="#fecaca",
+                        bbox={"boxstyle": "round,pad=0.20", "facecolor": "#2a0b11", "edgecolor": "#7f1d1d", "alpha": 0.90},
+                    )
+            except Exception:
+                pass
+
         sym_s = str(sym or "")
-        side_s = "롱" if str(side).lower() in ["buy", "long"] else "숏"
-        ttl = f"{event_type} | {sym_s} | {style} {side_s} | TF {tf}"
+        side_s = ("롱" if str(side).lower() in ["buy", "long"] else "숏") if has_kr_font else ("LONG" if str(side).lower() in ["buy", "long"] else "SHORT")
+        evt_map_ko = {"ENTRY": "진입", "TP": "익절", "SL": "손절", "PROTECT": "수익보호", "TAKE_FORCE": "강제익절"}
+        evt_map_en = {"ENTRY": "ENTRY", "TP": "TAKE", "SL": "STOP", "PROTECT": "PROTECT", "TAKE_FORCE": "TAKE_FORCE"}
+        evt_key = str(event_type or "").upper().strip()
+        evt_txt = evt_map_ko.get(evt_key, evt_key) if has_kr_font else evt_map_en.get(evt_key, evt_key)
+        ttl = f"{evt_txt} | {sym_s} | {style} {side_s} | TF {tf}"
         ax.set_title(ttl, color="white", fontsize=11, pad=10)
         ax.tick_params(colors="#cfd8dc", labelsize=8)
         for spine in ax.spines.values():
@@ -9917,37 +10059,41 @@ def build_trade_event_image(
         if len(one) > 180:
             one = one[:180] + "…"
         info_lines = []
-        if entry_price is not None and math.isfinite(float(entry_price)):
-            info_lines.append(f"진입가 {float(entry_price):.6g}")
-        if tp_price is not None and math.isfinite(float(tp_price)):
-            info_lines.append(f"익절가 {float(tp_price):.6g}")
-        if sl_price is not None and math.isfinite(float(sl_price)):
-            info_lines.append(f"손절가 {float(sl_price):.6g}")
+        if ep is not None:
+            info_lines.append(f"진입가 {float(ep):.6g}" if has_kr_font else f"Entry {float(ep):.6g}")
+        if tp_line is not None:
+            info_lines.append(f"목표익절 {float(tp_line):.6g}" if has_kr_font else f"TP target {float(tp_line):.6g}")
+        if sl_line is not None:
+            info_lines.append(f"목표손절 {float(sl_line):.6g}" if has_kr_font else f"SL target {float(sl_line):.6g}")
+        if tp_roi_pct is not None and math.isfinite(float(tp_roi_pct)):
+            info_lines.append(f"목표익절 ROI +{float(abs(tp_roi_pct)):.2f}%" if has_kr_font else f"TP ROI +{float(abs(tp_roi_pct)):.2f}%")
+        if sl_roi_pct is not None and math.isfinite(float(sl_roi_pct)):
+            info_lines.append(f"목표손절 ROI -{float(abs(sl_roi_pct)):.2f}%" if has_kr_font else f"SL ROI -{float(abs(sl_roi_pct)):.2f}%")
         if roi_pct is not None and math.isfinite(float(roi_pct)):
-            info_lines.append(f"결과 ROI {float(roi_pct):+.2f}%")
+            info_lines.append(f"결과 ROI {float(roi_pct):+.2f}%" if has_kr_font else f"Result ROI {float(roi_pct):+.2f}%")
         if pnl_usdt is not None and math.isfinite(float(pnl_usdt)):
-            info_lines.append(f"손익 {float(pnl_usdt):+.2f} USDT")
+            info_lines.append(f"손익 {float(pnl_usdt):+.2f} USDT" if has_kr_font else f"PnL {float(pnl_usdt):+.2f} USDT")
         if remain_free is not None and math.isfinite(float(remain_free)):
             if remain_total is not None and math.isfinite(float(remain_total)):
-                info_lines.append(f"잔액(가용/총) {float(remain_free):.2f}/{float(remain_total):.2f}")
+                info_lines.append(f"잔액(가용/총) {float(remain_free):.2f}/{float(remain_total):.2f}" if has_kr_font else f"Balance (free/total) {float(remain_free):.2f}/{float(remain_total):.2f}")
             else:
-                info_lines.append(f"잔액(가용) {float(remain_free):.2f}")
+                info_lines.append(f"잔액(가용) {float(remain_free):.2f}" if has_kr_font else f"Balance (free) {float(remain_free):.2f}")
         if ind_txt:
-            info_lines.append(f"지표: {ind_txt}")
+            info_lines.append(f"지표: {ind_txt}" if has_kr_font else f"Indicators: {ind_txt}")
         if pat_txt:
-            info_lines.append(f"패턴(단기): {pat_txt}")
+            info_lines.append(f"패턴(단기): {pat_txt}" if has_kr_font else f"Pattern(short): {pat_txt}")
         if mtf_txt:
-            info_lines.append(f"패턴(MTF): {mtf_txt[:180]}")
+            info_lines.append(f"패턴(MTF): {mtf_txt[:180]}" if has_kr_font else f"Pattern(MTF): {mtf_txt[:180]}")
         if one:
-            info_lines.append(f"근거: {one}")
+            info_lines.append(f"근거: {one}" if has_kr_font else f"Reason: {one}")
         box_text = "\n".join(info_lines[:10])
         if box_text:
             ax.text(
                 0.01,
-                0.99,
+                0.01,
                 box_text,
                 transform=ax.transAxes,
-                va="top",
+                va="bottom",
                 ha="left",
                 fontsize=8.2,
                 color="#e5e7eb",
@@ -12917,6 +13063,9 @@ def telegram_thread(ex):
                                             exit_price=float(exit_px),
                                             sl_price=(float(tgt.get("sl_price")) if tgt.get("sl_price") is not None else None),
                                             tp_price=(float(tgt.get("tp_price")) if tgt.get("tp_price") is not None else None),
+                                            sl_roi_pct=(float(tgt.get("sl")) if tgt.get("sl") is not None else None),
+                                            tp_roi_pct=(float(tgt.get("tp")) if tgt.get("tp") is not None else None),
+                                            leverage=(float(tgt.get("lev")) if tgt.get("lev") is not None else None),
                                             roi_pct=float(roi),
                                             pnl_usdt=float(pnl_usdt_snapshot),
                                             remain_free=float(free_after),
@@ -13289,6 +13438,9 @@ def telegram_thread(ex):
                                             exit_price=float(exit_px),
                                             sl_price=(float(tgt.get("sl_price")) if tgt.get("sl_price") is not None else None),
                                             tp_price=(float(tgt.get("tp_price")) if tgt.get("tp_price") is not None else None),
+                                            sl_roi_pct=(float(tgt.get("sl")) if tgt.get("sl") is not None else None),
+                                            tp_roi_pct=(float(tgt.get("tp")) if tgt.get("tp") is not None else None),
+                                            leverage=(float(tgt.get("lev")) if tgt.get("lev") is not None else None),
                                             roi_pct=float(roi),
                                             pnl_usdt=float(pnl_usdt_snapshot),
                                             remain_free=float(free_after),
@@ -15131,6 +15283,9 @@ def telegram_thread(ex):
                                                 entry_price=float(px),
                                                 sl_price=(float(sl_price) if sl_price is not None else None),
                                                 tp_price=(float(tp_price) if tp_price is not None else None),
+                                                sl_roi_pct=float(abs(slp)) if (slp is not None) else None,
+                                                tp_roi_pct=float(abs(tpp)) if (tpp is not None) else None,
+                                                leverage=float(lev) if (lev is not None) else None,
                                                 remain_free=(float(afree) if afree is not None else None),
                                                 remain_total=(float(atotal) if atotal is not None else None),
                                                 one_line=one_img,
