@@ -145,6 +145,11 @@ except Exception:
     mtransforms = None
     Rectangle = None
 
+try:
+    import koreanize_matplotlib as _koreanize_matplotlib  # Nanum 폰트 번들
+except Exception:
+    _koreanize_matplotlib = None
+
 # =========================================================
 # ✅ 글로벌 네트워크 타임아웃(안전장치)
 # - 일부 라이브러리(feedparser/urllib 등)는 timeout을 지정하지 않으면 영구 대기할 수 있음
@@ -10011,6 +10016,25 @@ _TRADE_IMG_FONT_OK = False
 _TRADE_IMG_FONT_NAME = ""
 
 
+def _register_packaged_korean_fonts() -> None:
+    if mfont is None or _koreanize_matplotlib is None:
+        return
+    try:
+        font_dir = os.path.join(os.path.dirname(str(_koreanize_matplotlib.__file__ or "")), "fonts")
+        if not os.path.isdir(font_dir):
+            return
+        for fn in os.listdir(font_dir):
+            if not str(fn).lower().endswith((".ttf", ".otf")):
+                continue
+            fp = os.path.join(font_dir, fn)
+            try:
+                mfont.fontManager.addfont(fp)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
 def _ensure_trade_image_font() -> bool:
     global _TRADE_IMG_FONT_READY, _TRADE_IMG_FONT_OK, _TRADE_IMG_FONT_NAME
     if plt is None:
@@ -10056,6 +10080,14 @@ def _ensure_trade_image_font() -> bool:
             for cand in preferred:
                 if cand.lower() in name_set2:
                     found_name = name_set2[cand.lower()]
+                    break
+        if not found_name:
+            _register_packaged_korean_fonts()
+            names3 = [str(getattr(f, "name", "") or "") for f in (mfont.fontManager.ttflist or [])]
+            name_set3 = {n.lower(): n for n in names3 if n}
+            for cand in preferred:
+                if cand.lower() in name_set3:
+                    found_name = name_set3[cand.lower()]
                     break
     except Exception:
         found_name = ""
