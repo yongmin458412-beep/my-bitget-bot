@@ -714,10 +714,10 @@ def default_settings() -> Dict[str, Any]:
         # - 실제로 "수익 보장"은 불가능하므로, 현실적인 안전장치로 자동매매를 강제 종료한다.
         # - 1) 계좌 드로다운이 임계치 이상이면 OFF
         # - 2) 일정 횟수 거래 후에도 당일 실현손익이 0 이하이면 OFF(과매매/손실 누적 방지)
-        "fail_safe_enable": True,
-        "fail_safe_drawdown_enable": True,
+        "fail_safe_enable": False,
+        "fail_safe_drawdown_enable": False,
         "fail_safe_drawdown_from_peak_pct": 18.0,   # peak equity 대비 -18%면 OFF (기존 30% → 강화)
-        "fail_safe_profit_guard_enable": True,      # ON: 연속 손실 누적 방지
+        "fail_safe_profit_guard_enable": False,      # ON: 연속 손실 누적 방지
         "fail_safe_profit_guard_min_trades": 6,     # 6회 거래 후에도
         "fail_safe_profit_guard_min_pnl_usdt": -30.0, # -30 USDT 이하 손실이면 OFF
 
@@ -764,7 +764,7 @@ def default_settings() -> Dict[str, Any]:
         # - SR(지지/저항) 가격 이탈 손절은 즉시 실행
         # - ROI(퍼센트) 손절은 n회 연속 조건일 때만 실행(순간 위꼬리/툭 찍고 복구 방지)
         "sl_confirm_enable": True,
-        "sl_confirm_n": 2,
+        "sl_confirm_n": 1,
         "sl_confirm_window_sec": 600.0,  # ✅ 6초→600초: 메인 루프 주기(수 분)가 6초보다 길어 손절 확인이 누적되지 않던 문제 수정
         # ✅ 청산 후 재진입 쿨다운(과매매/수수료/AI호출 낭비 방지)
         # - "bars"는 현재 단기 timeframe 기준 봉 개수(예: 5m에서 2 bars = 10분)
