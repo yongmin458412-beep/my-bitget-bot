@@ -633,6 +633,8 @@ def default_settings() -> Dict[str, Any]:
         "tg_image_chart_bars": 140,
         "tg_image_sr_lines": 3,
         "tg_image_volume_nodes": 4,
+        "tg_image_show_indicators": True,
+        "tg_image_show_pattern_overlay": True,
 
         # ✅ 텔레그램 라우팅: channel/group (secrets로 설정 권장)
         "tg_route_events_to": "channel",  # "channel"|"group"|"both"
@@ -10153,6 +10155,136 @@ def _style_plot_label(style: str, has_kr_font: bool) -> str:
     return s2 or "STYLE"
 
 
+def _pivot_indices_for_plot(high: np.ndarray, low: np.ndarray, order: int) -> Tuple[List[int], List[int]]:
+    hi_idx: List[int] = []
+    lo_idx: List[int] = []
+    try:
+        if len(high) < max(10, order * 4):
+            return hi_idx, lo_idx
+        if argrelextrema is not None:
+            try:
+                hi_idx = [int(x) for x in argrelextrema(high, np.greater_equal, order=order)[0].tolist()]
+                lo_idx = [int(x) for x in argrelextrema(low, np.less_equal, order=order)[0].tolist()]
+                return hi_idx, lo_idx
+            except Exception:
+                hi_idx, lo_idx = [], []
+        for i in range(order, len(high) - order):
+            try:
+                if high[i] >= np.max(high[i - order : i + order + 1]):
+                    hi_idx.append(int(i))
+                if low[i] <= np.min(low[i - order : i + order + 1]):
+                    lo_idx.append(int(i))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return hi_idx, lo_idx
+
+
+def _draw_pattern_overlay(
+    ax,
+    d: pd.DataFrame,
+    cfg: Dict[str, Any],
+    detected_patterns: List[str],
+    has_kr_font: bool,
+) -> None:
+    try:
+        if d is None or d.empty:
+            return
+        if not bool(cfg.get("tg_image_show_pattern_overlay", True)):
+            return
+        high = d["high"].astype(float).values
+        low = d["low"].astype(float).values
+        close = d["close"].astype(float).values
+        time_vals = pd.to_datetime(d["time"])
+        x_num = mdates.date2num(time_vals.dt.to_pydatetime())
+        order = int(cfg.get("pattern_pivot_order", 4) or 4)
+        order = int(clamp(order, 3, 12))
+        hi_idx, lo_idx = _pivot_indices_for_plot(high, low, order=order)
+        if not hi_idx and not lo_idx:
+            return
+
+        pats = [str(p or "") for p in (detected_patterns or []) if str(p or "").strip()]
+        ptxt = " | ".join(pats)
+
+        def _draw_points(idx_list: List[int], price_arr: np.ndarray, color: str, label: str):
+            if not idx_list:
+                return
+            xs = [float(x_num[i]) for i in idx_list if 0 <= int(i) < len(x_num)]
+            ys = [float(price_arr[i]) for i in idx_list if 0 <= int(i) < len(price_arr)]
+            if not xs or not ys:
+                return
+            ax.scatter(xs, ys, s=28, color=color, edgecolors="#111827", linewidths=0.4, zorder=9, alpha=0.95)
+            ax.plot(xs, ys, color=color, linewidth=1.2, alpha=0.45, zorder=8)
+            try:
+                ax.text(
+                    xs[-1],
+                    ys[-1],
+                    label,
+                    color=color,
+                    fontsize=8.2,
+                    ha="left",
+                    va="bottom",
+                    bbox={"boxstyle": "round,pad=0.15", "facecolor": "#0b1220", "edgecolor": color, "alpha": 0.75},
+                )
+            except Exception:
+                pass
+
+        # M/W/헤드앤숄더 류 위치 표시
+        if ("쌍바닥" in ptxt) or ("Double Bottom" in ptxt):
+            _draw_points(sorted(lo_idx)[-2:], low, "#22c55e", "W")
+        if ("쌍봉" in ptxt) or ("Double Top" in ptxt):
+            _draw_points(sorted(hi_idx)[-2:], high, "#ef4444", "M")
+        if ("삼중바닥" in ptxt) or ("Triple Bottom" in ptxt):
+            _draw_points(sorted(lo_idx)[-3:], low, "#10b981", "3B")
+        if ("삼중천정" in ptxt) or ("Triple Top" in ptxt):
+            _draw_points(sorted(hi_idx)[-3:], high, "#f97316", "3T")
+        if ("헤드앤숄더" in ptxt) and ("역헤드앤숄더" not in ptxt):
+            _draw_points(sorted(hi_idx)[-3:], high, "#fb7185", "H&S")
+        if "역헤드앤숄더" in ptxt:
+            _draw_points(sorted(lo_idx)[-3:], low, "#34d399", "iH&S")
+
+        # 삼각/쐐기/박스 위치(최근 피벗 추세선 근사)
+        if ("삼각" in ptxt) or ("쐐기" in ptxt) or ("박스권" in ptxt):
+            hi_recent = sorted(hi_idx)[-6:]
+            lo_recent = sorted(lo_idx)[-6:]
+            if len(hi_recent) >= 3 and len(lo_recent) >= 3:
+                xh = np.asarray(hi_recent, dtype=float)
+                yh = np.asarray([float(high[i]) for i in hi_recent], dtype=float)
+                xl = np.asarray(lo_recent, dtype=float)
+                yl = np.asarray([float(low[i]) for i in lo_recent], dtype=float)
+                try:
+                    sh, ih = np.polyfit(xh, yh, 1)
+                    sl, il = np.polyfit(xl, yl, 1)
+                    xx = np.arange(max(0, len(close) - 80), len(close), dtype=float)
+                    y_top = sh * xx + ih
+                    y_bot = sl * xx + il
+                    ax.plot(mdates.date2num(time_vals.iloc[xx.astype(int)].dt.to_pydatetime()), y_top, color="#f59e0b", linewidth=1.0, linestyle="--", alpha=0.55)
+                    ax.plot(mdates.date2num(time_vals.iloc[xx.astype(int)].dt.to_pydatetime()), y_bot, color="#38bdf8", linewidth=1.0, linestyle="--", alpha=0.55)
+                except Exception:
+                    pass
+
+        # 패턴 요약 라벨(한글 폰트 없으면 영어/ASCII만)
+        p_label = _plot_text_sanitize(", ".join(pats[:3]), has_kr_font=has_kr_font, max_len=80)
+        if p_label:
+            try:
+                ax.text(
+                    0.99,
+                    0.99,
+                    f"Pattern: {p_label}",
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=8.0,
+                    color="#e2e8f0",
+                    bbox={"boxstyle": "round,pad=0.2", "facecolor": "#111827", "edgecolor": "#374151", "alpha": 0.72},
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def build_trade_event_image(
     ex,
     sym: str,
@@ -10197,11 +10329,45 @@ def build_trade_event_image(
             return None
 
         has_kr_font = _ensure_trade_image_font()
-
-        fig, ax = plt.subplots(figsize=(12.8, 7.2), dpi=120)
+        show_indicator_panels = bool(cfg.get("tg_image_show_indicators", True))
+        if show_indicator_panels:
+            fig, axes = plt.subplots(
+                nrows=4,
+                ncols=1,
+                sharex=True,
+                figsize=(13.2, 8.8),
+                dpi=120,
+                gridspec_kw={"height_ratios": [5.0, 1.35, 1.55, 1.35], "hspace": 0.05},
+            )
+            ax = axes[0]
+            ax_rsi = axes[1]
+            ax_macd = axes[2]
+            ax_sqz = axes[3]
+            panel_axes = [ax_rsi, ax_macd, ax_sqz]
+        else:
+            fig, ax = plt.subplots(figsize=(12.8, 7.2), dpi=120)
+            ax_rsi = None
+            ax_macd = None
+            ax_sqz = None
+            panel_axes = []
         fig.patch.set_facecolor("#0e1117")
-        ax.set_facecolor("#11161c")
+        for axx in [ax] + panel_axes:
+            axx.set_facecolor("#11161c")
+            axx.tick_params(colors="#cfd8dc", labelsize=8)
+            for spine in axx.spines.values():
+                spine.set_color("#263238")
+                spine.set_linewidth(0.8)
         _draw_candles_simple(ax, d)
+
+        panel_df = pd.DataFrame()
+        try:
+            d2, _, _ = calc_indicators(df.copy(), cfg)
+            if isinstance(d2, pd.DataFrame) and not d2.empty:
+                panel_df = d2.copy()
+                panel_df["time"] = pd.to_datetime(panel_df["time"])
+                panel_df = panel_df[panel_df["time"] >= pd.to_datetime(d["time"].iloc[0])].copy()
+        except Exception:
+            panel_df = pd.DataFrame()
 
         now_px = float(d["close"].iloc[-1])
         sl_line = float(sl_price) if (sl_price is not None and math.isfinite(float(sl_price))) else None
@@ -10246,6 +10412,24 @@ def build_trade_event_image(
                         ax.axhline(float(lv), color="#b388ff", linewidth=0.7, linestyle="-.", alpha=0.40)
         except Exception:
             pass
+
+        detected_patterns: List[str] = []
+        if bool(cfg.get("use_chart_patterns", True)):
+            try:
+                pat_src = panel_df if (isinstance(panel_df, pd.DataFrame) and not panel_df.empty) else d
+                pat = detect_chart_patterns(pat_src.copy(), cfg)
+                detected_patterns = [str(x) for x in (pat or {}).get("detected", []) if str(x).strip()]
+            except Exception:
+                detected_patterns = []
+        if not detected_patterns and str(pattern_hint or "").strip():
+            try:
+                tmp = str(pattern_hint or "")
+                for sep in ["|", "/", ",", ";"]:
+                    tmp = tmp.replace(sep, ",")
+                detected_patterns = [x.strip() for x in tmp.split(",") if x.strip()]
+            except Exception:
+                detected_patterns = []
+        _draw_pattern_overlay(ax, d, cfg, detected_patterns, has_kr_font)
 
         ax.axhline(float(now_px), color="#a0aec0", linewidth=1.0, alpha=0.35, linestyle=":")
         if ep is not None:
@@ -10334,6 +10518,132 @@ def build_trade_event_image(
             except Exception:
                 pass
 
+        if show_indicator_panels and (ax_rsi is not None) and (ax_macd is not None) and (ax_sqz is not None):
+            px_df = panel_df if (isinstance(panel_df, pd.DataFrame) and not panel_df.empty) else d
+            try:
+                px_df = px_df.copy()
+                px_df["time"] = pd.to_datetime(px_df["time"])
+                x = mdates.date2num(px_df["time"].dt.to_pydatetime())
+            except Exception:
+                x = np.array([], dtype=float)
+                px_df = pd.DataFrame()
+
+            for axp in [ax_rsi, ax_macd, ax_sqz]:
+                axp.grid(True, color="#2d3238", linestyle="--", linewidth=0.45, alpha=0.32)
+                axp.tick_params(colors="#94a3b8", labelsize=7.8)
+
+            if (not px_df.empty) and ("RSI" in px_df.columns) and len(x) == len(px_df):
+                rsi = pd.to_numeric(px_df["RSI"], errors="coerce").to_numpy(dtype=float)
+                valid = np.isfinite(rsi)
+                if valid.any():
+                    ax_rsi.plot(x[valid], rsi[valid], color="#f59e0b", linewidth=1.2, alpha=0.95)
+                rsi_buy = float(cfg.get("rsi_buy", 30) or 30)
+                rsi_sell = float(cfg.get("rsi_sell", 70) or 70)
+                ax_rsi.axhline(rsi_buy, color="#22c55e", linestyle="--", linewidth=0.9, alpha=0.8)
+                ax_rsi.axhline(rsi_sell, color="#ef4444", linestyle="--", linewidth=0.9, alpha=0.8)
+                ax_rsi.set_ylim(0, 100)
+                try:
+                    rv = float(rsi[np.isfinite(rsi)][-1])
+                    rstate = "중립"
+                    if rv <= rsi_buy:
+                        rstate = "과매도"
+                    elif rv >= rsi_sell:
+                        rstate = "과매수"
+                    rtxt = f"RSI {rv:.1f} ({rstate})" if has_kr_font else f"RSI {rv:.1f}"
+                    ax_rsi.text(
+                        0.995,
+                        0.82,
+                        rtxt,
+                        transform=ax_rsi.transAxes,
+                        ha="right",
+                        va="center",
+                        fontsize=7.8,
+                        color="#fde68a",
+                        bbox={"boxstyle": "round,pad=0.18", "facecolor": "#1f2937", "edgecolor": "#374151", "alpha": 0.86},
+                    )
+                except Exception:
+                    pass
+            else:
+                ax_rsi.text(0.01, 0.6, "RSI N/A", transform=ax_rsi.transAxes, color="#94a3b8", fontsize=7.6)
+
+            if (not px_df.empty) and all(c in px_df.columns for c in ["MACD", "MACD_signal"]) and len(x) == len(px_df):
+                macd = pd.to_numeric(px_df["MACD"], errors="coerce").to_numpy(dtype=float)
+                sig = pd.to_numeric(px_df["MACD_signal"], errors="coerce").to_numpy(dtype=float)
+                hist = macd - sig
+                valid = np.isfinite(macd) & np.isfinite(sig)
+                if valid.any():
+                    ax_macd.plot(x[valid], macd[valid], color="#60a5fa", linewidth=1.0, alpha=0.95)
+                    ax_macd.plot(x[valid], sig[valid], color="#f43f5e", linewidth=1.0, alpha=0.95)
+                    h2 = hist.copy()
+                    h2[~np.isfinite(h2)] = 0.0
+                    bw = float(max(0.00018, np.median(np.diff(x[valid])) * 0.68)) if valid.sum() > 1 else 0.00028
+                    bar_colors = ["#22c55e" if v >= 0 else "#ef4444" for v in h2]
+                    ax_macd.bar(x, h2, width=bw, color=bar_colors, alpha=0.35, linewidth=0.0)
+                ax_macd.axhline(0.0, color="#94a3b8", linewidth=0.8, alpha=0.45)
+                try:
+                    mv = float(macd[np.isfinite(macd)][-1])
+                    sv = float(sig[np.isfinite(sig)][-1])
+                    mstate = "골든" if mv > sv else "데드"
+                    mtxt = f"MACD ({mstate})" if has_kr_font else f"MACD ({mstate})"
+                    ax_macd.text(
+                        0.995,
+                        0.82,
+                        mtxt,
+                        transform=ax_macd.transAxes,
+                        ha="right",
+                        va="center",
+                        fontsize=7.8,
+                        color="#bfdbfe",
+                        bbox={"boxstyle": "round,pad=0.18", "facecolor": "#0f172a", "edgecolor": "#334155", "alpha": 0.86},
+                    )
+                except Exception:
+                    pass
+            else:
+                ax_macd.text(0.01, 0.6, "MACD N/A", transform=ax_macd.transAxes, color="#94a3b8", fontsize=7.6)
+
+            if (not px_df.empty) and ("SQZ_MOM_PCT" in px_df.columns) and len(x) == len(px_df):
+                sqz = pd.to_numeric(px_df["SQZ_MOM_PCT"], errors="coerce").to_numpy(dtype=float)
+                sqz_on = np.zeros(len(px_df), dtype=int)
+                if "SQZ_ON" in px_df.columns:
+                    try:
+                        sqz_on = pd.to_numeric(px_df["SQZ_ON"], errors="coerce").fillna(0).astype(int).to_numpy(dtype=int)
+                    except Exception:
+                        sqz_on = np.zeros(len(px_df), dtype=int)
+                sqz2 = sqz.copy()
+                sqz2[~np.isfinite(sqz2)] = 0.0
+                bw = float(max(0.00018, np.median(np.diff(x)) * 0.70)) if len(x) > 1 else 0.00028
+                colors = []
+                for i, v in enumerate(sqz2):
+                    if int(sqz_on[i]) == 1:
+                        colors.append("#facc15")
+                    else:
+                        colors.append("#22c55e" if v >= 0 else "#ef4444")
+                ax_sqz.bar(x, sqz2, width=bw, color=colors, alpha=0.52, linewidth=0.0)
+                ax_sqz.axhline(0.0, color="#94a3b8", linewidth=0.8, alpha=0.45)
+                try:
+                    sv = float(sqz[np.isfinite(sqz)][-1])
+                    st = "압축중" if (len(sqz_on) > 0 and int(sqz_on[-1]) == 1) else ("상승" if sv > 0 else "하락")
+                    stxt = f"SQZ {sv:+.2f}% ({st})" if has_kr_font else f"SQZ {sv:+.2f}% ({st})"
+                    ax_sqz.text(
+                        0.995,
+                        0.82,
+                        stxt,
+                        transform=ax_sqz.transAxes,
+                        ha="right",
+                        va="center",
+                        fontsize=7.8,
+                        color="#fde68a",
+                        bbox={"boxstyle": "round,pad=0.18", "facecolor": "#111827", "edgecolor": "#374151", "alpha": 0.86},
+                    )
+                except Exception:
+                    pass
+            else:
+                ax_sqz.text(0.01, 0.6, "SQZ N/A", transform=ax_sqz.transAxes, color="#94a3b8", fontsize=7.6)
+
+            ax_rsi.set_ylabel("RSI", color="#94a3b8", fontsize=7.8)
+            ax_macd.set_ylabel("MACD", color="#94a3b8", fontsize=7.8)
+            ax_sqz.set_ylabel("SQZ%", color="#94a3b8", fontsize=7.8)
+
         sym_s = str(sym or "")
         side_s = ("롱" if str(side).lower() in ["buy", "long"] else "숏") if has_kr_font else ("LONG" if str(side).lower() in ["buy", "long"] else "SHORT")
         evt_map_ko = {"ENTRY": "진입", "TP": "익절", "SL": "손절", "PROTECT": "수익보호", "TAKE_FORCE": "강제익절", "POSITION": "포지션"}
@@ -10343,10 +10653,15 @@ def build_trade_event_image(
         style_txt = _style_plot_label(style, has_kr_font)
         ttl = f"{evt_txt} | {sym_s} | {style_txt} {side_s} | TF {tf}"
         ax.set_title(ttl, color="white", fontsize=11, pad=10)
-        ax.tick_params(colors="#cfd8dc", labelsize=8)
-        for spine in ax.spines.values():
-            spine.set_color("#263238")
-            spine.set_linewidth(0.8)
+        if show_indicator_panels and ax_sqz is not None:
+            for axh in [ax, ax_rsi, ax_macd]:
+                axh.tick_params(labelbottom=False)
+            ax_sqz.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+            for lab in ax_sqz.get_xticklabels():
+                lab.set_rotation(0)
+                lab.set_horizontalalignment("center")
+        else:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
 
         ind_txt = ", ".join([str(x) for x in (used_indicators or []) if str(x).strip()])[:120]
         ind_txt = _plot_text_sanitize(ind_txt, has_kr_font=has_kr_font, max_len=140)
@@ -10384,10 +10699,12 @@ def build_trade_event_image(
                 info_lines.append(f"잔액(가용/총) {float(remain_free):.2f}/{float(remain_total):.2f}" if has_kr_font else f"Balance (free/total) {float(remain_free):.2f}/{float(remain_total):.2f}")
             else:
                 info_lines.append(f"잔액(가용) {float(remain_free):.2f}" if has_kr_font else f"Balance (free) {float(remain_free):.2f}")
-        if ind_txt:
+        if ind_txt and (not show_indicator_panels):
             info_lines.append(f"지표: {ind_txt}" if has_kr_font else f"Indicators: {ind_txt}")
-        if pat_txt:
-            info_lines.append(f"패턴(단기): {pat_txt}" if has_kr_font else f"Pattern(short): {pat_txt}")
+        pat_info = ", ".join(detected_patterns[:4]) if detected_patterns else pat_txt
+        pat_info = _plot_text_sanitize(pat_info, has_kr_font=has_kr_font, max_len=160)
+        if pat_info:
+            info_lines.append(f"패턴(단기): {pat_info}" if has_kr_font else f"Pattern(short): {pat_info}")
         if mtf_txt:
             info_lines.append(f"패턴(MTF): {mtf_txt[:180]}" if has_kr_font else f"Pattern(MTF): {mtf_txt[:180]}")
         if one:
