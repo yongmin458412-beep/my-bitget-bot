@@ -130,6 +130,17 @@ try:
 except Exception:
     logger = None
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from matplotlib.patches import Rectangle
+except Exception:
+    plt = None
+    mdates = None
+    Rectangle = None
+
 # =========================================================
 # ✅ 글로벌 네트워크 타임아웃(안전장치)
 # - 일부 라이브러리(feedparser/urllib 등)는 timeout을 지정하지 않으면 영구 대기할 수 있음
@@ -174,8 +185,10 @@ MONITOR_FILE = "monitor_state.json"
 
 DETAIL_DIR = "trade_details"
 DAILY_REPORT_DIR = "daily_reports"
+EVENT_IMAGE_DIR = "trade_event_images"
 os.makedirs(DETAIL_DIR, exist_ok=True)
 os.makedirs(DAILY_REPORT_DIR, exist_ok=True)
+os.makedirs(EVENT_IMAGE_DIR, exist_ok=True)
 
 _cache = Cache("cache") if Cache else None  # 선택(디스크 캐시)
 
@@ -604,6 +617,13 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 사용자 요구: AI 시야 리포트(자동 전송)는 기본 OFF (필요할 때만 /vision 으로 조회)
         "tg_enable_hourly_vision_report": False,
         "vision_report_interval_min": 60,
+        # ✅ 진입/청산 이벤트 차트 이미지 전송
+        "tg_send_trade_images": True,
+        "tg_send_entry_image": True,
+        "tg_send_exit_image": True,
+        "tg_image_chart_bars": 140,
+        "tg_image_sr_lines": 3,
+        "tg_image_volume_nodes": 4,
 
         # ✅ 텔레그램 라우팅: channel/group (secrets로 설정 권장)
         "tg_route_events_to": "channel",  # "channel"|"group"|"both"
@@ -676,6 +696,12 @@ def default_settings() -> Dict[str, Any]:
         "pattern_gate_entry": True,
         "pattern_gate_strength": 0.65,
         "pattern_override_ai": True,
+        # ✅ 멀티 타임프레임 캔들패턴(요구)
+        # - 1m/3m/5m/15m/30m/1h/2h/4h를 함께 보고 패턴 bias를 합산
+        "pattern_mtf_enable": True,
+        "pattern_mtf_timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"],
+        "pattern_mtf_cache_sec": 90,
+        "pattern_mtf_merge_weight": 0.60,
 
         # 방어/전략
         "use_trailing_stop": True,
@@ -683,6 +709,9 @@ def default_settings() -> Dict[str, Any]:
         # - ON이면 SR/트레일링/본절보호/강제익절/손절확인 등 다른 청산 로직을 모두 무시하고
         #   "AI 목표 ROI" (tp/sl) 에 닿을 때만 청산한다.
         "exit_ai_targets_only": True,
+        # ✅ AI 목표(ROI) 자체를 SR/매물대 기준 가격에서 역산해 동기화
+        # - ON이면 동일한 +14.4/-9.0 반복을 줄이고, 코인/구간별로 목표가가 달라짐
+        "exit_ai_targets_sync_from_sr": True,
         # ✅ (핵심) 강제 청산 정책: "수익을 손실로 마감"하지 않기
         # - 진입 판단(AI)은 유지하되, 청산(Exit)만큼은 아래 규칙을 우선 적용한다.
         # - ON이면 기존 TP/SL/SR/부분익절/트레일링(기존)보다 아래 정책이 우선한다.
@@ -5602,6 +5631,7 @@ def _sr_pick_sl_tp_price(
     tp_bound: float,
     supports: List[float],
     resistances: List[float],
+    volume_nodes: Optional[List[float]] = None,
     buf: float,
     ai_sl_price: Optional[float] = None,
     ai_tp_price: Optional[float] = None,
@@ -5633,6 +5663,7 @@ def _sr_pick_sl_tp_price(
     ai_sl = _f(ai_sl_price)
     ai_tp = _f(ai_tp_price)
     buf2 = float(buf or 0.0)
+    vp = [float(x) for x in (volume_nodes or []) if x is not None and math.isfinite(float(x))]
 
     if s == "buy":
         # SL candidates: AI or supports-buf (must be below entry and <= sl_bound)
@@ -5644,6 +5675,13 @@ def _sr_pick_sl_tp_price(
                 sp = float(lv) - buf2
                 if sp < px:
                     sl_cands.append((sp, "SR"))
+            except Exception:
+                continue
+        for lv in vp:
+            try:
+                sp = float(lv)
+                if sp < px:
+                    sl_cands.append((sp, "VP"))
             except Exception:
                 continue
         sl_ok = [(p, src) for (p, src) in sl_cands if p <= float(sl_bound)]
@@ -5665,6 +5703,13 @@ def _sr_pick_sl_tp_price(
                 rp = float(lv)
                 if rp > px:
                     tp_cands.append((rp, "SR"))
+            except Exception:
+                continue
+        for lv in vp:
+            try:
+                rp = float(lv)
+                if rp > px:
+                    tp_cands.append((rp, "VP"))
             except Exception:
                 continue
         tp_ok = [(p, src) for (p, src) in tp_cands if p >= float(tp_bound)]
@@ -5689,6 +5734,13 @@ def _sr_pick_sl_tp_price(
                     sl_cands2.append((rp, "SR"))
             except Exception:
                 continue
+        for lv in vp:
+            try:
+                rp = float(lv)
+                if rp > px:
+                    sl_cands2.append((rp, "VP"))
+            except Exception:
+                continue
         sl_ok2 = [(p, src) for (p, src) in sl_cands2 if p >= float(sl_bound)]
         if sl_ok2:
             # 가장 덜 타이트(=entry에 가장 가까운) 기준으로 선택
@@ -5708,6 +5760,13 @@ def _sr_pick_sl_tp_price(
                 sp = float(lv)
                 if sp < px:
                     tp_cands2.append((sp, "SR"))
+            except Exception:
+                continue
+        for lv in vp:
+            try:
+                sp = float(lv)
+                if sp < px:
+                    tp_cands2.append((sp, "VP"))
             except Exception:
                 continue
         tp_ok2 = [(p, src) for (p, src) in tp_cands2 if p <= float(tp_bound)]
@@ -5776,6 +5835,8 @@ def sr_prices_for_style(
         atr = calc_atr(hdf, int(cfg.get("sr_atr_period", 14)))
         out["atr"] = float(atr)
         supports, resistances = pivot_levels(hdf, order=max(3, piv))
+        vp_nodes = volume_profile_nodes(hdf, bins=60, top_n=8)
+        out["volume_nodes"] = list(vp_nodes or [])
         buf = (atr * buf_mul) if atr > 0 else float(entry_price) * 0.0015
 
         sl_bound, tp_bound = _sr_price_bounds_from_price_pct(float(entry_price), str(side), float(sl_price_pct), float(tp_price_pct))
@@ -5786,6 +5847,7 @@ def sr_prices_for_style(
             tp_bound=float(tp_bound),
             supports=list(supports or []),
             resistances=list(resistances or []),
+            volume_nodes=list(vp_nodes or []),
             buf=float(buf),
             ai_sl_price=ai_sl_price,
             ai_tp_price=ai_tp_price,
@@ -6200,6 +6262,190 @@ def detect_chart_patterns(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, An
         return out
     except Exception:
         return out
+
+
+_PATTERN_MTF_CACHE: Dict[str, Dict[str, Any]] = {}
+_PATTERN_MTF_LOCK = threading.RLock()
+
+
+def _pattern_mtf_timeframes(cfg: Dict[str, Any]) -> List[str]:
+    try:
+        raw = cfg.get("pattern_mtf_timeframes", ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"])
+        if not isinstance(raw, list):
+            raw = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"]
+    except Exception:
+        raw = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"]
+    out: List[str] = []
+    seen = set()
+    for tf in raw:
+        t = str(tf or "").strip().lower()
+        if not t:
+            continue
+        if _timeframe_seconds(t, 0) <= 0:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    if not out:
+        out = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"]
+    return out[:12]
+
+
+def get_chart_patterns_mtf_cached(ex, sym: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "enabled": False,
+        "symbol": str(sym or ""),
+        "bias": 0,
+        "strength": 0.0,
+        "score_long": 0.0,
+        "score_short": 0.0,
+        "summary": "",
+        "rows": [],
+        "timeframes": [],
+    }
+    try:
+        if not bool(cfg.get("use_chart_patterns", True)):
+            return out
+        if not bool(cfg.get("pattern_mtf_enable", True)):
+            return out
+        tfs = _pattern_mtf_timeframes(cfg)
+        cache_sec = int(cfg.get("pattern_mtf_cache_sec", 90) or 90)
+        cache_sec = int(clamp(cache_sec, 10, 600))
+        lb = int(cfg.get("pattern_lookback", 220) or 220)
+        cache_key = f"{sym}|{'/'.join(tfs)}|{lb}|{int(cfg.get('pattern_pivot_order',4) or 4)}"
+        now_ts = time.time()
+        try:
+            with _PATTERN_MTF_LOCK:
+                ent = _PATTERN_MTF_CACHE.get(cache_key)
+                if isinstance(ent, dict):
+                    if (now_ts - float(ent.get("ts", 0) or 0.0)) < float(cache_sec):
+                        c = ent.get("data", {})
+                        if isinstance(c, dict):
+                            return dict(c)
+        except Exception:
+            pass
+
+        rows: List[Dict[str, Any]] = []
+        score_long = 0.0
+        score_short = 0.0
+        w_sum = 0.0
+        for tf in tfs:
+            try:
+                ohlcv = safe_fetch_ohlcv(ex, sym, tf, limit=max(120, lb))
+                if not ohlcv or len(ohlcv) < 80:
+                    continue
+                df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
+                pat = detect_chart_patterns(df, cfg)
+                bias = int(pat.get("bias", 0) or 0)
+                strength = float(pat.get("strength", 0.0) or 0.0)
+                sec = float(_timeframe_seconds(tf, 300))
+                w = float(max(1.0, pow(max(sec, 60.0) / 300.0, 0.35)))
+                w_sum += w
+                if bias > 0:
+                    score_long += float(strength) * w
+                elif bias < 0:
+                    score_short += float(strength) * w
+                rows.append(
+                    {
+                        "tf": tf,
+                        "bias": bias,
+                        "strength": round(float(strength), 4),
+                        "summary": str(pat.get("summary", "") or ""),
+                        "detected": list((pat.get("detected") or [])[:3]),
+                        "weight": round(w, 4),
+                    }
+                )
+            except Exception:
+                continue
+
+        if not rows:
+            out["enabled"] = True
+            out["timeframes"] = tfs
+            out["summary"] = "MTF 패턴 없음"
+            try:
+                with _PATTERN_MTF_LOCK:
+                    _PATTERN_MTF_CACHE[cache_key] = {"ts": now_ts, "data": dict(out)}
+            except Exception:
+                pass
+            return out
+
+        diff = float(score_long - score_short)
+        thr = float(max(0.25, w_sum * 0.06))
+        if diff >= thr:
+            bias_all = 1
+        elif diff <= -thr:
+            bias_all = -1
+        else:
+            bias_all = 0
+        top_score = float(max(score_long, score_short, 0.0))
+        strength_all = float(clamp(top_score / max(w_sum, 1e-9), 0.0, 1.0))
+        if bias_all == 0:
+            strength_all = float(min(strength_all, 0.6))
+        side_txt = "롱우세" if bias_all == 1 else ("숏우세" if bias_all == -1 else "중립")
+        rows_show = sorted(rows, key=lambda r: float(r.get("weight", 1.0)) * float(r.get("strength", 0.0)), reverse=True)[:5]
+        tags = []
+        for r in rows_show:
+            t = str(r.get("summary", "") or "").strip()
+            tf = str(r.get("tf", "") or "")
+            if t:
+                tags.append(f"{tf}:{t}")
+        summary = f"MTF {side_txt} | " + (" / ".join(tags) if tags else "패턴 없음")
+        out = {
+            "enabled": True,
+            "symbol": str(sym or ""),
+            "bias": int(bias_all),
+            "strength": float(strength_all),
+            "score_long": float(score_long),
+            "score_short": float(score_short),
+            "summary": str(summary)[:320],
+            "rows": rows,
+            "timeframes": tfs,
+        }
+        try:
+            with _PATTERN_MTF_LOCK:
+                _PATTERN_MTF_CACHE[cache_key] = {"ts": now_ts, "data": dict(out)}
+                if len(_PATTERN_MTF_CACHE) > 3000:
+                    items = sorted(_PATTERN_MTF_CACHE.items(), key=lambda kv: float((kv[1] or {}).get("ts", 0) or 0))
+                    for k0, _ in items[:600]:
+                        _PATTERN_MTF_CACHE.pop(k0, None)
+        except Exception:
+            pass
+        return out
+    except Exception:
+        return out
+
+
+def merge_pattern_bias(base_bias: int, base_strength: float, mtf_bias: int, mtf_strength: float, merge_weight: float = 0.6) -> Tuple[int, float]:
+    try:
+        b0 = int(base_bias or 0)
+    except Exception:
+        b0 = 0
+    try:
+        s0 = float(base_strength or 0.0)
+    except Exception:
+        s0 = 0.0
+    try:
+        b1 = int(mtf_bias or 0)
+    except Exception:
+        b1 = 0
+    try:
+        s1 = float(mtf_strength or 0.0)
+    except Exception:
+        s1 = 0.0
+    w = float(clamp(float(merge_weight), 0.0, 1.0))
+    if b1 == 0:
+        return b0, float(clamp(s0, 0.0, 1.0))
+    if b0 == 0:
+        return b1, float(clamp(s1, 0.0, 1.0))
+    if b0 == b1:
+        s = float(clamp((s0 * (1.0 - w)) + (s1 * w) + 0.10, 0.0, 1.0))
+        return b0, s
+    score0 = float(s0 * (1.0 - w))
+    score1 = float(s1 * w)
+    if score1 > score0:
+        return b1, float(clamp(score1, 0.0, 1.0))
+    return b0, float(clamp(score0, 0.0, 1.0))
 
 
 def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Optional[pd.Series]]:
@@ -7816,6 +8062,7 @@ def ai_decide_trade(
             "bullish": list(status.get("_pattern_bullish", []) or []),
             "bearish": list(status.get("_pattern_bearish", []) or []),
         },
+        "chart_patterns_mtf": status.get("_pattern_mtf", {}) if isinstance(status.get("_pattern_mtf", {}), dict) else {},
         "ml_signals": status.get("_ml_signals", {}) if isinstance(status.get("_ml_signals", {}), dict) else {},
         "sr_context": sr_context or {},
         "chart_style_hint": str(chart_style_hint or ""),
@@ -7912,6 +8159,8 @@ def ai_decide_trade(
 				3) SQZ(스퀴즈 모멘텀) 신호를 진입 판단의 80% 이상으로 반영해라. (모멘텀 방향/세기 우선)
 				4) chart_patterns(M/W, 쌍봉/쌍바닥, 삼중천정/삼중바닥, 삼각수렴, 박스, 쐐기, 헤드앤숄더)을 반드시 참고해라.
 				   - pattern bias와 반대 방향이면 보수적으로 hold를 우선해라.
+				4-1) chart_patterns_mtf는 1m/3m/5m/15m/30m/1h/2h/4h 종합 패턴이다.
+				   - 단기 패턴과 MTF 패턴이 같은 방향이면 신뢰도를 높이고, 반대면 보수적으로 접근해라.
 				5) ml_signals(주력 지표 수렴: Lorentzian/KNN/Logistic/SQZ/RSI/패턴)을 반드시 따른다.
 				   - ml_signals.dir이 "buy"면 decision은 buy만 가능(반대 방향 금지)
 				   - ml_signals.dir이 "sell"면 decision은 sell만 가능(반대 방향 금지)
@@ -8501,7 +8750,7 @@ _TG_SEND_LAST_ERR_KST = ""
 
 def tg_enqueue(method: str, data: Dict[str, Any], *, priority: str = "normal") -> None:
     """
-    method: "sendMessage" | "answerCallbackQuery" | ...
+    method: "sendMessage" | "sendPhoto" | "answerCallbackQuery" | ...
     priority: "high"(admin/중요) | "normal"
     """
     if not tg_token:
@@ -8558,7 +8807,17 @@ def telegram_send_worker_thread():
 
             url = f"https://api.telegram.org/bot{tg_token}/{method}"
             # send worker는 너무 오래 붙잡지 않게 timeout을 조금 더 짧게
-            _tg_post(url, data, timeout_sec=min(float(HTTP_TIMEOUT_SEC), 10.0))
+            if method == "sendPhoto":
+                file_path = str(data.pop("__file_path", "") or "").strip()
+                timeout_sec = min(float(HTTP_TIMEOUT_SEC), 12.0)
+                timeout = (min(4.0, max(1.0, timeout_sec * 0.5)), max(2.0, timeout_sec))
+                if (not file_path) or (not os.path.exists(file_path)):
+                    raise RuntimeError("sendPhoto 파일 없음")
+                with open(file_path, "rb") as fp:
+                    resp = requests.post(url, data=data, files={"photo": fp}, timeout=timeout)
+                    resp.raise_for_status()
+            else:
+                _tg_post(url, data, timeout_sec=min(float(HTTP_TIMEOUT_SEC), 10.0))
             backoff = 0.5
         except Exception as e:
             # 재시도는 제한적으로만(무한루프/스팸 방지)
@@ -8666,6 +8925,32 @@ def tg_send(text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = 
             tg_enqueue("sendMessage", data, priority=pri)
         except Exception:
             pass
+
+
+def tg_send_photo(photo_path: str, caption: str = "", target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False):
+    if not tg_token:
+        return
+    path = str(photo_path or "").strip()
+    if (not path) or (not os.path.exists(path)):
+        return
+    cfg = cfg or load_settings()
+    ids = _tg_chat_id_by_target(target, cfg)
+    pri = "high" if str(target or "").lower().strip() == "admin" else "normal"
+    cap = str(caption or "").strip()
+    if len(cap) > 1000:
+        cap = cap[:1000]
+    for cid in ids:
+        if not cid:
+            continue
+        try:
+            data: Dict[str, Any] = {"chat_id": cid, "__file_path": path}
+            if cap:
+                data["caption"] = cap
+            if bool(silent):
+                data["disable_notification"] = True
+            tg_enqueue("sendPhoto", data, priority=pri)
+        except Exception:
+            continue
 
 
 def tg_send_menu(cfg: Optional[Dict[str, Any]] = None):
@@ -9451,6 +9736,240 @@ def _rsi_state_ko(rsi: Optional[float], cfg: Dict[str, Any]) -> str:
     if v >= rsi_sell:
         return "과매수"
     return "중립"
+
+
+def _cleanup_event_images(max_files: int = 700, keep_hours: int = 48) -> None:
+    try:
+        if not os.path.isdir(EVENT_IMAGE_DIR):
+            return
+        files = [os.path.join(EVENT_IMAGE_DIR, f) for f in os.listdir(EVENT_IMAGE_DIR) if f.lower().endswith(".png")]
+        if not files:
+            return
+        now_ts = time.time()
+        old_sec = max(1, int(keep_hours)) * 3600
+        for p in files:
+            try:
+                if (now_ts - os.path.getmtime(p)) > old_sec:
+                    os.remove(p)
+            except Exception:
+                continue
+        files = [os.path.join(EVENT_IMAGE_DIR, f) for f in os.listdir(EVENT_IMAGE_DIR) if f.lower().endswith(".png")]
+        if len(files) <= int(max_files):
+            return
+        files.sort(key=lambda p: os.path.getmtime(p))
+        for p in files[: max(0, len(files) - int(max_files))]:
+            try:
+                os.remove(p)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _draw_candles_simple(ax, df: pd.DataFrame) -> None:
+    if plt is None or mdates is None or Rectangle is None:
+        return
+    if df is None or df.empty:
+        return
+    d = df.copy()
+    if "time" not in d.columns:
+        return
+    try:
+        d["time"] = pd.to_datetime(d["time"])
+    except Exception:
+        return
+    try:
+        d["open"] = pd.to_numeric(d["open"], errors="coerce")
+        d["high"] = pd.to_numeric(d["high"], errors="coerce")
+        d["low"] = pd.to_numeric(d["low"], errors="coerce")
+        d["close"] = pd.to_numeric(d["close"], errors="coerce")
+    except Exception:
+        return
+    d = d.dropna(subset=["time", "open", "high", "low", "close"])
+    if d.empty:
+        return
+    x = mdates.date2num(d["time"].dt.to_pydatetime())
+    if len(x) <= 1:
+        width = 0.00045
+    else:
+        dx = float(np.median(np.diff(x)))
+        width = float(max(0.0002, dx * 0.65))
+    up = "#00d084"
+    dn = "#ff4d4f"
+    for i in range(len(d)):
+        xx = x[i]
+        oo = float(d["open"].iloc[i])
+        hh = float(d["high"].iloc[i])
+        ll = float(d["low"].iloc[i])
+        cc = float(d["close"].iloc[i])
+        color = up if cc >= oo else dn
+        ax.vlines(xx, ll, hh, color=color, linewidth=0.8, alpha=0.95)
+        y0 = min(oo, cc)
+        h0 = max(abs(cc - oo), 1e-9)
+        rect = Rectangle((xx - width / 2.0, y0), width, h0, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.95)
+        ax.add_patch(rect)
+    ax.xaxis_date()
+    ax.grid(True, color="#2d3238", linestyle="--", linewidth=0.5, alpha=0.35)
+
+
+def build_trade_event_image(
+    ex,
+    sym: str,
+    cfg: Dict[str, Any],
+    *,
+    event_type: str,
+    side: str,
+    style: str,
+    entry_price: Optional[float] = None,
+    exit_price: Optional[float] = None,
+    sl_price: Optional[float] = None,
+    tp_price: Optional[float] = None,
+    roi_pct: Optional[float] = None,
+    pnl_usdt: Optional[float] = None,
+    remain_free: Optional[float] = None,
+    remain_total: Optional[float] = None,
+    one_line: str = "",
+    used_indicators: Optional[List[str]] = None,
+    pattern_hint: str = "",
+    mtf_pattern: Optional[Dict[str, Any]] = None,
+    trade_id: str = "",
+) -> Optional[str]:
+    if plt is None or mdates is None or Rectangle is None:
+        return None
+    try:
+        tf = str(cfg.get("timeframe", "5m") or "5m")
+        bars = int(cfg.get("tg_image_chart_bars", 140) or 140)
+        bars = int(clamp(bars, 80, 500))
+        ohlcv = safe_fetch_ohlcv(ex, sym, tf, limit=max(120, bars))
+        if not ohlcv or len(ohlcv) < 50:
+            return None
+        df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+        d = df.tail(bars).copy()
+        if d.empty:
+            return None
+
+        fig, ax = plt.subplots(figsize=(12.8, 7.2), dpi=120)
+        fig.patch.set_facecolor("#0e1117")
+        ax.set_facecolor("#11161c")
+        _draw_candles_simple(ax, d)
+
+        now_px = float(d["close"].iloc[-1])
+        ax.axhline(float(now_px), color="#a0aec0", linewidth=1.0, alpha=0.35, linestyle=":")
+        if entry_price is not None and math.isfinite(float(entry_price)):
+            ax.axhline(float(entry_price), color="#00bcd4", linewidth=1.2, linestyle="-", alpha=0.95)
+        if exit_price is not None and math.isfinite(float(exit_price)):
+            ax.axhline(float(exit_price), color="#ffd166", linewidth=1.2, linestyle="-", alpha=0.95)
+        if sl_price is not None and math.isfinite(float(sl_price)):
+            ax.axhline(float(sl_price), color="#ff4d4f", linewidth=1.2, linestyle="--", alpha=0.95)
+        if tp_price is not None and math.isfinite(float(tp_price)):
+            ax.axhline(float(tp_price), color="#00d084", linewidth=1.2, linestyle="--", alpha=0.95)
+
+        try:
+            sr_params = _sr_params_for_style(str(style), cfg)
+            sr_tf = str(sr_params.get("tf", cfg.get("sr_timeframe", "15m")) or "15m")
+            sr_lb = int(sr_params.get("lookback", cfg.get("sr_lookback", 220)) or 220)
+            sr_po = int(sr_params.get("pivot_order", cfg.get("sr_pivot_order", 6)) or 6)
+            sr_cache = int(cfg.get("sr_levels_cache_sec", 60) or 60)
+            sr_levels = get_sr_levels_cached(ex, sym, sr_tf, pivot_order=sr_po, cache_sec=sr_cache, limit=sr_lb)
+            supports = [float(x) for x in (sr_levels.get("supports") or []) if math.isfinite(float(x))]
+            resistances = [float(x) for x in (sr_levels.get("resistances") or []) if math.isfinite(float(x))]
+            n_sr = int(cfg.get("tg_image_sr_lines", 3) or 3)
+            n_sr = int(clamp(n_sr, 1, 6))
+            sup_near = sorted([x for x in supports if x <= now_px], reverse=True)[:n_sr]
+            res_near = sorted([x for x in resistances if x >= now_px])[:n_sr]
+            for lv in sup_near:
+                ax.axhline(float(lv), color="#64b5f6", linewidth=0.8, linestyle=":", alpha=0.55)
+            for lv in res_near:
+                ax.axhline(float(lv), color="#ff8a65", linewidth=0.8, linestyle=":", alpha=0.55)
+        except Exception:
+            pass
+
+        try:
+            vp_n = int(cfg.get("tg_image_volume_nodes", 4) or 4)
+            vp_n = int(clamp(vp_n, 0, 8))
+            if vp_n > 0:
+                vp_nodes = volume_profile_nodes(d, bins=60, top_n=vp_n)
+                for lv in (vp_nodes or [])[:vp_n]:
+                    if math.isfinite(float(lv)):
+                        ax.axhline(float(lv), color="#b388ff", linewidth=0.7, linestyle="-.", alpha=0.40)
+        except Exception:
+            pass
+
+        sym_s = str(sym or "")
+        side_s = "롱" if str(side).lower() in ["buy", "long"] else "숏"
+        ttl = f"{event_type} | {sym_s} | {style} {side_s} | TF {tf}"
+        ax.set_title(ttl, color="white", fontsize=11, pad=10)
+        ax.tick_params(colors="#cfd8dc", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#263238")
+            spine.set_linewidth(0.8)
+
+        ind_txt = ", ".join([str(x) for x in (used_indicators or []) if str(x).strip()])[:120]
+        pat_txt = str(pattern_hint or "").strip()[:140]
+        mtf_txt = ""
+        try:
+            if isinstance(mtf_pattern, dict) and bool(mtf_pattern):
+                mtf_txt = str(mtf_pattern.get("summary", "") or "").strip()
+        except Exception:
+            mtf_txt = ""
+        one = str(one_line or "").strip().replace("\n", " ")
+        if len(one) > 180:
+            one = one[:180] + "…"
+        info_lines = []
+        if entry_price is not None and math.isfinite(float(entry_price)):
+            info_lines.append(f"진입가 {float(entry_price):.6g}")
+        if tp_price is not None and math.isfinite(float(tp_price)):
+            info_lines.append(f"익절가 {float(tp_price):.6g}")
+        if sl_price is not None and math.isfinite(float(sl_price)):
+            info_lines.append(f"손절가 {float(sl_price):.6g}")
+        if roi_pct is not None and math.isfinite(float(roi_pct)):
+            info_lines.append(f"결과 ROI {float(roi_pct):+.2f}%")
+        if pnl_usdt is not None and math.isfinite(float(pnl_usdt)):
+            info_lines.append(f"손익 {float(pnl_usdt):+.2f} USDT")
+        if remain_free is not None and math.isfinite(float(remain_free)):
+            if remain_total is not None and math.isfinite(float(remain_total)):
+                info_lines.append(f"잔액(가용/총) {float(remain_free):.2f}/{float(remain_total):.2f}")
+            else:
+                info_lines.append(f"잔액(가용) {float(remain_free):.2f}")
+        if ind_txt:
+            info_lines.append(f"지표: {ind_txt}")
+        if pat_txt:
+            info_lines.append(f"패턴(단기): {pat_txt}")
+        if mtf_txt:
+            info_lines.append(f"패턴(MTF): {mtf_txt[:180]}")
+        if one:
+            info_lines.append(f"근거: {one}")
+        box_text = "\n".join(info_lines[:10])
+        if box_text:
+            ax.text(
+                0.01,
+                0.99,
+                box_text,
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=8.2,
+                color="#e5e7eb",
+                bbox={"boxstyle": "round,pad=0.4", "facecolor": "#0b1220", "edgecolor": "#334155", "alpha": 0.82},
+            )
+
+        ts = now_kst().strftime("%Y%m%d_%H%M%S")
+        sid = re.sub(r"[^A-Za-z0-9]+", "_", sym_s)[:40].strip("_") or "SYM"
+        tid = re.sub(r"[^A-Za-z0-9]+", "", str(trade_id or ""))[:16]
+        fname = f"{ts}_{sid}_{str(event_type).lower()}_{tid or uuid.uuid4().hex[:8]}.png"
+        out_path = os.path.join(EVENT_IMAGE_DIR, fname)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=130, bbox_inches="tight")
+        plt.close(fig)
+        _cleanup_event_images()
+        return out_path
+    except Exception:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return None
 
 
 def chart_snapshot_for_reason(ex, sym: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -12385,6 +12904,44 @@ def telegram_thread(ex):
                                         tg_send(msg, target="admin", cfg=cfg, silent=False)
                                 except Exception:
                                     pass
+                                try:
+                                    if bool(cfg.get("tg_send_trade_images", True)) and bool(cfg.get("tg_send_exit_image", True)):
+                                        img_path = build_trade_event_image(
+                                            ex,
+                                            sym,
+                                            cfg,
+                                            event_type=("PROTECT" if is_protect else "SL"),
+                                            side=str(side),
+                                            style=str(style_now),
+                                            entry_price=float(entry),
+                                            exit_price=float(exit_px),
+                                            sl_price=(float(tgt.get("sl_price")) if tgt.get("sl_price") is not None else None),
+                                            tp_price=(float(tgt.get("tp_price")) if tgt.get("tp_price") is not None else None),
+                                            roi_pct=float(roi),
+                                            pnl_usdt=float(pnl_usdt_snapshot),
+                                            remain_free=float(free_after),
+                                            remain_total=float(total_after),
+                                            one_line=str(one),
+                                            used_indicators=[],
+                                            pattern_hint=str(_fmt_indicator_line_for_reason(entry_snap, snap_now)),
+                                            mtf_pattern={},
+                                            trade_id=str(trade_id or ""),
+                                        )
+                                        if img_path:
+                                            cap = (
+                                                f"📷 청산 차트\n"
+                                                f"- {sym} | {style_now} | {_tg_dir_easy(side)}\n"
+                                                f"- 결과: {_tg_fmt_pct(float(roi))} ({_tg_fmt_usdt(float(pnl_usdt_snapshot))} USDT)"
+                                            )
+                                            tg_send_photo(img_path, caption=cap, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                            if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
+                                                tg_send_photo(img_path, caption=cap, target="admin", cfg=cfg, silent=False)
+                                            if trade_id:
+                                                d0 = load_trade_detail(str(trade_id)) or {}
+                                                d0["exit_chart_image"] = str(img_path)
+                                                save_trade_detail(str(trade_id), d0)
+                                except Exception:
+                                    pass
 
                                 # ✅ 청산 후 재진입 쿨다운 + 직전 청산 기록(과매매/수수료/AI호출 낭비 방지)
                                 try:
@@ -12719,6 +13276,44 @@ def telegram_thread(ex):
                                         tg_send(msg, target="admin", cfg=cfg, silent=False)
                                 except Exception:
                                     pass
+                                try:
+                                    if bool(cfg.get("tg_send_trade_images", True)) and bool(cfg.get("tg_send_exit_image", True)):
+                                        img_path = build_trade_event_image(
+                                            ex,
+                                            sym,
+                                            cfg,
+                                            event_type=("TAKE_FORCE" if bool(hard_take) else "TP"),
+                                            side=str(side),
+                                            style=str(style_now),
+                                            entry_price=float(entry),
+                                            exit_price=float(exit_px),
+                                            sl_price=(float(tgt.get("sl_price")) if tgt.get("sl_price") is not None else None),
+                                            tp_price=(float(tgt.get("tp_price")) if tgt.get("tp_price") is not None else None),
+                                            roi_pct=float(roi),
+                                            pnl_usdt=float(pnl_usdt_snapshot),
+                                            remain_free=float(free_after),
+                                            remain_total=float(total_after),
+                                            one_line=str(one),
+                                            used_indicators=[],
+                                            pattern_hint=str(_fmt_indicator_line_for_reason(entry_snap, snap_now)),
+                                            mtf_pattern={},
+                                            trade_id=str(trade_id or ""),
+                                        )
+                                        if img_path:
+                                            cap = (
+                                                f"📷 청산 차트\n"
+                                                f"- {sym} | {style_now} | {_tg_dir_easy(side)}\n"
+                                                f"- 결과: {_tg_fmt_pct(float(roi))} ({_tg_fmt_usdt(float(pnl_usdt_snapshot))} USDT)"
+                                            )
+                                            tg_send_photo(img_path, caption=cap, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                            if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
+                                                tg_send_photo(img_path, caption=cap, target="admin", cfg=cfg, silent=False)
+                                            if trade_id:
+                                                d0 = load_trade_detail(str(trade_id)) or {}
+                                                d0["exit_chart_image"] = str(img_path)
+                                                save_trade_detail(str(trade_id), d0)
+                                except Exception:
+                                    pass
 
                                 active_targets.pop(sym, None)
                                 rt.setdefault("trades", {}).pop(sym, None)
@@ -12984,9 +13579,50 @@ def telegram_thread(ex):
                                 "pattern": stt.get("패턴", ""),
                                 "pattern_bias": stt.get("_pattern_bias", 0),
                                 "pattern_strength": stt.get("_pattern_strength", 0.0),
+                                "pattern_mtf_summary": "",
                                 "pullback_candidate": bool(stt.get("_pullback_candidate", False)),
                             }
                         )
+
+                        # ✅ 멀티 타임프레임 패턴(1m/3m/5m/15m/30m/1h/2h/4h) 반영
+                        try:
+                            pat_mtf = get_chart_patterns_mtf_cached(ex, sym, cfg)
+                        except Exception:
+                            pat_mtf = {}
+                        try:
+                            if isinstance(pat_mtf, dict) and bool(pat_mtf.get("enabled", False)):
+                                stt["_pattern_mtf"] = dict(pat_mtf)
+                                cs["pattern_mtf_summary"] = str(pat_mtf.get("summary", "") or "")
+                                cs["pattern_mtf_bias"] = int(pat_mtf.get("bias", 0) or 0)
+                                cs["pattern_mtf_strength"] = float(pat_mtf.get("strength", 0.0) or 0.0)
+                                merge_w = float(cfg.get("pattern_mtf_merge_weight", 0.60) or 0.60)
+                                mb, ms = merge_pattern_bias(
+                                    int(stt.get("_pattern_bias", 0) or 0),
+                                    float(stt.get("_pattern_strength", 0.0) or 0.0),
+                                    int(pat_mtf.get("bias", 0) or 0),
+                                    float(pat_mtf.get("strength", 0.0) or 0.0),
+                                    merge_weight=merge_w,
+                                )
+                                stt["_pattern_bias"] = int(mb)
+                                stt["_pattern_strength"] = float(ms)
+                                stt["패턴"] = str((stt.get("패턴", "") or "패턴 없음")).strip()
+                                mtf_short = str(pat_mtf.get("summary", "") or "")
+                                if mtf_short:
+                                    stt["패턴"] = f"{stt['패턴']} | {mtf_short[:120]}"
+                                cs["pattern"] = stt.get("패턴", "")
+                                cs["pattern_bias"] = int(stt.get("_pattern_bias", 0) or 0)
+                                cs["pattern_strength"] = float(stt.get("_pattern_strength", 0.0) or 0.0)
+                                mon_add_scan(
+                                    mon,
+                                    stage="pattern_mtf",
+                                    symbol=sym,
+                                    tf="1m~4h",
+                                    signal=str(stt.get("_pattern_bias", 0)),
+                                    score=float(stt.get("_pattern_strength", 0.0) or 0.0),
+                                    message=str(pat_mtf.get("summary", "") or "")[:120],
+                                )
+                        except Exception:
+                            pass
 
                         # ✅ S/R 계산(스캔 과정 표시용) - 캐시 사용
                         sr_ctx: Optional[Dict[str, Any]] = None
@@ -14171,6 +14807,32 @@ def telegram_thread(ex):
                                     except Exception:
                                         pass
 
+                                # ✅ 목표 ROI를 SR/매물대 기준 가격에서 역산해 동기화
+                                # - exit_ai_targets_only=True일 때도 코인/구간별 목표가가 달라지도록 함
+                                try:
+                                    if bool(cfg.get("exit_ai_targets_sync_from_sr", True)) and (sl_price is not None) and (tp_price is not None):
+                                        px0 = float(px)
+                                        lev0 = float(max(1, int(lev)))
+                                        if px0 > 0 and lev0 > 0:
+                                            if str(decision) == "buy":
+                                                sl_price_pct_sync = max(0.0, ((px0 - float(sl_price)) / px0) * 100.0)
+                                                tp_price_pct_sync = max(0.0, ((float(tp_price) - px0) / px0) * 100.0)
+                                            else:
+                                                sl_price_pct_sync = max(0.0, ((float(sl_price) - px0) / px0) * 100.0)
+                                                tp_price_pct_sync = max(0.0, ((px0 - float(tp_price)) / px0) * 100.0)
+                                            if sl_price_pct_sync > 0 and tp_price_pct_sync > 0:
+                                                sl_price_pct = float(sl_price_pct_sync)
+                                                tp_price_pct = float(tp_price_pct_sync)
+                                                slp = float(sl_price_pct * lev0)
+                                                tpp = float(tp_price_pct * lev0)
+                                                ai2["sl_pct"] = float(slp)
+                                                ai2["tp_pct"] = float(tpp)
+                                                ai2["sl_price_pct"] = float(sl_price_pct)
+                                                ai2["tp_price_pct"] = float(tp_price_pct)
+                                                ai2["rr"] = float(float(tpp) / max(abs(float(slp)), 0.01))
+                                except Exception:
+                                    pass
+
                                 # 목표 저장
                                 # ✅ 진입 시점 차트 스냅샷(손절/익절/본절/추매/순환매 근거용)
                                 entry_rsi = None
@@ -14446,6 +15108,50 @@ def telegram_thread(ex):
                                     try:
                                         if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
                                             tg_send(msg, target="admin", cfg=cfg, silent=False)
+                                    except Exception:
+                                        pass
+                                    # ✅ 진입 근거 이미지(캔들 + SR/매물대 + 지표/패턴 요약)
+                                    try:
+                                        if bool(cfg.get("tg_send_trade_images", True)) and bool(cfg.get("tg_send_entry_image", True)):
+                                            aft = active_targets.get(sym, {}) if isinstance(active_targets.get(sym, {}), dict) else {}
+                                            afree = _as_float(aft.get("bal_entry_after_free", None), float("nan"))
+                                            atotal = _as_float(aft.get("bal_entry_after_total", None), float("nan"))
+                                            if not math.isfinite(float(afree)):
+                                                afree = None
+                                            if not math.isfinite(float(atotal)):
+                                                atotal = None
+                                            one_img = str(locals().get("one_line0", "") or ai2.get("reason_easy", "") or "").strip()
+                                            img_path = build_trade_event_image(
+                                                ex,
+                                                sym,
+                                                cfg,
+                                                event_type="ENTRY",
+                                                side=str(decision),
+                                                style=str(style),
+                                                entry_price=float(px),
+                                                sl_price=(float(sl_price) if sl_price is not None else None),
+                                                tp_price=(float(tp_price) if tp_price is not None else None),
+                                                remain_free=(float(afree) if afree is not None else None),
+                                                remain_total=(float(atotal) if atotal is not None else None),
+                                                one_line=one_img,
+                                                used_indicators=list(ai2.get("used_indicators", []) or []),
+                                                pattern_hint=str(stt.get("패턴", "") or ""),
+                                                mtf_pattern=(stt.get("_pattern_mtf", {}) if isinstance(stt.get("_pattern_mtf", {}), dict) else {}),
+                                                trade_id=str(trade_id),
+                                            )
+                                            if img_path:
+                                                cap = (
+                                                    f"📷 진입 차트\n"
+                                                    f"- {sym} | {style} | {_tg_dir_easy(decision)}\n"
+                                                    f"- 목표: 익절 {_tg_fmt_target_roi(tpp, sign='+', min_visible=0.05)} / 손절 {_tg_fmt_target_roi(slp, sign='-', min_visible=0.05)}"
+                                                )
+                                                tg_send_photo(img_path, caption=cap, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                                if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
+                                                    tg_send_photo(img_path, caption=cap, target="admin", cfg=cfg, silent=False)
+                                                if trade_id:
+                                                    d0 = load_trade_detail(str(trade_id)) or {}
+                                                    d0["entry_chart_image"] = str(img_path)
+                                                    save_trade_detail(str(trade_id), d0)
                                     except Exception:
                                         pass
 

@@ -17,6 +17,7 @@ feedparser>=6.0.11
 cachetools>=5.3.3
 deep-translator>=1.11.4
 websockets>=12.0
+matplotlib>=3.8.0
 
 # Google Sheets
 gspread>=6.0.0
