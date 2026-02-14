@@ -570,7 +570,7 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 9,
+        "settings_schema_version": 10,
         "openai_api_key": "",
         # ✅ 사용자 기본값 프리셋(요청): 하이리스크/하이리턴 + 자동매매 ON
         "auto_trade": True,
@@ -667,6 +667,10 @@ def default_settings() -> Dict[str, Any]:
 
         # 방어/전략
         "use_trailing_stop": True,
+        # ✅ 청산 정책: AI가 정한 TP/SL만 사용
+        # - ON이면 SR/트레일링/본절보호/강제익절/손절확인 등 다른 청산 로직을 모두 무시하고
+        #   "AI 목표 ROI" (tp/sl) 에 닿을 때만 청산한다.
+        "exit_ai_targets_only": True,
         # ✅ (핵심) 강제 청산 정책: "수익을 손실로 마감"하지 않기
         # - 진입 판단(AI)은 유지하되, 청산(Exit)만큼은 아래 규칙을 우선 적용한다.
         # - ON이면 기존 TP/SL/SR/부분익절/트레일링(기존)보다 아래 정책이 우선한다.
@@ -1157,6 +1161,14 @@ def load_settings() -> Dict[str, Any]:
                     changed = True
             except Exception:
                 pass
+        # v10: 청산은 AI 목표만 사용(요청)
+        if saved_ver < 10:
+            try:
+                if bool(cfg.get("exit_ai_targets_only", False)) is False:
+                    cfg["exit_ai_targets_only"] = True
+                    changed = True
+            except Exception:
+                pass
         cfg["settings_schema_version"] = base_ver
         if changed:
             try:
@@ -1211,8 +1223,16 @@ def load_runtime() -> Dict[str, Any]:
     if not isinstance(rt, dict):
         rt = default_runtime()
     if rt.get("date") != today_kst_str():
-        # 날짜 바뀌면 일일 상태 초기화(기존 유지)
+        # 날짜 바뀌면 일일 상태 초기화
+        # 단, 오버나잇 포지션의 목표정보(open_targets)는 보존해 -2% 같은 fallback 청산을 방지
+        prev_rt = dict(rt) if isinstance(rt, dict) else {}
         rt = default_runtime()
+        try:
+            ot = prev_rt.get("open_targets", {})
+            if isinstance(ot, dict):
+                rt["open_targets"] = ot
+        except Exception:
+            pass
     base = default_runtime()
     for k, v in base.items():
         if k not in rt:
@@ -10422,6 +10442,7 @@ def telegram_thread(ex):
                         p = pos_by_sym.get(sym)
                         if not p:
                             continue
+                        ai_exit_only = bool(cfg.get("exit_ai_targets_only", False))
                         side = position_side_normalize(p)
                         contracts = float(p.get("contracts") or 0)
                         entry = float(p.get("entryPrice") or 0)
@@ -10436,8 +10457,8 @@ def telegram_thread(ex):
                         tgt = active_targets.get(
                             sym,
                             {
-                                "sl": 2.0,
-                                "tp": 5.0,
+                                "sl": (None if ai_exit_only else 2.0),
+                                "tp": (None if ai_exit_only else 5.0),
                                 "entry_usdt": 0.0,
                                 "entry_pct": 0.0,
                                 "lev": p.get("leverage", "?"),
@@ -10458,9 +10479,11 @@ def telegram_thread(ex):
                         try:
                             if not isinstance(tgt, dict):
                                 tgt = {}
+                            default_sl = (None if ai_exit_only else 2.0)
+                            default_tp = (None if ai_exit_only else 5.0)
                             base_tgt = {
-                                "sl": 2.0,
-                                "tp": 5.0,
+                                "sl": default_sl,
+                                "tp": default_tp,
                                 "entry_usdt": 0.0,
                                 "entry_pct": 0.0,
                                 "entry_price": float(entry) if entry else 0.0,
@@ -10493,11 +10516,11 @@ def telegram_thread(ex):
                         except Exception:
                             pass
 
-                        forced_exit = bool(cfg.get("exit_trailing_protect_enable", False))
+                        forced_exit = bool(cfg.get("exit_trailing_protect_enable", False)) and (not ai_exit_only)
                         # ✅ 스타일 자동 전환(포지션 보유 중)
                         # - 강제 Exit(수익보존) 정책이 ON이면, 스타일 전환/목표(tp/sl) 보정을 멈추고 "진입 당시 값"을 고정한다.
                         #   (스윙↔스캘핑 반복 전환 + 목표 손익비가 계속 바뀌는 현상 방지)
-                        if not forced_exit:
+                        if (not forced_exit) and (not ai_exit_only):
                             tgt = _maybe_switch_style_for_open_position(ex, sym, side, tgt, cfg, mon)
                         style_now = str(tgt.get("style", "스캘핑"))
                         try:
@@ -10509,15 +10532,37 @@ def telegram_thread(ex):
                         rt.setdefault("open_targets", {})[sym] = tgt
                         save_runtime(rt)
 
-                        sl = float(tgt.get("sl", 2.0))
-                        tp = float(tgt.get("tp", 5.0))
+                        sl = float(abs(_as_float(tgt.get("sl", None), 0.0)))
+                        tp = float(abs(_as_float(tgt.get("tp", None), 0.0)))
+                        if not ai_exit_only:
+                            if (not math.isfinite(sl)) or sl <= 0:
+                                sl = 2.0
+                            if (not math.isfinite(tp)) or tp <= 0:
+                                tp = 5.0
                         trade_id = str(tgt.get("trade_id") or "")
+                        ai_targets_ready = bool(math.isfinite(sl) and math.isfinite(tp) and sl > 0 and tp > 0)
+                        if ai_exit_only and (not ai_targets_ready):
+                            try:
+                                now_ep = time.time()
+                                last_warn = float(tgt.get("ai_exit_missing_warn_epoch", 0) or 0.0)
+                                if (now_ep - last_warn) >= 120.0:
+                                    tgt["ai_exit_missing_warn_epoch"] = float(now_ep)
+                                    tgt["ai_exit_missing_warn_kst"] = now_kst_str()
+                                    mon_add_event(
+                                        mon,
+                                        "AI_EXIT_WAIT",
+                                        sym,
+                                        "AI 목표 TP/SL 없음: 청산 대기",
+                                        {"trade_id": trade_id, "code": CODE_VERSION},
+                                    )
+                            except Exception:
+                                pass
 
                         # ✅ 스윙은 "길게 가져가는" 매매:
                         # - 스윙인데 -2~-3% 같은 짧은 손절로 잘리는 문제를 줄이기 위해,
                         #   오픈 포지션에서도 하한(SL)과 최소 손익비(RR)를 강제 보정한다.
                         try:
-                            if (not forced_exit) and style_now == "스윙":
+                            if (not forced_exit) and (not ai_exit_only) and style_now == "스윙":
                                 changed_targets = False
                                 sl_min = float(cfg.get("swing_sl_roi_min", 12.0))
                                 if sl < sl_min:
@@ -10586,7 +10631,7 @@ def telegram_thread(ex):
                         # ✅ 스캘핑: 포지션 보유 중에도 "가격%" 가드레일을 유지해 TP/SL 과도 방지
                         # - (중요) 스캘핑인데 TP/SL이 커져 +50%가 넘어도 익절을 못 하는 문제를 줄임
                         try:
-                            if (not forced_exit) and style_now == "스캘핑":
+                            if (not forced_exit) and (not ai_exit_only) and style_now == "스캘핑":
                                 changed_targets = False
                                 try:
                                     lev0 = float(tgt.get("lev", lev_live) or lev_live or 1.0)
@@ -10680,7 +10725,7 @@ def telegram_thread(ex):
                             pass
 
                         # 트레일링(기존): 강제 수익보존 Exit 정책이 ON이면 사용하지 않음(Exit는 강제 정책이 우선)
-                        if (not forced_exit) and cfg.get("use_trailing_stop", True):
+                        if (not forced_exit) and (not ai_exit_only) and cfg.get("use_trailing_stop", True):
                             if roi >= (tp * 0.5):
                                 lev_now = float(tgt.get("lev", p.get("leverage", 1))) or 1.0
                                 base_price_sl = float(tgt.get("sl_price_pct") or max(0.25, float(sl) / max(lev_now, 1)))
@@ -10696,7 +10741,7 @@ def telegram_thread(ex):
                         # ✅ 본전 보호(브레이크이븐): 수익이 어느 정도 나면 SL을 진입가 근처로 끌어올림(가격 기준)
                         # - 손절이 아니라 "수익 보호" 목적(연속 손절 카운트에도 포함하지 않게 별도 처리)
                         try:
-                            if (not forced_exit) and bool(cfg.get("trail_breakeven_enable", True)):
+                            if (not forced_exit) and (not ai_exit_only) and bool(cfg.get("trail_breakeven_enable", True)):
                                 prev_sl_src = ""
                                 try:
                                     prev_sl_src = str(tgt.get("sl_price_source", "") or "").strip().upper()
@@ -10759,7 +10804,7 @@ def telegram_thread(ex):
                                                         pass
                         except Exception:
                             pass
-                        if (not forced_exit) and cfg.get("use_sr_stop", True):
+                        if (not forced_exit) and (not ai_exit_only) and cfg.get("use_sr_stop", True):
                             if sl_price is not None:
                                 if side == "long" and cur_px <= float(sl_price):
                                     hit_sl_by_price = True
@@ -10772,7 +10817,7 @@ def telegram_thread(ex):
                                     hit_tp_by_price = True
 
                         # ✅ 스윙: 부분익절(순환매도 옵션) - 요구사항 반영
-                        if (not forced_exit) and style_now == "스윙" and cfg.get("swing_partial_tp_enable", True) and contracts > 0:
+                        if (not forced_exit) and (not ai_exit_only) and style_now == "스윙" and cfg.get("swing_partial_tp_enable", True) and contracts > 0:
                             trade_state = rt.setdefault("trades", {}).setdefault(sym, {"dca_count": 0, "partial_tp_done": [], "recycle_count": 0})
                             done = set(trade_state.get("partial_tp_done", []) or [])
                             # TP 기반 트리거
@@ -11535,7 +11580,7 @@ def telegram_thread(ex):
 
                         # 강제 정책의 전량 청산(추적손절) → do_take로 처리(익절 로그/메시지 흐름 재사용)
                         hard_take = bool(forced_exit and forced_trail_hit)
-                        if (not forced_exit) and (not hard_take):
+                        if (not forced_exit) and (not ai_exit_only) and (not hard_take):
                             try:
                                 if str(style_now) == "스캘핑" and bool(cfg.get("scalp_hard_take_enable", True)):
                                     ht = float(cfg.get("scalp_hard_take_roi_pct", 35.0))
@@ -11549,9 +11594,9 @@ def telegram_thread(ex):
                         # - 기존 설정 키(time_exit_*)는 호환을 위해 유지하지만, 강제청산은 실행하지 않는다.
 
                         # ✅ ROI 손절은 "확인 n회"로 한 번 더 생각(휩쏘 방지)
-                        roi_stop_hit = bool(float(roi) <= -abs(float(sl)))
+                        roi_stop_hit = bool(ai_targets_ready and (float(roi) <= -abs(float(sl))))
                         roi_stop_confirmed = roi_stop_hit
-                        if (not forced_exit) and roi_stop_hit and (not bool(hit_sl_by_price)) and bool(cfg.get("sl_confirm_enable", True)):
+                        if (not forced_exit) and (not ai_exit_only) and roi_stop_hit and (not bool(hit_sl_by_price)) and bool(cfg.get("sl_confirm_enable", True)):
                             try:
                                 n_need = max(1, int(cfg.get("sl_confirm_n", 2) or 2))
                             except Exception:
@@ -11582,8 +11627,14 @@ def telegram_thread(ex):
                                 except Exception:
                                     pass
 
-                        do_stop = bool(hit_sl_by_price) or bool(roi_stop_confirmed)
-                        do_take = hit_tp_by_price or hard_take or (roi >= tp)
+                        if ai_exit_only:
+                            do_stop = bool(roi_stop_hit)
+                            do_take = bool(ai_targets_ready and (float(roi) >= float(tp)))
+                            sl_from_ai = True
+                            tp_from_ai = True
+                        else:
+                            do_stop = bool(hit_sl_by_price) or bool(roi_stop_confirmed)
+                            do_take = hit_tp_by_price or hard_take or (roi >= tp)
 
                         # 손절
                         if do_stop:
@@ -12234,9 +12285,9 @@ def telegram_thread(ex):
                                 "tp": _as_float(tgt.get("tp", tp), 0.0),
                                 "sl": _as_float(tgt.get("sl", sl), 0.0),
                                 # ✅ 실제 청산은 '수익보존' 정책이 우선일 수 있어, 혼동 방지용으로 함께 저장
-                                "exit_policy": ("TRAIL_PROTECT" if bool(forced_exit) else "TARGET"),
-                                "exit_rule": (_tg_trailing_protect_policy_line(cfg) if bool(forced_exit) else ""),
-                                "exit_sl_roi": float(abs(float(sl))) if bool(forced_exit) else float(abs(float(_as_float(tgt.get("sl", sl), 0.0)))),
+                                "exit_policy": ("AI_TARGET_ONLY" if bool(ai_exit_only) else ("TRAIL_PROTECT" if bool(forced_exit) else "TARGET")),
+                                "exit_rule": ("AI TP/SL only" if bool(ai_exit_only) else (_tg_trailing_protect_policy_line(cfg) if bool(forced_exit) else "")),
+                                "exit_sl_roi": float(abs(float(_as_float(tgt.get("sl", sl), 0.0)))),
                                 "trade_id": trade_id,
                             }
                         )
@@ -12267,9 +12318,9 @@ def telegram_thread(ex):
                                         "style": style_now,
                                         "tp": tp,
                                         "sl": sl,
-                                        "exit_policy": ("TRAIL_PROTECT" if bool(cfg.get("exit_trailing_protect_enable", False)) else "TARGET"),
-                                        "exit_rule": (_tg_trailing_protect_policy_line(cfg) if bool(cfg.get("exit_trailing_protect_enable", False)) else ""),
-                                        "exit_sl_roi": float(abs(_as_float(cfg.get("exit_trailing_protect_sl_roi", 15.0), 15.0))) if bool(cfg.get("exit_trailing_protect_enable", False)) else float(abs(sl)),
+                                        "exit_policy": ("AI_TARGET_ONLY" if bool(cfg.get("exit_ai_targets_only", False)) else ("TRAIL_PROTECT" if bool(cfg.get("exit_trailing_protect_enable", False)) else "TARGET")),
+                                        "exit_rule": ("AI TP/SL only" if bool(cfg.get("exit_ai_targets_only", False)) else (_tg_trailing_protect_policy_line(cfg) if bool(cfg.get("exit_trailing_protect_enable", False)) else "")),
+                                        "exit_sl_roi": float(abs(sl)),
                                         "trade_id": trade_id,
                                     }
                                 )
@@ -14975,6 +15026,11 @@ with st.sidebar.expander("추가 방어(서킷브레이커/일일 손실 한도)
 
 st.sidebar.divider()
 config["use_trailing_stop"] = st.sidebar.checkbox("🚀 트레일링 스탑(수익보호)", value=bool(config.get("use_trailing_stop", True)))
+config["exit_ai_targets_only"] = st.sidebar.checkbox(
+    "🎯 청산은 AI 목표만 사용",
+    value=bool(config.get("exit_ai_targets_only", True)),
+    help="ON이면 익절/손절은 AI 목표 TP/SL에 닿을 때만 실행합니다. SR/본절/강제추적손절 등 다른 청산 규칙은 무시합니다.",
+)
 with st.sidebar.expander("손절 확인(휩쏘 방지)"):
     config["sl_confirm_enable"] = st.checkbox("ROI 손절은 확인 후 실행", value=bool(config.get("sl_confirm_enable", True)))
     c_slc1, c_slc2 = st.columns(2)
