@@ -592,7 +592,7 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 13,
+        "settings_schema_version": 14,
         "openai_api_key": "",
         # ✅ 사용자 기본값 프리셋(요청): 하이리스크/하이리턴 + 자동매매 ON
         "auto_trade": True,
@@ -857,7 +857,16 @@ def default_settings() -> Dict[str, Any]:
         # - 0이면 기존처럼 원진입 대비 %로 계산
         "dca_add_pct": 50.0,
         "dca_add_usdt": 0.0,
-        "use_switching": True, "switch_trigger": -12.0,  # (옵션만 유지: 기존 코드도 로직 미구현)
+        "use_switching": True,
+        "switch_trigger": -12.0,
+        "switch_entry_pct": 6.0,
+        "switch_cooldown_min": 15,
+        # ✅ 손절 직후 반대 스위칭(룰 기반)
+        # - 손절 직후 차트가 반대 방향으로 강하게 정렬되면 즉시 반대 포지션 진입
+        # - AI 호출 없이 점수 기반으로만 판단(비용 증가 최소화)
+        "switch_on_sl_enable": True,
+        "switch_on_sl_score_min": 4,   # 반대전환 점수 임계치
+        "switch_on_sl_min_adx": 18.0,  # ADX가 너무 약하면 점수 보수적으로
         "no_trade_weekend": False,
 
         # 연속손실 보호
@@ -1331,6 +1340,38 @@ def load_settings() -> Dict[str, Any]:
                 cfg["entry_fresh_signal_window_bars"] = 2
                 cfg["sqz_fire_window_bars"] = 2
                 changed = True
+            except Exception:
+                pass
+        # v14: 손절 직후 반대 스위칭(룰 기반) 기본값 추가
+        if saved_ver < 14:
+            try:
+                if "switch_entry_pct" not in saved:
+                    cfg["switch_entry_pct"] = 6.0
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "switch_cooldown_min" not in saved:
+                    cfg["switch_cooldown_min"] = 15
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "switch_on_sl_enable" not in saved:
+                    cfg["switch_on_sl_enable"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "switch_on_sl_score_min" not in saved:
+                    cfg["switch_on_sl_score_min"] = 4
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "switch_on_sl_min_adx" not in saved:
+                    cfg["switch_on_sl_min_adx"] = 18.0
+                    changed = True
             except Exception:
                 pass
         cfg["settings_schema_version"] = base_ver
@@ -11454,6 +11495,21 @@ def chart_snapshot_for_reason(ex, sym: str, cfg: Dict[str, Any]) -> Dict[str, An
         if not ohlcv or len(ohlcv) < 40:
             return out
         df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
+        try:
+            df["time"] = pd.to_datetime(df["time"], unit="ms")
+        except Exception:
+            pass
+        try:
+            df_i, st_i, last_i = calc_indicators(df.copy(), cfg)
+            if isinstance(st_i, dict):
+                tr0 = str(st_i.get("추세", "") or "").strip()
+                if tr0:
+                    out["trend_short"] = tr0
+                out["sqz_state"] = str(st_i.get("SQZ", "") or "")
+                out["sqz_bias"] = int(st_i.get("_sqz_bias", 0) or 0)
+                out["sqz_mom_pct"] = float(st_i.get("_sqz_mom_pct", 0.0) or 0.0)
+        except Exception:
+            pass
         close = df["close"].astype(float)
         if ta is None:
             return out
@@ -11653,6 +11709,110 @@ def be_recheck_should_hold(
 
     note = f"점수 {score:+d}/{int(hold_min)} | " + ", ".join(tags[:5]) if tags else f"점수 {score:+d}/{int(hold_min)}"
     return hold, note[:220]
+
+
+def _reverse_decision_from_side(side: str) -> str:
+    s0 = str(side or "").lower().strip()
+    return "buy" if s0 == "short" else "sell"
+
+
+def evaluate_sl_reverse_signal(
+    side: str,
+    now_snap: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Tuple[bool, int, str]:
+    """
+    손절 직후 반대 방향 스위칭 가능성(룰 기반, AI 호출 없음).
+    returns: (should_switch, score, note)
+    """
+    if not isinstance(now_snap, dict):
+        return False, 0, "차트 스냅샷 없음"
+
+    rev_dec = _reverse_decision_from_side(side)
+    rev_side = "long" if rev_dec == "buy" else "short"
+    trend_s = _trend_clean_for_reason(now_snap.get("trend_short", ""))
+    trend_l = _trend_clean_for_reason(now_snap.get("trend_long", ""))
+    macd = str(now_snap.get("macd_state", "") or "").strip()
+    rsi_state = str(now_snap.get("rsi_state", "") or "").strip()
+    sqz_bias = int(_as_int(now_snap.get("sqz_bias", 0), 0))
+    sqz_mom = float(_as_float(now_snap.get("sqz_mom_pct", 0.0), 0.0))
+    adx_v = float(_as_float(now_snap.get("adx", 0.0), 0.0))
+
+    score = 0
+    tags: List[str] = []
+
+    if _trend_align(trend_s, rev_side):
+        score += 2
+        tags.append("단기추세정방향")
+    else:
+        score -= 2
+        tags.append("단기추세역방향")
+
+    if _trend_align(trend_l, rev_side):
+        score += 1
+        tags.append("장기추세정방향")
+    else:
+        score -= 1
+        tags.append("장기추세역방향")
+
+    if rev_dec == "buy":
+        if macd == "골든":
+            score += 1
+            tags.append("MACD골든")
+        elif macd == "데드":
+            score -= 1
+            tags.append("MACD데드")
+        if rsi_state == "과매도":
+            score += 1
+            tags.append("RSI과매도")
+        elif rsi_state == "과매수":
+            score -= 1
+            tags.append("RSI과매수")
+        if sqz_bias == 1:
+            score += 2
+            tags.append(f"SQZ상승({sqz_mom:+.2f}%)")
+        elif sqz_bias == -1:
+            score -= 2
+            tags.append(f"SQZ하락({sqz_mom:+.2f}%)")
+    else:
+        if macd == "데드":
+            score += 1
+            tags.append("MACD데드")
+        elif macd == "골든":
+            score -= 1
+            tags.append("MACD골든")
+        if rsi_state == "과매수":
+            score += 1
+            tags.append("RSI과매수")
+        elif rsi_state == "과매도":
+            score -= 1
+            tags.append("RSI과매도")
+        if sqz_bias == -1:
+            score += 2
+            tags.append(f"SQZ하락({sqz_mom:+.2f}%)")
+        elif sqz_bias == 1:
+            score -= 2
+            tags.append(f"SQZ상승({sqz_mom:+.2f}%)")
+
+    try:
+        min_adx = float(cfg.get("switch_on_sl_min_adx", 18.0) or 18.0)
+    except Exception:
+        min_adx = 18.0
+    if adx_v >= min_adx:
+        if score > 0:
+            score += 1
+        tags.append(f"ADX{adx_v:.0f}")
+    else:
+        tags.append(f"ADX약({adx_v:.0f})")
+
+    try:
+        need = int(cfg.get("switch_on_sl_score_min", 4) or 4)
+    except Exception:
+        need = 4
+    need = max(1, min(10, need))
+    should = bool(score >= need)
+    note = f"반대전환 점수 {score:+d}/{need} | " + ", ".join(tags[:6])
+    return should, int(score), note[:240]
 
 
 def _maybe_switch_style_for_open_position(
@@ -12211,6 +12371,245 @@ def _swing_partial_tp_levels(tp_roi: float, cfg: Dict[str, Any]) -> List[Tuple[f
         return out
     except Exception:
         return []
+
+
+def _try_reverse_switch_after_stop(
+    ex,
+    sym: str,
+    closed_side: str,
+    tgt_prev: Dict[str, Any],
+    now_snap: Dict[str, Any],
+    cfg: Dict[str, Any],
+    mode: str,
+    rule: Dict[str, Any],
+    rt: Dict[str, Any],
+    mon: Dict[str, Any],
+    active_targets: Dict[str, Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """
+    손절 직후 반대 포지션 스위칭(옵션).
+    - AI 호출 없이 차트 룰 기반 점수로만 판단
+    - 조건이 약하면 스킵(무리한 뒤집기 방지)
+    """
+    try:
+        if not bool(cfg.get("use_switching", True)):
+            return False, "switch_off"
+        if not bool(cfg.get("switch_on_sl_enable", True)):
+            return False, "switch_on_sl_off"
+
+        should, score, note = evaluate_sl_reverse_signal(closed_side, now_snap, cfg)
+        if not should:
+            return False, note
+
+        now_ep = time.time()
+        cd_sec = max(30.0, float(cfg.get("switch_cooldown_min", 15) or 15) * 60.0)
+        sw_cd = rt.setdefault("switch_cooldowns", {})
+        next_ok = float(sw_cd.get(sym, 0) or 0.0)
+        if now_ep < next_ok:
+            return False, f"switch_cooldown({int(next_ok - now_ep)}s)"
+
+        decision = _reverse_decision_from_side(closed_side)  # buy/sell
+        trend_short = str(now_snap.get("trend_short", "") or "")
+        trend_long = str(now_snap.get("trend_long", "") or "")
+        style_rec = _style_for_entry(sym, decision, trend_short, trend_long, cfg, allow_ai=False)
+        style = str(style_rec.get("style", "스캘핑") or "스캘핑")
+
+        free_usdt, total_usdt = safe_fetch_balance(ex)
+        if float(free_usdt) <= 0:
+            return False, "free<=0"
+
+        try:
+            score_min = int(cfg.get("switch_on_sl_score_min", 4) or 4)
+        except Exception:
+            score_min = 4
+        score_mul = float(clamp(1.0 + (float(score) - float(score_min)) * 0.08, 0.60, 1.50))
+
+        base_entry_pct = float(_as_float(cfg.get("switch_entry_pct", 6.0), 6.0))
+        entry_pct = float(clamp(base_entry_pct * score_mul, float(rule["entry_pct_min"]), float(rule["entry_pct_max"])))
+        entry_usdt = float(free_usdt) * (entry_pct / 100.0)
+        if entry_usdt < 5.0:
+            return False, "entry_usdt<5"
+
+        lev_seed = int(_as_int(tgt_prev.get("lev", rule["lev_min"]), int(rule["lev_min"])))
+        lev_seed = int(clamp(lev_seed, int(rule["lev_min"]), int(rule["lev_max"])))
+        sl_seed = max(1.0, abs(float(_as_float(tgt_prev.get("sl", 3.0), 3.0))))
+        rr_need = max(float(_rr_min_by_mode(mode)), float(_rr_min_by_style(style)))
+        tp_seed = max(abs(float(_as_float(tgt_prev.get("tp", 6.0), 6.0))), sl_seed * rr_need)
+
+        ai_like = {
+            "entry_pct": float(entry_pct),
+            "leverage": int(lev_seed),
+            "sl_pct": float(sl_seed),
+            "tp_pct": float(tp_seed),
+            "rr": float(tp_seed / max(sl_seed, 0.01)),
+        }
+        ai_like = apply_style_envelope(ai_like, style, cfg, rule)
+        if style == "스캘핑":
+            try:
+                tf0 = str(cfg.get("timeframe", "5m") or "5m")
+                ohlcv0 = safe_fetch_ohlcv(ex, sym, tf0, limit=220)
+                if ohlcv0:
+                    df0 = pd.DataFrame(ohlcv0, columns=["time", "open", "high", "low", "close", "vol"])
+                    ai_like = apply_scalp_price_guardrails(ai_like, df0, cfg, rule)
+            except Exception:
+                pass
+
+        lev = int(clamp(int(_as_int(ai_like.get("leverage", lev_seed), lev_seed)), int(rule["lev_min"]), int(rule["lev_max"])))
+        slp = float(max(0.5, abs(float(_as_float(ai_like.get("sl_pct", sl_seed), sl_seed)))))
+        tpp = float(max(0.8, abs(float(_as_float(ai_like.get("tp_pct", tp_seed), tp_seed)))))
+
+        px = float(get_last_price(ex, sym) or 0.0)
+        if px <= 0:
+            return False, "price<=0"
+
+        try:
+            set_margin_mode_safe(ex, sym, str(cfg.get("margin_mode", "cross")))
+        except Exception:
+            pass
+        set_leverage_safe(ex, sym, lev)
+        qty = to_precision_qty(ex, sym, (entry_usdt * lev) / max(px, 1e-9))
+        if qty <= 0:
+            return False, "qty<=0"
+
+        ok, err = market_order_safe_ex(ex, sym, decision, qty)
+        if not ok:
+            return False, f"order_fail:{err}"
+
+        trade_id = uuid.uuid4().hex[:10]
+        sl_price = None
+        tp_price = None
+        sl_source = "ROI"
+        tp_source = "ROI"
+        sl_price_pct = float(slp / max(lev, 1))
+        tp_price_pct = float(tpp / max(lev, 1))
+        sr_used: Dict[str, Any] = {}
+        try:
+            if bool(cfg.get("use_sr_stop", True)):
+                sr_res = sr_prices_for_style(
+                    ex,
+                    sym,
+                    entry_price=float(px),
+                    side=str(decision),
+                    style=str(style),
+                    cfg=cfg,
+                    sl_price_pct=float(sl_price_pct),
+                    tp_price_pct=float(tp_price_pct),
+                    ai_sl_price=None,
+                    ai_tp_price=None,
+                )
+                if isinstance(sr_res, dict):
+                    sl_price = sr_res.get("sl_price", None)
+                    tp_price = sr_res.get("tp_price", None)
+                    sl_source = str(sr_res.get("sl_source", sl_source) or sl_source)
+                    tp_source = str(sr_res.get("tp_source", tp_source) or tp_source)
+                    sr_used = {
+                        "tf": sr_res.get("tf", ""),
+                        "lookback": sr_res.get("lookback", 0),
+                        "pivot_order": sr_res.get("pivot_order", 0),
+                        "buffer_atr_mult": sr_res.get("buffer_atr_mult", 0.0),
+                        "rr_min": sr_res.get("rr_min", 0.0),
+                    }
+        except Exception:
+            pass
+        if sl_price is None or tp_price is None:
+            try:
+                slb, tpb = _sr_price_bounds_from_price_pct(float(px), str(decision), float(sl_price_pct), float(tp_price_pct))
+                if sl_price is None:
+                    sl_price = float(slb)
+                if tp_price is None:
+                    tp_price = float(tpb)
+            except Exception:
+                pass
+
+        free_after, total_after = safe_fetch_balance(ex)
+        reason = f"손절 후 반대전환 | {note}"
+        active_targets[sym] = {
+            "sl": float(slp),
+            "tp": float(tpp),
+            "entry_usdt": float(entry_usdt),
+            "entry_pct": float(entry_pct),
+            "entry_confidence": int(max(0, min(100, 50 + score * 5))),
+            "lev": int(lev),
+            "entry_price": float(px),
+            "entry_snapshot": dict(now_snap or {}),
+            "bal_entry_total": float(total_usdt) if total_usdt > 0 else "",
+            "bal_entry_free": float(free_usdt) if free_usdt > 0 else "",
+            "bal_entry_after_total": float(total_after) if total_after > 0 else "",
+            "bal_entry_after_free": float(free_after) if free_after > 0 else "",
+            "reason": str(reason)[:260],
+            "trade_id": str(trade_id),
+            "style": str(style),
+            "style_confidence": int(style_rec.get("confidence", 0) or 0),
+            "style_reason": str(style_rec.get("reason", "") or "")[:220],
+            "entry_epoch": float(time.time()),
+            "style_last_switch_epoch": float(time.time()),
+            "sl_price": sl_price,
+            "tp_price": tp_price,
+            "sl_price_pct": float(sl_price_pct),
+            "tp_price_pct": float(tp_price_pct),
+            "sl_price_source": str(sl_source),
+            "tp_price_source": str(tp_source),
+            "sr_used": sr_used,
+        }
+
+        rt.setdefault("open_targets", {})[sym] = active_targets[sym]
+        rt["last_entry_epoch"] = float(time.time())
+        rt["last_entry_kst"] = now_kst_str()
+        rt.setdefault("cooldowns", {})[sym] = float(time.time() + 30.0)
+        rt.setdefault("switch_cooldowns", {})[sym] = float(time.time() + cd_sec)
+        save_runtime(rt)
+
+        save_trade_detail(
+            trade_id,
+            {
+                "trade_id": str(trade_id),
+                "time": now_kst_str(),
+                "coin": sym,
+                "decision": decision,
+                "confidence": int(max(0, min(100, 50 + score * 5))),
+                "entry_price": float(px),
+                "entry_usdt": float(entry_usdt),
+                "entry_pct": float(entry_pct),
+                "lev": int(lev),
+                "sl_pct_roi": float(slp),
+                "tp_pct_roi": float(tpp),
+                "sl_price_sr": sl_price,
+                "tp_price_sr": tp_price,
+                "sl_price_source": str(sl_source),
+                "tp_price_source": str(tp_source),
+                "reason_easy": str(reason)[:240],
+                "style": str(style),
+                "style_reason": str(style_rec.get("reason", "") or "")[:240],
+                "raw_status": dict(now_snap or {}),
+            },
+        )
+
+        mon_add_event(
+            mon,
+            "SL_SWITCH",
+            sym,
+            f"손절 직후 반대전환: {decision} | {score:+d}",
+            {"trade_id": trade_id, "style": style, "note": note, "entry_usdt": entry_usdt, "lev": lev},
+        )
+        try:
+            if bool(cfg.get("tg_enable_reports", True)):
+                msg = (
+                    "🔁 손절 후 반대 스위칭\n"
+                    f"- 코인: {sym}\n"
+                    f"- 포지션: {_tg_dir_easy(decision)}\n"
+                    f"- 방식: {_tg_style_easy(style)}\n"
+                    f"- 진입금액(마진): {float(entry_usdt):.2f} USDT ({float(entry_pct):.1f}%)\n"
+                    f"- 목표(익절/손절): +{float(tpp):.2f}% / -{float(slp):.2f}%\n"
+                    f"- 점수: {score:+d} | {note[:120]}\n"
+                    f"- ID: {trade_id}"
+                )
+                tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+        except Exception:
+            pass
+
+        return True, note
+    except Exception as e:
+        return False, f"switch_err:{e}"
 
 
 def telegram_thread(ex):
@@ -14482,37 +14881,40 @@ def telegram_thread(ex):
                                 except Exception:
                                     pass
 
-                                # ✅ 청산 후 재진입 쿨다운 + 직전 청산 기록(과매매/수수료/AI호출 낭비 방지)
-                                try:
-                                    tf_sec = int(_timeframe_seconds(str(cfg.get("timeframe", "5m") or "5m"), 300))
-                                    bars = int(cfg.get("cooldown_after_exit_tp_bars", 1) or 0)
-                                    bars = max(0, bars)
-                                    if tf_sec > 0 and bars > 0:
-                                        rt.setdefault("cooldowns", {})[sym] = time.time() + float(tf_sec) * float(bars)
-                                except Exception:
-                                    pass
-                                try:
-                                    rt.setdefault("last_exit", {})[sym] = {
-                                        "time_kst": now_kst_str(),
-                                        "epoch": float(time.time()),
-                                        "type": "TP",
-                                        "symbol": str(sym),
-                                        "side": str(side),
-                                        "style": str(style_now),
-                                        "roi": float(roi),
-                                        "pnl_usdt": float(pnl_usdt_snapshot),
-                                        "trade_id": str(trade_id or ""),
-                                        "hard_take": bool(hard_take),
-                                    }
-                                except Exception:
-                                    pass
-
+                                tgt_prev_for_switch = dict(tgt) if isinstance(tgt, dict) else {}
                                 active_targets.pop(sym, None)
                                 rt.setdefault("trades", {}).pop(sym, None)
                                 rt.setdefault("open_targets", {}).pop(sym, None)
                                 save_runtime(rt)
 
-                                mon_add_event(mon, "PROTECT" if is_protect else "STOP", sym, f"{reason_ko} ROI {roi:.2f}%", {"trade_id": trade_id, "reason": reason_ko})
+                                switched = False
+                                switch_note = ""
+                                try:
+                                    if bool(is_loss) and (not bool(is_protect)) and bool(cfg.get("auto_trade", False)):
+                                        switched, switch_note = _try_reverse_switch_after_stop(
+                                            ex=ex,
+                                            sym=sym,
+                                            closed_side=str(side),
+                                            tgt_prev=tgt_prev_for_switch,
+                                            now_snap=(snap_now if isinstance(snap_now, dict) else {}),
+                                            cfg=cfg,
+                                            mode=str(mode),
+                                            rule=dict(rule),
+                                            rt=rt,
+                                            mon=mon,
+                                            active_targets=active_targets,
+                                        )
+                                except Exception:
+                                    switched = False
+                                    switch_note = ""
+
+                                mon_add_event(
+                                    mon,
+                                    "PROTECT" if is_protect else "STOP",
+                                    sym,
+                                    f"{reason_ko} ROI {roi:.2f}%",
+                                    {"trade_id": trade_id, "reason": reason_ko, "switched": bool(switched), "switch_note": str(switch_note)[:140]},
+                                )
                                 monitor_write_throttled(mon, 0.2)
                             else:
                                 mon_add_event(mon, "ORDER_FAIL", sym, "청산 실패(손절)", {"err": err_close, "roi": roi, "sl": sl, "trade_id": trade_id})
@@ -17820,6 +18222,7 @@ def telegram_thread(ex):
 def watchdog_thread():
     warned = False
     last_restart_epoch = 0.0
+    last_plain_restart_epoch = 0.0
     while True:
         try:
             mon = read_json_safe(MONITOR_FILE, {}) or {}
@@ -17888,22 +18291,32 @@ def watchdog_thread():
                 pass
 
             # 스레드가 아예 없으면 재시작
+            # - recovery 워커(TG_THREAD_RECOVERY_*)도 정상 워커로 간주
+            # - 반복 재시작 스팸 방지를 위해 최소 간격을 둔다.
             alive = False
+            has_recovery_alive = False
             for t in threading.enumerate():
-                if t.name == "TG_THREAD" and t.is_alive():
+                nm = str(getattr(t, "name", "") or "")
+                if (nm == "TG_THREAD" or nm.startswith("TG_THREAD_RECOVERY")) and t.is_alive():
                     alive = True
-                    break
-            if not alive:
+                if nm.startswith("TG_THREAD_RECOVERY") and t.is_alive():
+                    has_recovery_alive = True
+            restart_cooldown_sec = 90.0
+            if (not alive) and ((time.time() - float(last_plain_restart_epoch or 0.0)) >= restart_cooldown_sec):
                 try:
                     ex2 = create_exchange_client_uncached() or exchange
                     th = threading.Thread(target=telegram_thread, args=(ex2,), daemon=True, name="TG_THREAD")
                     add_script_run_ctx(th)
                     th.start()
+                    last_plain_restart_epoch = time.time()
                     msg2 = "🧯 워치독: TG_THREAD 재시작 시도"
                     tg_send(msg2, target="channel", cfg=cfg)
                     tg_send(msg2, target="admin", cfg=cfg)
                 except Exception:
                     pass
+            elif (not alive) and has_recovery_alive:
+                # recovery가 살아있으면 TG_THREAD 명칭 부재로 인한 재시작 반복만 막고 조용히 대기
+                pass
 
         except Exception:
             pass
@@ -18385,6 +18798,16 @@ config["dca_add_usdt"] = st.sidebar.number_input(
     step=5.0,
     help="0보다 크면, DCA는 % 대신 이 USDT(마진) 금액을 사용합니다. (선물: qty≈(usdt*레버)/가격)",
 )
+with st.sidebar.expander("🔁 손절 후 반대 스위칭"):
+    config["use_switching"] = st.checkbox("스위칭 사용", value=bool(config.get("use_switching", True)))
+    config["switch_on_sl_enable"] = st.checkbox("손절 직후 반대 진입", value=bool(config.get("switch_on_sl_enable", True)))
+    s1, s2 = st.columns(2)
+    config["switch_entry_pct"] = s1.number_input("스위칭 진입(%)", 1.0, 100.0, float(config.get("switch_entry_pct", 6.0) or 6.0), step=0.5)
+    config["switch_cooldown_min"] = s2.number_input("코인 쿨다운(분)", 1, 240, int(config.get("switch_cooldown_min", 15) or 15), step=1)
+    s3, s4 = st.columns(2)
+    config["switch_on_sl_score_min"] = s3.number_input("반대전환 점수", 1, 10, int(config.get("switch_on_sl_score_min", 4) or 4), step=1)
+    config["switch_on_sl_min_adx"] = s4.number_input("최소 ADX", 0.0, 60.0, float(config.get("switch_on_sl_min_adx", 18.0) or 18.0), step=1.0)
+    st.caption("손절 후 차트가 반대 방향으로 강하면 즉시 반대 포지션 진입합니다(AI 호출 없음).")
 
 st.sidebar.divider()
 st.sidebar.subheader("🪙 외부 시황")
