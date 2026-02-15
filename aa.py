@@ -592,7 +592,7 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 14,
+        "settings_schema_version": 15,
         "openai_api_key": "",
         # ✅ 사용자 기본값 프리셋(요청): 하이리스크/하이리턴 + 자동매매 ON
         "auto_trade": True,
@@ -842,6 +842,12 @@ def default_settings() -> Dict[str, Any]:
         "sl_confirm_enable": True,
         "sl_confirm_n": 1,
         "sl_confirm_window_sec": 600.0,  # ✅ 6초→600초: 메인 루프 주기(수 분)가 6초보다 길어 손절 확인이 누적되지 않던 문제 수정
+        # ✅ 유도리 청산(보조지표 반대 시그널)
+        # - 목표익절 미도달이어도, 반대 시그널이 강하면 청산 가능
+        "exit_signal_flex_enable": True,
+        "exit_signal_flex_min_roi": 0.8,      # 수익권 최소 조건(%) - 너무 이른 청산 방지
+        "exit_signal_flex_score_min": 4,      # 반대 시그널 점수 임계치
+        "exit_signal_flex_min_adx": 16.0,     # ADX 보정 기준
         # ✅ 청산 후 재진입 쿨다운(과매매/수수료/AI호출 낭비 방지)
         # - "bars"는 현재 단기 timeframe 기준 봉 개수(예: 5m에서 2 bars = 10분)
         "cooldown_after_exit_tp_bars": 1,
@@ -867,6 +873,9 @@ def default_settings() -> Dict[str, Any]:
         "switch_on_sl_enable": True,
         "switch_on_sl_score_min": 4,   # 반대전환 점수 임계치
         "switch_on_sl_min_adx": 18.0,  # ADX가 너무 약하면 점수 보수적으로
+        "switch_on_take_enable": True,          # 익절 후 반대 스위칭
+        "switch_on_take_min_roi": 1.0,          # 익절 후 스위칭 최소 ROI
+        "switch_on_take_score_min": 5,          # 익절 후는 더 보수적
         "no_trade_weekend": False,
 
         # 연속손실 보호
@@ -1371,6 +1380,50 @@ def load_settings() -> Dict[str, Any]:
             try:
                 if "switch_on_sl_min_adx" not in saved:
                     cfg["switch_on_sl_min_adx"] = 18.0
+                    changed = True
+            except Exception:
+                pass
+        # v15: 유도리 청산 + 익절 후 반대 스위칭 기본값 추가
+        if saved_ver < 15:
+            try:
+                if "exit_signal_flex_enable" not in saved:
+                    cfg["exit_signal_flex_enable"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "exit_signal_flex_min_roi" not in saved:
+                    cfg["exit_signal_flex_min_roi"] = 0.8
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "exit_signal_flex_score_min" not in saved:
+                    cfg["exit_signal_flex_score_min"] = 4
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "exit_signal_flex_min_adx" not in saved:
+                    cfg["exit_signal_flex_min_adx"] = 16.0
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "switch_on_take_enable" not in saved:
+                    cfg["switch_on_take_enable"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "switch_on_take_min_roi" not in saved:
+                    cfg["switch_on_take_min_roi"] = 1.0
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "switch_on_take_score_min" not in saved:
+                    cfg["switch_on_take_score_min"] = 5
                     changed = True
             except Exception:
                 pass
@@ -11815,6 +11868,90 @@ def evaluate_sl_reverse_signal(
     return should, int(score), note[:240]
 
 
+def evaluate_flexible_take_signal(
+    side: str,
+    entry_snap: Optional[Dict[str, Any]],
+    now_snap: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Tuple[bool, int, str]:
+    """
+    목표 TP 도달 전에도 보조지표 반대 시그널이 강하면 유도리 있게 청산.
+    returns: (should_take, score, note)
+    """
+    if not isinstance(now_snap, dict):
+        return False, 0, "차트 스냅샷 없음"
+
+    side0 = str(side or "").lower().strip()
+    trend_s = _trend_clean_for_reason(now_snap.get("trend_short", ""))
+    trend_l = _trend_clean_for_reason(now_snap.get("trend_long", ""))
+    macd = str(now_snap.get("macd_state", "") or "").strip()
+    rsi_state = str(now_snap.get("rsi_state", "") or "").strip()
+    sqz_bias = int(_as_int(now_snap.get("sqz_bias", 0), 0))
+    sqz_mom = float(_as_float(now_snap.get("sqz_mom_pct", 0.0), 0.0))
+    adx_v = float(_as_float(now_snap.get("adx", 0.0), 0.0))
+    rsi_now = float(_as_float(now_snap.get("rsi", 0.0), 0.0))
+    rsi_entry = float(_as_float((entry_snap or {}).get("rsi", 0.0), 0.0))
+
+    score = 0
+    tags: List[str] = []
+
+    if side0 == "long":
+        if "하락" in trend_s:
+            score += 2
+            tags.append("단기하락")
+        if "하락" in trend_l:
+            score += 1
+            tags.append("장기하락")
+        if macd == "데드":
+            score += 2
+            tags.append("MACD데드")
+        if rsi_state == "과매수":
+            score += 1
+            tags.append("RSI과매수")
+        if sqz_bias == -1:
+            score += 2
+            tags.append(f"SQZ하락({sqz_mom:+.2f}%)")
+        if rsi_entry > 0 and (rsi_now + 4.0) < rsi_entry:
+            score += 1
+            tags.append(f"RSI하락({rsi_entry:.0f}->{rsi_now:.0f})")
+    else:
+        if "상승" in trend_s:
+            score += 2
+            tags.append("단기상승")
+        if "상승" in trend_l:
+            score += 1
+            tags.append("장기상승")
+        if macd == "골든":
+            score += 2
+            tags.append("MACD골든")
+        if rsi_state == "과매도":
+            score += 1
+            tags.append("RSI과매도")
+        if sqz_bias == 1:
+            score += 2
+            tags.append(f"SQZ상승({sqz_mom:+.2f}%)")
+        if rsi_entry > 0 and (rsi_now - 4.0) > rsi_entry:
+            score += 1
+            tags.append(f"RSI상승({rsi_entry:.0f}->{rsi_now:.0f})")
+
+    try:
+        min_adx = float(cfg.get("exit_signal_flex_min_adx", 16.0) or 16.0)
+    except Exception:
+        min_adx = 16.0
+    if adx_v >= min_adx:
+        score += 1
+        tags.append(f"ADX{adx_v:.0f}")
+
+    try:
+        need = int(cfg.get("exit_signal_flex_score_min", 4) or 4)
+    except Exception:
+        need = 4
+    need = max(1, min(12, need))
+    should = bool(score >= need)
+    note = f"유도리청산 점수 {score:+d}/{need} | " + ", ".join(tags[:6])
+    return should, int(score), note[:240]
+
+
 def _maybe_switch_style_for_open_position(
     ex,
     sym: str,
@@ -12385,6 +12522,8 @@ def _try_reverse_switch_after_stop(
     rt: Dict[str, Any],
     mon: Dict[str, Any],
     active_targets: Dict[str, Dict[str, Any]],
+    trigger_kind: str = "SL",
+    closing_roi: Optional[float] = None,
 ) -> Tuple[bool, str]:
     """
     손절 직후 반대 포지션 스위칭(옵션).
@@ -12392,10 +12531,25 @@ def _try_reverse_switch_after_stop(
     - 조건이 약하면 스킵(무리한 뒤집기 방지)
     """
     try:
+        trig = str(trigger_kind or "SL").upper().strip()
+        if trig not in ["SL", "TP"]:
+            trig = "SL"
+
         if not bool(cfg.get("use_switching", True)):
             return False, "switch_off"
-        if not bool(cfg.get("switch_on_sl_enable", True)):
-            return False, "switch_on_sl_off"
+        if trig == "SL":
+            if not bool(cfg.get("switch_on_sl_enable", True)):
+                return False, "switch_on_sl_off"
+        else:
+            if not bool(cfg.get("switch_on_take_enable", True)):
+                return False, "switch_on_take_off"
+            try:
+                min_roi_take = float(cfg.get("switch_on_take_min_roi", 1.0) or 1.0)
+            except Exception:
+                min_roi_take = 1.0
+            roi0 = float(_as_float(closing_roi, 0.0))
+            if roi0 < float(min_roi_take):
+                return False, f"take_roi_low({roi0:.2f}<{min_roi_take:.2f})"
 
         should, score, note = evaluate_sl_reverse_signal(closed_side, now_snap, cfg)
         if not should:
@@ -12419,9 +12573,14 @@ def _try_reverse_switch_after_stop(
             return False, "free<=0"
 
         try:
-            score_min = int(cfg.get("switch_on_sl_score_min", 4) or 4)
+            if trig == "SL":
+                score_min = int(cfg.get("switch_on_sl_score_min", 4) or 4)
+            else:
+                score_min = int(cfg.get("switch_on_take_score_min", 5) or 5)
         except Exception:
-            score_min = 4
+            score_min = 4 if trig == "SL" else 5
+        if int(score) < int(score_min):
+            return False, f"score_low({int(score)}/{int(score_min)})"
         score_mul = float(clamp(1.0 + (float(score) - float(score_min)) * 0.08, 0.60, 1.50))
 
         base_entry_pct = float(_as_float(cfg.get("switch_entry_pct", 6.0), 6.0))
@@ -12593,8 +12752,9 @@ def _try_reverse_switch_after_stop(
         )
         try:
             if bool(cfg.get("tg_enable_reports", True)):
+                title0 = "🔁 손절 후 반대 스위칭" if trig == "SL" else "🔁 익절 후 반대 스위칭"
                 msg = (
-                    "🔁 손절 후 반대 스위칭\n"
+                    f"{title0}\n"
                     f"- 코인: {sym}\n"
                     f"- 포지션: {_tg_dir_easy(decision)}\n"
                     f"- 방식: {_tg_style_easy(style)}\n"
@@ -14518,14 +14678,43 @@ def telegram_thread(ex):
                                 except Exception:
                                     pass
 
+                        signal_take_hit = False
+                        signal_take_note = ""
+                        signal_take_score = 0
+                        snap_now_flex: Optional[Dict[str, Any]] = None
+                        try:
+                            if bool(cfg.get("exit_signal_flex_enable", True)):
+                                try:
+                                    min_roi_flex = float(cfg.get("exit_signal_flex_min_roi", 0.8) or 0.8)
+                                except Exception:
+                                    min_roi_flex = 0.8
+                                if float(roi) >= float(min_roi_flex):
+                                    snap_now_flex = chart_snapshot_for_reason(ex, sym, cfg)
+                                    entry_snap_flex = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
+                                    hit0, score0, note0 = evaluate_flexible_take_signal(
+                                        str(side),
+                                        entry_snap_flex if isinstance(entry_snap_flex, dict) else None,
+                                        snap_now_flex if isinstance(snap_now_flex, dict) else None,
+                                        cfg,
+                                    )
+                                    if bool(hit0):
+                                        signal_take_hit = True
+                                        signal_take_score = int(score0)
+                                        signal_take_note = str(note0 or "")
+                        except Exception:
+                            signal_take_hit = False
+                            signal_take_note = ""
+                            signal_take_score = 0
+                            snap_now_flex = None
+
                         if ai_exit_only:
                             do_stop = bool(roi_stop_hit)
-                            do_take = bool(ai_targets_ready and (float(roi) >= float(tp)))
+                            do_take = bool(ai_targets_ready and (float(roi) >= float(tp))) or bool(signal_take_hit)
                             sl_from_ai = True
                             tp_from_ai = True
                         else:
                             do_stop = bool(hit_sl_by_price) or bool(roi_stop_confirmed)
-                            do_take = hit_tp_by_price or hard_take or (roi >= tp)
+                            do_take = hit_tp_by_price or hard_take or (roi >= tp) or bool(signal_take_hit)
 
                         # 손절
                         if do_stop:
@@ -14544,7 +14733,10 @@ def telegram_thread(ex):
                             entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
                             snap_now = {}
                             try:
-                                snap_now = chart_snapshot_for_reason(ex, sym, cfg)
+                                if isinstance(snap_now_flex, dict) and snap_now_flex:
+                                    snap_now = dict(snap_now_flex)
+                                else:
+                                    snap_now = chart_snapshot_for_reason(ex, sym, cfg)
                             except Exception:
                                 snap_now = {}
                             sl_price_now = tgt.get("sl_price", None)
@@ -14903,6 +15095,8 @@ def telegram_thread(ex):
                                             rt=rt,
                                             mon=mon,
                                             active_targets=active_targets,
+                                            trigger_kind="SL",
+                                            closing_roi=float(roi),
                                         )
                                 except Exception:
                                     switched = False
@@ -14939,6 +15133,8 @@ def telegram_thread(ex):
                             else:
                                 if bool(hit_tp_by_price):
                                     take_reason_ko = "익절(저항/목표 도달)"
+                                elif bool(signal_take_hit):
+                                    take_reason_ko = "익절(반대시그널)"
                                 elif bool(hard_take):
                                     take_reason_ko = "익절(강제)"
                                 else:
@@ -14948,7 +15144,10 @@ def telegram_thread(ex):
                             entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
                             snap_now = {}
                             try:
-                                snap_now = chart_snapshot_for_reason(ex, sym, cfg)
+                                if isinstance(snap_now_flex, dict) and snap_now_flex:
+                                    snap_now = dict(snap_now_flex)
+                                else:
+                                    snap_now = chart_snapshot_for_reason(ex, sym, cfg)
                             except Exception:
                                 snap_now = {}
                             tp_price_now = tgt.get("tp_price", None)
@@ -14962,6 +15161,11 @@ def telegram_thread(ex):
                                 base_reason = f"{force_take_reason}" + (f" | {force_take_detail}" if force_take_detail else "")
                             elif bool(hard_take):
                                 base_reason = "수익이 많이 나서 일단 챙겼어요(강제익절)"
+                            elif bool(signal_take_hit):
+                                if signal_take_note:
+                                    base_reason = f"반대 시그널이 강해 선제 익절했어요 | {signal_take_note}"
+                                else:
+                                    base_reason = "반대 시그널이 강해 선제 익절했어요"
                             elif bool(hit_tp_by_price):
                                 base_reason = f"저항/목표가에 닿아서 익절했어요{tp_line_txt}"
                             else:
@@ -15235,12 +15439,60 @@ def telegram_thread(ex):
                                 except Exception:
                                     pass
 
+                                try:
+                                    tf_sec = int(_timeframe_seconds(str(cfg.get("timeframe", "5m") or "5m"), 300))
+                                    bars = int(cfg.get("cooldown_after_exit_tp_bars", 1) or 0)
+                                    bars = max(0, bars)
+                                    if tf_sec > 0 and bars > 0:
+                                        rt.setdefault("cooldowns", {})[sym] = time.time() + float(tf_sec) * float(bars)
+                                except Exception:
+                                    pass
+                                try:
+                                    rt.setdefault("last_exit", {})[sym] = {
+                                        "time_kst": now_kst_str(),
+                                        "epoch": float(time.time()),
+                                        "type": "TP",
+                                        "symbol": str(sym),
+                                        "side": str(side),
+                                        "style": str(style_now),
+                                        "roi": float(roi),
+                                        "pnl_usdt": float(pnl_usdt_snapshot),
+                                        "trade_id": str(trade_id or ""),
+                                        "hard_take": bool(hard_take),
+                                    }
+                                except Exception:
+                                    pass
+
+                                tgt_prev_for_switch = dict(tgt) if isinstance(tgt, dict) else {}
                                 active_targets.pop(sym, None)
                                 rt.setdefault("trades", {}).pop(sym, None)
                                 rt.setdefault("open_targets", {}).pop(sym, None)
                                 save_runtime(rt)
 
-                                mon_add_event(mon, "TAKE", sym, f"ROI +{roi:.2f}%", {"trade_id": trade_id})
+                                switched = False
+                                switch_note = ""
+                                try:
+                                    if bool(cfg.get("auto_trade", False)) and bool(cfg.get("switch_on_take_enable", True)):
+                                        switched, switch_note = _try_reverse_switch_after_stop(
+                                            ex=ex,
+                                            sym=sym,
+                                            closed_side=str(side),
+                                            tgt_prev=tgt_prev_for_switch,
+                                            now_snap=(snap_now if isinstance(snap_now, dict) else {}),
+                                            cfg=cfg,
+                                            mode=str(mode),
+                                            rule=dict(rule),
+                                            rt=rt,
+                                            mon=mon,
+                                            active_targets=active_targets,
+                                            trigger_kind="TP",
+                                            closing_roi=float(roi),
+                                        )
+                                except Exception:
+                                    switched = False
+                                    switch_note = ""
+
+                                mon_add_event(mon, "TAKE", sym, f"ROI +{roi:.2f}%", {"trade_id": trade_id, "switched": bool(switched), "switch_note": str(switch_note)[:140]})
                                 monitor_write_throttled(mon, 0.2)
                             else:
                                 mon_add_event(mon, "ORDER_FAIL", sym, "청산 실패(익절)", {"err": err_close, "roi": roi, "tp": tp, "trade_id": trade_id})
@@ -18807,7 +19059,18 @@ with st.sidebar.expander("🔁 손절 후 반대 스위칭"):
     s3, s4 = st.columns(2)
     config["switch_on_sl_score_min"] = s3.number_input("반대전환 점수", 1, 10, int(config.get("switch_on_sl_score_min", 4) or 4), step=1)
     config["switch_on_sl_min_adx"] = s4.number_input("최소 ADX", 0.0, 60.0, float(config.get("switch_on_sl_min_adx", 18.0) or 18.0), step=1.0)
+    config["switch_on_take_enable"] = st.checkbox("익절 후 반대 진입", value=bool(config.get("switch_on_take_enable", True)))
+    s5, s6 = st.columns(2)
+    config["switch_on_take_min_roi"] = s5.number_input("익절 스위칭 최소ROI(%)", 0.0, 100.0, float(config.get("switch_on_take_min_roi", 1.0) or 1.0), step=0.1)
+    config["switch_on_take_score_min"] = s6.number_input("익절 전환 점수", 1, 12, int(config.get("switch_on_take_score_min", 5) or 5), step=1)
     st.caption("손절 후 차트가 반대 방향으로 강하면 즉시 반대 포지션 진입합니다(AI 호출 없음).")
+with st.sidebar.expander("🎚️ 유도리 청산(반대시그널)"):
+    config["exit_signal_flex_enable"] = st.checkbox("목표 미도달 선제청산", value=bool(config.get("exit_signal_flex_enable", True)))
+    f1, f2, f3 = st.columns(3)
+    config["exit_signal_flex_min_roi"] = f1.number_input("최소 ROI(%)", 0.0, 100.0, float(config.get("exit_signal_flex_min_roi", 0.8) or 0.8), step=0.1)
+    config["exit_signal_flex_score_min"] = f2.number_input("반대신호 점수", 1, 12, int(config.get("exit_signal_flex_score_min", 4) or 4), step=1)
+    config["exit_signal_flex_min_adx"] = f3.number_input("ADX 기준", 0.0, 60.0, float(config.get("exit_signal_flex_min_adx", 16.0) or 16.0), step=1.0)
+    st.caption("보조지표 반대 시그널이 강하면 목표익절 전에도 유도리 있게 청산합니다.")
 
 st.sidebar.divider()
 st.sidebar.subheader("🪙 외부 시황")
