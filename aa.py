@@ -592,7 +592,7 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 12,
+        "settings_schema_version": 13,
         "openai_api_key": "",
         # ✅ 사용자 기본값 프리셋(요청): 하이리스크/하이리턴 + 자동매매 ON
         "auto_trade": True,
@@ -677,16 +677,19 @@ def default_settings() -> Dict[str, Any]:
         "fresh_soft_penalty_lev_mult": 0.90,
 
         # ✅ (추가) 주력 지표(요구): Lorentzian / KNN / Logistic / SQZ / RSI
-        # - 5개 중 3개 이상이 같은 방향으로 수렴할 때만 진입(비용/휩쏘 방지)
+        # - 5개 중 2개 이상이 같은 방향으로 수렴하면 진입 후보(과관망 완화)
         # - 스캔 단계에서 먼저 계산하고, 진입 시에만 AI를 호출해 TP/SL/SR를 유도리 있게 설계
         "entry_convergence_enable": True,
-        "entry_convergence_min_votes": 3,
+        "entry_convergence_min_votes": 2,
         # ✅ 신규: "시그널이 막 시작된 시점"에서만 AI 호출 허용
         # - MACD/MA 골든·데드 크로스 시작
         # - SQZ fire 시작
         # - RSI 해소/임계 진입 시작
         # False: 진행 중인 신호도 허용 → 진입 빈도 증가 (SQZ 게이트는 유지)
         "entry_require_fresh_start_signal": False,
+        # ✅ 신호 시효(TTL): 시작 신호를 N봉까지 유효로 봄(과도한 완벽타점 집착 완화)
+        "entry_fresh_signal_window_bars": 2,
+        "sqz_fire_window_bars": 2,
         # ML 시그널 계산(외부 라이브러리 없이 numpy/pandas로만)
         "ml_enable": True,
         "ml_lookback": 220,          # 학습(과거 N샘플)
@@ -877,7 +880,9 @@ def default_settings() -> Dict[str, Any]:
         # ✅ AI 호출 비용 절감:
         # - 자동 스캔에서 AI는 "같은 봉(단기 TF)에서는 1회만" 호출하고, 이후에는 캐시를 재사용한다.
         # - (강제스캔 /scan 은 예외)
-        "ai_scan_once_per_bar": True,
+        "ai_scan_once_per_bar": False,
+        # ai_scan_once_per_bar=False일 때 AI 재호출 최소 간격(초)
+        "ai_recall_cooldown_sec": 20,
         # ✅ 진입 필터 강화(요구): 거래량(스파이크) + 이격도(Disparity) 조건
         # - 횡보 박스(거래량 없음)에서 RSI 해소만 보고 진입하는 실수를 줄이기 위해 AI 호출 자체를 제한한다.
         # - /scan 강제스캔은 이 필터를 우회(사용자 의도)한다.
@@ -894,7 +899,7 @@ def default_settings() -> Dict[str, Any]:
         # - False면 AI는 호출하되(캐시/봉당 1회), 결과에 따라 entry를 줄이거나 hold를 기대(진입 기회↑)
         "ai_call_filters_block_ai": False,
         # ✅ AI가 buy/sell을 유지할 수 있는 최소 확신 바닥값(그 이하면 강제 hold)
-        "ai_decision_min_conf_floor": 55,
+        "ai_decision_min_conf_floor": 50,
 
         # 🌍 외부 시황 통합
         "use_external_context": True,
@@ -949,7 +954,7 @@ def default_settings() -> Dict[str, Any]:
         "soft_entry_conf_gap_attack": 12,
         "soft_entry_conf_gap_highrisk": 15,
         # 소프트 진입일 때 진입비중/레버를 더 줄이는 계수
-        "soft_entry_entry_pct_mult": 0.70,
+        "soft_entry_entry_pct_mult": 0.50,
         "soft_entry_leverage_mult": 0.85,
         # 소프트 진입일 때 허용하는 최소 진입비중(% of free) / 최소 레버리지
         "soft_entry_entry_pct_floor": 2.0,
@@ -1293,6 +1298,39 @@ def load_settings() -> Dict[str, Any]:
                 if "tg_watch_report_silent" not in saved:
                     cfg["tg_watch_report_silent"] = True
                     changed = True
+            except Exception:
+                pass
+        # v13: 과관망 완화 기본값(요청)
+        if saved_ver < 13:
+            try:
+                cfg["entry_convergence_min_votes"] = 2
+                changed = True
+            except Exception:
+                pass
+            try:
+                cfg["ai_scan_once_per_bar"] = False
+                changed = True
+            except Exception:
+                pass
+            try:
+                cfg["ai_recall_cooldown_sec"] = 20
+                changed = True
+            except Exception:
+                pass
+            try:
+                cfg["soft_entry_entry_pct_mult"] = 0.50
+                changed = True
+            except Exception:
+                pass
+            try:
+                cfg["ai_decision_min_conf_floor"] = 50
+                changed = True
+            except Exception:
+                pass
+            try:
+                cfg["entry_fresh_signal_window_bars"] = 2
+                cfg["sqz_fire_window_bars"] = 2
+                changed = True
             except Exception:
                 pass
         cfg["settings_schema_version"] = base_ver
@@ -7274,9 +7312,16 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
         ma_cross_up = False
         ma_cross_down = False
 
-    # SQZ fire(압축 해제 직후의 초기 모멘텀)
+    # SQZ fire(압축 해제 직후의 초기 모멘텀) + 최근 N봉 TTL
     sqz_fire_up = False
     sqz_fire_down = False
+    sqz_fire_up_recent = False
+    sqz_fire_down_recent = False
+    try:
+        sqz_fire_window = int(cfg.get("sqz_fire_window_bars", cfg.get("entry_fresh_signal_window_bars", 2)) or 2)
+    except Exception:
+        sqz_fire_window = 2
+    sqz_fire_window = int(clamp(sqz_fire_window, 1, 6))
     try:
         if "SQZ_ON" in df2.columns and "SQZ_MOM_PCT" in df2.columns:
             sqz_on_prev = int(prev.get("SQZ_ON", 0) or 0) == 1
@@ -7286,15 +7331,81 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
             sqz_thr = float(max(0.001, abs(float(cfg.get("sqz_mom_threshold_pct", 0.05) or 0.05))))
             sqz_fire_up = bool(sqz_on_prev and (not sqz_on_now) and (sqz_m_now >= sqz_thr) and (sqz_m_now > sqz_m_prev))
             sqz_fire_down = bool(sqz_on_prev and (not sqz_on_now) and (sqz_m_now <= -sqz_thr) and (sqz_m_now < sqz_m_prev))
+            sqz_fire_up_recent = bool(sqz_fire_up)
+            sqz_fire_down_recent = bool(sqz_fire_down)
+
+            if sqz_fire_window > 1 and len(df2) >= 3:
+                tail = df2.tail(sqz_fire_window + 1)
+                on_arr = pd.to_numeric(tail["SQZ_ON"], errors="coerce").fillna(0).astype(int).to_numpy(dtype=int)
+                mom_arr = pd.to_numeric(tail["SQZ_MOM_PCT"], errors="coerce").fillna(0.0).astype(float).to_numpy(dtype=float)
+                for i in range(1, len(tail)):
+                    prev_on = int(on_arr[i - 1]) == 1
+                    now_on = int(on_arr[i]) == 1
+                    prev_m = float(mom_arr[i - 1])
+                    now_m = float(mom_arr[i])
+                    if prev_on and (not now_on) and (now_m >= sqz_thr) and (now_m > prev_m):
+                        sqz_fire_up_recent = True
+                    if prev_on and (not now_on) and (now_m <= -sqz_thr) and (now_m < prev_m):
+                        sqz_fire_down_recent = True
     except Exception:
         sqz_fire_up = False
         sqz_fire_down = False
+        sqz_fire_up_recent = bool(sqz_fire_up)
+        sqz_fire_down_recent = bool(sqz_fire_down)
 
     adx_now = float(last.get("ADX", 0)) if (cfg.get("use_adx", True) and "ADX" in df2.columns) else 0.0
     pullback_candidate = (trend == "상승추세") and rsi_resolve_long and (adx_now >= 18)
 
     fresh_long = bool(rsi_resolve_long or rsi_enter_overbought or macd_cross_up or ma_cross_up or sqz_fire_up)
     fresh_short = bool(rsi_resolve_short or rsi_enter_oversold or macd_cross_down or ma_cross_down or sqz_fire_down)
+    fresh_long_recent = bool(fresh_long)
+    fresh_short_recent = bool(fresh_short)
+    try:
+        fresh_window = int(cfg.get("entry_fresh_signal_window_bars", 2) or 2)
+    except Exception:
+        fresh_window = 2
+    fresh_window = int(clamp(fresh_window, 1, 6))
+    try:
+        if fresh_window > 1 and len(df2) >= 3:
+            tail = df2.tail(fresh_window + 1).copy()
+            long_ev = pd.Series(False, index=tail.index)
+            short_ev = pd.Series(False, index=tail.index)
+            if "RSI" in tail.columns:
+                rsi_prev_s = pd.to_numeric(tail["RSI"], errors="coerce").shift(1)
+                rsi_now_s = pd.to_numeric(tail["RSI"], errors="coerce")
+                long_ev = long_ev | ((rsi_prev_s < float(rsi_buy)) & (rsi_now_s >= float(rsi_buy)))
+                short_ev = short_ev | ((rsi_prev_s > float(rsi_sell)) & (rsi_now_s <= float(rsi_sell)))
+                long_ev = long_ev | ((rsi_prev_s < float(rsi_sell)) & (rsi_now_s >= float(rsi_sell)))
+                short_ev = short_ev | ((rsi_prev_s > float(rsi_buy)) & (rsi_now_s <= float(rsi_buy)))
+            if all(c in tail.columns for c in ["MACD", "MACD_signal"]):
+                m_prev_s = pd.to_numeric(tail["MACD"], errors="coerce").shift(1)
+                s_prev_s = pd.to_numeric(tail["MACD_signal"], errors="coerce").shift(1)
+                m_now_s = pd.to_numeric(tail["MACD"], errors="coerce")
+                s_now_s = pd.to_numeric(tail["MACD_signal"], errors="coerce")
+                long_ev = long_ev | ((m_prev_s <= s_prev_s) & (m_now_s > s_now_s))
+                short_ev = short_ev | ((m_prev_s >= s_prev_s) & (m_now_s < s_now_s))
+            if all(c in tail.columns for c in ["MA_fast", "MA_slow"]):
+                f_prev_s = pd.to_numeric(tail["MA_fast"], errors="coerce").shift(1)
+                s_prev2_s = pd.to_numeric(tail["MA_slow"], errors="coerce").shift(1)
+                f_now_s = pd.to_numeric(tail["MA_fast"], errors="coerce")
+                s_now2_s = pd.to_numeric(tail["MA_slow"], errors="coerce")
+                long_ev = long_ev | ((f_prev_s <= s_prev2_s) & (f_now_s > s_now2_s))
+                short_ev = short_ev | ((f_prev_s >= s_prev2_s) & (f_now_s < s_now2_s))
+            if "SQZ_ON" in tail.columns and "SQZ_MOM_PCT" in tail.columns:
+                on_prev_s = pd.to_numeric(tail["SQZ_ON"], errors="coerce").shift(1).fillna(0).astype(int)
+                on_now_s = pd.to_numeric(tail["SQZ_ON"], errors="coerce").fillna(0).astype(int)
+                mom_prev_s = pd.to_numeric(tail["SQZ_MOM_PCT"], errors="coerce").shift(1)
+                mom_now_s = pd.to_numeric(tail["SQZ_MOM_PCT"], errors="coerce")
+                sqz_thr2 = float(max(0.001, abs(float(cfg.get("sqz_mom_threshold_pct", 0.05) or 0.05))))
+                sqz_up_s = (on_prev_s == 1) & (on_now_s == 0) & (mom_now_s >= sqz_thr2) & (mom_now_s > mom_prev_s)
+                sqz_down_s = (on_prev_s == 1) & (on_now_s == 0) & (mom_now_s <= -sqz_thr2) & (mom_now_s < mom_prev_s)
+                long_ev = long_ev | sqz_up_s
+                short_ev = short_ev | sqz_down_s
+            fresh_long_recent = bool(long_ev.tail(fresh_window).fillna(False).any()) or bool(sqz_fire_up_recent)
+            fresh_short_recent = bool(short_ev.tail(fresh_window).fillna(False).any()) or bool(sqz_fire_down_recent)
+    except Exception:
+        fresh_long_recent = bool(fresh_long)
+        fresh_short_recent = bool(fresh_short)
 
     status["_used_indicators"] = used
     status["_rsi_resolve_long"] = bool(rsi_resolve_long)
@@ -7307,8 +7418,14 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
     status["_ma_cross_down"] = bool(ma_cross_down)
     status["_sqz_fire_up"] = bool(sqz_fire_up)
     status["_sqz_fire_down"] = bool(sqz_fire_down)
+    status["_sqz_fire_up_recent"] = bool(sqz_fire_up_recent)
+    status["_sqz_fire_down_recent"] = bool(sqz_fire_down_recent)
     status["_fresh_long_trigger"] = bool(fresh_long)
     status["_fresh_short_trigger"] = bool(fresh_short)
+    status["_fresh_long_recent"] = bool(fresh_long_recent)
+    status["_fresh_short_recent"] = bool(fresh_short_recent)
+    status["_fresh_window_bars"] = int(fresh_window)
+    status["_sqz_fire_window_bars"] = int(sqz_fire_window)
     status["_pullback_candidate"] = bool(pullback_candidate)
 
     return df2, status, last
@@ -7496,10 +7613,10 @@ def ml_signals_and_convergence(
     else:
         out["rsi_sig"] = 0
 
-    # SQZ sig (압축 해제 직후 fire 우선)
+    # SQZ sig (압축 해제 직후 fire 우선 + 최근 N봉 fire 허용)
     try:
-        fire_up = bool(status.get("_sqz_fire_up", False))
-        fire_down = bool(status.get("_sqz_fire_down", False))
+        fire_up = bool(status.get("_sqz_fire_up_recent", status.get("_sqz_fire_up", False)))
+        fire_down = bool(status.get("_sqz_fire_down_recent", status.get("_sqz_fire_down", False)))
         if fire_up and (not fire_down):
             out["sqz_sig"] = 1
         elif fire_down and (not fire_up):
@@ -7666,9 +7783,9 @@ def ml_signals_and_convergence(
     out["votes_short"] = int(v_short)
     out["votes_max"] = int(max(v_long, v_short))
     try:
-        need = int(cfg.get("entry_convergence_min_votes", 3) or 3)
+        need = int(cfg.get("entry_convergence_min_votes", 2) or 2)
     except Exception:
-        need = 3
+        need = 2
     if v_long >= need and v_long > v_short:
         out["dir"] = "buy"
     elif v_short >= need and v_short > v_long:
@@ -8813,7 +8930,7 @@ JSON 형식:
             if out["decision"] in ["buy", "sell"] and out["confidence"] < int(rule["min_conf"]):
                 out["below_min_conf"] = True
                 # 너무 낮은 확신(바닥값)은 강제 hold
-                floor0 = int(cfg.get("ai_decision_min_conf_floor", 60) or 60)
+                floor0 = int(cfg.get("ai_decision_min_conf_floor", 50) or 50)
                 if int(out["confidence"]) < int(floor0):
                     out["decision"] = "hold"
         except Exception:
@@ -15265,7 +15382,7 @@ def telegram_thread(ex):
                         # - hard block 대신 soft penalty를 우선 적용(요청)
                         try:
                             if bool(cfg.get("entry_convergence_enable", True)):
-                                need_base = int(cfg.get("entry_convergence_min_votes", 3) or 3)
+                                need_base = int(cfg.get("entry_convergence_min_votes", 2) or 2)
                                 need = int(need_base)
                                 try:
                                     if int(relax_votes_reduce) > 0:
@@ -15276,8 +15393,8 @@ def telegram_thread(ex):
                                 ml_dir = str(ml.get("dir", "hold") or "hold")
                                 ml_votes = int(ml.get("votes_max", 0) or 0)
                                 need_fresh = bool(cfg.get("entry_require_fresh_start_signal", True))
-                                fresh_long = bool(stt.get("_fresh_long_trigger", False))
-                                fresh_short = bool(stt.get("_fresh_short_trigger", False))
+                                fresh_long = bool(stt.get("_fresh_long_recent", stt.get("_fresh_long_trigger", False)))
+                                fresh_short = bool(stt.get("_fresh_short_recent", stt.get("_fresh_short_trigger", False)))
                                 fresh_ok = True
                                 if need_fresh:
                                     if ml_dir == "buy":
@@ -15294,8 +15411,8 @@ def telegram_thread(ex):
                                 )
                                 sqz_ok = True
                                 if sqz_priority:
-                                    sqz_fire_buy = bool(stt.get("_sqz_fire_up", False))
-                                    sqz_fire_sell = bool(stt.get("_sqz_fire_down", False))
+                                    sqz_fire_buy = bool(stt.get("_sqz_fire_up_recent", stt.get("_sqz_fire_up", False)))
+                                    sqz_fire_sell = bool(stt.get("_sqz_fire_down_recent", stt.get("_sqz_fire_down", False)))
                                     if ml_dir == "buy":
                                         sqz_ok = bool(sqz_fire_buy)
                                     elif ml_dir == "sell":
@@ -15486,17 +15603,29 @@ def telegram_thread(ex):
                         # AI 판단
                         # ✅ 비용 절감: 같은 봉에서는 AI를 재호출하지 않고 캐시 재사용(강제스캔 제외)
                         use_cached_ai = False
+                        cache_reason = ""
                         try:
-                            if (not forced_ai) and bool(cfg.get("ai_scan_once_per_bar", True)):
+                            if (not forced_ai):
+                                has_cached_ai = bool(str(cs.get("ai_decision", "") or "").strip())
                                 last_ai_bar = int(cs.get("ai_last_called_bar_ms", 0) or 0)
                                 cur_bar = int(short_last_bar_ms or 0)
-                                if cur_bar > 0 and last_ai_bar == cur_bar and str(cs.get("ai_decision", "") or "").strip():
-                                    use_cached_ai = True
+                                last_ai_epoch = float(cs.get("ai_last_called_epoch", 0.0) or 0.0)
+                                if has_cached_ai and bool(cfg.get("ai_scan_once_per_bar", False)):
+                                    if cur_bar > 0 and last_ai_bar == cur_bar:
+                                        use_cached_ai = True
+                                        cache_reason = "같은 봉 캐시"
+                                elif has_cached_ai:
+                                    cooldown_sec = float(cfg.get("ai_recall_cooldown_sec", 20) or 20)
+                                    cooldown_sec = float(clamp(cooldown_sec, 5.0, 120.0))
+                                    if last_ai_epoch > 0 and (time.time() - last_ai_epoch) < cooldown_sec:
+                                        use_cached_ai = True
+                                        cache_reason = f"쿨다운 캐시({int(cooldown_sec)}s)"
                         except Exception:
                             use_cached_ai = False
+                            cache_reason = ""
 
                         if use_cached_ai:
-                            mon_add_scan(mon, stage="ai_cached", symbol=sym, tf=str(cfg.get("timeframe", "5m")), message="같은 봉: 캐시 재사용")
+                            mon_add_scan(mon, stage="ai_cached", symbol=sym, tf=str(cfg.get("timeframe", "5m")), message=f"{cache_reason or '캐시 재사용'}")
                             try:
                                 ai = {
                                     "decision": str(cs.get("ai_decision", "hold") or "hold"),
@@ -15593,12 +15722,14 @@ def telegram_thread(ex):
                                 sqz_on = bool(stt.get("_sqz_on", False))
                                 sqz_fire_up = bool(stt.get("_sqz_fire_up", False))
                                 sqz_fire_down = bool(stt.get("_sqz_fire_down", False))
+                                sqz_fire_up_recent = bool(stt.get("_sqz_fire_up_recent", sqz_fire_up))
+                                sqz_fire_down_recent = bool(stt.get("_sqz_fire_down_recent", sqz_fire_down))
                                 sqz_thr = float(max(0.001, abs(float(cfg.get("sqz_mom_threshold_pct", 0.05) or 0.05))))
                                 strict_sqz = bool(cfg.get("sqz_priority_entry_strict", True)) and (w >= 0.80)
 
                                 if strict_sqz:
-                                    allow_buy = bool(raw_decision == "buy" and sqz_fire_up)
-                                    allow_sell = bool(raw_decision == "sell" and sqz_fire_down)
+                                    allow_buy = bool(raw_decision == "buy" and sqz_fire_up_recent)
+                                    allow_sell = bool(raw_decision == "sell" and sqz_fire_down_recent)
                                     if not (allow_buy or allow_sell):
                                         if soft_mode:
                                             pen_conf = float(clamp(float(cfg.get("sqz_soft_penalty_conf_mult", max(0.25, 1.0 - (w * 0.45))) or max(0.25, 1.0 - (w * 0.45))), 0.10, 1.0))
@@ -16150,7 +16281,7 @@ def telegram_thread(ex):
                             try:
                                 if bool(is_soft_entry) and bool(cfg.get("soft_entry_enable", True)):
                                     if not bool(cfg.get("fixed_entry_pct_enable", False)):
-                                        mult_e = float(cfg.get("soft_entry_entry_pct_mult", 0.55) or 0.55)
+                                        mult_e = float(cfg.get("soft_entry_entry_pct_mult", 0.50) or 0.50)
                                         floor_e = float(cfg.get("soft_entry_entry_pct_floor", 2.0) or 2.0)
                                         entry_pct = float(max(float(floor_e), float(entry_pct) * float(clamp(mult_e, 0.1, 1.0))))
                                         ai2["entry_pct"] = float(entry_pct)
@@ -17887,8 +18018,38 @@ config["tg_simple_messages"] = st.sidebar.checkbox(
 st.sidebar.subheader("🧠 AI 비용 절감")
 config["ai_scan_once_per_bar"] = st.sidebar.checkbox(
     "스캔 AI: 같은 봉 재호출 금지(권장)",
-    value=bool(config.get("ai_scan_once_per_bar", True)),
-    help="자동 스캔에서 같은 봉(단기 TF)에서는 AI를 다시 부르지 않고 마지막 결과를 재사용합니다. /scan은 예외입니다.",
+    value=bool(config.get("ai_scan_once_per_bar", False)),
+    help="ON이면 같은 봉에서는 AI를 1회만 호출합니다. OFF이면 아래 쿨다운(초) 동안만 캐시를 재사용합니다. /scan은 예외입니다.",
+)
+config["ai_recall_cooldown_sec"] = st.sidebar.number_input(
+    "AI 재호출 쿨다운(초)",
+    5,
+    120,
+    int(config.get("ai_recall_cooldown_sec", 20) or 20),
+    step=1,
+    help="ai_scan_once_per_bar=OFF일 때, 같은 코인의 AI 재호출 최소 간격입니다.",
+)
+ca1, ca2 = st.sidebar.columns(2)
+config["entry_convergence_min_votes"] = ca1.number_input(
+    "수렴 최소표",
+    2,
+    5,
+    int(config.get("entry_convergence_min_votes", 2) or 2),
+    step=1,
+)
+config["entry_fresh_signal_window_bars"] = ca2.number_input(
+    "신호 시효(봉)",
+    1,
+    6,
+    int(config.get("entry_fresh_signal_window_bars", 2) or 2),
+    step=1,
+)
+config["sqz_fire_window_bars"] = st.sidebar.number_input(
+    "SQZ 시작 시효(봉)",
+    1,
+    6,
+    int(config.get("sqz_fire_window_bars", 2) or 2),
+    step=1,
 )
 with st.sidebar.expander("진입 전 AI 호출 필터(거래량/이격도)"):
     config["ai_call_require_volume_spike"] = st.checkbox(
