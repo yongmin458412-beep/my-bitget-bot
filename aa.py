@@ -592,7 +592,7 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 16,
+        "settings_schema_version": 17,
         "openai_api_key": "",
         "openai_model_trade": "gpt-4o-mini",
         "openai_model_style": "gpt-4o-mini",
@@ -669,6 +669,13 @@ def default_settings() -> Dict[str, Any]:
         "sqz_dependency_override_ai": True, # SQZ가 반대면 AI buy/sell을 hold로 강제
         # ✅ SQZ 최우선 진입(요구): SQZ "막 시작(fire)" 신호에서만 진입 허용
         "sqz_priority_entry_strict": True,
+        # ✅ SQZ 최우선이더라도, 다른 신호가 매우 강하면 예외 진입 허용
+        "sqz_strict_override_enable": True,
+        "sqz_strict_override_ml_votes": 4,
+        "sqz_strict_override_conf": 82,
+        "sqz_strict_override_adx": 22.0,
+        "sqz_strict_override_pattern_strength": 0.60,
+        "sqz_strict_override_vol_ratio": 1.40,
         # ✅ 하드차단 대신 소프트 감점(요청)
         # - strict 조건 미충족 시 진입 금지 대신 확신/진입금/레버를 감점한다.
         "sqz_soft_penalty_enable": True,
@@ -684,6 +691,19 @@ def default_settings() -> Dict[str, Any]:
         # - 스캔 단계에서 먼저 계산하고, 진입 시에만 AI를 호출해 TP/SL/SR를 유도리 있게 설계
         "entry_convergence_enable": True,
         "entry_convergence_min_votes": 2,
+        # ✅ 급등/급락 이벤트 모드(가격행동 기반, 지표 의존도 낮춤)
+        "event_mode_enable": True,
+        "event_mode_min_score": 68,
+        "event_mode_move_1bar_pct": 0.80,
+        "event_mode_move_3bar_pct": 1.20,
+        "event_mode_volume_spike_mul": 1.80,
+        "event_mode_retrace_max_frac": 0.40,
+        "event_mode_wick_reversal_min_frac": 0.42,
+        "event_mode_break_buffer_pct": 0.08,
+        "event_mode_conf_floor": 74,
+        "event_mode_flip_min_score": 82,
+        "event_mode_force_ai": True,
+        "event_mode_force_ai_min_score": 85,
         # ✅ 신규: "시그널이 막 시작된 시점"에서만 AI 호출 허용
         # - MACD/MA 골든·데드 크로스 시작
         # - SQZ fire 시작
@@ -1533,6 +1553,116 @@ def load_settings() -> Dict[str, Any]:
             try:
                 if "openai_model_review" not in saved:
                     cfg["openai_model_review"] = "gpt-4o-mini"
+                    changed = True
+            except Exception:
+                pass
+        # v17: SQZ 강신호 예외 + 급변 이벤트 진입 모드
+        if saved_ver < 17:
+            try:
+                if "sqz_strict_override_enable" not in saved:
+                    cfg["sqz_strict_override_enable"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "sqz_strict_override_ml_votes" not in saved:
+                    cfg["sqz_strict_override_ml_votes"] = 4
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "sqz_strict_override_conf" not in saved:
+                    cfg["sqz_strict_override_conf"] = 82
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "sqz_strict_override_adx" not in saved:
+                    cfg["sqz_strict_override_adx"] = 22.0
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "sqz_strict_override_pattern_strength" not in saved:
+                    cfg["sqz_strict_override_pattern_strength"] = 0.60
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "sqz_strict_override_vol_ratio" not in saved:
+                    cfg["sqz_strict_override_vol_ratio"] = 1.40
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "event_mode_enable" not in saved:
+                    cfg["event_mode_enable"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "event_mode_min_score" not in saved:
+                    cfg["event_mode_min_score"] = 68
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "event_mode_move_1bar_pct" not in saved:
+                    cfg["event_mode_move_1bar_pct"] = 0.80
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "event_mode_move_3bar_pct" not in saved:
+                    cfg["event_mode_move_3bar_pct"] = 1.20
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "event_mode_volume_spike_mul" not in saved:
+                    cfg["event_mode_volume_spike_mul"] = 1.80
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "event_mode_retrace_max_frac" not in saved:
+                    cfg["event_mode_retrace_max_frac"] = 0.40
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "event_mode_wick_reversal_min_frac" not in saved:
+                    cfg["event_mode_wick_reversal_min_frac"] = 0.42
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "event_mode_break_buffer_pct" not in saved:
+                    cfg["event_mode_break_buffer_pct"] = 0.08
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "event_mode_conf_floor" not in saved:
+                    cfg["event_mode_conf_floor"] = 74
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "event_mode_flip_min_score" not in saved:
+                    cfg["event_mode_flip_min_score"] = 82
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "event_mode_force_ai" not in saved:
+                    cfg["event_mode_force_ai"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "event_mode_force_ai_min_score" not in saved:
+                    cfg["event_mode_force_ai_min_score"] = 85
                     changed = True
             except Exception:
                 pass
@@ -7972,6 +8102,149 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
     status["_pullback_candidate"] = bool(pullback_candidate)
 
     return df2, status, last
+
+
+# =========================================================
+# ✅ 11.1) 급등/급락 이벤트 진입 시그널(가격행동 기반)
+# =========================================================
+def current_volume_ratio(df: pd.DataFrame, period: int = 20) -> float:
+    try:
+        if df is None or df.empty or len(df) < (int(period) + 1):
+            return 0.0
+        vv = pd.to_numeric(df["vol"], errors="coerce").astype(float)
+        v_now = float(vv.iloc[-1])
+        v_ma = float(vv.iloc[-(int(period) + 1):-1].mean())
+        if v_ma <= 0:
+            return 0.0
+        return float(v_now / v_ma)
+    except Exception:
+        return 0.0
+
+
+def detect_event_entry_setup(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    out = {
+        "triggered": False,
+        "decision": "hold",
+        "score": 0,
+        "kind": "",
+        "reason": "",
+        "move_1bar_pct": 0.0,
+        "move_3bar_pct": 0.0,
+        "vol_ratio": 0.0,
+        "range_pct": 0.0,
+        "wick_down_frac": 0.0,
+        "wick_up_frac": 0.0,
+    }
+    try:
+        if not bool(cfg.get("event_mode_enable", True)):
+            return out
+        if df is None or df.empty or len(df) < 6:
+            return out
+
+        close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+        open_ = pd.to_numeric(df["open"], errors="coerce").astype(float)
+        high = pd.to_numeric(df["high"], errors="coerce").astype(float)
+        low = pd.to_numeric(df["low"], errors="coerce").astype(float)
+        if len(close) < 4:
+            return out
+
+        c0 = float(close.iloc[-1])
+        c1 = float(close.iloc[-2])
+        c3 = float(close.iloc[-4])
+        if c1 <= 0 or c3 <= 0:
+            return out
+
+        move_1 = ((c0 - c1) / c1) * 100.0
+        move_3 = ((c0 - c3) / c3) * 100.0
+        out["move_1bar_pct"] = float(move_1)
+        out["move_3bar_pct"] = float(move_3)
+
+        vol_ratio = current_volume_ratio(df, period=20)
+        out["vol_ratio"] = float(vol_ratio)
+
+        h0 = float(high.iloc[-1])
+        l0 = float(low.iloc[-1])
+        o0 = float(open_.iloc[-1])
+        rng = max(1e-9, h0 - l0)
+        range_pct = (rng / max(c1, 1e-9)) * 100.0
+        out["range_pct"] = float(range_pct)
+
+        upper_wick = max(0.0, h0 - max(o0, c0))
+        lower_wick = max(0.0, min(o0, c0) - l0)
+        wick_up_frac = float(upper_wick / rng)
+        wick_down_frac = float(lower_wick / rng)
+        out["wick_down_frac"] = float(wick_down_frac)
+        out["wick_up_frac"] = float(wick_up_frac)
+
+        thr1 = float(cfg.get("event_mode_move_1bar_pct", 0.80) or 0.80)
+        thr3 = float(cfg.get("event_mode_move_3bar_pct", 1.20) or 1.20)
+        vol_mul = float(cfg.get("event_mode_volume_spike_mul", 1.80) or 1.80)
+        retrace_max = float(cfg.get("event_mode_retrace_max_frac", 0.40) or 0.40)
+        wick_rev = float(cfg.get("event_mode_wick_reversal_min_frac", 0.42) or 0.42)
+        break_buf = float(cfg.get("event_mode_break_buffer_pct", 0.08) or 0.08)
+
+        down_evt = (move_1 <= -abs(thr1)) or (move_3 <= -abs(thr3))
+        up_evt = (move_1 >= abs(thr1)) or (move_3 >= abs(thr3))
+        if (not down_evt) and (not up_evt):
+            return out
+        if vol_ratio < float(vol_mul):
+            return out
+
+        body_dir_down = (c0 < o0)
+        body_dir_up = (c0 > o0)
+        near_low = c0 <= (l0 + rng * 0.35)
+        near_high = c0 >= (h0 - rng * 0.35)
+        retrace_from_low = (c0 - l0) / rng
+        retrace_from_high = (h0 - c0) / rng
+
+        decision = "hold"
+        kind = ""
+        if down_evt and body_dir_down and near_low and (retrace_from_low <= float(retrace_max)):
+            decision = "sell"
+            kind = "급락지속"
+        elif up_evt and body_dir_up and near_high and (retrace_from_high <= float(retrace_max)):
+            decision = "buy"
+            kind = "급등지속"
+        elif down_evt and (wick_down_frac >= float(wick_rev)) and (c0 > o0):
+            decision = "buy"
+            kind = "급락반전"
+        elif up_evt and (wick_up_frac >= float(wick_rev)) and (c0 < o0):
+            decision = "sell"
+            kind = "급등반전"
+        if decision == "hold":
+            return out
+
+        prev_hi = float(high.iloc[-2]) if len(high) >= 2 else h0
+        prev_lo = float(low.iloc[-2]) if len(low) >= 2 else l0
+        if decision == "buy":
+            confirm_ok = c0 >= (prev_hi * (1.0 + (break_buf / 100.0)))
+            if kind == "급등지속":
+                confirm_ok = True
+        else:
+            confirm_ok = c0 <= (prev_lo * (1.0 - (break_buf / 100.0)))
+            if kind == "급락지속":
+                confirm_ok = True
+        if not bool(confirm_ok):
+            return out
+
+        score = 50.0
+        score += min(22.0, abs(float(move_3)) * 7.5)
+        score += min(14.0, max(0.0, float(vol_ratio) - float(vol_mul)) * 20.0)
+        score += min(8.0, max(0.0, float(range_pct) - abs(float(thr1))) * 2.0)
+        if "지속" in kind:
+            score += 8.0
+        if "반전" in kind:
+            score += 5.0
+        score_i = int(clamp(int(round(score)), 0, 99))
+
+        out["triggered"] = True
+        out["decision"] = str(decision)
+        out["score"] = int(score_i)
+        out["kind"] = str(kind)
+        out["reason"] = f"{kind} | 1봉 {move_1:+.2f}% / 3봉 {move_3:+.2f}% / 거래량 {vol_ratio:.2f}x"
+        return out
+    except Exception:
+        return out
 
 
 # =========================================================
@@ -16280,6 +16553,7 @@ def telegram_thread(ex):
                                 short_last_bar_ms = 0
                             df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
                             df["time"] = pd.to_datetime(df["time"], unit="ms")
+                            df_raw = df.copy()
                         except FuturesTimeoutError as e:
                             mon.setdefault("coins", {}).setdefault(sym, {})
                             mon["coins"][sym]["skip_reason"] = "ccxt timeout(ohlcv)"
@@ -16364,6 +16638,32 @@ def telegram_thread(ex):
                                 "pullback_candidate": bool(stt.get("_pullback_candidate", False)),
                             }
                         )
+
+                        event_sig = detect_event_entry_setup(df_raw, cfg)
+                        try:
+                            cs["event_triggered"] = bool(event_sig.get("triggered", False))
+                            cs["event_kind"] = str(event_sig.get("kind", "") or "")
+                            cs["event_decision"] = str(event_sig.get("decision", "hold") or "hold")
+                            cs["event_score"] = int(event_sig.get("score", 0) or 0)
+                            cs["event_reason"] = str(event_sig.get("reason", "") or "")[:180]
+                            cs["event_move_1"] = float(event_sig.get("move_1bar_pct", 0.0) or 0.0)
+                            cs["event_move_3"] = float(event_sig.get("move_3bar_pct", 0.0) or 0.0)
+                            cs["event_vol_ratio"] = float(event_sig.get("vol_ratio", 0.0) or 0.0)
+                        except Exception:
+                            pass
+                        try:
+                            if bool(event_sig.get("triggered", False)):
+                                mon_add_scan(
+                                    mon,
+                                    stage="event_signal",
+                                    symbol=sym,
+                                    tf=str(cfg.get("timeframe", "5m")),
+                                    signal=str(event_sig.get("decision", "hold")),
+                                    score=int(event_sig.get("score", 0) or 0),
+                                    message=str(event_sig.get("reason", "") or "")[:120],
+                                )
+                        except Exception:
+                            pass
 
                         # ✅ 멀티 타임프레임 패턴(1m/3m/5m/15m/30m/1h/2h/4h) 반영
                         try:
@@ -16507,6 +16807,12 @@ def telegram_thread(ex):
                         # - 강한 시그널(눌림목/RSI해소/밴드이탈)은 우선 호출
                         # - 그 외에는 ADX/거래량/모멘텀을 조합해 "추세 지속" 가능성이 있을 때 호출
                         call_ai = False
+                        event_triggered = bool(event_sig.get("triggered", False))
+                        event_decision = str(event_sig.get("decision", "hold") or "hold")
+                        event_score = int(event_sig.get("score", 0) or 0)
+                        event_override = False
+                        event_force_ai = False
+                        forced_ai = False
                         try:
                             sig_pullback = bool(stt.get("_pullback_candidate", False))
                             sig_rsi_resolve = bool(stt.get("_rsi_resolve_long", False)) or bool(stt.get("_rsi_resolve_short", False))
@@ -16581,35 +16887,44 @@ def telegram_thread(ex):
                             except Exception:
                                 sqz_thr = 0.05
                             sqz_strong = bool(cfg.get("use_sqz", True)) and bool(cfg.get("sqz_dependency_enable", True)) and (abs(float(sqz_mom_pct)) >= float(sqz_thr))
+                            event_min_score = int(cfg.get("event_mode_min_score", 68) or 68)
+                            event_force_min = int(cfg.get("event_mode_force_ai_min_score", 85) or 85)
 
-                            # 강한 시그널 우선
-                            if pattern_strong:
+                            if event_triggered and (event_decision in ["buy", "sell"]) and (event_score >= event_min_score):
                                 call_ai = True
-                            elif sqz_strong:
-                                call_ai = True
-                            elif sig_pullback or sig_rsi_resolve:
-                                call_ai = True
-                            elif ("상단 돌파" in bb_txt) or ("하단 이탈" in bb_txt):
-                                call_ai = True
-                            # ADX 추세강도 기반
-                            elif adxv >= adx_th:
-                                call_ai = True
-                            # MACD 교차는 추세 전환/지속 후보(특히 공격/하이리스크에서 기회 포착)
-                            elif (str(mode) != "안전모드") and macd_cross and (adxv >= max(6.0, float(trend_min_adx) - 3.0)):
-                                call_ai = True
-                            # RSI가 과매도/과매수 근처면(해소 전)도 AI를 부를 수 있게 완화(공격/하이리스크)
-                            elif (str(mode) != "안전모드") and rsi_extreme:
-                                call_ai = True
-                            # 추세 지속/모멘텀(거래량/RSI50/ MACD) 기반
-                            elif (
-                                (("상승" in trend_txt) or ("하락" in trend_txt))
-                                and (vol_spike or rsi50_cross or macd_cross)
-                                and (adxv >= max(12.0, adx_th - 5.0))
-                            ):
-                                call_ai = True
-                            # 추세 신호 단독으로도 AI 호출 허용(하이리스크 기회 포착)
-                            elif (("상승" in trend_txt) or ("하락" in trend_txt)) and adxv >= max(float(trend_min_adx), adx_th - 8.0):
-                                call_ai = True
+                                event_override = True
+                                if bool(cfg.get("event_mode_force_ai", True)) and (event_score >= event_force_min):
+                                    event_force_ai = True
+
+                            if not call_ai:
+                                # 강한 시그널 우선
+                                if pattern_strong:
+                                    call_ai = True
+                                elif sqz_strong:
+                                    call_ai = True
+                                elif sig_pullback or sig_rsi_resolve:
+                                    call_ai = True
+                                elif ("상단 돌파" in bb_txt) or ("하단 이탈" in bb_txt):
+                                    call_ai = True
+                                # ADX 추세강도 기반
+                                elif adxv >= adx_th:
+                                    call_ai = True
+                                # MACD 교차는 추세 전환/지속 후보(특히 공격/하이리스크에서 기회 포착)
+                                elif (str(mode) != "안전모드") and macd_cross and (adxv >= max(6.0, float(trend_min_adx) - 3.0)):
+                                    call_ai = True
+                                # RSI가 과매도/과매수 근처면(해소 전)도 AI를 부를 수 있게 완화(공격/하이리스크)
+                                elif (str(mode) != "안전모드") and rsi_extreme:
+                                    call_ai = True
+                                # 추세 지속/모멘텀(거래량/RSI50/ MACD) 기반
+                                elif (
+                                    (("상승" in trend_txt) or ("하락" in trend_txt))
+                                    and (vol_spike or rsi50_cross or macd_cross)
+                                    and (adxv >= max(12.0, adx_th - 5.0))
+                                ):
+                                    call_ai = True
+                                # 추세 신호 단독으로도 AI 호출 허용(하이리스크 기회 포착)
+                                elif (("상승" in trend_txt) or ("하락" in trend_txt)) and adxv >= max(float(trend_min_adx), adx_th - 8.0):
+                                    call_ai = True
                         except Exception:
                             call_ai = False
 
@@ -16676,7 +16991,35 @@ def telegram_thread(ex):
                                             call_ai = False
                                             cs["skip_reason"] = "초기 신호 아님(시작 구간 대기)"
                                     if call_ai and sqz_priority and (not sqz_ok):
-                                        if soft_mode:
+                                        try:
+                                            adx_now_ovr = float(last.get("ADX", 0.0)) if "ADX" in df.columns else 0.0
+                                        except Exception:
+                                            adx_now_ovr = 0.0
+                                        try:
+                                            pat_now_ovr = float(stt.get("_pattern_strength", 0.0) or 0.0)
+                                        except Exception:
+                                            pat_now_ovr = 0.0
+                                        try:
+                                            vr_now_ovr = float(current_volume_ratio(df, period=int(cfg.get("ai_call_volume_spike_period", 20) or 20)))
+                                        except Exception:
+                                            vr_now_ovr = 0.0
+                                        try:
+                                            strict_ovr = bool(cfg.get("sqz_strict_override_enable", True)) and (
+                                                int(ml_votes) >= int(cfg.get("sqz_strict_override_ml_votes", 4) or 4)
+                                                and adx_now_ovr >= float(cfg.get("sqz_strict_override_adx", 22.0) or 22.0)
+                                                and pat_now_ovr >= float(cfg.get("sqz_strict_override_pattern_strength", 0.60) or 0.60)
+                                                and vr_now_ovr >= float(cfg.get("sqz_strict_override_vol_ratio", 1.40) or 1.40)
+                                            )
+                                        except Exception:
+                                            strict_ovr = False
+
+                                        if strict_ovr:
+                                            event_override = True
+                                            soft_penalty_conf_mul *= 0.95
+                                            soft_penalty_entry_mul *= 0.90
+                                            soft_penalty_lev_mul *= 0.95
+                                            soft_penalty_tags.append("SQZ강신호예외")
+                                        elif soft_mode:
                                             w_soft = float(clamp(float(cfg.get("sqz_dependency_weight", 0.80) or 0.80), 0.0, 1.0))
                                             p_conf = float(clamp(float(cfg.get("sqz_soft_penalty_conf_mult", max(0.25, 1.0 - (w_soft * 0.45))) or max(0.25, 1.0 - (w_soft * 0.45))), 0.10, 1.0))
                                             p_entry = float(clamp(float(cfg.get("sqz_soft_penalty_entry_mult", max(0.20, 1.0 - (w_soft * 0.60))) or max(0.20, 1.0 - (w_soft * 0.60))), 0.10, 1.0))
@@ -16689,14 +17032,21 @@ def telegram_thread(ex):
                                             call_ai = False
                                             cs["skip_reason"] = "SQZ 시작 신호 아님(최우선 SQZ 대기)"
                                 else:
-                                    call_ai = False
-                                    try:
-                                        if need != need_base:
-                                            cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need}) [완화]"
-                                        else:
-                                            cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need})"
-                                    except Exception:
-                                        pass
+                                    if not bool(event_override):
+                                        call_ai = False
+                                        try:
+                                            if need != need_base:
+                                                cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need}) [완화]"
+                                            else:
+                                                cs["skip_reason"] = f"지표 수렴 부족({ml_votes}/{need})"
+                                        except Exception:
+                                            pass
+                                    else:
+                                        call_ai = True
+                                        soft_penalty_conf_mul *= 0.92
+                                        soft_penalty_entry_mul *= 0.90
+                                        soft_penalty_lev_mul *= 0.95
+                                        soft_penalty_tags.append("이벤트우선")
                         except Exception:
                             pass
 
@@ -16707,18 +17057,24 @@ def telegram_thread(ex):
                         vol_ratio: Optional[float] = None
                         disparity_pct: Optional[float] = None
                         try:
+                            if call_ai:
+                                try:
+                                    vol_ratio = float(current_volume_ratio(df, period=int(cfg.get("ai_call_volume_spike_period", 20) or 20)))
+                                except Exception:
+                                    vol_ratio = None
                             if call_ai and bool(cfg.get("ai_call_require_volume_spike", True)):
                                 per = max(5, int(cfg.get("ai_call_volume_spike_period", 20) or 20))
                                 mul = float(cfg.get("ai_call_volume_spike_mul", 1.5) or 1.5)
                                 try:
-                                    vv = df["vol"].astype(float)
-                                    if len(vv) >= per + 1:
-                                        v_now = float(vv.iloc[-1])
-                                        v_ma = float(vv.iloc[-(per + 1):-1].mean())
-                                        if v_ma > 0:
-                                            vol_ratio = float(v_now / v_ma)
-                                            if float(vol_ratio) < float(mul):
-                                                filter_msgs.append(f"거래량 부족({vol_ratio:.2f}x < {mul:.2f}x)")
+                                    if vol_ratio is None:
+                                        vv = df["vol"].astype(float)
+                                        if len(vv) >= per + 1:
+                                            v_now = float(vv.iloc[-1])
+                                            v_ma = float(vv.iloc[-(per + 1):-1].mean())
+                                            if v_ma > 0:
+                                                vol_ratio = float(v_now / v_ma)
+                                    if vol_ratio is not None and float(vol_ratio) < float(mul):
+                                        filter_msgs.append(f"거래량 부족({vol_ratio:.2f}x < {mul:.2f}x)")
                                 except Exception:
                                     pass
 
@@ -16766,7 +17122,7 @@ def telegram_thread(ex):
                                 pass
                         # ✅ 비용 절감 strict: 약한 조건에서는 AI 호출 자체를 스킵
                         try:
-                            if call_ai and (not forced_ai) and bool(cfg.get("ai_cost_saver_strict", True)):
+                            if call_ai and (not forced_ai) and (not event_override) and bool(cfg.get("ai_cost_saver_strict", True)):
                                 ml_votes_now = int(ml.get("votes_max", 0) or 0)
                                 need_votes_now = max(2, int(cfg.get("entry_convergence_min_votes", 2) or 2))
                                 strong_sig_now = bool(stt.get("_pullback_candidate", False)) or bool(stt.get("_rsi_resolve_long", False)) or bool(stt.get("_rsi_resolve_short", False))
@@ -16777,7 +17133,7 @@ def telegram_thread(ex):
                         except Exception:
                             pass
 
-                        if call_ai and filter_msgs and bool(cfg.get("ai_call_filters_block_ai", False)):
+                        if call_ai and filter_msgs and bool(cfg.get("ai_call_filters_block_ai", False)) and (not event_override):
                             call_ai = False
                             try:
                                 cs["skip_reason"] = " / ".join(filter_msgs)[:160]
@@ -16790,7 +17146,7 @@ def telegram_thread(ex):
                                 pass
 
                         # ✅ /scan 강제스캔: 원래 call_ai=False인 경우에만 AI를 "추가로" 호출(주문은 막기 위해 플래그 보관)
-                        forced_ai = False
+                        forced_ai = bool(event_force_ai)
                         try:
                             if force_scan_pending and ((not force_scan_syms_set) or (sym in force_scan_syms_set)) and (not call_ai):
                                 call_ai = True
@@ -16813,6 +17169,11 @@ def telegram_thread(ex):
                                     sigs.append("pattern_long")
                                 elif pb == -1:
                                     sigs.append("pattern_short")
+                            except Exception:
+                                pass
+                            try:
+                                if bool(event_triggered):
+                                    sigs.append(f"event_{str(event_decision)}")
                             except Exception:
                                 pass
                             adxv2 = float(last.get("ADX", 0)) if "ADX" in df.columns else 0.0
@@ -16912,7 +17273,13 @@ def telegram_thread(ex):
                                     message=f"budget_guard: {budget_note}",
                                 )
                                 continue
-                            mon_add_scan(mon, stage="ai_call", symbol=sym, tf=str(cfg.get("timeframe", "5m")), message="AI 판단 요청")
+                            mon_add_scan(
+                                mon,
+                                stage="ai_call",
+                                symbol=sym,
+                                tf=str(cfg.get("timeframe", "5m")),
+                                message=("AI 판단 요청(이벤트)" if bool(event_override) else "AI 판단 요청"),
+                            )
                         # ✅ 요구: 스윙 판단일 때만 외부시황을 AI에 제공(스캘핑/단기=차트만)
                         try:
                             tr_s = str(stt.get("추세", "") or "")
@@ -16983,6 +17350,25 @@ def telegram_thread(ex):
                         except Exception:
                             pass
 
+                        try:
+                            if bool(event_triggered) and str(event_decision) in ["buy", "sell"]:
+                                event_conf_floor = int(cfg.get("event_mode_conf_floor", 74) or 74)
+                                event_flip_min = int(cfg.get("event_mode_flip_min_score", 82) or 82)
+                                if str(decision) == "hold":
+                                    decision = str(event_decision)
+                                    conf = int(max(int(conf), int(event_conf_floor), int(event_score)))
+                                    cs["skip_reason"] = ""
+                                elif str(decision) != str(event_decision):
+                                    if int(event_score) >= int(event_flip_min) and int(conf) < int(event_score):
+                                        decision = str(event_decision)
+                                        conf = int(max(int(event_conf_floor), int(event_score)))
+                                        cs["skip_reason"] = ""
+                                    else:
+                                        conf = int(max(0, int(round(float(conf) * 0.72))))
+                                        cs["skip_reason"] = f"이벤트({str(event_sig.get('kind',''))}) vs AI 불일치"
+                        except Exception:
+                            pass
+
                         # ✅ SQZ 의존도(요구: 80%+): SQZ 모멘텀이 반대/중립이면 진입을 강하게 억제
                         sqz_skip_reason = ""
                         try:
@@ -17009,7 +17395,41 @@ def telegram_thread(ex):
                                     allow_buy = bool(raw_decision == "buy" and sqz_fire_up_recent)
                                     allow_sell = bool(raw_decision == "sell" and sqz_fire_down_recent)
                                     if not (allow_buy or allow_sell):
-                                        if soft_mode:
+                                        try:
+                                            adx_now_ovr2 = float(last.get("ADX", 0.0)) if "ADX" in df.columns else 0.0
+                                        except Exception:
+                                            adx_now_ovr2 = 0.0
+                                        try:
+                                            pat_now_ovr2 = float(stt.get("_pattern_strength", 0.0) or 0.0)
+                                        except Exception:
+                                            pat_now_ovr2 = 0.0
+                                        try:
+                                            vr_now_ovr2 = float(vol_ratio) if vol_ratio is not None else float(current_volume_ratio(df, period=int(cfg.get("ai_call_volume_spike_period", 20) or 20)))
+                                        except Exception:
+                                            vr_now_ovr2 = 0.0
+                                        try:
+                                            ml_votes_now2 = int(ml.get("votes_max", 0) or 0)
+                                        except Exception:
+                                            ml_votes_now2 = 0
+                                        try:
+                                            strict_ovr2 = bool(cfg.get("sqz_strict_override_enable", True)) and (
+                                                int(ml_votes_now2) >= int(cfg.get("sqz_strict_override_ml_votes", 4) or 4)
+                                                and int(raw_conf) >= int(cfg.get("sqz_strict_override_conf", 82) or 82)
+                                                and adx_now_ovr2 >= float(cfg.get("sqz_strict_override_adx", 22.0) or 22.0)
+                                                and pat_now_ovr2 >= float(cfg.get("sqz_strict_override_pattern_strength", 0.60) or 0.60)
+                                                and vr_now_ovr2 >= float(cfg.get("sqz_strict_override_vol_ratio", 1.40) or 1.40)
+                                            )
+                                        except Exception:
+                                            strict_ovr2 = False
+
+                                        if strict_ovr2:
+                                            event_override = True
+                                            soft_penalty_conf_mul *= 0.95
+                                            soft_penalty_entry_mul *= 0.90
+                                            soft_penalty_lev_mul *= 0.95
+                                            soft_penalty_tags.append("SQZ강신호예외")
+                                            sqz_skip_reason = f"SQZ 미충족 예외(ML{ml_votes_now2}, ADX {adx_now_ovr2:.0f}, VOL {vr_now_ovr2:.2f}x)"
+                                        elif soft_mode:
                                             pen_conf = float(clamp(float(cfg.get("sqz_soft_penalty_conf_mult", max(0.25, 1.0 - (w * 0.45))) or max(0.25, 1.0 - (w * 0.45))), 0.10, 1.0))
                                             pen_entry = float(clamp(float(cfg.get("sqz_soft_penalty_entry_mult", max(0.20, 1.0 - (w * 0.60))) or max(0.20, 1.0 - (w * 0.60))), 0.10, 1.0))
                                             pen_lev = float(clamp(float(cfg.get("sqz_soft_penalty_lev_mult", max(0.35, 1.0 - (w * 0.35))) or max(0.35, 1.0 - (w * 0.35))), 0.10, 1.0))
@@ -19777,6 +20197,7 @@ with st.sidebar.expander("🔥 스퀴즈 모멘텀(SQZ) 설정"):
     config["sqz_dependency_enable"] = st.checkbox("SQZ 의존(진입 필터)", value=bool(config.get("sqz_dependency_enable", True)))
     config["sqz_dependency_gate_entry"] = st.checkbox("SQZ 중립이면 진입 억제", value=bool(config.get("sqz_dependency_gate_entry", True)))
     config["sqz_dependency_override_ai"] = st.checkbox("SQZ 반대면 AI 신호 무시", value=bool(config.get("sqz_dependency_override_ai", True)))
+    config["sqz_priority_entry_strict"] = st.checkbox("SQZ 시작 신호 엄격모드", value=bool(config.get("sqz_priority_entry_strict", True)))
     config["sqz_dependency_weight"] = st.slider("SQZ 의존도(가중치)", 0.5, 1.0, float(config.get("sqz_dependency_weight", 0.80) or 0.80), step=0.05)
     c_sq1, c_sq2 = st.columns(2)
     config["sqz_mom_threshold_pct"] = c_sq1.number_input("모멘텀 기준(%)", 0.005, 1.0, float(config.get("sqz_mom_threshold_pct", 0.05) or 0.05), step=0.01)
@@ -19787,6 +20208,33 @@ with st.sidebar.expander("🔥 스퀴즈 모멘텀(SQZ) 설정"):
     c_sq5, c_sq6 = st.columns(2)
     config["sqz_kc_mult"] = c_sq5.number_input("KC 배수", 0.5, 6.0, float(config.get("sqz_kc_mult", 1.5) or 1.5), step=0.1)
     config["sqz_mom_length"] = c_sq6.number_input("모멘텀 길이", 5, 120, int(config.get("sqz_mom_length", 20) or 20), step=1)
+    st.caption("SQZ 미충족이어도 다른 신호가 매우 강하면 예외 진입 허용")
+    config["sqz_strict_override_enable"] = st.checkbox("SQZ 강신호 예외 허용", value=bool(config.get("sqz_strict_override_enable", True)))
+    so1, so2, so3 = st.columns(3)
+    config["sqz_strict_override_ml_votes"] = so1.number_input("ML표", 2, 6, int(config.get("sqz_strict_override_ml_votes", 4) or 4), step=1)
+    config["sqz_strict_override_adx"] = so2.number_input("ADX", 0.0, 60.0, float(config.get("sqz_strict_override_adx", 22.0) or 22.0), step=1.0)
+    config["sqz_strict_override_conf"] = so3.number_input("conf", 0, 100, int(config.get("sqz_strict_override_conf", 82) or 82), step=1)
+    so4, so5 = st.columns(2)
+    config["sqz_strict_override_pattern_strength"] = so4.number_input("패턴강도", 0.0, 1.0, float(config.get("sqz_strict_override_pattern_strength", 0.60) or 0.60), step=0.05)
+    config["sqz_strict_override_vol_ratio"] = so5.number_input("거래량배수", 1.0, 10.0, float(config.get("sqz_strict_override_vol_ratio", 1.40) or 1.40), step=0.1)
+
+with st.sidebar.expander("⚡ 급등/급락 이벤트 진입"):
+    config["event_mode_enable"] = st.checkbox("이벤트 모드 사용", value=bool(config.get("event_mode_enable", True)))
+    ev1, ev2, ev3 = st.columns(3)
+    config["event_mode_move_1bar_pct"] = ev1.number_input("1봉 변동%", 0.2, 5.0, float(config.get("event_mode_move_1bar_pct", 0.80) or 0.80), step=0.1)
+    config["event_mode_move_3bar_pct"] = ev2.number_input("3봉 변동%", 0.3, 8.0, float(config.get("event_mode_move_3bar_pct", 1.20) or 1.20), step=0.1)
+    config["event_mode_volume_spike_mul"] = ev3.number_input("거래량 배수", 1.0, 10.0, float(config.get("event_mode_volume_spike_mul", 1.80) or 1.80), step=0.1)
+    ev4, ev5, ev6 = st.columns(3)
+    config["event_mode_retrace_max_frac"] = ev4.number_input("지속 되돌림", 0.1, 0.9, float(config.get("event_mode_retrace_max_frac", 0.40) or 0.40), step=0.05)
+    config["event_mode_wick_reversal_min_frac"] = ev5.number_input("반전 꼬리", 0.1, 0.9, float(config.get("event_mode_wick_reversal_min_frac", 0.42) or 0.42), step=0.05)
+    config["event_mode_break_buffer_pct"] = ev6.number_input("돌파 버퍼%", 0.0, 1.0, float(config.get("event_mode_break_buffer_pct", 0.08) or 0.08), step=0.01)
+    ev7, ev8, ev9 = st.columns(3)
+    config["event_mode_min_score"] = ev7.number_input("최소 점수", 30, 99, int(config.get("event_mode_min_score", 68) or 68), step=1)
+    config["event_mode_conf_floor"] = ev8.number_input("최소 확신도", 30, 99, int(config.get("event_mode_conf_floor", 74) or 74), step=1)
+    config["event_mode_flip_min_score"] = ev9.number_input("방향 전환 점수", 50, 99, int(config.get("event_mode_flip_min_score", 82) or 82), step=1)
+    ev10, ev11 = st.columns(2)
+    config["event_mode_force_ai"] = ev10.checkbox("강이벤트는 AI 우선 호출", value=bool(config.get("event_mode_force_ai", True)))
+    config["event_mode_force_ai_min_score"] = ev11.number_input("강이벤트 점수", 60, 99, int(config.get("event_mode_force_ai_min_score", 85) or 85), step=1)
 
 with st.sidebar.expander("📐 차트 패턴 설정"):
     config["pattern_gate_entry"] = st.checkbox("패턴 반대면 진입 억제", value=bool(config.get("pattern_gate_entry", True)))
