@@ -592,8 +592,11 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 15,
+        "settings_schema_version": 16,
         "openai_api_key": "",
+        "openai_model_trade": "gpt-4o-mini",
+        "openai_model_style": "gpt-4o-mini",
+        "openai_model_review": "gpt-4o-mini",
         # ✅ 사용자 기본값 프리셋(요청): 하이리스크/하이리턴 + 자동매매 ON
         "auto_trade": True,
         "trade_mode": "하이리스크/하이리턴",
@@ -895,12 +898,22 @@ def default_settings() -> Dict[str, Any]:
         "ai_reco_apply": False,
         "ai_reco_refresh_sec": 20,
         "ai_easy_korean": True,
+        # ✅ 회고 호출 비용 절감: 기본은 룰기반 회고, 필요 시에만 OpenAI 회고
+        "ai_review_on_loss_enable": False,
+        "ai_review_openai_min_abs_roi": 12.0,
         # ✅ AI 호출 비용 절감:
         # - 자동 스캔에서 AI는 "같은 봉(단기 TF)에서는 1회만" 호출하고, 이후에는 캐시를 재사용한다.
         # - (강제스캔 /scan 은 예외)
-        "ai_scan_once_per_bar": False,
+        "ai_scan_once_per_bar": True,
         # ai_scan_once_per_bar=False일 때 AI 재호출 최소 간격(초)
-        "ai_recall_cooldown_sec": 20,
+        "ai_recall_cooldown_sec": 45,
+        # ✅ AI 비용 절약(강화): 자동 스캔에서 불필요한 호출 최소화
+        # - strict ON: 스타일 AI 비활성 + 외부시황 AI 입력 제외 + 약한 신호는 AI 호출 스킵
+        "ai_cost_saver_strict": True,
+        "ai_budget_enable": True,
+        "ai_budget_hourly_limit": 24,
+        "ai_budget_daily_limit": 180,
+        "ai_budget_min_interval_sec": 45,
         # ✅ 진입 필터 강화(요구): 거래량(스파이크) + 이격도(Disparity) 조건
         # - 횡보 박스(거래량 없음)에서 RSI 해소만 보고 진입하는 실수를 줄이기 위해 AI 호출 자체를 제한한다.
         # - /scan 강제스캔은 이 필터를 우회(사용자 의도)한다.
@@ -1030,6 +1043,11 @@ def default_settings() -> Dict[str, Any]:
         "trail_breakeven_at_roi_scalp": 6.0,
         "trail_breakeven_at_roi_swing": 12.0,
         "trail_breakeven_offset_price_pct": 0.05,
+        # ✅ SR/목표가 트리거 오차범위(휩쏘 완화)
+        # - SL: 라인을 '조금 더' 이탈해야 트리거(가짜 돌파 방지)
+        # - TP: 라인 '근처'에서도 체결 허용(터치 직전 반전 방지)
+        "sr_trigger_sl_buffer_pct": 0.12,
+        "sr_trigger_tp_buffer_pct": 0.08,
 
         "swing_tp_roi_min": 8.0,
         "swing_tp_roi_max": 80.0,
@@ -1427,6 +1445,97 @@ def load_settings() -> Dict[str, Any]:
                     changed = True
             except Exception:
                 pass
+        # v16: 손절 회고 강화 + SR 트리거 오차범위 + AI 호출 비용 가드
+        if saved_ver < 16:
+            try:
+                cfg["ai_scan_once_per_bar"] = True
+                changed = True
+            except Exception:
+                pass
+            try:
+                if int(cfg.get("ai_recall_cooldown_sec", 0) or 0) < 45:
+                    cfg["ai_recall_cooldown_sec"] = 45
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "ai_cost_saver_strict" not in saved:
+                    cfg["ai_cost_saver_strict"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "ai_budget_enable" not in saved:
+                    cfg["ai_budget_enable"] = True
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "ai_budget_hourly_limit" not in saved:
+                    cfg["ai_budget_hourly_limit"] = 24
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "ai_budget_daily_limit" not in saved:
+                    cfg["ai_budget_daily_limit"] = 180
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "ai_budget_min_interval_sec" not in saved:
+                    cfg["ai_budget_min_interval_sec"] = 45
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "style_entry_ai_enable" not in saved:
+                    cfg["style_entry_ai_enable"] = False
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "sr_trigger_sl_buffer_pct" not in saved:
+                    cfg["sr_trigger_sl_buffer_pct"] = 0.12
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "sr_trigger_tp_buffer_pct" not in saved:
+                    cfg["sr_trigger_tp_buffer_pct"] = 0.08
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "ai_review_on_loss_enable" not in saved:
+                    cfg["ai_review_on_loss_enable"] = False
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "ai_review_openai_min_abs_roi" not in saved:
+                    cfg["ai_review_openai_min_abs_roi"] = 12.0
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "openai_model_trade" not in saved:
+                    cfg["openai_model_trade"] = "gpt-4o-mini"
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "openai_model_style" not in saved:
+                    cfg["openai_model_style"] = "gpt-4o-mini"
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "openai_model_review" not in saved:
+                    cfg["openai_model_review"] = "gpt-4o-mini"
+                    changed = True
+            except Exception:
+                pass
         cfg["settings_schema_version"] = base_ver
         if changed:
             try:
@@ -1476,6 +1585,15 @@ def default_runtime() -> Dict[str, Any]:
         # ✅ 워커 리스(중복 스레드/워치독 복구 시 안전장치)
         "worker_lease": {"id": "", "until_epoch": 0.0, "updated_kst": "", "owner": ""},
         "revoked_worker_ids": [],
+        # ✅ AI 호출 예산(비용 보호)
+        "ai_budget": {
+            "day": today_kst_str(),
+            "day_calls": 0,
+            "hour_key": "",
+            "hour_calls": 0,
+            "last_call_epoch": 0.0,
+            "by_symbol": {},
+        },
     }
 
 
@@ -1512,6 +1630,75 @@ def load_runtime() -> Dict[str, Any]:
 
 def save_runtime(rt: Dict[str, Any]) -> None:
     write_json_atomic(RUNTIME_FILE, rt)
+
+
+# =========================================================
+# ✅ AI 호출 예산(비용 보호)
+# =========================================================
+def _ai_budget_state(rt: Dict[str, Any]) -> Dict[str, Any]:
+    st = rt.setdefault("ai_budget", {}) if isinstance(rt, dict) else {}
+    if not isinstance(st, dict):
+        st = {}
+        rt["ai_budget"] = st
+    day_now = today_kst_str()
+    if str(st.get("day", "") or "") != day_now:
+        st["day"] = day_now
+        st["day_calls"] = 0
+    hour_now = now_kst().strftime("%Y-%m-%d %H")
+    if str(st.get("hour_key", "") or "") != hour_now:
+        st["hour_key"] = hour_now
+        st["hour_calls"] = 0
+    if "last_call_epoch" not in st:
+        st["last_call_epoch"] = 0.0
+    if "by_symbol" not in st or not isinstance(st.get("by_symbol"), dict):
+        st["by_symbol"] = {}
+    return st
+
+
+def ai_budget_can_call(rt: Dict[str, Any], cfg: Dict[str, Any], force: bool = False) -> Tuple[bool, str]:
+    try:
+        if force:
+            return True, "force"
+        if not bool(cfg.get("ai_budget_enable", True)):
+            return True, "disabled"
+        st = _ai_budget_state(rt)
+        now_ep = time.time()
+        min_itv = float(cfg.get("ai_budget_min_interval_sec", 45) or 45)
+        min_itv = float(clamp(min_itv, 1.0, 3600.0))
+        last_ep = float(st.get("last_call_epoch", 0.0) or 0.0)
+        if last_ep > 0 and (now_ep - last_ep) < min_itv:
+            left = int(max(1.0, min_itv - (now_ep - last_ep)))
+            return False, f"호출 간격 제한({left}s)"
+        h_lim = int(cfg.get("ai_budget_hourly_limit", 24) or 24)
+        d_lim = int(cfg.get("ai_budget_daily_limit", 180) or 180)
+        h_lim = max(1, h_lim)
+        d_lim = max(1, d_lim)
+        h_calls = int(st.get("hour_calls", 0) or 0)
+        d_calls = int(st.get("day_calls", 0) or 0)
+        if h_calls >= h_lim:
+            return False, f"시간 예산 초과({h_calls}/{h_lim})"
+        if d_calls >= d_lim:
+            return False, f"일일 예산 초과({d_calls}/{d_lim})"
+        return True, f"ok(h:{h_calls}/{h_lim}, d:{d_calls}/{d_lim})"
+    except Exception:
+        return True, "unknown"
+
+
+def ai_budget_mark_call(rt: Dict[str, Any], symbol: str = "") -> None:
+    try:
+        st = _ai_budget_state(rt)
+        st["day_calls"] = int(st.get("day_calls", 0) or 0) + 1
+        st["hour_calls"] = int(st.get("hour_calls", 0) or 0) + 1
+        st["last_call_epoch"] = float(time.time())
+        if symbol:
+            bs = st.get("by_symbol", {})
+            if not isinstance(bs, dict):
+                bs = {}
+                st["by_symbol"] = bs
+            key = str(symbol)
+            bs[key] = int(bs.get(key, 0) or 0) + 1
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -1895,9 +2082,24 @@ def get_past_mistakes_text(max_items: int = 5) -> str:
             worst = df.sort_values("PnL_Percent", ascending=True).head(max_items)
             lines.append("[최악 손실]")
             for _, r in worst.iterrows():
+                rv = str(r.get("Review", "") or "").strip()
+                rv_txt = f" | 회고: {rv[:52]}" if rv else ""
                 lines.append(
-                    f"- {r.get('Coin','?')} {r.get('Side','?')} {float(r.get('PnL_Percent',0)):.2f}% 손실 | 이유: {str(r.get('Reason',''))[:40]}"
+                    f"- {r.get('Coin','?')} {r.get('Side','?')} {float(r.get('PnL_Percent',0)):.2f}% 손실 | 이유: {str(r.get('Reason',''))[:40]}{rv_txt}"
                 )
+        except Exception:
+            pass
+
+        # 2-1) 손실 회고 요약(반대전환/지표 변화 학습)
+        try:
+            if "Review" in df.columns:
+                rv_df = df[df["PnL_Percent"].astype(float) < 0].copy()
+                rv_df["Review"] = rv_df["Review"].astype(str).fillna("")
+                rv_df = rv_df[rv_df["Review"].str.strip() != ""].head(max_items)
+                if not rv_df.empty:
+                    lines.append("[손실 회고 요약]")
+                    for _, r in rv_df.iterrows():
+                        lines.append(f"- {str(r.get('Review',''))[:88]}")
         except Exception:
             pass
 
@@ -5574,6 +5776,213 @@ def safe_fetch_balance(ex) -> Tuple[float, float]:
         return 0.0, 0.0
 
 
+def wallet_fetch_currencies_safe(ex) -> Dict[str, Any]:
+    try:
+        out = _ccxt_call_with_timeout(
+            lambda: ex.fetch_currencies(),
+            CCXT_TIMEOUT_SEC_PRIVATE,
+            where="fetch_currencies",
+        )
+        if isinstance(out, dict):
+            return out
+        return {}
+    except Exception:
+        return {}
+
+
+def _wallet_clean_text(v: Any) -> str:
+    try:
+        s = str(v or "").strip()
+        return s
+    except Exception:
+        return ""
+
+
+def wallet_network_options(currencies: Dict[str, Any], code: str) -> List[str]:
+    out = set()
+    try:
+        cur = {}
+        if isinstance(currencies, dict):
+            cur = currencies.get(str(code or "").upper(), {}) or {}
+        if isinstance(cur, dict):
+            nets = cur.get("networks")
+            if isinstance(nets, dict):
+                for k, v in nets.items():
+                    ks = _wallet_clean_text(k)
+                    if ks:
+                        out.add(ks)
+                    if isinstance(v, dict):
+                        for nk in ["network", "name", "id", "code", "chain", "chainName"]:
+                            ns = _wallet_clean_text(v.get(nk))
+                            if ns:
+                                out.add(ns)
+            info = cur.get("info")
+            if isinstance(info, dict):
+                for arr_key in ["chains", "chainList", "networkList", "coinChainList", "supportChains"]:
+                    arr = info.get(arr_key)
+                    if not isinstance(arr, list):
+                        continue
+                    for it in arr:
+                        if not isinstance(it, dict):
+                            continue
+                        for nk in ["chain", "network", "chainName", "name", "withdrawChain", "coinChain"]:
+                            ns = _wallet_clean_text(it.get(nk))
+                            if ns:
+                                out.add(ns)
+    except Exception:
+        pass
+    cleaned = []
+    for x in sorted(out):
+        xs = _wallet_clean_text(x)
+        if xs:
+            cleaned.append(xs)
+    return cleaned
+
+
+def wallet_fetch_deposit_address_safe(ex, code: str, network: str = "") -> Dict[str, Any]:
+    c = _wallet_clean_text(code).upper()
+    if not c:
+        return {"ok": False, "error": "코인 코드를 입력하세요."}
+    nw = _wallet_clean_text(network)
+    params_list: List[Dict[str, Any]] = [{}]
+    if nw:
+        params_list = [
+            {"network": nw},
+            {"chain": nw},
+            {"network": nw, "chain": nw},
+            {"coin": c, "network": nw},
+            {"coin": c, "chain": nw},
+            {},
+        ]
+    last_err = ""
+    raw: Any = None
+    for params in params_list:
+        try:
+            raw = _ccxt_call_with_timeout(
+                lambda p=dict(params): ex.fetch_deposit_address(c, p),
+                CCXT_TIMEOUT_SEC_PRIVATE,
+                where="fetch_deposit_address",
+                context={"code": c, "network": nw, "params": params},
+            )
+            if raw:
+                break
+        except Exception as e:
+            last_err = str(e)
+            raw = None
+    if not raw and hasattr(ex, "create_deposit_address"):
+        for params in params_list:
+            try:
+                raw = _ccxt_call_with_timeout(
+                    lambda p=dict(params): ex.create_deposit_address(c, p),  # type: ignore[attr-defined]
+                    CCXT_TIMEOUT_SEC_PRIVATE,
+                    where="create_deposit_address",
+                    context={"code": c, "network": nw, "params": params},
+                )
+                if raw:
+                    break
+            except Exception as e:
+                last_err = str(e)
+                raw = None
+    if not raw:
+        return {"ok": False, "error": last_err or "입금 주소 조회/발급 실패"}
+    address = ""
+    tag = ""
+    net = nw
+    try:
+        if isinstance(raw, dict):
+            address = (
+                _wallet_clean_text(raw.get("address"))
+                or _wallet_clean_text(raw.get("addr"))
+                or _wallet_clean_text(raw.get("depositAddress"))
+            )
+            tag = (
+                _wallet_clean_text(raw.get("tag"))
+                or _wallet_clean_text(raw.get("memo"))
+                or _wallet_clean_text(raw.get("paymentId"))
+                or _wallet_clean_text(raw.get("destinationTag"))
+            )
+            net = _wallet_clean_text(raw.get("network")) or _wallet_clean_text(raw.get("chain")) or net
+            info = raw.get("info")
+            if isinstance(info, dict):
+                if not address:
+                    address = (
+                        _wallet_clean_text(info.get("address"))
+                        or _wallet_clean_text(info.get("addr"))
+                        or _wallet_clean_text(info.get("depositAddress"))
+                    )
+                if not tag:
+                    tag = (
+                        _wallet_clean_text(info.get("tag"))
+                        or _wallet_clean_text(info.get("memo"))
+                        or _wallet_clean_text(info.get("paymentId"))
+                        or _wallet_clean_text(info.get("destinationTag"))
+                    )
+                if not net:
+                    net = _wallet_clean_text(info.get("network")) or _wallet_clean_text(info.get("chain"))
+    except Exception:
+        pass
+    if not address:
+        return {"ok": False, "error": "주소를 찾지 못했습니다.", "raw": raw}
+    return {
+        "ok": True,
+        "code": c,
+        "network": net or nw,
+        "address": address,
+        "tag": tag,
+        "raw": raw,
+    }
+
+
+def wallet_withdraw_safe(
+    ex,
+    code: str,
+    amount: float,
+    address: str,
+    tag: str = "",
+    network: str = "",
+) -> Dict[str, Any]:
+    c = _wallet_clean_text(code).upper()
+    addr = _wallet_clean_text(address)
+    nw = _wallet_clean_text(network)
+    tg = _wallet_clean_text(tag)
+    amt = _as_float(amount, 0.0)
+    if not c:
+        return {"ok": False, "error": "코인 코드가 비어 있습니다."}
+    if amt <= 0:
+        return {"ok": False, "error": "출금 수량은 0보다 커야 합니다."}
+    if not addr:
+        return {"ok": False, "error": "출금 주소를 입력하세요."}
+    params: Dict[str, Any] = {}
+    if nw:
+        params["network"] = nw
+        params["chain"] = nw
+    try:
+        raw = _ccxt_call_with_timeout(
+            lambda: ex.withdraw(c, float(amt), addr, (tg or None), params),
+            CCXT_TIMEOUT_SEC_PRIVATE,
+            where="withdraw",
+            context={"code": c, "amount": amt, "network": nw},
+        )
+        wd_id = ""
+        status = ""
+        if isinstance(raw, dict):
+            wd_id = _wallet_clean_text(raw.get("id"))
+            status = _wallet_clean_text(raw.get("status"))
+        return {
+            "ok": True,
+            "code": c,
+            "amount": float(amt),
+            "network": nw,
+            "address": addr,
+            "tag": tg,
+            "withdraw_id": wd_id,
+            "status": status,
+            "raw": raw,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def safe_fetch_positions(ex, symbols: List[str]) -> List[Dict[str, Any]]:
     try:
         def _do():
@@ -6337,6 +6746,46 @@ def sr_prices_for_style(
         return out
     except Exception:
         return out
+
+
+def sr_trigger_hits_with_tolerance(
+    side: str,
+    cur_px: float,
+    sl_price: Optional[float],
+    tp_price: Optional[float],
+    cfg: Dict[str, Any],
+) -> Tuple[bool, bool]:
+    """
+    SR/목표가 트리거에 오차범위를 적용해 휩쏘를 줄인다.
+    - SL: 라인을 일정 % 더 이탈해야 트리거
+    - TP: 라인 근처 도달도 허용
+    """
+    hit_sl = False
+    hit_tp = False
+    try:
+        s = str(side or "").lower().strip()
+        px = float(cur_px)
+        sl_buf = float(cfg.get("sr_trigger_sl_buffer_pct", 0.12) or 0.12)
+        tp_buf = float(cfg.get("sr_trigger_tp_buffer_pct", 0.08) or 0.08)
+        sl_buf = float(clamp(sl_buf, 0.0, 2.0))
+        tp_buf = float(clamp(tp_buf, 0.0, 2.0))
+
+        slv = float(sl_price) if sl_price is not None and math.isfinite(float(sl_price)) else None
+        tpv = float(tp_price) if tp_price is not None and math.isfinite(float(tp_price)) else None
+
+        if s == "long":
+            if slv is not None:
+                hit_sl = px <= (slv * (1.0 - sl_buf / 100.0))
+            if tpv is not None:
+                hit_tp = px >= (tpv * (1.0 - tp_buf / 100.0))
+        else:
+            if slv is not None:
+                hit_sl = px >= (slv * (1.0 + sl_buf / 100.0))
+            if tpv is not None:
+                hit_tp = px <= (tpv * (1.0 + tp_buf / 100.0))
+    except Exception:
+        return False, False
+    return bool(hit_sl), bool(hit_tp)
 
 
 def plan_swing_management_levels(
@@ -8940,9 +9389,9 @@ JSON 형식:
         # 모델 fallback (gpt-4o 미지원 계정/환경 대응)
         models = [
             str(cfg.get("openai_model_trade", "") or "").strip(),
-            "gpt-4o",
             "gpt-4o-mini",
             "gpt-4.1-mini",
+            "gpt-4o",
             "gpt-4.1",
         ]
         # 중복 제거(순서 유지)
@@ -9304,9 +9753,9 @@ JSON 형식:
     try:
         models = [
             str(cfg.get("openai_model_review", "") or "").strip(),
-            "gpt-4o",
             "gpt-4o-mini",
             "gpt-4.1-mini",
+            "gpt-4o",
             "gpt-4.1",
         ]
         models2: List[str] = []
@@ -11661,6 +12110,110 @@ def build_exit_one_line(
     return base
 
 
+def build_reverse_learning_note(
+    *,
+    side: str,
+    entry_snap: Optional[Dict[str, Any]],
+    now_snap: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> str:
+    """
+    손절/마이너스 청산 후 회고 문구:
+    - 진입 당시 vs 청산 당시 지표 변화
+    - 반대 포지션(스위칭) 신호 강도
+    """
+    if not isinstance(now_snap, dict):
+        return "회고: 차트 스냅샷이 부족해 반대전환 신호를 확인하지 못했어요."
+    try:
+        should_sw, rev_score, rev_note = evaluate_sl_reverse_signal(str(side), now_snap, cfg)
+    except Exception:
+        should_sw, rev_score, rev_note = False, 0, "점수 계산 실패"
+    rev_dec = _reverse_decision_from_side(str(side))
+    rev_ko = "롱" if str(rev_dec) == "buy" else "숏"
+
+    deltas: List[str] = []
+    try:
+        if isinstance(entry_snap, dict):
+            t0 = _trend_clean_for_reason(entry_snap.get("trend_short", ""))
+            t1 = _trend_clean_for_reason(now_snap.get("trend_short", ""))
+            if t0 and t1 and t0 != t1:
+                deltas.append(f"단기추세 {t0}→{t1}")
+    except Exception:
+        pass
+    try:
+        if isinstance(entry_snap, dict):
+            m0 = str(entry_snap.get("macd_state", "") or "").strip()
+            m1 = str(now_snap.get("macd_state", "") or "").strip()
+            if m0 and m1 and m0 != m1:
+                deltas.append(f"MACD {m0}→{m1}")
+    except Exception:
+        pass
+    try:
+        if isinstance(entry_snap, dict):
+            r0 = entry_snap.get("rsi", None)
+            r1 = now_snap.get("rsi", None)
+            if r0 is not None and r1 is not None:
+                deltas.append(f"RSI {float(r0):.0f}→{float(r1):.0f}")
+    except Exception:
+        pass
+    try:
+        if isinstance(entry_snap, dict):
+            sq0 = int(_as_int(entry_snap.get("sqz_bias", 0), 0))
+            sq1 = int(_as_int(now_snap.get("sqz_bias", 0), 0))
+            if sq0 != sq1:
+                sq_map = {1: "상승", -1: "하락", 0: "중립"}
+                deltas.append(f"SQZ {sq_map.get(sq0,'중립')}→{sq_map.get(sq1,'중립')}")
+    except Exception:
+        pass
+
+    delta_txt = (" | " + ", ".join(deltas[:3])) if deltas else ""
+    if bool(should_sw):
+        return f"회고: 청산 시점엔 반대({rev_ko}) 신호가 더 강했어요({rev_score:+d}). 다음 진입 전 반대전환 조건을 재확인하세요.{delta_txt} | {str(rev_note)[:140]}"
+    return f"회고: 반대({rev_ko}) 전환 점수는 약했어요({rev_score:+d}). 무리한 반대진입보다 기존 규칙 유지가 유리했어요.{delta_txt} | {str(rev_note)[:140]}"
+
+
+def compose_loss_review(
+    *,
+    symbol: str,
+    side: str,
+    roi: float,
+    reason_ko: str,
+    entry_snap: Optional[Dict[str, Any]],
+    now_snap: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> str:
+    """
+    비용 절약형 손실 회고:
+    - 기본: 룰 기반 회고(무료)
+    - 선택: 큰 손실일 때만 OpenAI 회고를 덧붙임
+    """
+    review_rule = build_reverse_learning_note(side=side, entry_snap=entry_snap, now_snap=now_snap, cfg=cfg)
+    use_ai = False
+    try:
+        use_ai = bool(cfg.get("ai_review_on_loss_enable", False))
+    except Exception:
+        use_ai = False
+    if not use_ai:
+        return review_rule
+
+    min_abs_roi = 12.0
+    try:
+        min_abs_roi = float(cfg.get("ai_review_openai_min_abs_roi", 12.0) or 12.0)
+    except Exception:
+        min_abs_roi = 12.0
+    if abs(float(roi)) < float(min_abs_roi):
+        return review_rule
+
+    try:
+        _one, ai_review = ai_write_review(symbol, side, float(roi), reason_ko, cfg)
+        ai_txt = str(ai_review or "").strip()
+        if ai_txt:
+            return f"{review_rule}\n{ai_txt[:420]}"
+    except Exception:
+        pass
+    return review_rule
+
+
 def be_recheck_should_hold(
     side: str,
     entry_snap: Optional[Dict[str, Any]],
@@ -11991,7 +12544,11 @@ def _maybe_switch_style_for_open_position(
         # 추천 스타일(룰 기반)
         dec = "buy" if pos_side == "long" else "sell"
         # ✅ 강제 Exit(수익보존) 정책이 ON이면, 포지션 관리 루프가 AI 호출로 지연되지 않게 스타일 전환 AI는 잠시 비활성
-        allow_ai_switch = bool(cfg.get("style_switch_ai_enable", False)) and (not bool(cfg.get("exit_trailing_protect_enable", False)))
+        allow_ai_switch = (
+            bool(cfg.get("style_switch_ai_enable", False))
+            and (not bool(cfg.get("exit_trailing_protect_enable", False)))
+            and (not bool(cfg.get("ai_cost_saver_strict", True)))
+        )
         rec = _style_for_entry(sym, dec, short_trend, long_trend, cfg, allow_ai=bool(allow_ai_switch))
         rec_style = rec.get("style", cur_style)
         # ✅ 레짐(스캘핑/스윙) 강제/자동 선택
@@ -13020,19 +13577,24 @@ def telegram_thread(ex):
                 monitor_write_throttled(mon, 0.2)
             except Exception:
                 pass
-            try:
-                external_context_refresh_maybe(cfg, rt, force=False)
-            except Exception:
-                pass
-            try:
-                ext = external_context_snapshot()
-                if not bool(cfg.get("use_external_context", True)):
-                    mon["loop_stage"] = "EXTERNAL_CONTEXT_OFF"
-                    mon["loop_stage_kst"] = now_kst_str()
-            except Exception as e:
-                ext = {"enabled": False, "error": str(e)[:240], "asof_kst": now_kst_str(), "_source": "snapshot_fail"}
-                notify_admin_error("EXTERNAL_CONTEXT", e, tb=traceback.format_exc(), min_interval_sec=180.0)
-                mon_add_event(mon, "EXTERNAL_FAIL", "", f"{e}"[:140], {})
+            use_external_now = bool(cfg.get("use_external_context", True))
+            if bool(cfg.get("ai_cost_saver_strict", True)):
+                use_external_now = False
+            if use_external_now:
+                try:
+                    external_context_refresh_maybe(cfg, rt, force=False)
+                except Exception:
+                    pass
+                try:
+                    ext = external_context_snapshot()
+                except Exception as e:
+                    ext = {"enabled": False, "error": str(e)[:240], "asof_kst": now_kst_str(), "_source": "snapshot_fail"}
+                    notify_admin_error("EXTERNAL_CONTEXT", e, tb=traceback.format_exc(), min_interval_sec=180.0)
+                    mon_add_event(mon, "EXTERNAL_FAIL", "", f"{e}"[:140], {})
+            else:
+                ext = {"enabled": False, "asof_kst": now_kst_str(), "_source": "cost_saver_off"}
+                mon["loop_stage"] = "EXTERNAL_CONTEXT_OFF"
+                mon["loop_stage_kst"] = now_kst_str()
             mon["external"] = ext
 
             # ✅ 일별 내보내기 자동(새벽 00시대, 전일 기준)
@@ -13815,16 +14377,13 @@ def telegram_thread(ex):
                         except Exception:
                             pass
                         if (not forced_exit) and (not ai_exit_only) and cfg.get("use_sr_stop", True):
-                            if sl_price is not None:
-                                if side == "long" and cur_px <= float(sl_price):
-                                    hit_sl_by_price = True
-                                if side == "short" and cur_px >= float(sl_price):
-                                    hit_sl_by_price = True
-                            if tp_price is not None:
-                                if side == "long" and cur_px >= float(tp_price):
-                                    hit_tp_by_price = True
-                                if side == "short" and cur_px <= float(tp_price):
-                                    hit_tp_by_price = True
+                            hit_sl_by_price, hit_tp_by_price = sr_trigger_hits_with_tolerance(
+                                side=str(side),
+                                cur_px=float(cur_px),
+                                sl_price=(float(sl_price) if sl_price is not None else None),
+                                tp_price=(float(tp_price) if tp_price is not None else None),
+                                cfg=cfg,
+                            )
 
                         # ✅ 스윙: 부분익절(순환매도 옵션) - 요구사항 반영
                         if (not forced_exit) and (not ai_exit_only) and style_now == "스윙" and cfg.get("swing_partial_tp_enable", True) and contracts > 0:
@@ -14726,9 +15285,9 @@ def telegram_thread(ex):
                             if is_protect:
                                 reason_ko = "수익보호(본전)"
                             elif bool(hit_sl_by_price):
-                                reason_ko = "손절(지지/저항 이탈)"
+                                reason_ko = "손절(SR라인 이탈)"
                             else:
-                                reason_ko = "손절(AI목표)" if bool(sl_from_ai) else "손절(목표 손절)"
+                                reason_ko = (f"손절(AI목표 -{abs(float(sl)):.1f}% 도달)" if bool(sl_from_ai) else f"손절(목표 -{abs(float(sl)):.1f}% 도달)")
                             # ✅ 차트 근거(룰 기반) 스냅샷: "왜 정리했는지"를 명확히 남긴다(AI 호출 없음)
                             entry_snap = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
                             snap_now = {}
@@ -14777,19 +15336,39 @@ def telegram_thread(ex):
                             else:
                                 base_reason = f"손실이 목표손절(-{abs(float(sl)):.1f}%)에 닿아서 정리했어요"
                             one_rule = build_exit_one_line(base_reason=base_reason, entry_snap=entry_snap, now_snap=snap_now)
+                            retro_note = ""
+                            if is_loss:
+                                try:
+                                    retro_note = build_reverse_learning_note(
+                                        side=str(side),
+                                        entry_snap=(entry_snap if isinstance(entry_snap, dict) else None),
+                                        now_snap=(snap_now if isinstance(snap_now, dict) else None),
+                                        cfg=cfg,
+                                    )
+                                    if retro_note:
+                                        one_rule = f"{one_rule}\n{str(retro_note)[:170]}"
+                                except Exception:
+                                    retro_note = ""
                             ok, err_close = close_position_market_ex(ex, sym, side, contracts)
                             if ok:
                                 exit_px = get_last_price(ex, sym) or entry
                                 free_after, total_after = safe_fetch_balance(ex)
 
-                                # ✅ AI 회고 비용 절감: 손실일 때만 AI 회고 작성(사용자 요구)
+                                # ✅ 손실 회고: 기본은 룰기반, 필요 시에만 OpenAI 보강
                                 review = ""
                                 if is_loss:
                                     try:
-                                        _ai_one, _ai_review = ai_write_review(sym, side, roi, reason_ko, cfg)
-                                        review = str(_ai_review or "")
+                                        review = compose_loss_review(
+                                            symbol=str(sym),
+                                            side=str(side),
+                                            roi=float(roi),
+                                            reason_ko=str(reason_ko),
+                                            entry_snap=(entry_snap if isinstance(entry_snap, dict) else None),
+                                            now_snap=(snap_now if isinstance(snap_now, dict) else None),
+                                            cfg=cfg,
+                                        )
                                     except Exception:
-                                        review = ""
+                                        review = str(retro_note or "")
                                 # ✅ 텔레그램/일지에는 "차트 기반 한줄 근거"를 우선 기록
                                 one = str(one_rule or "").strip() or ("본전으로 지킴" if is_protect else "정리 완료")
                                 # ✅ 매매일지/구글시트에 "진입 전/청산 후 잔액"을 같이 기록(요구사항)
@@ -15179,12 +15758,19 @@ def telegram_thread(ex):
                                 exit_px = get_last_price(ex, sym) or entry
                                 free_after, total_after = safe_fetch_balance(ex)
 
-                                # ✅ AI 회고 비용 절감: 손실일 때만 AI 회고 작성
+                                # ✅ 손실 회고: 기본은 룰기반, 필요 시에만 OpenAI 보강
                                 review = ""
                                 if is_loss_take:
                                     try:
-                                        _ai_one, _ai_review = ai_write_review(sym, side, roi, take_reason_ko, cfg)
-                                        review = str(_ai_review or "")
+                                        review = compose_loss_review(
+                                            symbol=str(sym),
+                                            side=str(side),
+                                            roi=float(roi),
+                                            reason_ko=str(take_reason_ko),
+                                            entry_snap=(entry_snap if isinstance(entry_snap, dict) else None),
+                                            now_snap=(snap_now if isinstance(snap_now, dict) else None),
+                                            cfg=cfg,
+                                        )
                                     except Exception:
                                         review = ""
                                 # ✅ 텔레그램/일지에는 "차트 기반 한줄 근거"를 우선 기록
@@ -16178,6 +16764,19 @@ def telegram_thread(ex):
                                 )
                             except Exception:
                                 pass
+                        # ✅ 비용 절감 strict: 약한 조건에서는 AI 호출 자체를 스킵
+                        try:
+                            if call_ai and (not forced_ai) and bool(cfg.get("ai_cost_saver_strict", True)):
+                                ml_votes_now = int(ml.get("votes_max", 0) or 0)
+                                need_votes_now = max(2, int(cfg.get("entry_convergence_min_votes", 2) or 2))
+                                strong_sig_now = bool(stt.get("_pullback_candidate", False)) or bool(stt.get("_rsi_resolve_long", False)) or bool(stt.get("_rsi_resolve_short", False))
+                                strong_sig_now = bool(strong_sig_now or (abs(int(stt.get("_pattern_bias", 0) or 0)) == 1 and float(stt.get("_pattern_strength", 0.0) or 0.0) >= float(cfg.get("pattern_call_strength_min", 0.45) or 0.45)))
+                                if (ml_votes_now < need_votes_now) and (not strong_sig_now):
+                                    call_ai = False
+                                    cs["skip_reason"] = f"AI 절약모드: 약한 신호({ml_votes_now}/{need_votes_now})"
+                        except Exception:
+                            pass
+
                         if call_ai and filter_msgs and bool(cfg.get("ai_call_filters_block_ai", False)):
                             call_ai = False
                             try:
@@ -16297,6 +16896,22 @@ def telegram_thread(ex):
                             except Exception:
                                 ai = {"decision": "hold", "confidence": 0, "reason_easy": "ai_cache_parse_fail", "used_indicators": stt.get("_used_indicators", [])}
                         else:
+                            # ✅ AI 호출 예산(비용 보호): 자동 스캔 호출을 시간/일 단위로 제한
+                            allow_ai_budget, budget_note = ai_budget_can_call(rt, cfg, force=bool(forced_ai))
+                            if not bool(allow_ai_budget):
+                                try:
+                                    cs["ai_called"] = False
+                                    cs["skip_reason"] = f"AI 예산: {budget_note}"
+                                except Exception:
+                                    pass
+                                mon_add_scan(
+                                    mon,
+                                    stage="ai_skipped",
+                                    symbol=sym,
+                                    tf=str(cfg.get("timeframe", "5m")),
+                                    message=f"budget_guard: {budget_note}",
+                                )
+                                continue
                             mon_add_scan(mon, stage="ai_call", symbol=sym, tf=str(cfg.get("timeframe", "5m")), message="AI 판단 요청")
                         # ✅ 요구: 스윙 판단일 때만 외부시황을 AI에 제공(스캘핑/단기=차트만)
                         try:
@@ -16310,7 +16925,10 @@ def telegram_thread(ex):
                             mon_add_scan(mon, stage="style_hint", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=chart_style_hint, message="차트 기반 스타일 힌트")
                         except Exception:
                             pass
-                        ext_for_ai = ext if chart_style_hint == "스윙" else {"enabled": False}
+                        if bool(cfg.get("ai_cost_saver_strict", True)):
+                            ext_for_ai = {"enabled": False}
+                        else:
+                            ext_for_ai = ext if chart_style_hint == "스윙" else {"enabled": False}
                         if not use_cached_ai:
                             ai = ai_decide_trade(
                                 df,
@@ -16323,6 +16941,12 @@ def telegram_thread(ex):
                                 sr_context=sr_ctx,
                                 chart_style_hint=chart_style_hint,
                             )
+                            try:
+                                if bool(ai.get("_openai_model", "")):
+                                    ai_budget_mark_call(rt, symbol=str(sym))
+                                    save_runtime(rt)
+                            except Exception:
+                                pass
                             try:
                                 cs["ai_last_called_epoch"] = float(time.time())
                                 cs["ai_last_called_bar_ms"] = int(short_last_bar_ms or 0)
@@ -16693,7 +17317,7 @@ def telegram_thread(ex):
                                 stt.get("추세", ""),
                                 htf_trend,
                                 cfg,
-                                allow_ai=bool(cfg.get("style_entry_ai_enable", False)),
+                                allow_ai=bool(cfg.get("style_entry_ai_enable", False)) and (not bool(cfg.get("ai_cost_saver_strict", True))),
                             )
                             style = style_info.get("style", "스캘핑")
                             cs["style_reco"] = style
@@ -18683,16 +19307,33 @@ config["tg_simple_messages"] = st.sidebar.checkbox(
 st.sidebar.subheader("🧠 AI 비용 절감")
 config["ai_scan_once_per_bar"] = st.sidebar.checkbox(
     "스캔 AI: 같은 봉 재호출 금지(권장)",
-    value=bool(config.get("ai_scan_once_per_bar", False)),
+    value=bool(config.get("ai_scan_once_per_bar", True)),
     help="ON이면 같은 봉에서는 AI를 1회만 호출합니다. OFF이면 아래 쿨다운(초) 동안만 캐시를 재사용합니다. /scan은 예외입니다.",
 )
 config["ai_recall_cooldown_sec"] = st.sidebar.number_input(
     "AI 재호출 쿨다운(초)",
     5,
-    120,
-    int(config.get("ai_recall_cooldown_sec", 20) or 20),
+    1800,
+    int(config.get("ai_recall_cooldown_sec", 45) or 45),
     step=1,
     help="ai_scan_once_per_bar=OFF일 때, 같은 코인의 AI 재호출 최소 간격입니다.",
+)
+config["ai_cost_saver_strict"] = st.sidebar.checkbox(
+    "AI 절약모드(강화)",
+    value=bool(config.get("ai_cost_saver_strict", True)),
+    help="ON이면 스타일 AI를 끄고, 약한 신호에서는 AI 호출 자체를 건너뜁니다.",
+)
+bz1, bz2, bz3 = st.sidebar.columns(3)
+config["ai_budget_enable"] = bz1.checkbox("예산제한", value=bool(config.get("ai_budget_enable", True)))
+config["ai_budget_hourly_limit"] = bz2.number_input("시간당", 1, 200, int(config.get("ai_budget_hourly_limit", 24) or 24), step=1)
+config["ai_budget_daily_limit"] = bz3.number_input("일일", 10, 2000, int(config.get("ai_budget_daily_limit", 180) or 180), step=10)
+config["ai_budget_min_interval_sec"] = st.sidebar.number_input(
+    "AI 최소 간격(초)",
+    1,
+    3600,
+    int(config.get("ai_budget_min_interval_sec", 45) or 45),
+    step=1,
+    help="자동 스캔에서 AI 호출 사이 최소 간격입니다.",
 )
 ca1, ca2 = st.sidebar.columns(2)
 config["entry_convergence_min_votes"] = ca1.number_input(
@@ -18909,6 +19550,9 @@ c_sr3, c_sr4 = st.sidebar.columns(2)
 config["sr_atr_period"] = c_sr3.number_input("ATR 기간", 7, 30, int(config.get("sr_atr_period", 14)))
 config["sr_buffer_atr_mult"] = c_sr4.number_input("버퍼(ATR배)", 0.05, 2.0, float(config.get("sr_buffer_atr_mult", 0.25)), step=0.05)
 config["sr_rr_min"] = st.sidebar.number_input("SR 최소 RR", 1.0, 5.0, float(config.get("sr_rr_min", 1.5)), step=0.1)
+c_sr5, c_sr6 = st.sidebar.columns(2)
+config["sr_trigger_sl_buffer_pct"] = c_sr5.number_input("SL 오차(%)", 0.0, 2.0, float(config.get("sr_trigger_sl_buffer_pct", 0.12)), step=0.01, help="손절은 라인을 이 값만큼 더 이탈해야 실행")
+config["sr_trigger_tp_buffer_pct"] = c_sr6.number_input("TP 오차(%)", 0.0, 2.0, float(config.get("sr_trigger_tp_buffer_pct", 0.08)), step=0.01, help="익절은 라인 근처 도달도 허용")
 with st.sidebar.expander("스윙(Swing) SR 상세(선택)"):
     c_sw1, c_sw2 = st.columns(2)
     config["sr_timeframe_swing"] = c_sw1.selectbox(
@@ -19694,6 +20338,89 @@ with t2:
             contracts = float(p.get("contracts") or 0)
             close_position_market(exchange, sym, side, contracts)
         st.success("전량 청산 요청 완료(데모)")
+
+    st.divider()
+    st.subheader("💸 입출금 (내 계정 전용)")
+    st.caption("입금 주소 조회/발급과 출금 요청을 한글로 처리합니다.")
+    st.warning("⚠️ API 키에 Withdraw 권한이 있으면 매우 위험합니다. IP 화이트리스트를 반드시 설정하세요.")
+    if IS_SANDBOX:
+        st.info("현재는 데모 모드(IS_SANDBOX=True)입니다. 실입출금은 지원되지 않거나 실패할 수 있습니다.")
+    use_wallet = st.checkbox("입출금 기능 활성화(위험 동의)", value=False, key="wallet_enable_ui")
+
+    if use_wallet:
+        cur_map = wallet_fetch_currencies_safe(exchange)
+        coin_opts = []
+        try:
+            if isinstance(cur_map, dict) and cur_map:
+                for k, v in cur_map.items():
+                    ks = _wallet_clean_text(k).upper()
+                    if not ks:
+                        continue
+                    active = True
+                    if isinstance(v, dict) and v.get("active") is not None:
+                        active = bool(v.get("active"))
+                    if active:
+                        coin_opts.append(ks)
+            coin_opts = sorted(list(set(coin_opts)))
+        except Exception:
+            coin_opts = []
+        if not coin_opts:
+            coin_opts = ["USDT", "BTC", "ETH", "XRP", "DOGE"]
+
+        dcol, wcol = st.columns(2)
+
+        with dcol:
+            st.markdown("#### 📥 입금 주소 조회/발급")
+            dep_coin = st.selectbox("입금 코인", coin_opts, index=coin_opts.index("USDT") if "USDT" in coin_opts else 0, key="wallet_dep_coin")
+            dep_networks = wallet_network_options(cur_map, dep_coin)
+            dep_net = st.selectbox("입금 네트워크(체인)", ["자동 선택"] + dep_networks, index=0, key="wallet_dep_net")
+            if st.button("입금 주소 가져오기", key="wallet_dep_btn"):
+                chosen_net = "" if dep_net == "자동 선택" else dep_net
+                res = wallet_fetch_deposit_address_safe(exchange, dep_coin, chosen_net)
+                if bool(res.get("ok", False)):
+                    st.success(f"{dep_coin} 입금 주소를 가져왔습니다.")
+                    st.code(str(res.get("address", "")))
+                    tag_txt = str(res.get("tag", "") or "")
+                    if tag_txt:
+                        st.code(f"메모/태그: {tag_txt}")
+                    net_txt = str(res.get("network", "") or "")
+                    if net_txt:
+                        st.caption(f"네트워크: {net_txt}")
+                else:
+                    st.error(f"입금 주소 조회 실패: {res.get('error', 'unknown')}")
+
+        with wcol:
+            st.markdown("#### 📤 출금 요청")
+            wd_coin = st.selectbox("출금 코인", coin_opts, index=coin_opts.index("USDT") if "USDT" in coin_opts else 0, key="wallet_wd_coin")
+            wd_networks = wallet_network_options(cur_map, wd_coin)
+            wd_net = st.selectbox("출금 네트워크(체인)", ["자동 선택"] + wd_networks, index=0, key="wallet_wd_net")
+            wd_addr = st.text_input("출금 주소", key="wallet_wd_addr")
+            wd_tag = st.text_input("메모/태그(필요한 코인만)", key="wallet_wd_tag")
+            wd_amt = st.number_input("출금 수량", min_value=0.0, value=0.0, step=0.01, key="wallet_wd_amt")
+            st.caption("실수 방지를 위해 확인 문구를 정확히 입력해야 출금 버튼이 동작합니다.")
+            wd_confirm = st.text_input("확인 문구 입력: 출금실행", key="wallet_wd_confirm")
+            wd_disabled = bool(IS_SANDBOX)
+            if st.button("출금 실행", type="primary", key="wallet_wd_btn", disabled=wd_disabled):
+                if wd_confirm.strip() != "출금실행":
+                    st.error("확인 문구가 다릅니다. 정확히 '출금실행'을 입력하세요.")
+                else:
+                    chosen_net = "" if wd_net == "자동 선택" else wd_net
+                    out = wallet_withdraw_safe(exchange, wd_coin, float(wd_amt), wd_addr, wd_tag, chosen_net)
+                    if bool(out.get("ok", False)):
+                        st.success("출금 요청을 보냈습니다.")
+                        st.write(
+                            {
+                                "코인": out.get("code", ""),
+                                "수량": out.get("amount", ""),
+                                "네트워크": out.get("network", ""),
+                                "출금ID": out.get("withdraw_id", ""),
+                                "상태": out.get("status", ""),
+                            }
+                        )
+                    else:
+                        st.error(f"출금 실패: {out.get('error', 'unknown')}")
+            if wd_disabled:
+                st.caption("데모 모드에서는 출금 버튼이 비활성화됩니다.")
 
 with t3:
     st.subheader("📅 시장정보(외부 시황)")
