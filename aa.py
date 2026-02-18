@@ -687,7 +687,7 @@ def style_rule(style: Any) -> Dict[str, Any]:
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 19,
+        "settings_schema_version": 20,
         "openai_api_key": "",
         "openai_model_trade": "gpt-4o-mini",
         "openai_model_style": "gpt-4o-mini",
@@ -702,7 +702,8 @@ def default_settings() -> Dict[str, Any]:
         "tg_enable_reports": True,  # 이벤트 알림(진입/청산 등)
         "tg_send_entry_reason": False,
         # 알림 채널 선택: telegram | discord | both
-        "notification_channel": "telegram",
+        # ✅ 기본값: 둘 다 전송
+        "notification_channel": "both",
         "discord_webhook_url": "",
         # ✅ 텔레그램 메시지 가독성(요구사항):
         # - 코인/선물 용어를 모르는 사람도 이해하도록 "쉬운 한글 + 핵심만" 모드(기본 ON)
@@ -1853,7 +1854,7 @@ def load_settings() -> Dict[str, Any]:
         # v19: Streamlit Cloud 싱글톤/알림 채널 선택/SQLite 상태저장 기본키 추가
         if saved_ver < 19:
             for k, v in {
-                "notification_channel": "telegram",
+                "notification_channel": "both",
                 "discord_webhook_url": "",
             }.items():
                 try:
@@ -1862,6 +1863,15 @@ def load_settings() -> Dict[str, Any]:
                         changed = True
                 except Exception:
                     pass
+        # v20: 알림 채널 기본을 both로 상향(기존 telegram-only 사용자도 자동 전환)
+        if saved_ver < 20:
+            try:
+                cur_ch = str(saved.get("notification_channel", cfg.get("notification_channel", "both")) or "both").strip().lower()
+                if cur_ch in ["", "telegram"]:
+                    cfg["notification_channel"] = "both"
+                    changed = True
+            except Exception:
+                pass
         cfg["settings_schema_version"] = base_ver
         if changed:
             try:
@@ -12147,25 +12157,69 @@ def mon_recent_events(mon: Dict[str, Any], within_min: int = 15) -> List[Dict[st
 # =========================================================
 def _notification_channel_of(cfg: Optional[Dict[str, Any]]) -> str:
     try:
-        ch = str((cfg or {}).get("notification_channel", "telegram") or "telegram").strip().lower()
+        ch = str((cfg or {}).get("notification_channel", "both") or "both").strip().lower()
         if ch not in ["telegram", "discord", "both"]:
-            return "telegram"
+            return "both"
         return ch
     except Exception:
-        return "telegram"
+        return "both"
 
 
 class Notifier:
     def __init__(self):
         self._lock = threading.RLock()
 
-    def should_send_telegram(self, cfg: Optional[Dict[str, Any]]) -> bool:
+    def _telegram_configured(self) -> bool:
+        try:
+            token = str(tg_token or "").strip()
+            if (not token) or (":" not in token):
+                return False
+            # 최소한 하나의 대상 chat id가 있어야 전송 가능
+            has_chat = bool(str(tg_id_default or "").strip() or str(tg_id_channel or "").strip() or str(tg_id_group or "").strip() or tg_admin_chat_ids())
+            return bool(has_chat)
+        except Exception:
+            return False
+
+    def _discord_configured(self, cfg: Optional[Dict[str, Any]]) -> bool:
+        try:
+            w = str(self._discord_webhook(cfg) or "").strip()
+            if not w:
+                return False
+            wl = w.lower()
+            # 기본 형식 검증(오입력 방지)
+            return ("discord.com/api/webhooks/" in wl) or ("discordapp.com/api/webhooks/" in wl) or ("ptb.discord.com/api/webhooks/" in wl) or ("canary.discord.com/api/webhooks/" in wl)
+        except Exception:
+            return False
+
+    def _effective_channels(self, cfg: Optional[Dict[str, Any]]) -> List[str]:
         ch = _notification_channel_of(cfg)
-        return ch in ["telegram", "both"]
+        tg_ok = self._telegram_configured()
+        dc_ok = self._discord_configured(cfg)
+        out: List[str] = []
+        if ch == "both":
+            if tg_ok:
+                out.append("telegram")
+            if dc_ok:
+                out.append("discord")
+            return out
+        if ch == "telegram":
+            if tg_ok:
+                out.append("telegram")
+            elif dc_ok:
+                out.append("discord")
+            return out
+        # ch == "discord"
+        if dc_ok:
+            out.append("discord")
+        elif tg_ok:
+            out.append("telegram")
+        return out
+
+    def should_send_telegram(self, cfg: Optional[Dict[str, Any]]) -> bool:
+        return "telegram" in self._effective_channels(cfg)
 
     def should_send_discord(self, cfg: Optional[Dict[str, Any]]) -> bool:
-        ch = _notification_channel_of(cfg)
-        return ch in ["discord", "both"]
+        return "discord" in self._effective_channels(cfg)
 
     def _discord_webhook(self, cfg: Optional[Dict[str, Any]]) -> str:
         try:
@@ -22022,9 +22076,9 @@ config["tg_simple_messages"] = st.sidebar.checkbox(
 )
 st.sidebar.subheader("🔔 알림 채널")
 _notify_opts = ["telegram", "discord", "both"]
-_notify_now = str(config.get("notification_channel", "telegram") or "telegram").strip().lower()
+_notify_now = str(config.get("notification_channel", "both") or "both").strip().lower()
 if _notify_now not in _notify_opts:
-    _notify_now = "telegram"
+    _notify_now = "both"
 config["notification_channel"] = st.sidebar.selectbox(
     "알림 전송 채널",
     _notify_opts,
@@ -22603,7 +22657,7 @@ if st.sidebar.button("🧪 Discord 연결 테스트"):
                 fields=[
                     {"name": "코드 버전", "value": str(CODE_VERSION), "inline": False},
                     {"name": "시간(KST)", "value": now_kst_str(), "inline": False},
-                    {"name": "알림 채널 설정", "value": str(config.get("notification_channel", "telegram")), "inline": False},
+                    {"name": "알림 채널 설정", "value": str(config.get("notification_channel", "both")), "inline": False},
                 ],
                 target="default",
                 cfg=cfg_test,
