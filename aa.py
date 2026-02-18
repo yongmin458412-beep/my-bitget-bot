@@ -687,7 +687,7 @@ def style_rule(style: Any) -> Dict[str, Any]:
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 20,
+        "settings_schema_version": 21,
         "openai_api_key": "",
         "openai_model_trade": "gpt-4o-mini",
         "openai_model_style": "gpt-4o-mini",
@@ -1043,9 +1043,18 @@ def default_settings() -> Dict[str, Any]:
         # - strict ON: 스타일 AI 비활성 + 외부시황 AI 입력 제외 + 약한 신호는 AI 호출 스킵
         "ai_cost_saver_strict": True,
         "ai_budget_enable": True,
-        "ai_budget_hourly_limit": 24,
+        # 0 이하면 시간당 제한 없음(요청)
+        "ai_budget_hourly_limit": 0,
         "ai_budget_daily_limit": 180,
         "ai_budget_min_interval_sec": 45,
+        # 횡보/저변동/저거래량 구간에서는 AI 호출 간격을 자동으로 늘려 비용 절감
+        "ai_budget_adaptive_interval_enable": True,
+        "ai_budget_adaptive_max_interval_sec": 180,
+        "ai_budget_low_adx": 18.0,
+        "ai_budget_low_atr_pct": 0.35,
+        "ai_budget_low_vol_ratio": 0.90,
+        "ai_budget_low_bb_width_pct": 1.20,
+        "ai_budget_low_sqz_abs_pct": 0.06,
         # ✅ 진입 필터 강화(요구): 거래량(스파이크) + 이격도(Disparity) 조건
         # - 횡보 박스(거래량 없음)에서 RSI 해소만 보고 진입하는 실수를 줄이기 위해 AI 호출 자체를 제한한다.
         # - /scan 강제스캔은 이 필터를 우회(사용자 의도)한다.
@@ -1872,6 +1881,36 @@ def load_settings() -> Dict[str, Any]:
                     changed = True
             except Exception:
                 pass
+        # v21: AI 예산 정책 개편
+        # - 시간당 한도 제거(0=무제한), 최소간격 45초 유지
+        # - 횡보장 자동 간격 증가(비용 절감) 기본 ON
+        if saved_ver < 21:
+            try:
+                cfg["ai_budget_hourly_limit"] = 0
+                changed = True
+            except Exception:
+                pass
+            try:
+                if int(cfg.get("ai_budget_min_interval_sec", 45) or 45) < 45:
+                    cfg["ai_budget_min_interval_sec"] = 45
+                    changed = True
+            except Exception:
+                pass
+            for k, v in {
+                "ai_budget_adaptive_interval_enable": True,
+                "ai_budget_adaptive_max_interval_sec": 180,
+                "ai_budget_low_adx": 18.0,
+                "ai_budget_low_atr_pct": 0.35,
+                "ai_budget_low_vol_ratio": 0.90,
+                "ai_budget_low_bb_width_pct": 1.20,
+                "ai_budget_low_sqz_abs_pct": 0.06,
+            }.items():
+                try:
+                    if k not in saved:
+                        cfg[k] = v
+                        changed = True
+                except Exception:
+                    pass
         cfg["settings_schema_version"] = base_ver
         if changed:
             try:
@@ -2249,7 +2288,110 @@ def _ai_budget_state(rt: Dict[str, Any]) -> Dict[str, Any]:
     return st
 
 
-def ai_budget_can_call(rt: Dict[str, Any], cfg: Dict[str, Any], force: bool = False) -> Tuple[bool, str]:
+def _ai_dynamic_min_interval_sec(
+    cfg: Dict[str, Any],
+    last: Optional[pd.Series] = None,
+    status: Optional[Dict[str, Any]] = None,
+    urgent: bool = False,
+) -> Tuple[float, str]:
+    try:
+        base = float(cfg.get("ai_budget_min_interval_sec", 45) or 45)
+    except Exception:
+        base = 45.0
+    base = float(clamp(base, 1.0, 3600.0))
+    if bool(urgent):
+        return base, "urgent"
+    if not bool(cfg.get("ai_budget_adaptive_interval_enable", True)):
+        return base, "fixed"
+    if last is None:
+        return base, "no_market_data"
+    try:
+        adx = float(_as_float(last.get("ADX", 0.0), 0.0))
+    except Exception:
+        adx = 0.0
+    try:
+        atr_pct = float(_as_float(last.get("ATR_PCT", 0.0), 0.0))
+    except Exception:
+        atr_pct = 0.0
+    try:
+        close = float(_as_float(last.get("close", 0.0), 0.0))
+        high = float(_as_float(last.get("high", 0.0), 0.0))
+        low = float(_as_float(last.get("low", 0.0), 0.0))
+        if atr_pct <= 0 and close > 0 and high > 0 and low > 0:
+            atr_pct = max(0.0, abs(high - low) / close * 100.0)
+    except Exception:
+        pass
+    try:
+        bb_u = float(_as_float(last.get("BB_upper", 0.0), 0.0))
+        bb_l = float(_as_float(last.get("BB_lower", 0.0), 0.0))
+        bb_w_pct = ((bb_u - bb_l) / max(close, 1e-9) * 100.0) if (bb_u > 0 and bb_l > 0 and close > 0) else 0.0
+    except Exception:
+        bb_w_pct = 0.0
+    try:
+        vol = float(_as_float(last.get("vol", 0.0), 0.0))
+        vol_ma = float(_as_float(last.get("VOL_MA", 0.0), 0.0))
+        vol_ratio = (vol / vol_ma) if vol_ma > 0 else 1.0
+    except Exception:
+        vol_ratio = 1.0
+    try:
+        sqz_abs = abs(float(_as_float(last.get("SQZ_MOM_PCT", 0.0), 0.0)))
+    except Exception:
+        sqz_abs = 0.0
+    low_flags = 0
+    try:
+        if adx > 0 and adx <= float(cfg.get("ai_budget_low_adx", 18.0) or 18.0):
+            low_flags += 1
+    except Exception:
+        pass
+    try:
+        if atr_pct > 0 and atr_pct <= float(cfg.get("ai_budget_low_atr_pct", 0.35) or 0.35):
+            low_flags += 1
+    except Exception:
+        pass
+    try:
+        if bb_w_pct > 0 and bb_w_pct <= float(cfg.get("ai_budget_low_bb_width_pct", 1.20) or 1.20):
+            low_flags += 1
+    except Exception:
+        pass
+    try:
+        if vol_ratio <= float(cfg.get("ai_budget_low_vol_ratio", 0.90) or 0.90):
+            low_flags += 1
+    except Exception:
+        pass
+    try:
+        if sqz_abs <= float(cfg.get("ai_budget_low_sqz_abs_pct", 0.06) or 0.06):
+            low_flags += 1
+    except Exception:
+        pass
+    if low_flags >= 4:
+        mult = 3.0
+    elif low_flags >= 3:
+        mult = 2.2
+    elif low_flags >= 2:
+        mult = 1.6
+    elif low_flags >= 1:
+        mult = 1.3
+    else:
+        mult = 1.0
+    try:
+        max_itv = float(cfg.get("ai_budget_adaptive_max_interval_sec", 180) or 180)
+    except Exception:
+        max_itv = 180.0
+    max_itv = float(clamp(max_itv, base, 3600.0))
+    dyn = float(clamp(base * mult, base, max_itv))
+    note = f"adaptive(flags={low_flags},adx={adx:.1f},atr%={atr_pct:.2f},volx={vol_ratio:.2f},bbw%={bb_w_pct:.2f},sqz={sqz_abs:.3f})"
+    return dyn, note
+
+
+def ai_budget_can_call(
+    rt: Dict[str, Any],
+    cfg: Dict[str, Any],
+    force: bool = False,
+    last: Optional[pd.Series] = None,
+    status: Optional[Dict[str, Any]] = None,
+    symbol: str = "",
+    urgent: bool = False,
+) -> Tuple[bool, str]:
     try:
         if force:
             return True, "force"
@@ -2257,23 +2399,25 @@ def ai_budget_can_call(rt: Dict[str, Any], cfg: Dict[str, Any], force: bool = Fa
             return True, "disabled"
         st = _ai_budget_state(rt)
         now_ep = time.time()
-        min_itv = float(cfg.get("ai_budget_min_interval_sec", 45) or 45)
+        min_itv, min_itv_note = _ai_dynamic_min_interval_sec(cfg, last=last, status=status, urgent=bool(urgent))
         min_itv = float(clamp(min_itv, 1.0, 3600.0))
         last_ep = float(st.get("last_call_epoch", 0.0) or 0.0)
         if last_ep > 0 and (now_ep - last_ep) < min_itv:
             left = int(max(1.0, min_itv - (now_ep - last_ep)))
-            return False, f"호출 간격 제한({left}s)"
-        h_lim = int(cfg.get("ai_budget_hourly_limit", 24) or 24)
+            return False, f"호출 간격 제한({left}s/{int(min_itv)}s)"
+        h_lim = int(cfg.get("ai_budget_hourly_limit", 0) or 0)
         d_lim = int(cfg.get("ai_budget_daily_limit", 180) or 180)
-        h_lim = max(1, h_lim)
         d_lim = max(1, d_lim)
         h_calls = int(st.get("hour_calls", 0) or 0)
         d_calls = int(st.get("day_calls", 0) or 0)
-        if h_calls >= h_lim:
+        if h_lim > 0 and h_calls >= h_lim:
             return False, f"시간 예산 초과({h_calls}/{h_lim})"
         if d_calls >= d_lim:
             return False, f"일일 예산 초과({d_calls}/{d_lim})"
-        return True, f"ok(h:{h_calls}/{h_lim}, d:{d_calls}/{d_lim})"
+        h_txt = str(h_lim) if h_lim > 0 else "∞"
+        _ = status
+        _ = symbol
+        return True, f"ok(itv:{int(min_itv)}s,{min_itv_note}, h:{h_calls}/{h_txt}, d:{d_calls}/{d_lim})"
     except Exception:
         return True, "unknown"
 
@@ -12168,6 +12312,41 @@ def _notification_channel_of(cfg: Optional[Dict[str, Any]]) -> str:
 class Notifier:
     def __init__(self):
         self._lock = threading.RLock()
+        self._last_discord_error = ""
+        self._last_discord_error_kst = ""
+
+    def _set_discord_error(self, msg: Any) -> None:
+        try:
+            s = str(msg or "").strip()
+        except Exception:
+            s = "unknown"
+        with self._lock:
+            self._last_discord_error = s[:500]
+            self._last_discord_error_kst = now_kst_str()
+
+    def _clear_discord_error(self) -> None:
+        with self._lock:
+            self._last_discord_error = ""
+            self._last_discord_error_kst = ""
+
+    def discord_diagnose(self, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        cfg = cfg or load_settings()
+        webhook_cfg = str((cfg or {}).get("discord_webhook_url", "") or "").strip()
+        webhook_sec = str(st.secrets.get("DISCORD_WEBHOOK_URL", "") or "").strip()
+        webhook = self._discord_webhook(cfg)
+        with self._lock:
+            err = str(self._last_discord_error or "")
+            err_kst = str(self._last_discord_error_kst or "")
+        return {
+            "notification_channel": _notification_channel_of(cfg),
+            "effective_channels": self._effective_channels(cfg),
+            "telegram_configured": bool(self._telegram_configured()),
+            "discord_configured": bool(self._discord_configured(cfg)),
+            "discord_webhook_source": ("config" if webhook_cfg else ("secrets" if webhook_sec else "none")),
+            "discord_webhook_set": bool(webhook),
+            "discord_last_error": err,
+            "discord_last_error_kst": err_kst,
+        }
 
     def _telegram_configured(self) -> bool:
         try:
@@ -12281,7 +12460,19 @@ class Notifier:
                         }
                     ],
                 }
-                requests.post(webhook, json=payload, timeout=timeout)
+                r = requests.post(webhook, json=payload, timeout=timeout)
+                if int(getattr(r, "status_code", 0) or 0) >= 400:
+                    # 일부 환경에서는 flags를 거부할 수 있어 fallback(일반 전송)
+                    payload2 = dict(payload)
+                    payload2.pop("flags", None)
+                    r2 = requests.post(webhook, json=payload2, timeout=timeout)
+                    if int(getattr(r2, "status_code", 0) or 0) >= 400:
+                        body2 = str(getattr(r2, "text", "") or "")[:240]
+                        self._set_discord_error(f"http {int(getattr(r2, 'status_code', 0) or 0)}: {body2}")
+                        return False
+                    self._clear_discord_error()
+                    return True
+                self._clear_discord_error()
                 return True
 
             if DiscordWebhook is not None and DiscordEmbed is not None:
@@ -12291,7 +12482,13 @@ class Notifier:
                     emb.add_embed_field(name=row["name"], value=row["value"], inline=bool(row.get("inline", False)))
                 emb.set_footer(text=f"route={str(target or 'default')} | {now_kst_str()}")
                 wh.add_embed(emb)
-                wh.execute()
+                r0 = wh.execute()
+                sc = int(getattr(r0, "status_code", 204) or 204)
+                if sc >= 400:
+                    body0 = str(getattr(r0, "text", "") or "")[:240]
+                    self._set_discord_error(f"http {sc}: {body0}")
+                    return False
+                self._clear_discord_error()
                 return True
 
             payload = {
@@ -12305,13 +12502,19 @@ class Notifier:
                     }
                 ]
             }
-            requests.post(webhook, json=payload, timeout=timeout)
+            r = requests.post(webhook, json=payload, timeout=timeout)
+            sc = int(getattr(r, "status_code", 0) or 0)
+            if sc >= 400:
+                body = str(getattr(r, "text", "") or "")[:240]
+                self._set_discord_error(f"http {sc}: {body}")
+                return False
+            self._clear_discord_error()
             return True
-        except Exception:
+        except Exception as e:
+            self._set_discord_error(e)
             return False
 
     def send_discord_text(self, text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False) -> bool:
-        del silent
         try:
             cfg = cfg or load_settings()
             if not self.should_send_discord(cfg):
@@ -19579,7 +19782,15 @@ def telegram_thread(ex):
                                 ai = {"decision": "hold", "confidence": 0, "reason_easy": "ai_cache_parse_fail", "used_indicators": stt.get("_used_indicators", [])}
                         else:
                             # ✅ AI 호출 예산(비용 보호): 자동 스캔 호출을 시간/일 단위로 제한
-                            allow_ai_budget, budget_note = ai_budget_can_call(rt, cfg, force=bool(forced_ai))
+                            allow_ai_budget, budget_note = ai_budget_can_call(
+                                rt,
+                                cfg,
+                                force=bool(forced_ai),
+                                last=last,
+                                status=stt,
+                                symbol=str(sym),
+                                urgent=bool(event_triggered),
+                            )
                             if not bool(allow_ai_budget):
                                 try:
                                     cs["ai_called"] = False
@@ -22182,8 +22393,14 @@ config["ai_cost_saver_strict"] = st.sidebar.checkbox(
 )
 bz1, bz2, bz3 = st.sidebar.columns(3)
 config["ai_budget_enable"] = bz1.checkbox("예산제한", value=bool(config.get("ai_budget_enable", True)))
-config["ai_budget_hourly_limit"] = bz2.number_input("시간당", 1, 200, int(config.get("ai_budget_hourly_limit", 24) or 24), step=1)
-config["ai_budget_daily_limit"] = bz3.number_input("일일", 10, 2000, int(config.get("ai_budget_daily_limit", 180) or 180), step=10)
+config["ai_budget_hourly_limit"] = bz2.number_input(
+    "시간당(0=무제한)",
+    0,
+    50000,
+    int(config.get("ai_budget_hourly_limit", 0) or 0),
+    step=1,
+)
+config["ai_budget_daily_limit"] = bz3.number_input("일일", 10, 200000, int(config.get("ai_budget_daily_limit", 180) or 180), step=10)
 config["ai_budget_min_interval_sec"] = st.sidebar.number_input(
     "AI 최소 간격(초)",
     1,
@@ -22191,6 +22408,19 @@ config["ai_budget_min_interval_sec"] = st.sidebar.number_input(
     int(config.get("ai_budget_min_interval_sec", 45) or 45),
     step=1,
     help="자동 스캔에서 AI 호출 사이 최소 간격입니다.",
+)
+ba1, ba2 = st.sidebar.columns(2)
+config["ai_budget_adaptive_interval_enable"] = ba1.checkbox(
+    "횡보시 자동 느리게",
+    value=bool(config.get("ai_budget_adaptive_interval_enable", True)),
+    help="횡보/저변동/저거래량 구간에서는 AI 호출 간격을 자동으로 늘립니다.",
+)
+config["ai_budget_adaptive_max_interval_sec"] = ba2.number_input(
+    "자동 최대간격(초)",
+    45,
+    1800,
+    int(config.get("ai_budget_adaptive_max_interval_sec", 180) or 180),
+    step=5,
 )
 ca1, ca2 = st.sidebar.columns(2)
 config["entry_convergence_min_votes"] = ca1.number_input(
@@ -22709,6 +22939,11 @@ if st.sidebar.button("📡 텔레그램 메뉴 전송(/menu)"):
 
 if st.sidebar.button("🧪 Discord 연결 테스트"):
     try:
+        diag0 = get_notifier().discord_diagnose(config)
+        st.sidebar.caption(
+            f"진단: ch={diag0.get('notification_channel')} / effective={diag0.get('effective_channels')} / "
+            f"webhook_source={diag0.get('discord_webhook_source')} / discord_ok={diag0.get('discord_configured')}"
+        )
         webhook = str(config.get("discord_webhook_url", "") or "").strip()
         if not webhook:
             webhook = str(st.secrets.get("DISCORD_WEBHOOK_URL", "") or "").strip()
@@ -22733,7 +22968,11 @@ if st.sidebar.button("🧪 Discord 연결 테스트"):
             if ok:
                 st.sidebar.success("✅ Discord 테스트 메시지 전송 완료")
             else:
-                st.sidebar.error("❌ Discord 전송 실패(웹훅/채널 권한 확인)")
+                d = get_notifier().discord_diagnose(cfg_test)
+                st.sidebar.error(
+                    "❌ Discord 전송 실패(웹훅/채널 권한 확인)\n"
+                    f"- last_error: {str(d.get('discord_last_error', '') or '-')}"
+                )
     except Exception as e:
         st.sidebar.error(f"❌ Discord 테스트 오류: {e}")
         notify_admin_error("UI:DISCORD_TEST", e, context={"code": CODE_VERSION})
