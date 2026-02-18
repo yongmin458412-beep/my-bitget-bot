@@ -22351,6 +22351,37 @@ st.sidebar.subheader("🔍 긴급 점검")
 if st.sidebar.button("📡 텔레그램 메뉴 전송(/menu)"):
     tg_send_menu(cfg=config)
 
+if st.sidebar.button("🧪 Discord 연결 테스트"):
+    try:
+        webhook = str(config.get("discord_webhook_url", "") or "").strip()
+        if not webhook:
+            webhook = str(st.secrets.get("DISCORD_WEBHOOK_URL", "") or "").strip()
+        if not webhook:
+            st.sidebar.error("❌ Discord Webhook URL이 비어있습니다.")
+        else:
+            cfg_test = dict(config)
+            cfg_test["notification_channel"] = "discord"
+            cfg_test["discord_webhook_url"] = webhook
+            ok = get_notifier().send_discord_embed(
+                title="✅ Discord 연결 테스트",
+                description="웹훅 전송이 정상 동작합니다.",
+                color=5763719,
+                fields=[
+                    {"name": "코드 버전", "value": str(CODE_VERSION), "inline": False},
+                    {"name": "시간(KST)", "value": now_kst_str(), "inline": False},
+                    {"name": "알림 채널 설정", "value": str(config.get("notification_channel", "telegram")), "inline": False},
+                ],
+                target="default",
+                cfg=cfg_test,
+            )
+            if ok:
+                st.sidebar.success("✅ Discord 테스트 메시지 전송 완료")
+            else:
+                st.sidebar.error("❌ Discord 전송 실패(웹훅/채널 권한 확인)")
+    except Exception as e:
+        st.sidebar.error(f"❌ Discord 테스트 오류: {e}")
+        notify_admin_error("UI:DISCORD_TEST", e, context={"code": CODE_VERSION})
+
 if st.sidebar.button("🤖 OpenAI 연결 테스트"):
     # 운영자가 결제/쿼터를 복구한 직후 즉시 재시도할 수 있게 수동 clear
     openai_clear_suspension(config)
