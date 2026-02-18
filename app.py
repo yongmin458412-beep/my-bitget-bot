@@ -35,6 +35,7 @@ import json
 import time
 import uuid
 import math
+import html
 import sqlite3
 import threading
 import traceback
@@ -12580,6 +12581,7 @@ class Notifier:
         cfg: Optional[Dict[str, Any]] = None,
         *,
         silent: bool = False,
+        footer_text: str = "",
     ) -> bool:
         try:
             cfg = cfg or load_settings()
@@ -12606,6 +12608,9 @@ class Notifier:
                     continue
 
             timeout = (3.0, min(10.0, float(HTTP_TIMEOUT_SEC)))
+            footer = str(footer_text or "").strip()
+            if not footer:
+                footer = f"route={str(target or 'default')} | v:{CODE_VERSION} | {now_kst_str()}"
             # Discord 무음 전송(알림 배너 억제)
             # flags=4096 (SUPPRESS_NOTIFICATIONS)
             if bool(silent):
@@ -12617,7 +12622,7 @@ class Notifier:
                             "description": desc,
                             "color": int(color),
                             "fields": rows[:20],
-                            "footer": {"text": f"route={str(target or 'default')} | {now_kst_str()}"},
+                            "footer": {"text": footer},
                         }
                     ],
                 }
@@ -12641,7 +12646,7 @@ class Notifier:
                 emb = DiscordEmbed(title=ttl, description=desc, color=int(color))
                 for row in rows[:20]:
                     emb.add_embed_field(name=row["name"], value=row["value"], inline=bool(row.get("inline", False)))
-                emb.set_footer(text=f"route={str(target or 'default')} | {now_kst_str()}")
+                emb.set_footer(text=footer)
                 wh.add_embed(emb)
                 r0 = wh.execute()
                 sc = int(getattr(r0, "status_code", 204) or 204)
@@ -12659,7 +12664,7 @@ class Notifier:
                         "description": desc,
                         "color": int(color),
                         "fields": rows[:20],
-                        "footer": {"text": f"route={str(target or 'default')} | {now_kst_str()}"},
+                        "footer": {"text": footer},
                     }
                 ]
             }
@@ -12674,6 +12679,212 @@ class Notifier:
         except Exception as e:
             self._set_discord_error(e)
             return False
+
+    def _trade_palette(self, data: Dict[str, Any]) -> Tuple[int, str]:
+        try:
+            event = str((data or {}).get("event", "") or "").upper().strip()
+            side = str((data or {}).get("side", "") or "").lower().strip()
+            pnl = _as_float((data or {}).get("pnl_usdt", None), 0.0)
+            roi = _as_float((data or {}).get("roi_pct", None), 0.0)
+            style = str((data or {}).get("style", "") or "").strip()
+            style_txt = f" ({style})" if style else ""
+
+            is_long_side = side in ["buy", "long", "롱"]
+            is_short_side = side in ["sell", "short", "숏"]
+            green = 0x00FF00
+            red = 0xFF0000
+
+            if event in ["ENTRY", "OPEN"]:
+                if is_short_side:
+                    return red, f"🔴 SHORT ENTRY{style_txt}"
+                return green, f"🟢 LONG ENTRY{style_txt}"
+            if event in ["EXIT_TP", "TP", "TAKE", "PROFIT"]:
+                return green, f"✅ TAKE PROFIT{style_txt}"
+            if event in ["EXIT_SL", "SL", "STOP", "LOSS", "PROTECT", "EXIT_CLOSE"]:
+                if (pnl > 0.0) or (roi > 0.0):
+                    return green, f"🛡️ EXIT (PROTECT){style_txt}"
+                return red, f"🩸 STOP / LOSS{style_txt}"
+
+            if (pnl > 0.0) or (roi > 0.0):
+                return green, f"📣 TRADE EVENT{style_txt}"
+            if (pnl < 0.0) or (roi < 0.0):
+                return red, f"📣 TRADE EVENT{style_txt}"
+            return (red if is_short_side else green), f"📣 TRADE EVENT{style_txt}"
+        except Exception:
+            return 0x5865F2, "📣 TRADE EVENT"
+
+    def _build_trade_discord_payload(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        d = dict(data or {})
+        color, title = self._trade_palette(d)
+        symbol = str(d.get("symbol", "-") or "-")
+        side = str(d.get("side", "-") or "-").upper()
+        style = str(d.get("style", "-") or "-")
+        reason = str(d.get("reason", "") or "").strip()
+        if len(reason) > 360:
+            reason = reason[:360] + "..."
+
+        fields: List[Dict[str, Any]] = []
+        def _add(name: str, value: Any, inline: bool = True) -> None:
+            v = str(value if value is not None else "").strip()
+            if v:
+                fields.append({"name": name, "value": v, "inline": bool(inline)})
+
+        _add("🪙 Symbol", symbol, True)
+        _add("🧭 Side", side, True)
+        _add("🧩 Style", style, True)
+        if d.get("price") is not None:
+            _add("💰 Price", f"{_as_float(d.get('price'), 0.0):,.6g}", True)
+        if d.get("entry_price") is not None:
+            _add("🎯 Entry", f"{_as_float(d.get('entry_price'), 0.0):,.6g}", True)
+        if d.get("exit_price") is not None:
+            _add("🏁 Exit", f"{_as_float(d.get('exit_price'), 0.0):,.6g}", True)
+        if d.get("size") is not None:
+            _add("📊 Size", f"{_as_float(d.get('size'), 0.0):,.6g}", True)
+        if d.get("entry_pct") is not None:
+            _add("📦 Size(%)", f"{_as_float(d.get('entry_pct'), 0.0):.2f}%", True)
+        if d.get("leverage") is not None:
+            _add("⚡ Leverage", f"x{_as_float(d.get('leverage'), 0.0):.0f}", True)
+        if d.get("tp_pct") is not None or d.get("sl_pct") is not None:
+            tp = _as_float(d.get("tp_pct", 0.0), 0.0)
+            sl = _as_float(d.get("sl_pct", 0.0), 0.0)
+            _add("🎯 Target", f"TP +{abs(tp):.2f}% / SL -{abs(sl):.2f}%", False)
+        if d.get("roi_pct") is not None:
+            _add("📈 ROI", f"{_as_float(d.get('roi_pct'), 0.0):+.2f}%", True)
+        if d.get("pnl_usdt") is not None:
+            _add("💵 PnL", f"{_as_float(d.get('pnl_usdt'), 0.0):+,.2f} USDT", True)
+        if d.get("balance_total") is not None:
+            _add("🏦 Balance", f"{_as_float(d.get('balance_total'), 0.0):,.2f} USDT", True)
+        if d.get("trade_id"):
+            _add("🆔 Trade ID", str(d.get("trade_id")), True)
+        if reason:
+            _add("💡 Reason", reason, False)
+
+        desc = str(d.get("subtitle", "") or "").strip()
+        footer = f"Bitget AI Bot | v:{CODE_VERSION} | {now_kst_str()}"
+        return {"title": title, "description": desc, "color": color, "fields": fields[:20], "footer": footer}
+
+    def _telegram_send_html(self, html_text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False) -> bool:
+        cfg = cfg or load_settings()
+        if not self.should_send_telegram(cfg):
+            return False
+        if (not tg_token) or (not str(html_text or "").strip()):
+            return False
+        ids = _tg_chat_id_by_target(target, cfg)
+        pri = "high" if str(target or "").lower().strip() == "admin" else "normal"
+        sent_any = False
+        for cid in ids:
+            if not cid:
+                continue
+            try:
+                data = {
+                    "chat_id": cid,
+                    "text": str(html_text),
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                }
+                if bool(silent):
+                    data["disable_notification"] = True
+                tg_enqueue("sendMessage", data, priority=pri)
+                sent_any = True
+            except Exception:
+                continue
+        return sent_any
+
+    def _build_trade_telegram_html(self, data: Dict[str, Any]) -> str:
+        d = dict(data or {})
+        _color, title = self._trade_palette(d)
+        symbol = html.escape(str(d.get("symbol", "-") or "-"))
+        side = html.escape(str(d.get("side", "-") or "-").upper())
+        style = html.escape(str(d.get("style", "") or ""))
+        reason = html.escape(str(d.get("reason", "") or "").strip())
+        if len(reason) > 260:
+            reason = reason[:260] + "..."
+
+        def _code(v: Any) -> str:
+            try:
+                return f"<code>{html.escape(str(v))}</code>"
+            except Exception:
+                return "<code>-</code>"
+
+        lines: List[str] = []
+        style_txt = f" ({style})" if style and style != "-" else ""
+        lines.append(f"<b>{html.escape(title)}</b>{style_txt}")
+        lines.append("────────────────")
+        lines.append(f"🪙 <b>Symbol:</b> {_code(symbol)}")
+        lines.append(f"🧭 <b>Side:</b> {_code(side)}")
+        if d.get("price") is not None:
+            price_txt = f"{_as_float(d.get('price'), 0.0):,.6g}"
+            lines.append(f"💰 <b>Price:</b> {_code(price_txt)}")
+        if d.get("entry_price") is not None:
+            entry_txt = f"{_as_float(d.get('entry_price'), 0.0):,.6g}"
+            lines.append(f"🎯 <b>Entry:</b> {_code(entry_txt)}")
+        if d.get("exit_price") is not None:
+            exit_txt = f"{_as_float(d.get('exit_price'), 0.0):,.6g}"
+            lines.append(f"🏁 <b>Exit:</b> {_code(exit_txt)}")
+        if (d.get("size") is not None) or (d.get("entry_pct") is not None):
+            sz = f"{_as_float(d.get('size'), 0.0):,.6g}" if d.get("size") is not None else "-"
+            pct = f"{_as_float(d.get('entry_pct'), 0.0):.2f}%" if d.get("entry_pct") is not None else "-"
+            lines.append(f"📊 <b>Size:</b> {_code(sz)} ({_code(pct)})")
+        if d.get("leverage") is not None:
+            lev_txt = f"x{_as_float(d.get('leverage'), 0.0):.0f}"
+            lines.append(f"⚡ <b>Leverage:</b> {_code(lev_txt)}")
+        if d.get("tp_pct") is not None or d.get("sl_pct") is not None:
+            tp = _as_float(d.get("tp_pct"), 0.0)
+            sl = _as_float(d.get("sl_pct"), 0.0)
+            lines.append(f"🎯 <b>Target:</b> {_code(f'TP +{abs(tp):.2f}%')} / {_code(f'SL -{abs(sl):.2f}%')}")
+        if d.get("roi_pct") is not None:
+            roi_txt = f"{_as_float(d.get('roi_pct'), 0.0):+.2f}%"
+            lines.append(f"📈 <b>ROI:</b> {_code(roi_txt)}")
+        if d.get("pnl_usdt") is not None:
+            pnl_txt = f"{_as_float(d.get('pnl_usdt'), 0.0):+,.2f} USDT"
+            lines.append(f"💵 <b>PnL:</b> {_code(pnl_txt)}")
+        if d.get("balance_total") is not None:
+            bal_txt = f"{_as_float(d.get('balance_total'), 0.0):,.2f} USDT"
+            lines.append(f"🏦 <b>Balance:</b> {_code(bal_txt)}")
+        if d.get("trade_id"):
+            lines.append(f"🆔 <b>ID:</b> {_code(str(d.get('trade_id')))}")
+        lines.append("────────────────")
+        if reason:
+            lines.append(f"💡 <b>Reason:</b> {reason}")
+        return "\n".join(lines)
+
+    def send_telegram(self, data: Dict[str, Any], target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False) -> bool:
+        try:
+            html_text = self._build_trade_telegram_html(data or {})
+            return self._telegram_send_html(html_text, target=target, cfg=cfg, silent=bool(silent))
+        except Exception:
+            return False
+
+    def send_discord(self, data: Dict[str, Any], target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False) -> bool:
+        try:
+            p = self._build_trade_discord_payload(data or {})
+            return self.send_discord_embed(
+                title=str(p.get("title", "Trade Alert")),
+                description=str(p.get("description", "") or ""),
+                color=int(p.get("color", 0x5865F2)),
+                fields=list(p.get("fields", []) or []),
+                target=target,
+                cfg=cfg,
+                silent=bool(silent),
+                footer_text=str(p.get("footer", "") or ""),
+            )
+        except Exception:
+            return False
+
+    def send_trade(self, data: Dict[str, Any], target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False) -> bool:
+        cfg = cfg or load_settings()
+        ok_any = False
+        try:
+            if self.should_send_telegram(cfg):
+                ok_any = bool(self.send_telegram(data or {}, target=target, cfg=cfg, silent=bool(silent))) or ok_any
+        except Exception:
+            pass
+        try:
+            if self.should_send_discord(cfg):
+                ok_any = bool(self.send_discord(data or {}, target=target, cfg=cfg, silent=bool(silent))) or ok_any
+        except Exception:
+            pass
+        return ok_any
 
     def send_discord_text(self, text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False) -> bool:
         try:
@@ -18430,10 +18641,38 @@ def telegram_thread(ex):
                                         f"- 이유: {reason_ko}\n"
                                         f"- 한줄평: {one}\n- 일지ID: {trade_id or '없음'}"
                                     )
-                                tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                trade_data = {
+                                    "event": ("PROTECT" if bool(is_protect) else "EXIT_SL"),
+                                    "symbol": str(sym),
+                                    "side": str(side),
+                                    "style": str(style_now),
+                                    "entry_price": float(entry) if entry is not None else None,
+                                    "exit_price": float(exit_px) if exit_px is not None else None,
+                                    "price": float(exit_px) if exit_px is not None else None,
+                                    "size": float(contracts) if contracts is not None else None,
+                                    "entry_usdt": float(tgt.get("entry_usdt", 0.0) or 0.0),
+                                    "entry_pct": float(tgt.get("entry_pct", 0.0) or 0.0),
+                                    "leverage": _as_float(tgt.get("lev", None), 0.0),
+                                    "tp_pct": float(tgt.get("tp", 0.0) or 0.0),
+                                    "sl_pct": float(tgt.get("sl", 0.0) or 0.0),
+                                    "roi_pct": float(roi),
+                                    "pnl_usdt": float(pnl_usdt_snapshot),
+                                    "balance_total": float(total_after),
+                                    "balance_free": float(free_after),
+                                    "reason": f"{reason_ko} | {one}",
+                                    "trade_id": str(trade_id or ""),
+                                }
+                                sent_evt = get_notifier().send_trade(
+                                    trade_data,
+                                    target=cfg.get("tg_route_events_to", "channel"),
+                                    cfg=cfg,
+                                    silent=False,
+                                )
+                                if not bool(sent_evt):
+                                    tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
                                 try:
                                     if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
-                                        tg_send(msg, target="admin", cfg=cfg, silent=False)
+                                        get_notifier().send_trade(trade_data, target="admin", cfg=cfg, silent=False)
                                 except Exception:
                                     pass
                                 try:
@@ -18830,10 +19069,38 @@ def telegram_thread(ex):
                                         f"- 이유: {take_reason_ko}\n"
                                         f"- 한줄평: {one}\n- 일지ID: {trade_id or '없음'}"
                                     )
-                                tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                trade_data = {
+                                    "event": ("EXIT_CLOSE" if bool(is_loss_take) else "EXIT_TP"),
+                                    "symbol": str(sym),
+                                    "side": str(side),
+                                    "style": str(style_now),
+                                    "entry_price": float(entry) if entry is not None else None,
+                                    "exit_price": float(exit_px) if exit_px is not None else None,
+                                    "price": float(exit_px) if exit_px is not None else None,
+                                    "size": float(contracts) if contracts is not None else None,
+                                    "entry_usdt": float(tgt.get("entry_usdt", 0.0) or 0.0),
+                                    "entry_pct": float(tgt.get("entry_pct", 0.0) or 0.0),
+                                    "leverage": _as_float(tgt.get("lev", None), 0.0),
+                                    "tp_pct": float(tgt.get("tp", 0.0) or 0.0),
+                                    "sl_pct": float(tgt.get("sl", 0.0) or 0.0),
+                                    "roi_pct": float(roi),
+                                    "pnl_usdt": float(pnl_usdt_snapshot),
+                                    "balance_total": float(total_after),
+                                    "balance_free": float(free_after),
+                                    "reason": f"{take_reason_ko} | {one}",
+                                    "trade_id": str(trade_id or ""),
+                                }
+                                sent_evt = get_notifier().send_trade(
+                                    trade_data,
+                                    target=cfg.get("tg_route_events_to", "channel"),
+                                    cfg=cfg,
+                                    silent=False,
+                                )
+                                if not bool(sent_evt):
+                                    tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
                                 try:
                                     if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
-                                        tg_send(msg, target="admin", cfg=cfg, silent=False)
+                                        get_notifier().send_trade(trade_data, target="admin", cfg=cfg, silent=False)
                                 except Exception:
                                     pass
                                 try:
@@ -21370,11 +21637,44 @@ def telegram_thread(ex):
                                                 f"- 자세한 근거: /log {trade_id}\n"
                                                 f"- AI지표: {', '.join(ai2.get('used_indicators', []))}\n"
                                             )
-                                    tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                    trade_data = {
+                                        "event": "ENTRY",
+                                        "symbol": str(sym),
+                                        "side": str(decision),
+                                        "style": str(style),
+                                        "entry_price": float(px) if px is not None else None,
+                                        "price": float(px) if px is not None else None,
+                                        "size": float(qty) if qty is not None else None,
+                                        "entry_usdt": float(entry_usdt) if entry_usdt is not None else None,
+                                        "entry_pct": float(entry_pct) if entry_pct is not None else None,
+                                        "leverage": float(lev) if lev is not None else None,
+                                        "tp_pct": float(tpp) if tpp is not None else None,
+                                        "sl_pct": float(slp) if slp is not None else None,
+                                        "reason": str(locals().get("one_line0", "") or ai2.get("reason_easy", "") or "").strip(),
+                                        "trade_id": str(trade_id or ""),
+                                        "balance_total": (
+                                            float(locals().get("ba_total"))
+                                            if (locals().get("ba_total", None) is not None and str(locals().get("ba_total")) != "")
+                                            else None
+                                        ),
+                                        "balance_free": (
+                                            float(locals().get("ba_free"))
+                                            if (locals().get("ba_free", None) is not None and str(locals().get("ba_free")) != "")
+                                            else None
+                                        ),
+                                    }
+                                    sent_evt = get_notifier().send_trade(
+                                        trade_data,
+                                        target=cfg.get("tg_route_events_to", "channel"),
+                                        cfg=cfg,
+                                        silent=False,
+                                    )
+                                    if not bool(sent_evt):
+                                        tg_send(msg, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
                                     # ✅ 채널을 음소거해도 중요한 알림을 놓치지 않도록(사용자 요구): 관리자 DM에도 복사
                                     try:
                                         if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
-                                            tg_send(msg, target="admin", cfg=cfg, silent=False)
+                                            get_notifier().send_trade(trade_data, target="admin", cfg=cfg, silent=False)
                                     except Exception:
                                         pass
                                     # ✅ 진입 근거 이미지(캔들 + SR/매물대 + 지표/패턴 요약)
