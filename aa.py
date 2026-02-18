@@ -1050,8 +1050,16 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 유도리 청산(보조지표 반대 시그널)
         # - 목표익절 미도달이어도, 반대 시그널이 강하면 청산 가능
         "exit_signal_flex_enable": True,
-        "exit_signal_flex_min_roi": 0.8,      # 수익권 최소 조건(%) - 너무 이른 청산 방지
-        "exit_signal_flex_score_min": 4,      # 반대 시그널 점수 임계치
+        "exit_signal_flex_min_roi": 0.5,      # 호환용(스타일별 키 미설정 시)
+        "exit_signal_flex_score_min": 5,      # 호환용(스타일별 키 미설정 시)
+        "exit_signal_flex_min_roi_scalp": 0.5,
+        "exit_signal_flex_min_roi_day": 1.5,
+        "exit_signal_flex_min_roi_swing": 3.0,
+        "exit_signal_flex_score_scalp_min": 5,
+        "exit_signal_flex_score_day_min": 7,
+        "exit_signal_flex_score_swing_min": 9,
+        "exit_signal_flex_rsi_cross_delta": 3.0,
+        "exit_signal_flex_adx_drop_min": 2.0,
         "exit_signal_flex_min_adx": 16.0,     # ADX 보정 기준
         # ✅ 청산 후 재진입 쿨다운(과매매/수수료/AI호출 낭비 방지)
         # - "bars"는 현재 단기 timeframe 기준 봉 개수(예: 5m에서 2 bars = 10분)
@@ -1651,13 +1659,61 @@ def load_settings() -> Dict[str, Any]:
                 pass
             try:
                 if "exit_signal_flex_min_roi" not in saved:
-                    cfg["exit_signal_flex_min_roi"] = 0.8
+                    cfg["exit_signal_flex_min_roi"] = 0.5
                     changed = True
             except Exception:
                 pass
             try:
                 if "exit_signal_flex_score_min" not in saved:
-                    cfg["exit_signal_flex_score_min"] = 4
+                    cfg["exit_signal_flex_score_min"] = 5
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "exit_signal_flex_min_roi_scalp" not in saved:
+                    cfg["exit_signal_flex_min_roi_scalp"] = 0.5
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "exit_signal_flex_min_roi_day" not in saved:
+                    cfg["exit_signal_flex_min_roi_day"] = 1.5
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "exit_signal_flex_min_roi_swing" not in saved:
+                    cfg["exit_signal_flex_min_roi_swing"] = 3.0
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "exit_signal_flex_score_scalp_min" not in saved:
+                    cfg["exit_signal_flex_score_scalp_min"] = 5
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "exit_signal_flex_score_day_min" not in saved:
+                    cfg["exit_signal_flex_score_day_min"] = 7
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "exit_signal_flex_score_swing_min" not in saved:
+                    cfg["exit_signal_flex_score_swing_min"] = 9
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "exit_signal_flex_rsi_cross_delta" not in saved:
+                    cfg["exit_signal_flex_rsi_cross_delta"] = 3.0
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if "exit_signal_flex_adx_drop_min" not in saved:
+                    cfg["exit_signal_flex_adx_drop_min"] = 2.0
                     changed = True
             except Exception:
                 pass
@@ -12582,6 +12638,7 @@ class Notifier:
         *,
         silent: bool = False,
         footer_text: str = "",
+        image_path: str = "",
     ) -> bool:
         try:
             cfg = cfg or load_settings()
@@ -12611,68 +12668,67 @@ class Notifier:
             footer = str(footer_text or "").strip()
             if not footer:
                 footer = f"route={str(target or 'default')} | v:{CODE_VERSION} | {now_kst_str()}"
-            # Discord 무음 전송(알림 배너 억제)
-            # flags=4096 (SUPPRESS_NOTIFICATIONS)
+            img = str(image_path or "").strip()
+            has_img = bool(img and os.path.isfile(img))
+            img_name = os.path.basename(img) if has_img else ""
+
+            embed_obj: Dict[str, Any] = {
+                "title": ttl,
+                "description": desc,
+                "color": int(color),
+                "fields": rows[:20],
+                "footer": {"text": footer},
+            }
+            if has_img and img_name:
+                embed_obj["image"] = {"url": f"attachment://{img_name}"}
+
+            payload: Dict[str, Any] = {"embeds": [embed_obj]}
             if bool(silent):
-                payload = {
-                    "flags": 4096,
-                    "embeds": [
-                        {
-                            "title": ttl,
-                            "description": desc,
-                            "color": int(color),
-                            "fields": rows[:20],
-                            "footer": {"text": footer},
-                        }
-                    ],
-                }
-                r = requests.post(webhook, json=payload, timeout=timeout)
-                if int(getattr(r, "status_code", 0) or 0) >= 400:
-                    # 일부 환경에서는 flags를 거부할 수 있어 fallback(일반 전송)
+                payload["flags"] = 4096  # SUPPRESS_NOTIFICATIONS
+
+            if has_img and img_name:
+                with open(img, "rb") as fp:
+                    files = {"files[0]": (img_name, fp, "application/octet-stream")}
+                    data = {"payload_json": json.dumps(payload, ensure_ascii=False)}
+                    r = requests.post(webhook, data=data, files=files, timeout=timeout)
+                sc = int(getattr(r, "status_code", 0) or 0)
+                if sc >= 400 and bool(silent):
                     payload2 = dict(payload)
                     payload2.pop("flags", None)
-                    r2 = requests.post(webhook, json=payload2, timeout=timeout)
-                    if int(getattr(r2, "status_code", 0) or 0) >= 400:
+                    with open(img, "rb") as fp2:
+                        files2 = {"files[0]": (img_name, fp2, "application/octet-stream")}
+                        data2 = {"payload_json": json.dumps(payload2, ensure_ascii=False)}
+                        r2 = requests.post(webhook, data=data2, files=files2, timeout=timeout)
+                    sc = int(getattr(r2, "status_code", 0) or 0)
+                    if sc >= 400:
                         body2 = str(getattr(r2, "text", "") or "")[:240]
-                        self._set_discord_error(f"http {int(getattr(r2, 'status_code', 0) or 0)}: {body2}")
+                        self._set_discord_error(f"http {sc}: {body2}")
                         return False
                     self._clear_discord_error()
                     return True
-                self._clear_discord_error()
-                return True
-
-            if DiscordWebhook is not None and DiscordEmbed is not None:
-                wh = DiscordWebhook(url=webhook, rate_limit_retry=True, timeout=min(float(HTTP_TIMEOUT_SEC), 12.0))
-                emb = DiscordEmbed(title=ttl, description=desc, color=int(color))
-                for row in rows[:20]:
-                    emb.add_embed_field(name=row["name"], value=row["value"], inline=bool(row.get("inline", False)))
-                emb.set_footer(text=footer)
-                wh.add_embed(emb)
-                r0 = wh.execute()
-                sc = int(getattr(r0, "status_code", 204) or 204)
                 if sc >= 400:
-                    body0 = str(getattr(r0, "text", "") or "")[:240]
-                    self._set_discord_error(f"http {sc}: {body0}")
+                    body = str(getattr(r, "text", "") or "")[:240]
+                    self._set_discord_error(f"http {sc}: {body}")
                     return False
                 self._clear_discord_error()
                 return True
 
-            payload = {
-                "embeds": [
-                    {
-                        "title": ttl,
-                        "description": desc,
-                        "color": int(color),
-                        "fields": rows[:20],
-                        "footer": {"text": footer},
-                    }
-                ]
-            }
-            r = requests.post(webhook, json=payload, timeout=timeout)
-            sc = int(getattr(r, "status_code", 0) or 0)
-            if sc >= 400:
-                body = str(getattr(r, "text", "") or "")[:240]
-                self._set_discord_error(f"http {sc}: {body}")
+            r0 = requests.post(webhook, json=payload, timeout=timeout)
+            sc0 = int(getattr(r0, "status_code", 0) or 0)
+            if sc0 >= 400 and bool(silent):
+                payload3 = dict(payload)
+                payload3.pop("flags", None)
+                r3 = requests.post(webhook, json=payload3, timeout=timeout)
+                sc0 = int(getattr(r3, "status_code", 0) or 0)
+                if sc0 >= 400:
+                    body3 = str(getattr(r3, "text", "") or "")[:240]
+                    self._set_discord_error(f"http {sc0}: {body3}")
+                    return False
+                self._clear_discord_error()
+                return True
+            if sc0 >= 400:
+                body0 = str(getattr(r0, "text", "") or "")[:240]
+                self._set_discord_error(f"http {sc0}: {body0}")
                 return False
             self._clear_discord_error()
             return True
@@ -12686,8 +12742,9 @@ class Notifier:
             side = str((data or {}).get("side", "") or "").lower().strip()
             pnl = _as_float((data or {}).get("pnl_usdt", None), 0.0)
             roi = _as_float((data or {}).get("roi_pct", None), 0.0)
+            symbol = str((data or {}).get("symbol", "-") or "-").strip() or "-"
             style = str((data or {}).get("style", "") or "").strip()
-            style_txt = f" ({style})" if style else ""
+            style_txt = f" · {style}" if style else ""
 
             is_long_side = side in ["buy", "long", "롱"]
             is_short_side = side in ["sell", "short", "숏"]
@@ -12696,29 +12753,53 @@ class Notifier:
 
             if event in ["ENTRY", "OPEN"]:
                 if is_short_side:
-                    return red, f"🔴 SHORT ENTRY{style_txt}"
-                return green, f"🟢 LONG ENTRY{style_txt}"
+                    return red, f"🔴 숏 진입 | {symbol}{style_txt}"
+                return green, f"🟢 롱 진입 | {symbol}{style_txt}"
             if event in ["EXIT_TP", "TP", "TAKE", "PROFIT"]:
-                return green, f"✅ TAKE PROFIT{style_txt}"
+                if is_short_side:
+                    return red, f"🎉 숏 청산(익절) | {symbol}{style_txt}"
+                return green, f"🎉 롱 청산(익절) | {symbol}{style_txt}"
             if event in ["EXIT_SL", "SL", "STOP", "LOSS", "PROTECT", "EXIT_CLOSE"]:
                 if (pnl > 0.0) or (roi > 0.0):
-                    return green, f"🛡️ EXIT (PROTECT){style_txt}"
-                return red, f"🩸 STOP / LOSS{style_txt}"
+                    if is_short_side:
+                        return red, f"🛡️ 숏 청산(수익보호) | {symbol}{style_txt}"
+                    return green, f"🛡️ 롱 청산(수익보호) | {symbol}{style_txt}"
+                if is_short_side:
+                    return red, f"🩸 숏 청산(손절) | {symbol}{style_txt}"
+                return red, f"🩸 롱 청산(손절) | {symbol}{style_txt}"
 
             if (pnl > 0.0) or (roi > 0.0):
-                return green, f"📣 TRADE EVENT{style_txt}"
+                return green, f"📣 거래 알림 | {symbol}{style_txt}"
             if (pnl < 0.0) or (roi < 0.0):
-                return red, f"📣 TRADE EVENT{style_txt}"
-            return (red if is_short_side else green), f"📣 TRADE EVENT{style_txt}"
+                return red, f"📣 거래 알림 | {symbol}{style_txt}"
+            return (red if is_short_side else green), f"📣 거래 알림 | {symbol}{style_txt}"
         except Exception:
-            return 0x5865F2, "📣 TRADE EVENT"
+            return 0x5865F2, "📣 거래 알림"
+
+    def _image_path_from_data(self, data: Dict[str, Any]) -> str:
+        try:
+            d = dict(data or {})
+            for k in ["image_path", "chart_image", "entry_chart_image", "exit_chart_image", "snapshot_image", "photo_path"]:
+                p = str(d.get(k, "") or "").strip()
+                if p and os.path.isfile(p):
+                    return p
+            return ""
+        except Exception:
+            return ""
 
     def _build_trade_discord_payload(self, data: Dict[str, Any]) -> Dict[str, Any]:
         d = dict(data or {})
         color, title = self._trade_palette(d)
         symbol = str(d.get("symbol", "-") or "-")
-        side = str(d.get("side", "-") or "-").upper()
+        side_raw = str(d.get("side", "-") or "-").strip().lower()
+        if side_raw in ["buy", "long", "롱"]:
+            side_kr = "롱"
+        elif side_raw in ["sell", "short", "숏"]:
+            side_kr = "숏"
+        else:
+            side_kr = "-"
         style = str(d.get("style", "-") or "-")
+        mode = str(d.get("mode", "-") or "-")
         reason = str(d.get("reason", "") or "").strip()
         if len(reason) > 360:
             reason = reason[:360] + "..."
@@ -12729,39 +12810,59 @@ class Notifier:
             if v:
                 fields.append({"name": name, "value": v, "inline": bool(inline)})
 
-        _add("🪙 Symbol", symbol, True)
-        _add("🧭 Side", side, True)
-        _add("🧩 Style", style, True)
-        if d.get("price") is not None:
-            _add("💰 Price", f"{_as_float(d.get('price'), 0.0):,.6g}", True)
-        if d.get("entry_price") is not None:
-            _add("🎯 Entry", f"{_as_float(d.get('entry_price'), 0.0):,.6g}", True)
-        if d.get("exit_price") is not None:
-            _add("🏁 Exit", f"{_as_float(d.get('exit_price'), 0.0):,.6g}", True)
-        if d.get("size") is not None:
-            _add("📊 Size", f"{_as_float(d.get('size'), 0.0):,.6g}", True)
-        if d.get("entry_pct") is not None:
-            _add("📦 Size(%)", f"{_as_float(d.get('entry_pct'), 0.0):.2f}%", True)
+        strategy_lines: List[str] = []
+        strategy_lines.append(f"스타일: `{style}`")
+        strategy_lines.append(f"포지션: `{side_kr}`")
+        if mode and mode != "-":
+            strategy_lines.append(f"모드: `{mode}`")
         if d.get("leverage") is not None:
-            _add("⚡ Leverage", f"x{_as_float(d.get('leverage'), 0.0):.0f}", True)
-        if d.get("tp_pct") is not None or d.get("sl_pct") is not None:
-            tp = _as_float(d.get("tp_pct", 0.0), 0.0)
-            sl = _as_float(d.get("sl_pct", 0.0), 0.0)
-            _add("🎯 Target", f"TP +{abs(tp):.2f}% / SL -{abs(sl):.2f}%", False)
+            strategy_lines.append(f"레버리지: `x{_as_float(d.get('leverage'), 0.0):.0f}`")
+        _add("🧩 전략", "\n".join(strategy_lines), True)
+
+        fin_lines: List[str] = [f"심볼: `{symbol}`"]
+        if d.get("entry_price") is not None:
+            fin_lines.append(f"진입가: `{_as_float(d.get('entry_price'), 0.0):,.6g}`")
+        if d.get("exit_price") is not None:
+            fin_lines.append(f"청산가: `{_as_float(d.get('exit_price'), 0.0):,.6g}`")
+        elif d.get("price") is not None:
+            fin_lines.append(f"현재가: `{_as_float(d.get('price'), 0.0):,.6g}`")
         if d.get("roi_pct") is not None:
-            _add("📈 ROI", f"{_as_float(d.get('roi_pct'), 0.0):+.2f}%", True)
+            fin_lines.append(f"ROI: `{_as_float(d.get('roi_pct'), 0.0):+.2f}%`")
         if d.get("pnl_usdt") is not None:
-            _add("💵 PnL", f"{_as_float(d.get('pnl_usdt'), 0.0):+,.2f} USDT", True)
+            fin_lines.append(f"손익: `{_as_float(d.get('pnl_usdt'), 0.0):+,.2f} USDT`")
+        _add("💰 손익", "\n".join(fin_lines), True)
+
+        target_lines: List[str] = []
+        if d.get("tp_pct") is not None:
+            target_lines.append(f"익절(TP): `+{abs(_as_float(d.get('tp_pct'), 0.0)):.2f}%`")
+        if d.get("sl_pct") is not None:
+            target_lines.append(f"손절(SL): `-{abs(_as_float(d.get('sl_pct'), 0.0)):.2f}%`")
+        if d.get("entry_pct") is not None:
+            target_lines.append(f"진입비중: `{_as_float(d.get('entry_pct'), 0.0):.2f}%`")
+        if d.get("size") is not None:
+            target_lines.append(f"수량: `{_as_float(d.get('size'), 0.0):,.6g}`")
         if d.get("balance_total") is not None:
-            _add("🏦 Balance", f"{_as_float(d.get('balance_total'), 0.0):,.2f} USDT", True)
-        if d.get("trade_id"):
-            _add("🆔 Trade ID", str(d.get("trade_id")), True)
+            target_lines.append(f"총자산: `{_as_float(d.get('balance_total'), 0.0):,.2f} USDT`")
+        if d.get("balance_free") is not None:
+            target_lines.append(f"가용자산: `{_as_float(d.get('balance_free'), 0.0):,.2f} USDT`")
+        if target_lines:
+            _add("🎯 목표/포지션", "\n".join(target_lines), True)
+
         if reason:
-            _add("💡 Reason", reason, False)
+            _add("💡 근거", reason, False)
+        if d.get("trade_id"):
+            _add("🆔 거래 ID", f"`{str(d.get('trade_id'))}`", False)
 
         desc = str(d.get("subtitle", "") or "").strip()
-        footer = f"Bitget AI Bot | v:{CODE_VERSION} | {now_kst_str()}"
-        return {"title": title, "description": desc, "color": color, "fields": fields[:20], "footer": footer}
+        footer = f"비트겟 AI 봇 | v:{CODE_VERSION} | {now_kst_str()}"
+        return {
+            "title": title,
+            "description": desc,
+            "color": color,
+            "fields": fields[:20],
+            "footer": footer,
+            "image_path": self._image_path_from_data(d),
+        }
 
     def _telegram_send_html(self, html_text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False) -> bool:
         cfg = cfg or load_settings()
@@ -12794,8 +12895,16 @@ class Notifier:
         d = dict(data or {})
         _color, title = self._trade_palette(d)
         symbol = html.escape(str(d.get("symbol", "-") or "-"))
-        side = html.escape(str(d.get("side", "-") or "-").upper())
+        side_raw = str(d.get("side", "-") or "-").strip().lower()
+        if side_raw in ["buy", "long", "롱"]:
+            side = "롱"
+        elif side_raw in ["sell", "short", "숏"]:
+            side = "숏"
+        else:
+            side = "-"
+        side = html.escape(side)
         style = html.escape(str(d.get("style", "") or ""))
+        mode = html.escape(str(d.get("mode", "") or ""))
         reason = html.escape(str(d.get("reason", "") or "").strip())
         if len(reason) > 260:
             reason = reason[:260] + "..."
@@ -12810,42 +12919,47 @@ class Notifier:
         style_txt = f" ({style})" if style and style != "-" else ""
         lines.append(f"<b>{html.escape(title)}</b>{style_txt}")
         lines.append("────────────────")
-        lines.append(f"🪙 <b>Symbol:</b> {_code(symbol)}")
-        lines.append(f"🧭 <b>Side:</b> {_code(side)}")
+        lines.append(f"🪙 <b>코인:</b> {_code(symbol)}")
+        lines.append(f"🧭 <b>포지션:</b> {_code(side)}")
+        if mode and mode != "-":
+            lines.append(f"🎛️ <b>모드:</b> {_code(mode)}")
         if d.get("price") is not None:
             price_txt = f"{_as_float(d.get('price'), 0.0):,.6g}"
-            lines.append(f"💰 <b>Price:</b> {_code(price_txt)}")
+            lines.append(f"💰 <b>현재가:</b> {_code(price_txt)}")
         if d.get("entry_price") is not None:
             entry_txt = f"{_as_float(d.get('entry_price'), 0.0):,.6g}"
-            lines.append(f"🎯 <b>Entry:</b> {_code(entry_txt)}")
+            lines.append(f"🎯 <b>진입가:</b> {_code(entry_txt)}")
         if d.get("exit_price") is not None:
             exit_txt = f"{_as_float(d.get('exit_price'), 0.0):,.6g}"
-            lines.append(f"🏁 <b>Exit:</b> {_code(exit_txt)}")
+            lines.append(f"🏁 <b>청산가:</b> {_code(exit_txt)}")
         if (d.get("size") is not None) or (d.get("entry_pct") is not None):
             sz = f"{_as_float(d.get('size'), 0.0):,.6g}" if d.get("size") is not None else "-"
             pct = f"{_as_float(d.get('entry_pct'), 0.0):.2f}%" if d.get("entry_pct") is not None else "-"
-            lines.append(f"📊 <b>Size:</b> {_code(sz)} ({_code(pct)})")
+            lines.append(f"📊 <b>수량/비중:</b> {_code(sz)} ({_code(pct)})")
         if d.get("leverage") is not None:
             lev_txt = f"x{_as_float(d.get('leverage'), 0.0):.0f}"
-            lines.append(f"⚡ <b>Leverage:</b> {_code(lev_txt)}")
+            lines.append(f"⚡ <b>레버리지:</b> {_code(lev_txt)}")
         if d.get("tp_pct") is not None or d.get("sl_pct") is not None:
             tp = _as_float(d.get("tp_pct"), 0.0)
             sl = _as_float(d.get("sl_pct"), 0.0)
-            lines.append(f"🎯 <b>Target:</b> {_code(f'TP +{abs(tp):.2f}%')} / {_code(f'SL -{abs(sl):.2f}%')}")
+            lines.append(f"🎯 <b>목표:</b> {_code(f'익절 +{abs(tp):.2f}%')} / {_code(f'손절 -{abs(sl):.2f}%')}")
         if d.get("roi_pct") is not None:
             roi_txt = f"{_as_float(d.get('roi_pct'), 0.0):+.2f}%"
-            lines.append(f"📈 <b>ROI:</b> {_code(roi_txt)}")
+            lines.append(f"📈 <b>수익률:</b> {_code(roi_txt)}")
         if d.get("pnl_usdt") is not None:
             pnl_txt = f"{_as_float(d.get('pnl_usdt'), 0.0):+,.2f} USDT"
-            lines.append(f"💵 <b>PnL:</b> {_code(pnl_txt)}")
+            lines.append(f"💵 <b>손익:</b> {_code(pnl_txt)}")
         if d.get("balance_total") is not None:
             bal_txt = f"{_as_float(d.get('balance_total'), 0.0):,.2f} USDT"
-            lines.append(f"🏦 <b>Balance:</b> {_code(bal_txt)}")
+            lines.append(f"🏦 <b>총자산:</b> {_code(bal_txt)}")
+        if d.get("balance_free") is not None:
+            free_txt = f"{_as_float(d.get('balance_free'), 0.0):,.2f} USDT"
+            lines.append(f"💳 <b>가용자산:</b> {_code(free_txt)}")
         if d.get("trade_id"):
-            lines.append(f"🆔 <b>ID:</b> {_code(str(d.get('trade_id')))}")
+            lines.append(f"🆔 <b>거래 ID:</b> {_code(str(d.get('trade_id')))}")
         lines.append("────────────────")
         if reason:
-            lines.append(f"💡 <b>Reason:</b> {reason}")
+            lines.append(f"💡 <b>근거:</b> {reason}")
         return "\n".join(lines)
 
     def send_telegram(self, data: Dict[str, Any], target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False) -> bool:
@@ -12867,6 +12981,7 @@ class Notifier:
                 cfg=cfg,
                 silent=bool(silent),
                 footer_text=str(p.get("footer", "") or ""),
+                image_path=str(p.get("image_path", "") or ""),
             )
         except Exception:
             return False
@@ -15082,7 +15197,9 @@ def chart_snapshot_for_reason(ex, sym: str, cfg: Dict[str, Any]) -> Dict[str, An
                 rsi_p = int(cfg.get("rsi_period", 14) or 14)
                 rsi_s = ta.momentum.rsi(close, window=rsi_p)
                 rsi_v = float(rsi_s.iloc[-1]) if pd.notna(rsi_s.iloc[-1]) else None
+                rsi_prev = float(rsi_s.iloc[-2]) if len(rsi_s) >= 2 and pd.notna(rsi_s.iloc[-2]) else None
                 out["rsi"] = rsi_v
+                out["rsi_prev"] = rsi_prev
                 out["rsi_state"] = _rsi_state_ko(rsi_v, cfg)
             except Exception:
                 pass
@@ -15090,10 +15207,22 @@ def chart_snapshot_for_reason(ex, sym: str, cfg: Dict[str, Any]) -> Dict[str, An
         if bool(cfg.get("use_macd", True)):
             try:
                 m = ta.trend.MACD(close)
-                macd_v = float(m.macd().iloc[-1])
-                sig_v = float(m.macd_signal().iloc[-1])
+                macd_line = m.macd()
+                sig_line = m.macd_signal()
+                macd_v = float(macd_line.iloc[-1])
+                sig_v = float(sig_line.iloc[-1])
                 if pd.notna(macd_v) and pd.notna(sig_v):
                     out["macd_state"] = "골든" if macd_v > sig_v else "데드"
+                hist = (macd_line - sig_line)
+                if len(hist) >= 3:
+                    h0 = float(hist.iloc[-1]) if pd.notna(hist.iloc[-1]) else 0.0
+                    h1 = float(hist.iloc[-2]) if pd.notna(hist.iloc[-2]) else 0.0
+                    h2 = float(hist.iloc[-3]) if pd.notna(hist.iloc[-3]) else 0.0
+                    out["macd_hist_0"] = h0
+                    out["macd_hist_1"] = h1
+                    out["macd_hist_2"] = h2
+                    out["macd_cross_up_confirm2"] = bool((h0 > 0.0) and (h1 > 0.0))
+                    out["macd_cross_dn_confirm2"] = bool((h0 < 0.0) and (h1 < 0.0))
             except Exception:
                 pass
 
@@ -15101,7 +15230,9 @@ def chart_snapshot_for_reason(ex, sym: str, cfg: Dict[str, Any]) -> Dict[str, An
             try:
                 adx_s = ta.trend.adx(df["high"].astype(float), df["low"].astype(float), close, window=14)
                 adx_v = float(adx_s.iloc[-1]) if pd.notna(adx_s.iloc[-1]) else None
+                adx_prev = float(adx_s.iloc[-2]) if len(adx_s) >= 2 and pd.notna(adx_s.iloc[-2]) else None
                 out["adx"] = adx_v
+                out["adx_prev"] = adx_prev
             except Exception:
                 pass
     except Exception:
@@ -15487,6 +15618,8 @@ def evaluate_flexible_take_signal(
     entry_snap: Optional[Dict[str, Any]],
     now_snap: Optional[Dict[str, Any]],
     cfg: Dict[str, Any],
+    style: str = "",
+    current_roi: float = 0.0,
 ) -> Tuple[bool, int, str]:
     """
     목표 TP 도달 전에도 보조지표 반대 시그널이 강하면 유도리 있게 청산.
@@ -15496,6 +15629,7 @@ def evaluate_flexible_take_signal(
         return False, 0, "차트 스냅샷 없음"
 
     side0 = str(side or "").lower().strip()
+    style0 = normalize_style_name(style)
     trend_s = _trend_clean_for_reason(now_snap.get("trend_short", ""))
     trend_l = _trend_clean_for_reason(now_snap.get("trend_long", ""))
     macd = str(now_snap.get("macd_state", "") or "").strip()
@@ -15503,11 +15637,30 @@ def evaluate_flexible_take_signal(
     sqz_bias = int(_as_int(now_snap.get("sqz_bias", 0), 0))
     sqz_mom = float(_as_float(now_snap.get("sqz_mom_pct", 0.0), 0.0))
     adx_v = float(_as_float(now_snap.get("adx", 0.0), 0.0))
+    adx_prev = float(_as_float(now_snap.get("adx_prev", adx_v), adx_v))
     rsi_now = float(_as_float(now_snap.get("rsi", 0.0), 0.0))
+    rsi_prev = float(_as_float(now_snap.get("rsi_prev", rsi_now), rsi_now))
     rsi_entry = float(_as_float((entry_snap or {}).get("rsi", 0.0), 0.0))
+    macd_up_confirm2 = bool(now_snap.get("macd_cross_up_confirm2", False))
+    macd_dn_confirm2 = bool(now_snap.get("macd_cross_dn_confirm2", False))
+
+    if style0 == "단타":
+        min_roi_need = float(_as_float(cfg.get("exit_signal_flex_min_roi_day", cfg.get("exit_signal_flex_min_roi", 1.5)), 1.5))
+        need = int(_as_int(cfg.get("exit_signal_flex_score_day_min", cfg.get("exit_signal_flex_score_min", 7)), 7))
+    elif style0 == "스윙":
+        min_roi_need = float(_as_float(cfg.get("exit_signal_flex_min_roi_swing", cfg.get("exit_signal_flex_min_roi", 3.0)), 3.0))
+        need = int(_as_int(cfg.get("exit_signal_flex_score_swing_min", cfg.get("exit_signal_flex_score_min", 9)), 9))
+    else:
+        min_roi_need = float(_as_float(cfg.get("exit_signal_flex_min_roi_scalp", cfg.get("exit_signal_flex_min_roi", 0.5)), 0.5))
+        need = int(_as_int(cfg.get("exit_signal_flex_score_scalp_min", cfg.get("exit_signal_flex_score_min", 5)), 5))
+    need = max(1, min(12, need))
+    if float(current_roi) < float(min_roi_need):
+        return False, 0, f"유도리청산 보류: ROI {float(current_roi):.2f}% < 최소 {float(min_roi_need):.2f}% ({style0})"
 
     score = 0
     tags: List[str] = []
+    rsi_cross_delta = float(_as_float(cfg.get("exit_signal_flex_rsi_cross_delta", 3.0), 3.0))
+    adx_drop_min = float(_as_float(cfg.get("exit_signal_flex_adx_drop_min", 2.0), 2.0))
 
     if side0 == "long":
         if "하락" in trend_s:
@@ -15516,12 +15669,15 @@ def evaluate_flexible_take_signal(
         if "하락" in trend_l:
             score += 1
             tags.append("장기하락")
-        if macd == "데드":
+        if macd == "데드" and macd_dn_confirm2:
             score += 2
-            tags.append("MACD데드")
-        if rsi_state == "과매수":
+            tags.append("MACD데드(2봉확인)")
+        elif macd == "데드":
+            tags.append("MACD데드(확인대기)")
+        rsi_bear_confirm = bool(rsi_state == "과매수") or bool((rsi_prev >= (50.0 + rsi_cross_delta)) and (rsi_now <= (50.0 - rsi_cross_delta)))
+        if rsi_bear_confirm:
             score += 1
-            tags.append("RSI과매수")
+            tags.append(f"RSI약세({rsi_prev:.0f}->{rsi_now:.0f})")
         if sqz_bias == -1:
             score += 2
             tags.append(f"SQZ하락({sqz_mom:+.2f}%)")
@@ -15535,12 +15691,15 @@ def evaluate_flexible_take_signal(
         if "상승" in trend_l:
             score += 1
             tags.append("장기상승")
-        if macd == "골든":
+        if macd == "골든" and macd_up_confirm2:
             score += 2
-            tags.append("MACD골든")
-        if rsi_state == "과매도":
+            tags.append("MACD골든(2봉확인)")
+        elif macd == "골든":
+            tags.append("MACD골든(확인대기)")
+        rsi_bull_confirm = bool(rsi_state == "과매도") or bool((rsi_prev <= (50.0 - rsi_cross_delta)) and (rsi_now >= (50.0 + rsi_cross_delta)))
+        if rsi_bull_confirm:
             score += 1
-            tags.append("RSI과매도")
+            tags.append(f"RSI강세({rsi_prev:.0f}->{rsi_now:.0f})")
         if sqz_bias == 1:
             score += 2
             tags.append(f"SQZ상승({sqz_mom:+.2f}%)")
@@ -15552,17 +15711,15 @@ def evaluate_flexible_take_signal(
         min_adx = float(cfg.get("exit_signal_flex_min_adx", 16.0) or 16.0)
     except Exception:
         min_adx = 16.0
-    if adx_v >= min_adx:
+    adx_drop = float(adx_prev - adx_v)
+    if adx_v >= min_adx and adx_drop >= adx_drop_min:
         score += 1
-        tags.append(f"ADX{adx_v:.0f}")
+        tags.append(f"ADX약화({adx_prev:.0f}->{adx_v:.0f})")
+    else:
+        tags.append(f"ADX유지({adx_prev:.0f}->{adx_v:.0f})")
 
-    try:
-        need = int(cfg.get("exit_signal_flex_score_min", 4) or 4)
-    except Exception:
-        need = 4
-    need = max(1, min(12, need))
     should = bool(score >= need)
-    note = f"유도리청산 점수 {score:+d}/{need} | " + ", ".join(tags[:6])
+    note = f"유도리청산({style0}) 점수 {score:+d}/{need} | " + ", ".join(tags[:6])
     return should, int(score), note[:240]
 
 
@@ -18310,23 +18467,20 @@ def telegram_thread(ex):
                         snap_now_flex: Optional[Dict[str, Any]] = None
                         try:
                             if bool(cfg.get("exit_signal_flex_enable", True)):
-                                try:
-                                    min_roi_flex = float(cfg.get("exit_signal_flex_min_roi", 0.8) or 0.8)
-                                except Exception:
-                                    min_roi_flex = 0.8
-                                if float(roi) >= float(min_roi_flex):
-                                    snap_now_flex = chart_snapshot_for_reason(ex, sym, cfg)
-                                    entry_snap_flex = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
-                                    hit0, score0, note0 = evaluate_flexible_take_signal(
-                                        str(side),
-                                        entry_snap_flex if isinstance(entry_snap_flex, dict) else None,
-                                        snap_now_flex if isinstance(snap_now_flex, dict) else None,
-                                        cfg,
-                                    )
-                                    if bool(hit0):
-                                        signal_take_hit = True
-                                        signal_take_score = int(score0)
-                                        signal_take_note = str(note0 or "")
+                                snap_now_flex = chart_snapshot_for_reason(ex, sym, cfg)
+                                entry_snap_flex = tgt.get("entry_snapshot") if isinstance(tgt.get("entry_snapshot"), dict) else None
+                                hit0, score0, note0 = evaluate_flexible_take_signal(
+                                    str(side),
+                                    entry_snap_flex if isinstance(entry_snap_flex, dict) else None,
+                                    snap_now_flex if isinstance(snap_now_flex, dict) else None,
+                                    cfg,
+                                    style=str(style_now),
+                                    current_roi=float(roi),
+                                )
+                                if bool(hit0):
+                                    signal_take_hit = True
+                                    signal_take_score = int(score0)
+                                    signal_take_note = str(note0 or "")
                         except Exception:
                             signal_take_hit = False
                             signal_take_note = ""
@@ -18646,6 +18800,7 @@ def telegram_thread(ex):
                                     "symbol": str(sym),
                                     "side": str(side),
                                     "style": str(style_now),
+                                    "mode": str(mode),
                                     "entry_price": float(entry) if entry is not None else None,
                                     "exit_price": float(exit_px) if exit_px is not None else None,
                                     "price": float(exit_px) if exit_px is not None else None,
@@ -18713,6 +18868,14 @@ def telegram_thread(ex):
                                             tg_send_photo(img_path, caption=cap, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
                                             if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
                                                 tg_send_photo(img_path, caption=cap, target="admin", cfg=cfg, silent=False)
+                                            try:
+                                                td_img = dict(trade_data)
+                                                td_img["image_path"] = str(img_path)
+                                                get_notifier().send_discord(td_img, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                                if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
+                                                    get_notifier().send_discord(td_img, target="admin", cfg=cfg, silent=False)
+                                            except Exception:
+                                                pass
                                             if trade_id:
                                                 d0 = load_trade_detail(str(trade_id)) or {}
                                                 d0["exit_chart_image"] = str(img_path)
@@ -19074,6 +19237,7 @@ def telegram_thread(ex):
                                     "symbol": str(sym),
                                     "side": str(side),
                                     "style": str(style_now),
+                                    "mode": str(mode),
                                     "entry_price": float(entry) if entry is not None else None,
                                     "exit_price": float(exit_px) if exit_px is not None else None,
                                     "price": float(exit_px) if exit_px is not None else None,
@@ -19141,6 +19305,14 @@ def telegram_thread(ex):
                                             tg_send_photo(img_path, caption=cap, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
                                             if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
                                                 tg_send_photo(img_path, caption=cap, target="admin", cfg=cfg, silent=False)
+                                            try:
+                                                td_img = dict(trade_data)
+                                                td_img["image_path"] = str(img_path)
+                                                get_notifier().send_discord(td_img, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                                if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
+                                                    get_notifier().send_discord(td_img, target="admin", cfg=cfg, silent=False)
+                                            except Exception:
+                                                pass
                                             if trade_id:
                                                 d0 = load_trade_detail(str(trade_id)) or {}
                                                 d0["exit_chart_image"] = str(img_path)
@@ -21642,6 +21814,7 @@ def telegram_thread(ex):
                                         "symbol": str(sym),
                                         "side": str(decision),
                                         "style": str(style),
+                                        "mode": str(mode),
                                         "entry_price": float(px) if px is not None else None,
                                         "price": float(px) if px is not None else None,
                                         "size": float(qty) if qty is not None else None,
@@ -21721,6 +21894,14 @@ def telegram_thread(ex):
                                                 tg_send_photo(img_path, caption=cap, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
                                                 if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
                                                     tg_send_photo(img_path, caption=cap, target="admin", cfg=cfg, silent=False)
+                                                try:
+                                                    td_img = dict(trade_data)
+                                                    td_img["image_path"] = str(img_path)
+                                                    get_notifier().send_discord(td_img, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                                    if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
+                                                        get_notifier().send_discord(td_img, target="admin", cfg=cfg, silent=False)
+                                                except Exception:
+                                                    pass
                                                 if trade_id:
                                                     d0 = load_trade_detail(str(trade_id)) or {}
                                                     d0["entry_chart_image"] = str(img_path)
@@ -23300,11 +23481,23 @@ with st.sidebar.expander("🔁 손절 후 반대 스위칭"):
     st.caption("손절 후 차트가 반대 방향으로 강하면 즉시 반대 포지션 진입합니다(AI 호출 없음).")
 with st.sidebar.expander("🎚️ 유도리 청산(반대시그널)"):
     config["exit_signal_flex_enable"] = st.checkbox("목표 미도달 선제청산", value=bool(config.get("exit_signal_flex_enable", True)))
-    f1, f2, f3 = st.columns(3)
-    config["exit_signal_flex_min_roi"] = f1.number_input("최소 ROI(%)", 0.0, 100.0, float(config.get("exit_signal_flex_min_roi", 0.8) or 0.8), step=0.1)
-    config["exit_signal_flex_score_min"] = f2.number_input("반대신호 점수", 1, 12, int(config.get("exit_signal_flex_score_min", 4) or 4), step=1)
-    config["exit_signal_flex_min_adx"] = f3.number_input("ADX 기준", 0.0, 60.0, float(config.get("exit_signal_flex_min_adx", 16.0) or 16.0), step=1.0)
-    st.caption("보조지표 반대 시그널이 강하면 목표익절 전에도 유도리 있게 청산합니다.")
+    st.caption("스타일별 최소 ROI/점수 기준을 높여서 조기청산을 줄입니다.")
+    f1, f2 = st.columns(2)
+    config["exit_signal_flex_min_roi_scalp"] = f1.number_input("스캘핑 최소 ROI(%)", 0.0, 100.0, float(config.get("exit_signal_flex_min_roi_scalp", 0.5) or 0.5), step=0.1)
+    config["exit_signal_flex_score_scalp_min"] = f2.number_input("스캘핑 점수", 1, 12, int(config.get("exit_signal_flex_score_scalp_min", 5) or 5), step=1)
+    f3, f4 = st.columns(2)
+    config["exit_signal_flex_min_roi_day"] = f3.number_input("단타 최소 ROI(%)", 0.0, 100.0, float(config.get("exit_signal_flex_min_roi_day", 1.5) or 1.5), step=0.1)
+    config["exit_signal_flex_score_day_min"] = f4.number_input("단타 점수", 1, 12, int(config.get("exit_signal_flex_score_day_min", 7) or 7), step=1)
+    f5, f6 = st.columns(2)
+    config["exit_signal_flex_min_roi_swing"] = f5.number_input("스윙 최소 ROI(%)", 0.0, 100.0, float(config.get("exit_signal_flex_min_roi_swing", 3.0) or 3.0), step=0.1)
+    config["exit_signal_flex_score_swing_min"] = f6.number_input("스윙 점수", 1, 12, int(config.get("exit_signal_flex_score_swing_min", 9) or 9), step=1)
+    f7, f8, f9 = st.columns(3)
+    config["exit_signal_flex_min_adx"] = f7.number_input("최소 ADX", 0.0, 60.0, float(config.get("exit_signal_flex_min_adx", 16.0) or 16.0), step=1.0)
+    config["exit_signal_flex_adx_drop_min"] = f8.number_input("ADX 하락폭", 0.0, 30.0, float(config.get("exit_signal_flex_adx_drop_min", 2.0) or 2.0), step=0.5)
+    config["exit_signal_flex_rsi_cross_delta"] = f9.number_input("RSI 교차강도", 0.0, 20.0, float(config.get("exit_signal_flex_rsi_cross_delta", 3.0) or 3.0), step=0.5)
+    config["exit_signal_flex_min_roi"] = float(config.get("exit_signal_flex_min_roi_scalp", 0.5) or 0.5)
+    config["exit_signal_flex_score_min"] = int(config.get("exit_signal_flex_score_scalp_min", 5) or 5)
+    st.caption("MACD는 2봉 연속 확인, RSI는 강한 50선 교차/과열구간, ADX는 유의미한 하락일 때만 점수에 반영합니다.")
 
 st.sidebar.divider()
 st.sidebar.subheader("🪙 외부 시황")
