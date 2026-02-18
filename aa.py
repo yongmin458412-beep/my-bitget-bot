@@ -585,6 +585,66 @@ MODE_RULES = {
     "하이리스크/하이리턴": {"min_conf": 72, "entry_pct_min": 18, "entry_pct_max": 40, "lev_min": 12, "lev_max": 25},
 }
 
+# =========================================================
+# ✅ 3-1) 스타일 규칙(스캘핑/단타/스윙)
+# - 기존 trade_mode(안전/공격/하이리스크)는 그대로 유지
+# - 실제 매매 스타일 파라미터는 아래 STYLE_RULES로 별도 관리
+# =========================================================
+STYLE_RULES = {
+    "스캘핑": {
+        "min_conf": 68,
+        "entry_pct_min": 3,
+        "entry_pct_max": 16,
+        "lev_min": 10,
+        "lev_max": 30,
+        "tp_roi_min": 0.5,
+        "tp_roi_max": 1.5,
+        "sl_roi_min": 0.4,
+        "sl_roi_max": 1.2,
+        "preferred_tfs": ["1m", "5m"],
+    },
+    "단타": {
+        "min_conf": 72,
+        "entry_pct_min": 5,
+        "entry_pct_max": 20,
+        "lev_min": 5,
+        "lev_max": 10,
+        "tp_roi_min": 2.0,
+        "tp_roi_max": 5.0,
+        "sl_roi_min": 1.0,
+        "sl_roi_max": 2.8,
+        "preferred_tfs": ["15m", "1h"],
+    },
+    "스윙": {
+        "min_conf": 78,
+        "entry_pct_min": 6,
+        "entry_pct_max": 22,
+        "lev_min": 1,
+        "lev_max": 5,
+        "tp_roi_min": 6.0,
+        "tp_roi_max": 20.0,
+        "sl_roi_min": 2.0,
+        "sl_roi_max": 8.0,
+        "preferred_tfs": ["4h", "1d"],
+    },
+}
+
+
+def normalize_style_name(style: Any) -> str:
+    s = str(style or "").strip().lower()
+    if s in ["스캘핑", "scalping", "scalp"]:
+        return "스캘핑"
+    if s in ["단타", "day", "daytrading", "day_trading", "day-trading", "dan-ta", "danta"]:
+        return "단타"
+    if s in ["스윙", "swing"]:
+        return "스윙"
+    return "스캘핑"
+
+
+def style_rule(style: Any) -> Dict[str, Any]:
+    st = normalize_style_name(style)
+    return dict(STYLE_RULES.get(st, STYLE_RULES["스캘핑"]))
+
 
 # =========================================================
 # ✅ 4) 설정 관리 (load/save)
@@ -592,7 +652,7 @@ MODE_RULES = {
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 17,
+        "settings_schema_version": 18,
         "openai_api_key": "",
         "openai_model_trade": "gpt-4o-mini",
         "openai_model_style": "gpt-4o-mini",
@@ -653,6 +713,15 @@ def default_settings() -> Dict[str, Any]:
         # 지표 ON/OFF
         "use_rsi": True, "use_bb": True, "use_cci": True, "use_vol": True, "use_ma": True,
         "use_macd": True, "use_stoch": True, "use_mfi": True, "use_willr": True, "use_adx": True,
+        # ✅ Super-Bot 확장 지표
+        "use_ichimoku": True,
+        "use_psar": True,
+        "use_vwap": True,
+        "use_stochrsi": True,
+        "use_obv": True,
+        "use_cmf": True,
+        "use_vwma": True,
+        "use_keltner": True,
         # ✅ 추가: 스퀴즈 모멘텀(Squeeze Momentum) - 초단기/추세 전환 포착용
         "use_sqz": True,
         "sqz_bb_length": 20,
@@ -740,6 +809,7 @@ def default_settings() -> Dict[str, Any]:
         "ml_cache_enable": True,
         # 차트 패턴 감지(진입 보조): M/W, 쌍봉/쌍바닥, 삼중천정/삼중바닥, 삼각수렴, 박스, 쐐기, 헤드앤숄더
         "use_chart_patterns": True,
+        "use_advanced_patterns": True,
         "pattern_lookback": 220,
         "pattern_pivot_order": 4,
         "pattern_tolerance_pct": 0.60,
@@ -750,6 +820,9 @@ def default_settings() -> Dict[str, Any]:
         "pattern_gate_entry": True,
         "pattern_gate_strength": 0.65,
         "pattern_override_ai": True,
+        "pattern_divergence_enable": True,
+        "pattern_harmonic_enable": True,
+        "pattern_candle_enable": True,
         # ✅ 멀티 타임프레임 캔들패턴(요구)
         # - 1m/3m/5m/15m/30m/1h/2h/4h를 함께 보고 패턴 bias를 합산
         "pattern_mtf_enable": True,
@@ -973,10 +1046,10 @@ def default_settings() -> Dict[str, Any]:
         "daily_btc_brief_max_items": 5,
         "daily_btc_brief_ai_summarize": True,  # OpenAI 키 있을 때만 동작
 
-        # ✅ 스타일(스캘핑/스윙) 자동 선택/전환
-        # - regime_mode: Telegram /mode로도 변경 가능(auto|scalping|swing)
+        # ✅ 스타일(스캘핑/단타/스윙) 자동 선택/전환
+        # - regime_mode: Telegram /mode로도 변경 가능(auto|scalping|daytrading|swing)
         # - regime_switch_control: 시간락 없이 흔들림 방지(confirm2/hysteresis/off)
-        "regime_mode": "auto",                 # "auto"|"scalping"|"swing"
+        "regime_mode": "auto",                 # "auto"|"scalping"|"daytrading"|"swing"
         "regime_switch_control": "confirm2",   # "confirm2"|"hysteresis"|"off"
         # confirm2 상세: n회 연속 동일 레짐일 때만 전환(기본 2)
         # - 플립백(바로 되돌림) 방지: 직전 전환의 반대방향으로는 더 많은 확인(기본 3)
@@ -1049,6 +1122,14 @@ def default_settings() -> Dict[str, Any]:
         "scalp_sl_roi_max": 5.0,
         "scalp_entry_pct_mult": 0.65,
         "scalp_lev_cap": 8,
+        # ✅ 단타(데이 트레이딩) 기본 envelope
+        # - 요청: 15m/1h 기반, 목표 2~5%, 레버 5~10x
+        "day_tp_roi_min": 2.0,
+        "day_tp_roi_max": 5.0,
+        "day_sl_roi_min": 1.0,
+        "day_sl_roi_max": 3.0,
+        "day_entry_pct_mult": 0.85,
+        "day_lev_cap": 10,
         # ✅ 스캘핑: "가격 변동폭(%)" 기준 가드레일(레버가 높아도 TP/SL이 과도해지지 않게)
         "scalp_sl_price_pct_min": 0.25,
         "scalp_sl_price_pct_max": 0.75,
@@ -1109,6 +1190,12 @@ def default_settings() -> Dict[str, Any]:
         "sr_buffer_atr_mult": 0.25,
         "sr_rr_min": 1.5,
         "sr_levels_cache_sec": 60,
+        # ✅ 단타(데이) 전용 SR 파라미터
+        "sr_timeframe_day": "1h",
+        "sr_lookback_day": 260,
+        "sr_pivot_order_day": 7,
+        "sr_buffer_atr_mult_day": 0.35,
+        "sr_rr_min_day": 1.8,
         # ✅ 스윙 전용 SR 파라미터(더 큰 매물대/완만한 SL/TP)
         "sr_timeframe_swing": "1h",
         "sr_lookback_swing": 320,
@@ -1666,6 +1753,40 @@ def load_settings() -> Dict[str, Any]:
                     changed = True
             except Exception:
                 pass
+        # v18: 스캘핑/단타/스윙 3스타일 + 슈퍼지표/고급패턴
+        if saved_ver < 18:
+            for k, v in {
+                "use_advanced_patterns": True,
+                "pattern_divergence_enable": True,
+                "pattern_harmonic_enable": True,
+                "pattern_candle_enable": True,
+                "use_ichimoku": True,
+                "use_psar": True,
+                "use_vwap": True,
+                "use_stochrsi": True,
+                "use_obv": True,
+                "use_cmf": True,
+                "use_vwma": True,
+                "use_keltner": True,
+                "regime_mode": str(cfg.get("regime_mode", "auto") or "auto"),
+                "day_tp_roi_min": 2.0,
+                "day_tp_roi_max": 5.0,
+                "day_sl_roi_min": 1.0,
+                "day_sl_roi_max": 3.0,
+                "day_entry_pct_mult": 0.85,
+                "day_lev_cap": 10,
+                "sr_timeframe_day": "1h",
+                "sr_lookback_day": 260,
+                "sr_pivot_order_day": 7,
+                "sr_buffer_atr_mult_day": 0.35,
+                "sr_rr_min_day": 1.8,
+            }.items():
+                try:
+                    if k not in saved:
+                        cfg[k] = v
+                        changed = True
+                except Exception:
+                    pass
         cfg["settings_schema_version"] = base_ver
         if changed:
             try:
@@ -6602,7 +6723,7 @@ def _sr_params_for_style(style: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     - 스윙: 더 큰 매물대/완만한 버퍼(손절/익절이 너무 타이트해지는 문제 완화)
     - 스캘핑: 기존(기본) SR
     """
-    st = str(style or "").strip()
+    st = normalize_style_name(style)
     if st == "스윙":
         return {
             "tf": str(cfg.get("sr_timeframe_swing", "1h") or "1h"),
@@ -6610,6 +6731,14 @@ def _sr_params_for_style(style: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
             "pivot_order": int(cfg.get("sr_pivot_order_swing", 8) or 8),
             "buffer_atr_mult": float(cfg.get("sr_buffer_atr_mult_swing", 0.45) or 0.45),
             "rr_min": float(cfg.get("sr_rr_min_swing", 2.0) or 2.0),
+        }
+    if st == "단타":
+        return {
+            "tf": str(cfg.get("sr_timeframe_day", "1h") or "1h"),
+            "lookback": int(cfg.get("sr_lookback_day", 260) or 260),
+            "pivot_order": int(cfg.get("sr_pivot_order_day", 7) or 7),
+            "buffer_atr_mult": float(cfg.get("sr_buffer_atr_mult_day", 0.35) or 0.35),
+            "rr_min": float(cfg.get("sr_rr_min_day", 1.8) or 1.8),
         }
     return {
         "tf": str(cfg.get("sr_timeframe", "15m") or "15m"),
@@ -7396,6 +7525,199 @@ def detect_chart_patterns(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, An
         return out
 
 
+def detect_advanced_patterns(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "detected": [],
+        "bullish": [],
+        "bearish": [],
+        "neutral": [],
+        "divergences": [],
+        "harmonics": [],
+        "candles": [],
+        "bias": 0,
+        "strength": 0.0,
+        "score_long": 0.0,
+        "score_short": 0.0,
+        "summary": "고급 패턴 없음",
+    }
+    try:
+        if not bool(cfg.get("use_advanced_patterns", True)):
+            return out
+        if df is None or df.empty or len(df) < 40:
+            return out
+
+        d = df.tail(int(max(60, min(600, int(cfg.get("pattern_lookback", 220) or 220))))).copy()
+        open_ = pd.to_numeric(d["open"], errors="coerce").astype(float).to_numpy(dtype=float)
+        high = pd.to_numeric(d["high"], errors="coerce").astype(float).to_numpy(dtype=float)
+        low = pd.to_numeric(d["low"], errors="coerce").astype(float).to_numpy(dtype=float)
+        close = pd.to_numeric(d["close"], errors="coerce").astype(float).to_numpy(dtype=float)
+        n = len(d)
+        if n < 30:
+            return out
+
+        order = int(max(2, min(12, int(cfg.get("pattern_pivot_order", 4) or 4))))
+        min_sep = int(max(2, order))
+        highs_idx = _local_extrema_idx(high, order=order, mode="max")
+        lows_idx = _local_extrema_idx(low, order=order, mode="min")
+
+        bull_items: List[Tuple[str, float]] = []
+        bear_items: List[Tuple[str, float]] = []
+        neutral_items: List[Tuple[str, float]] = []
+        seen = set()
+
+        def _add(name: str, side: int, score: float, bucket: str = "") -> None:
+            nm = str(name or "").strip()
+            if not nm or nm in seen:
+                return
+            seen.add(nm)
+            sc = float(clamp(float(score), 0.05, 2.0))
+            out["detected"].append(nm)
+            if side > 0:
+                bull_items.append((nm, sc))
+            elif side < 0:
+                bear_items.append((nm, sc))
+            else:
+                neutral_items.append((nm, sc))
+            if bucket == "div":
+                out["divergences"].append(nm)
+            elif bucket == "harm":
+                out["harmonics"].append(nm)
+            elif bucket == "candle":
+                out["candles"].append(nm)
+
+        def _pivot_pair(idxs: List[int], arr_price: np.ndarray, arr_osc: np.ndarray) -> Optional[Tuple[int, int, float, float, float, float]]:
+            pts = _pick_last_n_with_min_sep(idxs, 2, min_sep)
+            if len(pts) != 2:
+                return None
+            i1, i2 = int(pts[0]), int(pts[1])
+            if i1 >= i2 or i2 >= len(arr_price):
+                return None
+            p1 = float(arr_price[i1])
+            p2 = float(arr_price[i2])
+            o1 = float(arr_osc[i1]) if i1 < len(arr_osc) else float("nan")
+            o2 = float(arr_osc[i2]) if i2 < len(arr_osc) else float("nan")
+            if (not math.isfinite(o1)) or (not math.isfinite(o2)):
+                return None
+            return i1, i2, p1, p2, o1, o2
+
+        # 1) 다이버전스 (Price vs RSI / MACD)
+        if bool(cfg.get("pattern_divergence_enable", True)):
+            rsi_arr = pd.to_numeric(d.get("RSI"), errors="coerce").to_numpy(dtype=float) if "RSI" in d.columns else np.full(n, np.nan)
+            macd_arr = pd.to_numeric(d.get("MACD"), errors="coerce").to_numpy(dtype=float) if "MACD" in d.columns else np.full(n, np.nan)
+            for osc_name, osc_arr in [("RSI", rsi_arr), ("MACD", macd_arr)]:
+                if not np.isfinite(osc_arr).any():
+                    continue
+                lo = _pivot_pair(lows_idx, low, osc_arr)
+                if lo is not None:
+                    _i1, _i2, p1, p2, o1, o2 = lo
+                    if p2 < p1 and o2 > o1:
+                        _add(f"{osc_name} 정규 강세 다이버전스", 1, 1.25, "div")
+                    if p2 > p1 and o2 < o1:
+                        _add(f"{osc_name} 히든 강세 다이버전스", 1, 0.95, "div")
+                hi = _pivot_pair(highs_idx, high, osc_arr)
+                if hi is not None:
+                    _i1, _i2, p1, p2, o1, o2 = hi
+                    if p2 > p1 and o2 < o1:
+                        _add(f"{osc_name} 정규 약세 다이버전스", -1, 1.25, "div")
+                    if p2 < p1 and o2 > o1:
+                        _add(f"{osc_name} 히든 약세 다이버전스", -1, 0.95, "div")
+
+        # 2) 하모닉(XABCD) 단순 탐지
+        if bool(cfg.get("pattern_harmonic_enable", True)):
+            pivot_rows: List[Tuple[int, str, float]] = []
+            for i in highs_idx:
+                if 0 <= int(i) < n:
+                    pivot_rows.append((int(i), "H", float(high[int(i)])))
+            for i in lows_idx:
+                if 0 <= int(i) < n:
+                    pivot_rows.append((int(i), "L", float(low[int(i)])))
+            pivot_rows = sorted(pivot_rows, key=lambda x: x[0])
+            # 인접 같은 타입 제거(마지막 것 우선)
+            alt: List[Tuple[int, str, float]] = []
+            for row in pivot_rows:
+                if not alt:
+                    alt.append(row)
+                    continue
+                if alt[-1][1] == row[1]:
+                    alt[-1] = row
+                else:
+                    alt.append(row)
+            if len(alt) >= 5:
+                x, a, b, c, d0 = alt[-5], alt[-4], alt[-3], alt[-2], alt[-1]
+                xv, av, bv, cv, dv = float(x[2]), float(a[2]), float(b[2]), float(c[2]), float(d0[2])
+                xa = av - xv
+                ab = bv - av
+                bc = cv - bv
+                cd = dv - cv
+                if abs(xa) > 1e-9 and abs(ab) > 1e-9 and abs(bc) > 1e-9:
+                    r_ab = abs(ab / xa)
+                    r_bc = abs(bc / ab)
+                    r_cd = abs(cd / bc)
+                    r_ad = abs((dv - xv) / xa)
+                    is_gartley = (0.55 <= r_ab <= 0.70) and (0.35 <= r_bc <= 0.92) and (1.10 <= r_cd <= 1.75) and (0.74 <= r_ad <= 0.84)
+                    is_bat = (0.35 <= r_ab <= 0.55) and (0.35 <= r_bc <= 0.92) and (1.55 <= r_cd <= 2.70) and (0.84 <= r_ad <= 0.93)
+                    side = 1 if d0[1] == "L" else -1
+                    if is_gartley:
+                        _add("가틀리 패턴(Gartley)", side, 1.15, "harm")
+                    if is_bat:
+                        _add("배트 패턴(Bat)", side, 1.05, "harm")
+
+        # 3) 캔들 패턴(최근 1~3봉)
+        if bool(cfg.get("pattern_candle_enable", True)) and n >= 3:
+            o0, h0, l0, c0 = float(open_[-1]), float(high[-1]), float(low[-1]), float(close[-1])
+            o1, h1, l1, c1 = float(open_[-2]), float(high[-2]), float(low[-2]), float(close[-2])
+            o2, h2, l2, c2 = float(open_[-3]), float(high[-3]), float(low[-3]), float(close[-3])
+            rng0 = max(1e-9, h0 - l0)
+            body0 = abs(c0 - o0)
+            body1 = abs(c1 - o1)
+            body2 = abs(c2 - o2)
+            upper0 = max(0.0, h0 - max(o0, c0))
+            lower0 = max(0.0, min(o0, c0) - l0)
+            doji_now = (body0 / rng0) <= 0.12
+            if doji_now:
+                _add("도지(Doji)", 0, 0.35, "candle")
+            if (c1 < o1) and (c0 > o0) and (c0 >= o1) and (o0 <= c1):
+                _add("강세 장악형(Engulfing)", 1, 0.95, "candle")
+            if (c1 > o1) and (c0 < o0) and (c0 <= o1) and (o0 >= c1):
+                _add("약세 장악형(Engulfing)", -1, 0.95, "candle")
+            if (lower0 >= body0 * 2.2) and (upper0 <= body0 * 0.6):
+                _add("해머(Hammer)", 1, 0.85, "candle")
+            if (upper0 >= body0 * 2.2) and (lower0 <= body0 * 0.6):
+                _add("슈팅스타(Shooting Star)", -1, 0.85, "candle")
+            # Morning/Evening star (간이)
+            if (c2 < o2) and (body1 < body2 * 0.55) and (c0 > o0) and (c0 >= (o2 + c2) * 0.5):
+                _add("모닝스타(Morning Star)", 1, 1.05, "candle")
+            if (c2 > o2) and (body1 < body2 * 0.55) and (c0 < o0) and (c0 <= (o2 + c2) * 0.5):
+                _add("이브닝스타(Evening Star)", -1, 1.05, "candle")
+
+        bull_score = float(sum(x[1] for x in bull_items))
+        bear_score = float(sum(x[1] for x in bear_items))
+        diff = float(bull_score - bear_score)
+        if diff >= 0.25:
+            bias = 1
+        elif diff <= -0.25:
+            bias = -1
+        else:
+            bias = 0
+        base = float(max(bull_score, bear_score, 0.0))
+        strength = float(clamp((base / 3.5) + min(0.40, abs(diff) / 3.0), 0.0, 1.0))
+        if bias == 0:
+            strength = float(min(strength, 0.55))
+        out["bias"] = int(bias)
+        out["strength"] = float(strength)
+        out["score_long"] = float(bull_score)
+        out["score_short"] = float(bear_score)
+        out["bullish"] = [x[0] for x in bull_items[:12]]
+        out["bearish"] = [x[0] for x in bear_items[:12]]
+        out["neutral"] = [x[0] for x in neutral_items[:12]]
+        if out["detected"]:
+            side_txt = "롱 우세" if bias == 1 else ("숏 우세" if bias == -1 else "중립")
+            out["summary"] = f"{side_txt} | " + ", ".join(out["detected"][:4])
+        return out
+    except Exception:
+        return out
+
+
 _PATTERN_MTF_CACHE: Dict[str, Dict[str, Any]] = {}
 _PATTERN_MTF_LOCK = threading.RLock()
 
@@ -7469,8 +7791,18 @@ def get_chart_patterns_mtf_cached(ex, sym: str, cfg: Dict[str, Any]) -> Dict[str
                     continue
                 df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
                 pat = detect_chart_patterns(df, cfg)
-                bias = int(pat.get("bias", 0) or 0)
-                strength = float(pat.get("strength", 0.0) or 0.0)
+                adv = detect_advanced_patterns(df, cfg) if bool(cfg.get("use_advanced_patterns", True)) else {}
+                sc_long = float((pat or {}).get("score_long", 0.0) or 0.0) + float((adv or {}).get("score_long", 0.0) or 0.0)
+                sc_short = float((pat or {}).get("score_short", 0.0) or 0.0) + float((adv or {}).get("score_short", 0.0) or 0.0)
+                diff = float(sc_long - sc_short)
+                bias = 1 if diff > 0.25 else (-1 if diff < -0.25 else 0)
+                strength = float(clamp(max(sc_long, sc_short) / 3.5, 0.0, 1.0))
+                if bias == 0:
+                    strength = float(min(strength, 0.6))
+                det_all = list(dict.fromkeys(list((pat or {}).get("detected", []) or []) + list((adv or {}).get("detected", []) or [])))
+                summary_tf = str((pat or {}).get("summary", "") or "")
+                if det_all:
+                    summary_tf = ", ".join(det_all[:3])
                 sec = float(_timeframe_seconds(tf, 300))
                 w = float(max(1.0, pow(max(sec, 60.0) / 300.0, 0.35)))
                 w_sum += w
@@ -7483,8 +7815,8 @@ def get_chart_patterns_mtf_cached(ex, sym: str, cfg: Dict[str, Any]) -> Dict[str
                         "tf": tf,
                         "bias": bias,
                         "strength": round(float(strength), 4),
-                        "summary": str(pat.get("summary", "") or ""),
-                        "detected": list((pat.get("detected") or [])[:3]),
+                        "summary": str(summary_tf)[:120],
+                        "detected": list(det_all[:5]),
                         "weight": round(w, 4),
                     }
                 )
@@ -7736,6 +8068,154 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
         except Exception as e:
             status["_VOL_ERROR"] = str(e)[:160]
 
+    # ✅ Super-Bot 확장 지표(벡터화 중심)
+    def _pick_first_col(frame: Any, prefixes: List[str]) -> str:
+        try:
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                return ""
+            for p in prefixes:
+                c = next((x for x in frame.columns if str(x).startswith(p)), "")
+                if c:
+                    return str(c)
+            return ""
+        except Exception:
+            return ""
+
+    # Ichimoku
+    if bool(cfg.get("use_ichimoku", True)):
+        try:
+            if use_ta:
+                ichi = ta.trend.IchimokuIndicator(high=high, low=low, window1=9, window2=26, window3=52)
+                df["ICHI_CONV"] = ichi.ichimoku_conversion_line()
+                df["ICHI_BASE"] = ichi.ichimoku_base_line()
+                df["ICHI_SPAN_A"] = ichi.ichimoku_a()
+                df["ICHI_SPAN_B"] = ichi.ichimoku_b()
+            elif pta is not None:
+                ichi_raw = pta.ichimoku(high, low, close)
+                if isinstance(ichi_raw, tuple):
+                    ichi_df = pd.concat([x for x in ichi_raw if isinstance(x, pd.DataFrame)], axis=1)
+                else:
+                    ichi_df = ichi_raw if isinstance(ichi_raw, pd.DataFrame) else pd.DataFrame()
+                if not ichi_df.empty:
+                    c_conv = _pick_first_col(ichi_df, ["ITS_", "IKS_"])
+                    c_base = _pick_first_col(ichi_df, ["IKS_", "ITS_"])
+                    c_a = _pick_first_col(ichi_df, ["ISA_"])
+                    c_b = _pick_first_col(ichi_df, ["ISB_"])
+                    if c_conv:
+                        df["ICHI_CONV"] = ichi_df[c_conv]
+                    if c_base:
+                        df["ICHI_BASE"] = ichi_df[c_base]
+                    if c_a:
+                        df["ICHI_SPAN_A"] = ichi_df[c_a]
+                    if c_b:
+                        df["ICHI_SPAN_B"] = ichi_df[c_b]
+        except Exception as e:
+            status["_ICHI_ERROR"] = str(e)[:160]
+
+    # Parabolic SAR
+    if bool(cfg.get("use_psar", True)):
+        try:
+            if use_ta:
+                psar_i = ta.trend.PSARIndicator(high=high, low=low, close=close, step=0.02, max_step=0.2)
+                df["PSAR"] = psar_i.psar()
+            elif pta is not None:
+                psar = pta.psar(high, low, close)
+                c_psar = _pick_first_col(psar, ["PSARl_", "PSARs_", "PSAR_"])
+                if c_psar:
+                    df["PSAR"] = psar[c_psar]
+        except Exception as e:
+            status["_PSAR_ERROR"] = str(e)[:160]
+
+    # VWAP
+    if bool(cfg.get("use_vwap", True)):
+        try:
+            if use_ta:
+                df["VWAP"] = ta.volume.volume_weighted_average_price(high, low, close, vol, window=14)
+            else:
+                # pta.vwap은 DatetimeIndex일 때 안정적
+                tdf = df.copy()
+                if "time" in tdf.columns:
+                    tdf = tdf.set_index(pd.to_datetime(tdf["time"], errors="coerce"))
+                vwap_s = pta.vwap(tdf["high"], tdf["low"], tdf["close"], tdf["vol"])
+                if isinstance(vwap_s, pd.Series):
+                    df["VWAP"] = vwap_s.values
+        except Exception as e:
+            status["_VWAP_ERROR"] = str(e)[:160]
+
+    # Stochastic RSI
+    if bool(cfg.get("use_stochrsi", True)):
+        try:
+            if use_ta:
+                df["STOCHRSI_K"] = ta.momentum.stochrsi_k(close, window=14, smooth1=3, smooth2=3)
+                df["STOCHRSI_D"] = ta.momentum.stochrsi_d(close, window=14, smooth1=3, smooth2=3)
+            elif pta is not None:
+                srsi = pta.stochrsi(close, length=14, rsi_length=14, k=3, d=3)
+                c_k = _pick_first_col(srsi, ["STOCHRSIk_"])
+                c_d = _pick_first_col(srsi, ["STOCHRSId_"])
+                if c_k:
+                    df["STOCHRSI_K"] = srsi[c_k]
+                if c_d:
+                    df["STOCHRSI_D"] = srsi[c_d]
+        except Exception as e:
+            status["_STOCHRSI_ERROR"] = str(e)[:160]
+
+    # OBV / CMF / VWMA
+    if bool(cfg.get("use_obv", True)):
+        try:
+            if use_ta:
+                df["OBV"] = ta.volume.on_balance_volume(close, vol)
+            elif pta is not None:
+                df["OBV"] = pta.obv(close, vol)
+        except Exception as e:
+            status["_OBV_ERROR"] = str(e)[:160]
+    if bool(cfg.get("use_cmf", True)):
+        try:
+            if use_ta:
+                df["CMF"] = ta.volume.chaikin_money_flow(high, low, close, vol, window=20)
+            elif pta is not None:
+                df["CMF"] = pta.cmf(high, low, close, vol, length=20)
+        except Exception as e:
+            status["_CMF_ERROR"] = str(e)[:160]
+    if bool(cfg.get("use_vwma", True)):
+        try:
+            if pta is not None:
+                df["VWMA"] = pta.vwma(close, vol, length=20)
+            else:
+                den = vol.rolling(20).sum().replace(0, np.nan)
+                df["VWMA"] = (close * vol).rolling(20).sum() / den
+        except Exception as e:
+            status["_VWMA_ERROR"] = str(e)[:160]
+
+    # ATR + Keltner
+    try:
+        if use_ta:
+            df["ATR"] = ta.volatility.average_true_range(high, low, close, window=14)
+        elif pta is not None:
+            df["ATR"] = pta.atr(high, low, close, length=14)
+    except Exception as e:
+        status["_ATR_ERROR"] = str(e)[:160]
+
+    if bool(cfg.get("use_keltner", True)):
+        try:
+            if use_ta:
+                kc = ta.volatility.KeltnerChannel(high=high, low=low, close=close, window=20, window_atr=10, multiplier=2.0)
+                df["KC_UPPER"] = kc.keltner_channel_hband()
+                df["KC_MID"] = kc.keltner_channel_mband()
+                df["KC_LOWER"] = kc.keltner_channel_lband()
+            elif pta is not None:
+                kc = pta.kc(high, low, close, length=20, scalar=2.0, mamode="ema")
+                c_u = _pick_first_col(kc, ["KCU_"])
+                c_m = _pick_first_col(kc, ["KCB_"])
+                c_l = _pick_first_col(kc, ["KCL_"])
+                if c_u:
+                    df["KC_UPPER"] = kc[c_u]
+                if c_m:
+                    df["KC_MID"] = kc[c_m]
+                if c_l:
+                    df["KC_LOWER"] = kc[c_l]
+        except Exception as e:
+            status["_KC_ERROR"] = str(e)[:160]
+
     # ✅ Squeeze Momentum (LazyBear 유사) - pandas/numpy로 직접 계산(추가 의존성 없음)
     # - 스퀴즈(변동성 압축) 이후 모멘텀 방향/세기를 주요 진입/필터로 사용
     if cfg.get("use_sqz", True):
@@ -7929,22 +8409,155 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
         status["_sqz_strength"] = float(strength)
         status["_sqz_on"] = bool(sqz_on_now)
 
+    # Super-Bot 지표 상태 요약
+    if bool(cfg.get("use_ichimoku", True)) and all(c in df2.columns for c in ["ICHI_CONV", "ICHI_BASE", "ICHI_SPAN_A", "ICHI_SPAN_B"]):
+        used.append("일목균형표")
+        try:
+            conv = float(last.get("ICHI_CONV", np.nan))
+            base = float(last.get("ICHI_BASE", np.nan))
+            span_a = float(last.get("ICHI_SPAN_A", np.nan))
+            span_b = float(last.get("ICHI_SPAN_B", np.nan))
+            px0 = float(last.get("close", np.nan))
+            cloud_top = max(span_a, span_b)
+            cloud_bot = min(span_a, span_b)
+            if math.isfinite(px0) and math.isfinite(cloud_top) and math.isfinite(cloud_bot):
+                if px0 > cloud_top and conv >= base:
+                    status["ICHI"] = "🟢 구름 위(상승 우세)"
+                elif px0 < cloud_bot and conv <= base:
+                    status["ICHI"] = "🔴 구름 아래(하락 우세)"
+                else:
+                    status["ICHI"] = "⚪ 구름 내부/혼조"
+        except Exception:
+            pass
+
+    if bool(cfg.get("use_psar", True)) and ("PSAR" in df2.columns):
+        used.append("PSAR")
+        try:
+            ps = float(last.get("PSAR", np.nan))
+            px0 = float(last.get("close", np.nan))
+            if math.isfinite(ps) and math.isfinite(px0):
+                status["PSAR"] = "🟢 PSAR 아래(상승)" if ps < px0 else "🔴 PSAR 위(하락)"
+        except Exception:
+            pass
+
+    if bool(cfg.get("use_vwap", True)) and ("VWAP" in df2.columns):
+        used.append("VWAP")
+        try:
+            vwap0 = float(last.get("VWAP", np.nan))
+            px0 = float(last.get("close", np.nan))
+            if math.isfinite(vwap0) and math.isfinite(px0):
+                status["VWAP"] = "🟢 VWAP 위" if px0 >= vwap0 else "🔴 VWAP 아래"
+        except Exception:
+            pass
+
+    if bool(cfg.get("use_stochrsi", True)) and all(c in df2.columns for c in ["STOCHRSI_K", "STOCHRSI_D"]):
+        used.append("StochRSI")
+        try:
+            k0 = float(last.get("STOCHRSI_K", np.nan))
+            d0 = float(last.get("STOCHRSI_D", np.nan))
+            if math.isfinite(k0) and math.isfinite(d0):
+                if k0 >= 80 and k0 >= d0:
+                    status["STOCHRSI"] = "🔴 과열 구간"
+                elif k0 <= 20 and k0 <= d0:
+                    status["STOCHRSI"] = "🟢 저점 구간"
+                else:
+                    status["STOCHRSI"] = "⚪ 중립"
+        except Exception:
+            pass
+
+    if bool(cfg.get("use_obv", True)) and ("OBV" in df2.columns):
+        used.append("OBV")
+        try:
+            obv_prev = float(prev.get("OBV", np.nan))
+            obv_now = float(last.get("OBV", np.nan))
+            if math.isfinite(obv_prev) and math.isfinite(obv_now):
+                status["OBV"] = "🟢 누적매수 우세" if obv_now >= obv_prev else "🔴 누적매도 우세"
+        except Exception:
+            pass
+
+    if bool(cfg.get("use_cmf", True)) and ("CMF" in df2.columns):
+        used.append("CMF")
+        try:
+            cmf0 = float(last.get("CMF", np.nan))
+            if math.isfinite(cmf0):
+                status["CMF"] = "🟢 자금유입" if cmf0 > 0 else ("🔴 자금유출" if cmf0 < 0 else "⚪ 중립")
+        except Exception:
+            pass
+
+    if bool(cfg.get("use_vwma", True)) and ("VWMA" in df2.columns):
+        used.append("VWMA")
+        try:
+            vwma0 = float(last.get("VWMA", np.nan))
+            px0 = float(last.get("close", np.nan))
+            if math.isfinite(vwma0) and math.isfinite(px0):
+                status["VWMA"] = "🟢 VWMA 위" if px0 >= vwma0 else "🔴 VWMA 아래"
+        except Exception:
+            pass
+
+    if bool(cfg.get("use_keltner", True)) and all(c in df2.columns for c in ["KC_UPPER", "KC_LOWER"]):
+        used.append("켈트너채널")
+        try:
+            px0 = float(last.get("close", np.nan))
+            kup = float(last.get("KC_UPPER", np.nan))
+            klw = float(last.get("KC_LOWER", np.nan))
+            if math.isfinite(px0) and math.isfinite(kup) and math.isfinite(klw):
+                if px0 > kup:
+                    status["KC"] = "🔴 상단 돌파"
+                elif px0 < klw:
+                    status["KC"] = "🟢 하단 이탈"
+                else:
+                    status["KC"] = "⚪ 채널 내부"
+        except Exception:
+            pass
+
+    if "ATR" in df2.columns:
+        try:
+            atr0 = float(last.get("ATR", np.nan))
+            px0 = float(last.get("close", np.nan))
+            if math.isfinite(atr0) and math.isfinite(px0) and px0 > 0:
+                status["ATR"] = f"{(atr0 / px0) * 100.0:.2f}%"
+        except Exception:
+            pass
+
     if bool(cfg.get("use_chart_patterns", True)):
         try:
             pat = detect_chart_patterns(df2, cfg)
         except Exception:
             pat = {}
         try:
+            adv_pat = detect_advanced_patterns(df2, cfg)
+        except Exception:
+            adv_pat = {}
+        try:
             used.append("차트패턴")
+            pl = float((pat or {}).get("score_long", 0.0) or 0.0)
+            ps = float((pat or {}).get("score_short", 0.0) or 0.0)
+            al = float((adv_pat or {}).get("score_long", 0.0) or 0.0)
+            ass = float((adv_pat or {}).get("score_short", 0.0) or 0.0)
+            score_long_all = pl + al
+            score_short_all = ps + ass
+            diff_all = score_long_all - score_short_all
+            bias_all = 1 if diff_all >= 0.3 else (-1 if diff_all <= -0.3 else 0)
+            strength_all = float(clamp(max(score_long_all, score_short_all) / 3.5, 0.0, 1.0))
+            if bias_all == 0:
+                strength_all = float(min(strength_all, 0.65))
+            det_main = list((pat or {}).get("detected", []) or [])
+            det_adv = list((adv_pat or {}).get("detected", []) or [])
+            det_all = list(dict.fromkeys(det_main + det_adv))
             status["패턴"] = str((pat or {}).get("summary", "패턴 없음"))
-            status["_pattern_bias"] = int((pat or {}).get("bias", 0) or 0)
-            status["_pattern_strength"] = float((pat or {}).get("strength", 0.0) or 0.0)
-            status["_pattern_tags"] = list((pat or {}).get("detected", []) or [])
-            status["_pattern_bullish"] = list((pat or {}).get("bullish", []) or [])
-            status["_pattern_bearish"] = list((pat or {}).get("bearish", []) or [])
-            status["_pattern_neutral"] = list((pat or {}).get("neutral", []) or [])
-            status["_pattern_score_long"] = float((pat or {}).get("score_long", 0.0) or 0.0)
-            status["_pattern_score_short"] = float((pat or {}).get("score_short", 0.0) or 0.0)
+            if det_adv:
+                status["패턴"] += " | 고급:" + ", ".join(det_adv[:3])
+            status["_pattern_bias"] = int(bias_all)
+            status["_pattern_strength"] = float(strength_all)
+            status["_pattern_tags"] = det_all[:16]
+            status["_pattern_bullish"] = list(dict.fromkeys(list((pat or {}).get("bullish", []) or []) + list((adv_pat or {}).get("bullish", []) or [])))[:16]
+            status["_pattern_bearish"] = list(dict.fromkeys(list((pat or {}).get("bearish", []) or []) + list((adv_pat or {}).get("bearish", []) or [])))[:16]
+            status["_pattern_neutral"] = list(dict.fromkeys(list((pat or {}).get("neutral", []) or []) + list((adv_pat or {}).get("neutral", []) or [])))[:16]
+            status["_pattern_score_long"] = float(score_long_all)
+            status["_pattern_score_short"] = float(score_short_all)
+            status["_pattern_divergences"] = list((adv_pat or {}).get("divergences", []) or [])[:12]
+            status["_pattern_harmonics"] = list((adv_pat or {}).get("harmonics", []) or [])[:12]
+            status["_pattern_candles"] = list((adv_pat or {}).get("candles", []) or [])[:12]
         except Exception:
             pass
 
@@ -9379,12 +9992,14 @@ def _rr_min_by_mode(mode: str) -> float:
 
 def _rr_min_by_style(style: str) -> float:
     # 스타일별 최소 손익비 가이드
-    if style == "스캘핑":
+    st = normalize_style_name(style)
+    if st == "스캘핑":
         return 1.2
-    if style == "스윙":
-        # ✅ 스윙은 스캘핑보다 "훨씬 길게" 가져가는 전략이므로 RR 하한을 더 높게
-        return 2.8
-    return 1.5
+    if st == "단타":
+        return 1.8
+    if st == "스윙":
+        return 2.6
+    return 1.4
 
 
 def _risk_guardrail(out: Dict[str, Any], df: pd.DataFrame, decision: str, mode: str, style: str, external: Dict[str, Any]) -> Dict[str, Any]:
@@ -9486,6 +10101,9 @@ def ai_decide_trade(
     features = {
         "symbol": symbol,
         "mode": mode,
+        "timeframe": str(cfg.get("timeframe", "5m")),
+        "style_hint": normalize_style_name(chart_style_hint or "스캘핑"),
+        "style_rule": style_rule(chart_style_hint or "스캘핑"),
         "price": float(last["close"]),
         "rsi_prev": float(prev.get("RSI", 50)) if "RSI" in df.columns else None,
         "rsi_now": float(last.get("RSI", 50)) if "RSI" in df.columns else None,
@@ -9506,6 +10124,17 @@ def ai_decide_trade(
             "bias": int(status.get("_sqz_bias", 0) or 0),
             "strength": float(status.get("_sqz_strength", 0.0) or 0.0),
         },
+        "super_indicators": {
+            "ichimoku": str(status.get("ICHI", "") or ""),
+            "psar": str(status.get("PSAR", "") or ""),
+            "vwap": str(status.get("VWAP", "") or ""),
+            "stochrsi": str(status.get("STOCHRSI", "") or ""),
+            "obv": str(status.get("OBV", "") or ""),
+            "cmf": str(status.get("CMF", "") or ""),
+            "vwma": str(status.get("VWMA", "") or ""),
+            "keltner": str(status.get("KC", "") or ""),
+            "atr_pct": str(status.get("ATR", "") or ""),
+        },
         "chart_patterns": {
             "summary": status.get("패턴", ""),
             "bias": int(status.get("_pattern_bias", 0) or 0),
@@ -9513,6 +10142,9 @@ def ai_decide_trade(
             "detected": list(status.get("_pattern_tags", []) or []),
             "bullish": list(status.get("_pattern_bullish", []) or []),
             "bearish": list(status.get("_pattern_bearish", []) or []),
+            "divergences": list(status.get("_pattern_divergences", []) or []),
+            "harmonics": list(status.get("_pattern_harmonics", []) or []),
+            "candles": list(status.get("_pattern_candles", []) or []),
         },
         "chart_patterns_mtf": status.get("_pattern_mtf", {}) if isinstance(status.get("_pattern_mtf", {}), dict) else {},
         "ml_signals": status.get("_ml_signals", {}) if isinstance(status.get("_ml_signals", {}), dict) else {},
@@ -9605,23 +10237,29 @@ def ai_decide_trade(
 
 {ext_hdr}
 
-			[핵심 룰]
-			1) RSI 과매도/과매수 '상태'에 즉시 진입하지 말고, '해소되는 시점'에서만 진입 후보.
-				2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. (역추세는 더 짧게/보수적으로)
-				3) SQZ(스퀴즈 모멘텀) 신호를 진입 판단의 80% 이상으로 반영해라. (모멘텀 방향/세기 우선)
-				4) chart_patterns(M/W, 쌍봉/쌍바닥, 삼중천정/삼중바닥, 삼각수렴, 박스, 쐐기, 헤드앤숄더)을 반드시 참고해라.
-				   - pattern bias와 반대 방향이면 보수적으로 hold를 우선해라.
-				4-1) chart_patterns_mtf는 1m/3m/5m/15m/30m/1h/2h/4h 종합 패턴이다.
-				   - 단기 패턴과 MTF 패턴이 같은 방향이면 신뢰도를 높이고, 반대면 보수적으로 접근해라.
-				5) ml_signals(주력 지표 수렴: Lorentzian/KNN/Logistic/SQZ/RSI/패턴)을 반드시 따른다.
-				   - ml_signals.dir이 "buy"면 decision은 buy만 가능(반대 방향 금지)
-				   - ml_signals.dir이 "sell"면 decision은 sell만 가능(반대 방향 금지)
-				   - ml_signals.dir이 "hold"면 hold
-				6) 모드 규칙 반드시 준수:
-		   - 최소 확신도: {rule["min_conf"]}
-		   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
-		   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
-		{soft_entry_hint}
+				[핵심 룰]
+				1) RSI 과매도/과매수 '상태'에 즉시 진입하지 말고, '해소되는 시점'을 우선한다.
+				2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. 역추세는 확신/사이즈를 낮춘다.
+				3) SQZ(스퀴즈 모멘텀) 신호는 항상 최상위 가중치로 본다.
+				4) super_indicators를 반드시 참고:
+				   - 추세: Ichimoku, PSAR, ADX, VWAP
+				   - 모멘텀: RSI, StochRSI, CCI, Williams %R, MFI, MACD
+				   - 거래량: OBV, CMF, VWMA
+				   - 변동성: ATR, Keltner, Bollinger
+				5) chart_patterns + chart_patterns_mtf + divergences/harmonics/candles를 함께 판단한다.
+				6) ml_signals.dir을 우선 따른다.
+				   - ml_signals.dir이 "buy"면 buy/hold만 허용
+				   - ml_signals.dir이 "sell"면 sell/hold만 허용
+				   - ml_signals.dir이 "hold"면 hold 우선
+				7) style_hint 기준 가중치:
+				   - 스캘핑: 1m/5m, SQZ·VWAP·OBV·캔들패턴 가중치↑, 장기지표 영향↓
+				   - 단타: 15m/1h, 추세+모멘텀 균형, 다이버전스 확인
+				   - 스윙: 4h/1d, Ichimoku·ADX·하모닉·MTF 패턴 가중치↑
+				8) 모드 규칙 반드시 준수:
+				   - 최소 확신도: {rule["min_conf"]}
+				   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
+				   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
+			{soft_entry_hint}
 
 	[중요]
 	- sl_pct / tp_pct는 ROI%(레버 반영 수익률)로 출력한다.
@@ -9804,9 +10442,9 @@ def ai_decide_style(symbol: str, decision: str, trend_short: str, trend_long: st
     }
     sys = (
         "너는 트레이딩 스타일 분류기다.\n"
-        "단기/장기 추세와 방향(decision)을 보고 지금은 '스캘핑'이 유리한지 '스윙'이 유리한지 결정한다.\n"
+        "단기/장기 추세와 방향(decision)을 보고 지금은 '스캘핑'/'단타'/'스윙' 중 무엇이 유리한지 결정한다.\n"
         "출력은 반드시 JSON만.\n"
-        '형식: {"style":"스캘핑"|"스윙","confidence":0-100,"reason":"쉬운 한글"}'
+        '형식: {"style":"스캘핑"|"단타"|"스윙","confidence":0-100,"reason":"쉬운 한글"}'
     )
     try:
         models = [
@@ -9835,9 +10473,7 @@ def ai_decide_style(symbol: str, decision: str, trend_short: str, trend_long: st
             timeout_sec=OPENAI_TIMEOUT_SEC,
         )
         out = json.loads(resp.choices[0].message.content)
-        style = str(out.get("style", "스캘핑"))
-        if style not in ["스캘핑", "스윙"]:
-            style = "스캘핑"
+        style = normalize_style_name(out.get("style", "스캘핑"))
         conf = int(clamp(int(out.get("confidence", 55)), 0, 100))
         reason = str(out.get("reason", ""))[:240]
         res = {"style": style, "confidence": conf, "reason": reason}
@@ -9881,12 +10517,12 @@ def decide_style_rule_based(decision: str, trend_short: str, trend_long: str) ->
     long_ok = _align(tl, d)
 
     if short_ok and long_ok:
-        return "스윙", 85, "단기+장기 추세가 같은 방향 → 스윙 유리"
+        return "스윙", 86, "단기+장기 추세가 같은 방향 → 스윙 유리"
     if short_ok and not long_ok:
-        return "스캘핑", 82, "단기만 같은 방향(역추세/전환 구간) → 스캘핑 유리"
+        return "스캘핑", 80, "단기만 같은 방향(초단기 파동) → 스캘핑 유리"
     if (not short_ok) and long_ok:
-        return "스캘핑", 65, "장기만 같은 방향(단기 흔들림) → 보수적으로 스캘핑"
-    return "스캘핑", 55, "추세 애매/불일치 → 스캘핑(보수)"
+        return "단타", 74, "장기 방향은 맞지만 단기 흔들림 → 단타 유리"
+    return "스캘핑", 55, "추세 애매/불일치 → 보수적으로 스캘핑"
 
 
 def apply_style_envelope(ai: Dict[str, Any], style: str, cfg: Dict[str, Any], rule: Dict[str, Any]) -> Dict[str, Any]:
@@ -9895,12 +10531,24 @@ def apply_style_envelope(ai: Dict[str, Any], style: str, cfg: Dict[str, Any], ru
     """
     out = dict(ai or {})
     try:
+        st = normalize_style_name(style)
+        sr = style_rule(st)
         entry_pct = float(out.get("entry_pct", rule["entry_pct_min"]))
         lev = int(out.get("leverage", rule["lev_min"]))
         sl = float(out.get("sl_pct", 1.2))
         tp = float(out.get("tp_pct", 3.0))
 
-        if style == "스캘핑":
+        # 모드와 스타일 규칙을 동시에 만족하도록 범위 교집합 적용
+        lev_lo = int(max(int(rule.get("lev_min", 1)), int(sr.get("lev_min", 1))))
+        lev_hi = int(min(int(rule.get("lev_max", 125)), int(sr.get("lev_max", 125))))
+        if lev_hi < lev_lo:
+            lev_lo, lev_hi = int(rule.get("lev_min", 1)), int(rule.get("lev_max", 125))
+        entry_lo = float(max(float(rule.get("entry_pct_min", 1.0)), float(sr.get("entry_pct_min", 1.0))))
+        entry_hi = float(min(float(rule.get("entry_pct_max", 100.0)), float(sr.get("entry_pct_max", 100.0))))
+        if entry_hi < entry_lo:
+            entry_lo, entry_hi = float(rule.get("entry_pct_min", 1.0)), float(rule.get("entry_pct_max", 100.0))
+
+        if st == "스캘핑":
             entry_pct = float(clamp(entry_pct * float(cfg.get("scalp_entry_pct_mult", 0.65)), rule["entry_pct_min"], rule["entry_pct_max"]))
             # ✅ 모드(MODE_RULES)의 레버 범위를 우선 존중:
             # - 하이리스크/하이리턴(예: lev_min=12)에서 scalp_lev_cap=8 때문에 레버가 8로 고정되는 문제 방지
@@ -9919,17 +10567,38 @@ def apply_style_envelope(ai: Dict[str, Any], style: str, cfg: Dict[str, Any], ru
             sl = float(clamp(sl, float(cfg.get("scalp_sl_roi_min", 0.8)), float(cfg.get("scalp_sl_roi_max", 5.0))))
             tp = float(clamp(tp, float(cfg.get("scalp_tp_roi_min", 0.8)), float(cfg.get("scalp_tp_roi_max", 6.0))))
 
-        elif style == "스윙":
+        elif st == "단타":
+            entry_pct = float(clamp(entry_pct * float(cfg.get("day_entry_pct_mult", 0.85)), entry_lo, entry_hi))
+            day_cap = int(cfg.get("day_lev_cap", sr.get("lev_max", 10)) or sr.get("lev_max", 10))
+            lev = int(clamp(lev, lev_lo, min(lev_hi, int(day_cap))))
+            sl = float(clamp(sl, float(cfg.get("day_sl_roi_min", sr.get("sl_roi_min", 1.0))), float(cfg.get("day_sl_roi_max", sr.get("sl_roi_max", 3.0)))))
+            tp = float(clamp(tp, float(cfg.get("day_tp_roi_min", sr.get("tp_roi_min", 2.0))), float(cfg.get("day_tp_roi_max", sr.get("tp_roi_max", 5.0)))))
+
+        elif st == "스윙":
             entry_pct = float(clamp(entry_pct * float(cfg.get("swing_entry_pct_mult", 1.0)), rule["entry_pct_min"], rule["entry_pct_max"]))
             lev = int(min(lev, int(cfg.get("swing_lev_cap", rule["lev_max"]))))
             sl = float(clamp(sl, float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 30.0))))
             tp = float(clamp(tp, float(cfg.get("swing_tp_roi_min", 3.0)), float(cfg.get("swing_tp_roi_max", 50.0))))
+
+        # 스타일 범위(요청 스펙) 재보정
+        entry_pct = float(clamp(entry_pct, entry_lo, entry_hi))
+        lev = int(clamp(lev, lev_lo, lev_hi))
+        if st == "스캘핑":
+            sl = float(clamp(sl, float(sr.get("sl_roi_min", 0.4)), float(sr.get("sl_roi_max", 1.2))))
+            tp = float(clamp(tp, float(sr.get("tp_roi_min", 0.5)), float(sr.get("tp_roi_max", 1.5))))
+        elif st == "단타":
+            sl = float(clamp(sl, float(sr.get("sl_roi_min", 1.0)), float(sr.get("sl_roi_max", 2.8))))
+            tp = float(clamp(tp, float(sr.get("tp_roi_min", 2.0)), float(sr.get("tp_roi_max", 5.0))))
+        else:
+            sl = float(clamp(sl, float(sr.get("sl_roi_min", 2.0)), float(sr.get("sl_roi_max", 8.0))))
+            tp = float(clamp(tp, float(sr.get("tp_roi_min", 6.0)), float(sr.get("tp_roi_max", 20.0))))
 
         out["entry_pct"] = entry_pct
         out["leverage"] = lev
         out["sl_pct"] = sl
         out["tp_pct"] = tp
         out["rr"] = float(out.get("rr", tp / max(sl, 0.01)))
+        out["style"] = st
     except Exception:
         pass
     return out
@@ -10520,7 +11189,7 @@ def tg_send_menu(cfg: Optional[Dict[str, Any]] = None):
                 "sendMessage",
                 {
                     "chat_id": cid,
-                    "text": "✅ /menu\n/status /positions /scan /mode auto|scalping|swing /log <id> /gsheet\n(매매일지 버튼에서 금일/일별/월별 표 확인 가능)",
+                    "text": "✅ /menu\n/status /positions /scan /mode auto|scalping|daytrading|swing /log <id> /gsheet\n(매매일지 버튼에서 금일/일별/월별 표 확인 가능)",
                     "reply_markup": json.dumps(kb, ensure_ascii=False),
                 },
                 priority="high",
@@ -10625,12 +11294,14 @@ def _tg_trailing_protect_policy_line(cfg: Optional[Dict[str, Any]] = None) -> st
 
 
 def _tg_style_easy(style: str) -> str:
-    s = str(style or "").strip()
+    s = normalize_style_name(style)
     if s == "스캘핑":
         return "스캘핑"
+    if s == "단타":
+        return "단타"
     if s == "스윙":
         return "스윙"
-    return s or "-"
+    return "-"
 
 
 def _tg_dir_easy(decision_or_side: str) -> str:
@@ -11343,12 +12014,13 @@ def _style_for_entry(
     allow_ai: bool = True,
 ) -> Dict[str, Any]:
     style, conf, reason = decide_style_rule_based(decision, trend_short, trend_long)
+    style = normalize_style_name(style)
     # 애매하면 AI로 2차 판단
     if allow_ai and cfg.get("style_auto_enable", True) and conf <= 60:
         ai = ai_decide_style(symbol, decision, trend_short, trend_long, cfg)
         # AI가 스윙이라고 강하게 말하면 반영
         if int(ai.get("confidence", 0)) >= 70:
-            style = ai.get("style", style)
+            style = normalize_style_name(ai.get("style", style))
             conf = int(ai.get("confidence", conf))
             reason = str(ai.get("reason", reason))
     return {"style": style, "confidence": conf, "reason": reason}
@@ -11607,11 +12279,13 @@ def _plot_text_sanitize(text: Any, *, has_kr_font: bool, max_len: int = 220) -> 
 
 
 def _style_plot_label(style: str, has_kr_font: bool) -> str:
-    s = str(style or "").strip()
+    s = normalize_style_name(style)
     if has_kr_font:
         return s or "-"
     if s == "스캘핑":
         return "SCALP"
+    if s == "단타":
+        return "DAY"
     if s == "스윙":
         return "SWING"
     s2 = _plot_text_sanitize(s, has_kr_font=False, max_len=24)
@@ -12830,6 +13504,8 @@ def _maybe_switch_style_for_open_position(
         regime_mode = str(cfg.get("regime_mode", "auto")).lower().strip()
         if regime_mode in ["scalping", "scalp", "short"]:
             rec_style = "스캘핑"
+        elif regime_mode in ["daytrading", "day", "danta", "dan-ta", "mid"]:
+            rec_style = "단타"
         elif regime_mode in ["swing", "long"]:
             rec_style = "스윙"
 
@@ -13034,12 +13710,16 @@ def _maybe_switch_style_for_open_position(
             tgt["trend_short_now"] = f"{short_tf} {short_trend}"
             tgt["trend_long_now"] = f"{long_tf} {long_trend}"
 
-            # 전환 시 목표 보정: 스윙->스캘핑이면 "빨리 청산" 모드로 목표 낮춤
+            # 전환 시 목표 보정: 스타일별 목표 범위로 재정렬
             if rec_style == "스캘핑":
                 # 기존 TP/SL이 너무 크면 스캘핑 범위로 조임
                 tgt["tp"] = float(clamp(float(tgt.get("tp", 3.0)), float(cfg.get("scalp_tp_roi_min", 0.8)), float(cfg.get("scalp_tp_roi_max", 6.0))))
                 tgt["sl"] = float(clamp(float(tgt.get("sl", 2.0)), float(cfg.get("scalp_sl_roi_min", 0.8)), float(cfg.get("scalp_sl_roi_max", 5.0))))
                 tgt["scalp_exit_mode"] = True
+            elif rec_style == "단타":
+                tgt["tp"] = float(clamp(float(tgt.get("tp", 3.5)), float(cfg.get("day_tp_roi_min", 2.0)), float(cfg.get("day_tp_roi_max", 5.0))))
+                tgt["sl"] = float(clamp(float(tgt.get("sl", 1.8)), float(cfg.get("day_sl_roi_min", 1.0)), float(cfg.get("day_sl_roi_max", 3.0))))
+                tgt["scalp_exit_mode"] = False
             else:
                 tgt["tp"] = float(clamp(float(tgt.get("tp", 6.0)), float(cfg.get("swing_tp_roi_min", 3.0)), float(cfg.get("swing_tp_roi_max", 50.0))))
                 tgt["sl"] = float(clamp(float(tgt.get("sl", 3.0)), float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 30.0))))
@@ -13959,7 +14639,7 @@ def telegram_thread(ex):
                         free, total = safe_fetch_balance(ex)
                         realized = float(rt.get("daily_realized_pnl", 0.0) or 0.0)
                         regime_mode = str(cfg.get("regime_mode", "auto")).lower().strip()
-                        regime_txt = "AUTO" if regime_mode == "auto" else ("SCALPING" if regime_mode.startswith("scal") else "SWING")
+                        regime_txt = "AUTO" if regime_mode == "auto" else ("SCALPING" if regime_mode.startswith("scal") else ("DAYTRADING" if regime_mode.startswith("day") else "SWING"))
 
                         # 포지션 요약
                         pos_blocks: List[str] = []
@@ -14078,7 +14758,7 @@ def telegram_thread(ex):
                             ev_soon = (ext or {}).get("high_impact_events_soon") or []
                             ev_soon_line = " / ".join([f"{x.get('country','')} {x.get('title','')[:18]}" for x in ev_soon[:2]]) if ev_soon else "없음"
                             regime_mode = str(cfg.get("regime_mode", "auto")).lower().strip()
-                            regime_txt = "AUTO" if regime_mode == "auto" else ("SCALPING" if regime_mode.startswith("scal") else "SWING")
+                            regime_txt = "AUTO" if regime_mode == "auto" else ("SCALPING" if regime_mode.startswith("scal") else ("DAYTRADING" if regime_mode.startswith("day") else "SWING"))
                             realized = float(rt.get("daily_realized_pnl", 0.0) or 0.0)
 
                             # 신규진입 가능 여부(자동매매 ON인데 진입을 안 하면 즉시 확인)
@@ -17284,7 +17964,14 @@ def telegram_thread(ex):
                         try:
                             tr_s = str(stt.get("추세", "") or "")
                             tr_l = str(htf_trend or "")
-                            chart_style_hint = "스윙" if (("상승" in tr_s and "상승" in tr_l) or ("하락" in tr_s and "하락" in tr_l)) else "스캘핑"
+                            same_dir = (("상승" in tr_s and "상승" in tr_l) or ("하락" in tr_s and "하락" in tr_l))
+                            mixed_dir = (("상승" in tr_s and "하락" in tr_l) or ("하락" in tr_s and "상승" in tr_l))
+                            if same_dir:
+                                chart_style_hint = "스윙"
+                            elif mixed_dir:
+                                chart_style_hint = "단타"
+                            else:
+                                chart_style_hint = "스캘핑"
                         except Exception:
                             chart_style_hint = "스캘핑"
                         cs["chart_style_hint"] = chart_style_hint
@@ -17295,7 +17982,7 @@ def telegram_thread(ex):
                         if bool(cfg.get("ai_cost_saver_strict", True)):
                             ext_for_ai = {"enabled": False}
                         else:
-                            ext_for_ai = ext if chart_style_hint == "스윙" else {"enabled": False}
+                            ext_for_ai = ext if chart_style_hint in ["단타", "스윙"] else {"enabled": False}
                         if not use_cached_ai:
                             ai = ai_decide_trade(
                                 df,
@@ -17739,17 +18426,22 @@ def telegram_thread(ex):
                                 cfg,
                                 allow_ai=bool(cfg.get("style_entry_ai_enable", False)) and (not bool(cfg.get("ai_cost_saver_strict", True))),
                             )
-                            style = style_info.get("style", "스캘핑")
+                            style = normalize_style_name(style_info.get("style", "스캘핑"))
                             cs["style_reco"] = style
                             cs["style_confidence"] = int(style_info.get("confidence", 0))
                             cs["style_reason"] = str(style_info.get("reason", ""))[:240]
-                            # ✅ /mode 레짐 강제(auto|scalping|swing)
+                            # ✅ /mode 레짐 강제(auto|scalping|daytrading|swing)
                             regime_mode = str(cfg.get("regime_mode", "auto")).lower().strip()
                             if regime_mode in ["scalping", "scalp", "short"]:
                                 style = "스캘핑"
                                 cs["style_reco"] = "스캘핑"
                                 cs["style_confidence"] = 100
                                 cs["style_reason"] = "레짐 강제: scalping"
+                            elif regime_mode in ["daytrading", "day", "danta", "dan-ta", "mid"]:
+                                style = "단타"
+                                cs["style_reco"] = "단타"
+                                cs["style_confidence"] = 100
+                                cs["style_reason"] = "레짐 강제: daytrading"
                             elif regime_mode in ["swing", "long"]:
                                 style = "스윙"
                                 cs["style_reco"] = "스윙"
@@ -17833,6 +18525,8 @@ def telegram_thread(ex):
                                     try:
                                         if str(style) == "스캘핑":
                                             lev_max_allowed = min(lev_max_allowed, int(cfg.get("scalp_lev_cap", lev_max_allowed) or lev_max_allowed))
+                                        elif str(style) == "단타":
+                                            lev_max_allowed = min(lev_max_allowed, int(cfg.get("day_lev_cap", lev_max_allowed) or lev_max_allowed))
                                         elif str(style) == "스윙":
                                             lev_max_allowed = min(lev_max_allowed, int(cfg.get("swing_lev_cap", lev_max_allowed) or lev_max_allowed))
                                     except Exception:
@@ -17855,8 +18549,8 @@ def telegram_thread(ex):
                                     ai2["atr_price_pct"] = float(atr_pct)
                             except Exception:
                                 pass
-                            # ✅ 요구: 스윙만 외부시황 반영(스캘핑=차트만)
-                            ext_for_risk = ext if str(style) == "스윙" else {"enabled": False}
+                            # ✅ 요구: 스캘핑은 차트 중심, 단타/스윙은 외부시황 일부 반영
+                            ext_for_risk = ext if str(style) in ["단타", "스윙"] else {"enabled": False}
                             ai2 = _risk_guardrail(ai2, df, decision, mode, style, ext_for_risk)
                             # ✅ 스캘핑: 레버가 높을 때 TP/SL이 과도해지는 문제(익절 미발동 등) 방지
                             if str(style) == "스캘핑":
@@ -18864,7 +19558,7 @@ def telegram_thread(ex):
                             rt2 = load_runtime()
                             mon_now = read_json_safe(MONITOR_FILE, {}) or {}
                             regime_mode = str(cfg_live.get("regime_mode", "auto")).lower().strip()
-                            regime_txt = "AUTO" if regime_mode == "auto" else ("SCALPING" if regime_mode.startswith("scal") else "SWING")
+                            regime_txt = "AUTO" if regime_mode == "auto" else ("SCALPING" if regime_mode.startswith("scal") else ("DAYTRADING" if regime_mode.startswith("day") else "SWING"))
                             h = openai_health_info(cfg_live)
                             ai_txt = "OK" if bool(h.get("available", False)) else str(h.get("message", "OFF"))
                             until = str(h.get("until_kst", "")).strip()
@@ -19009,26 +19703,28 @@ def telegram_thread(ex):
                                         pass
                                     _reply_admin_dm(f"🔎 강제스캔 요청 완료: {rid}\n- 대상: {', '.join(syms)}\n- 주의: 강제스캔은 '스캔만' 수행(주문X)")
 
-                        # /mode auto|scalping|swing (관리자)
+                        # /mode auto|scalping|daytrading|swing (관리자)
                         elif low.startswith("/mode") or low.startswith("모드"):
                             if not is_admin:
                                 _deny()
                             else:
                                 parts = txt.split()
                                 if len(parts) < 2:
-                                    _reply_admin_dm("사용법: /mode auto|scalping|swing")
+                                    _reply_admin_dm("사용법: /mode auto|scalping|daytrading|swing")
                                 else:
                                     arg = str(parts[1]).lower().strip()
                                     if arg in ["auto", "a"]:
                                         m = "auto"
                                     elif arg in ["scalping", "scalp", "short", "s"]:
                                         m = "scalping"
+                                    elif arg in ["daytrading", "day", "danta", "dan-ta", "mid", "d"]:
+                                        m = "daytrading"
                                     elif arg in ["swing", "long", "l"]:
                                         m = "swing"
                                     else:
                                         m = ""
                                     if not m:
-                                        _reply_admin_dm("사용법: /mode auto|scalping|swing")
+                                        _reply_admin_dm("사용법: /mode auto|scalping|daytrading|swing")
                                     else:
                                         cfg2 = load_settings()
                                         cfg2["regime_mode"] = m
@@ -19269,7 +19965,7 @@ def telegram_thread(ex):
                             free, total = safe_fetch_balance(ex)
                             rt2 = load_runtime()
                             regime_mode = str(cfg_live.get("regime_mode", "auto")).lower().strip()
-                            regime_txt = "AUTO" if regime_mode == "auto" else ("SCALPING" if regime_mode.startswith("scal") else "SWING")
+                            regime_txt = "AUTO" if regime_mode == "auto" else ("SCALPING" if regime_mode.startswith("scal") else ("DAYTRADING" if regime_mode.startswith("day") else "SWING"))
                             _cb_reply(
                                 f"📡 상태\n- 자동매매: {'ON' if cfg_live.get('auto_trade') else 'OFF'}\n"
                                 f"- 모드: {cfg_live.get('trade_mode','-')}\n"
@@ -19431,7 +20127,7 @@ def telegram_thread(ex):
                             if not is_admin:
                                 _cb_reply("⛔️ 관리자만 사용할 수 있는 버튼입니다.")
                             else:
-                                _cb_reply("🎚️ /mode 사용법\n- /mode auto\n- /mode scalping\n- /mode swing")
+                                _cb_reply("🎚️ /mode 사용법\n- /mode auto\n- /mode scalping\n- /mode daytrading\n- /mode swing")
 
                         elif data == "gsheet":
                             if not is_admin:
@@ -19893,8 +20589,8 @@ st.sidebar.caption("ALLOW_SCALP: 역추세 허용(스캘핑 강제) / STRICT: �
 
 config["regime_mode"] = st.sidebar.selectbox(
     "레짐 모드(/mode)",
-    ["auto", "scalping", "swing"],
-    index=["auto", "scalping", "swing"].index(str(config.get("regime_mode", "auto")).lower() if str(config.get("regime_mode", "auto")).lower() in ["auto", "scalping", "swing"] else "auto"),
+    ["auto", "scalping", "daytrading", "swing"],
+    index=["auto", "scalping", "daytrading", "swing"].index(str(config.get("regime_mode", "auto")).lower() if str(config.get("regime_mode", "auto")).lower() in ["auto", "scalping", "daytrading", "swing"] else "auto"),
 )
 config["regime_switch_control"] = st.sidebar.selectbox(
     "레짐 흔들림 방지(시간락 없음)",
@@ -20163,7 +20859,7 @@ config["export_excel_enable"] = st.sidebar.checkbox("Excel(xlsx) 저장", value=
 config["export_gsheet_enable"] = st.sidebar.checkbox("Google Sheets 저장", value=bool(config.get("export_gsheet_enable", True)))
 
 st.sidebar.divider()
-st.sidebar.subheader("📊 보조지표 (12종) ON/OFF")
+st.sidebar.subheader("📊 보조지표 (확장) ON/OFF")
 colA, colB = st.sidebar.columns(2)
 config["use_rsi"] = colA.checkbox("RSI", value=bool(config.get("use_rsi", True)))
 config["use_bb"] = colB.checkbox("볼린저", value=bool(config.get("use_bb", True)))
@@ -20177,6 +20873,15 @@ config["use_adx"] = colA.checkbox("ADX", value=bool(config.get("use_adx", True))
 config["use_vol"] = colB.checkbox("거래량", value=bool(config.get("use_vol", True)))
 config["use_sqz"] = colA.checkbox("SQZ(스퀴즈)", value=bool(config.get("use_sqz", True)))
 config["use_chart_patterns"] = colB.checkbox("차트패턴", value=bool(config.get("use_chart_patterns", True)))
+config["use_advanced_patterns"] = colA.checkbox("고급패턴(다이버전스/하모닉/캔들)", value=bool(config.get("use_advanced_patterns", True)))
+config["use_ichimoku"] = colB.checkbox("일목균형표", value=bool(config.get("use_ichimoku", True)))
+config["use_psar"] = colA.checkbox("Parabolic SAR", value=bool(config.get("use_psar", True)))
+config["use_vwap"] = colB.checkbox("VWAP", value=bool(config.get("use_vwap", True)))
+config["use_stochrsi"] = colA.checkbox("Stoch RSI", value=bool(config.get("use_stochrsi", True)))
+config["use_obv"] = colB.checkbox("OBV", value=bool(config.get("use_obv", True)))
+config["use_cmf"] = colA.checkbox("CMF", value=bool(config.get("use_cmf", True)))
+config["use_vwma"] = colB.checkbox("VWMA", value=bool(config.get("use_vwma", True)))
+config["use_keltner"] = colA.checkbox("Keltner", value=bool(config.get("use_keltner", True)))
 
 st.sidebar.divider()
 st.sidebar.subheader("지표 파라미터")
@@ -20239,6 +20944,10 @@ with st.sidebar.expander("⚡ 급등/급락 이벤트 진입"):
 with st.sidebar.expander("📐 차트 패턴 설정"):
     config["pattern_gate_entry"] = st.checkbox("패턴 반대면 진입 억제", value=bool(config.get("pattern_gate_entry", True)))
     config["pattern_override_ai"] = st.checkbox("강한 반대패턴이면 AI 신호 무시", value=bool(config.get("pattern_override_ai", True)))
+    pz1, pz2, pz3 = st.columns(3)
+    config["pattern_divergence_enable"] = pz1.checkbox("다이버전스", value=bool(config.get("pattern_divergence_enable", True)))
+    config["pattern_harmonic_enable"] = pz2.checkbox("하모닉", value=bool(config.get("pattern_harmonic_enable", True)))
+    config["pattern_candle_enable"] = pz3.checkbox("캔들패턴", value=bool(config.get("pattern_candle_enable", True)))
     c_pt1, c_pt2 = st.columns(2)
     config["pattern_lookback"] = c_pt1.number_input("탐지 봉 수", 80, 800, int(config.get("pattern_lookback", 220) or 220), step=20)
     config["pattern_pivot_order"] = c_pt2.number_input("피벗 민감도", 2, 12, int(config.get("pattern_pivot_order", 4) or 4), step=1)
@@ -20444,6 +21153,14 @@ with right:
                     "ADX": stt.get("ADX", "-"),
                     "거래량": stt.get("거래량", "-"),
                     "SQZ": stt.get("SQZ", "-"),
+                    "일목": stt.get("ICHI", "-"),
+                    "PSAR": stt.get("PSAR", "-"),
+                    "VWAP": stt.get("VWAP", "-"),
+                    "StochRSI": stt.get("STOCHRSI", "-"),
+                    "OBV": stt.get("OBV", "-"),
+                    "CMF": stt.get("CMF", "-"),
+                    "VWMA": stt.get("VWMA", "-"),
+                    "Keltner": stt.get("KC", "-"),
                     "차트패턴": stt.get("패턴", "-"),
                     "눌림목후보(해소)": "✅" if stt.get("_pullback_candidate") else "—",
                     "지표엔진": stt.get("_backend", "-"),
@@ -20733,9 +21450,25 @@ with t1:
                         stt["_ml_signals"] = dict(ml0) if isinstance(ml0, dict) else {}
                     except Exception:
                         pass
-                    ai = ai_decide_trade(df2, stt, symbol, config.get("trade_mode", "안전모드"), config, external=ext_now)
-                    # 스타일 힌트
                     htf_trend = get_htf_trend_cached(exchange, symbol, "1h", int(config.get("ma_fast", 7)), int(config.get("ma_slow", 99)), int(config.get("trend_filter_cache_sec", 60)))
+                    tr_s = str(stt.get("추세", "") or "")
+                    tr_l = str(htf_trend or "")
+                    if (("상승" in tr_s and "상승" in tr_l) or ("하락" in tr_s and "하락" in tr_l)):
+                        chart_style_hint = "스윙"
+                    elif (("상승" in tr_s and "하락" in tr_l) or ("하락" in tr_s and "상승" in tr_l)):
+                        chart_style_hint = "단타"
+                    else:
+                        chart_style_hint = "스캘핑"
+                    ai = ai_decide_trade(
+                        df2,
+                        stt,
+                        symbol,
+                        config.get("trade_mode", "안전모드"),
+                        config,
+                        external=ext_now,
+                        trend_long=str(htf_trend or ""),
+                        chart_style_hint=chart_style_hint,
+                    )
                     # 수동 분석에서도 스타일 힌트는 룰 기반만 사용(불필요한 추가 OpenAI 호출 방지)
                     style_info = _style_for_entry(symbol, ai.get("decision", "hold"), stt.get("추세", ""), htf_trend, config, allow_ai=False)
                     st.json({"ai": ai, "style": style_info, "htf_trend": htf_trend})
@@ -21083,7 +21816,7 @@ with t5:
     bt_tf = bt_col2.selectbox("타임프레임", ["1m", "3m", "5m", "15m", "1h"], index=["1m", "3m", "5m", "15m", "1h"].index(config.get("timeframe", "5m")))
     bt_n = bt_col3.number_input("최근 N봉", 200, 2000, 600, step=50)
 
-    bt_style = st.selectbox("전략 스타일", ["스캘핑", "스윙"], index=0)
+    bt_style = st.selectbox("전략 스타일", ["스캘핑", "단타", "스윙"], index=0)
     run_bt = st.button("▶️ 백테스트 실행")
 
     if run_bt:
@@ -21216,7 +21949,7 @@ st.caption("⚠️ 이 봇은 모의투자(IS_SANDBOX=True)에서 충분히 검�
 #   - 채널 사용 시 봇을 채널 관리자(게시 권한)로 추가해야 함.
 # - Telegram 명령이 동작하는가?
 #   - /status (누구나)
-#   - /positions /scan /mode auto|scalping|swing /log <id> (관리자: TG_ADMIN_USER_IDS 설정 시 제한)
+#   - /positions /scan /mode auto|scalping|daytrading|swing /log <id> (관리자: TG_ADMIN_USER_IDS 설정 시 제한)
 # - GSHEET_ENABLED="true"일 때 Google Sheets에 append_row가 동작하는가?
 #   - GSHEET_SERVICE_ACCOUNT_JSON 을 json.loads로 읽음
 #   - GSHEET_SPREADSHEET_ID / GSHEET_WORKSHEET 로 워크시트 열고 없으면 생성
