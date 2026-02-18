@@ -7891,7 +7891,7 @@ def render_plotly_candles(
         fig.update_traces(selector=dict(type="candlestick"), hoverlabel=dict(namelength=0))
         st.plotly_chart(
             fig,
-            use_container_width=True,
+            width="stretch",
             config={
                 "displaylogo": False,
                 "scrollZoom": True,
