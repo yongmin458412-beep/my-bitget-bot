@@ -35,6 +35,7 @@ import json
 import time
 import uuid
 import math
+import sqlite3
 import threading
 import traceback
 import socket
@@ -77,11 +78,12 @@ except Exception:
     orjson = None
 
 try:
-    from tenacity import retry, stop_after_attempt, wait_exponential_jitter
+    from tenacity import retry, stop_after_attempt, wait_exponential_jitter, retry_if_exception
 except Exception:
     retry = None
     stop_after_attempt = None
     wait_exponential_jitter = None
+    retry_if_exception = None
 
 try:
     from diskcache import Cache
@@ -129,6 +131,17 @@ try:
     from loguru import logger  # pip: loguru
 except Exception:
     logger = None
+
+try:
+    import plotly.graph_objects as go  # pip: plotly
+except Exception:
+    go = None
+
+try:
+    from discord_webhook import DiscordWebhook, DiscordEmbed  # pip: discord-webhook
+except Exception:
+    DiscordWebhook = None
+    DiscordEmbed = None
 
 try:
     import matplotlib
@@ -191,6 +204,7 @@ SETTINGS_FILE = "bot_settings.json"
 RUNTIME_FILE = "runtime_state.json"
 LOG_FILE = "trade_log.csv"
 MONITOR_FILE = "monitor_state.json"
+SQLITE_DB_FILE = "bot_data.db"
 
 DETAIL_DIR = "trade_details"
 DAILY_REPORT_DIR = "daily_reports"
@@ -208,6 +222,9 @@ TARGET_COINS = [
     "XRP/USDT:USDT",
     "DOGE/USDT:USDT",
 ]
+
+# 풀스펙트럼 분석 타임프레임(요구사항)
+FULL_SPECTRUM_TFS = ["1m", "5m", "15m", "1h", "4h", "1d"]
 
 # OpenAI 호출 타임아웃(초) - 스레드 멈춤 방지
 OPENAI_TIMEOUT_SEC = 20
@@ -583,6 +600,10 @@ MODE_RULES = {
     "안전모드": {"min_conf": 85, "entry_pct_min": 2, "entry_pct_max": 7, "lev_min": 2, "lev_max": 6},
     "공격모드": {"min_conf": 75, "entry_pct_min": 7, "entry_pct_max": 22, "lev_min": 4, "lev_max": 12},
     "하이리스크/하이리턴": {"min_conf": 72, "entry_pct_min": 18, "entry_pct_max": 40, "lev_min": 12, "lev_max": 25},
+    # Streamlit Cloud 단일 스크립트 운용에서도 선택 가능하도록 스타일 모드를 MODE_RULES에 추가(기존 구조 유지)
+    "스캘핑": {"min_conf": 68, "entry_pct_min": 3, "entry_pct_max": 16, "lev_min": 10, "lev_max": 30},
+    "단타": {"min_conf": 72, "entry_pct_min": 5, "entry_pct_max": 20, "lev_min": 5, "lev_max": 10},
+    "스윙": {"min_conf": 78, "entry_pct_min": 6, "entry_pct_max": 22, "lev_min": 1, "lev_max": 5},
 }
 
 # =========================================================
@@ -652,7 +673,7 @@ def style_rule(style: Any) -> Dict[str, Any]:
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 18,
+        "settings_schema_version": 19,
         "openai_api_key": "",
         "openai_model_trade": "gpt-4o-mini",
         "openai_model_style": "gpt-4o-mini",
@@ -666,6 +687,9 @@ def default_settings() -> Dict[str, Any]:
         # Telegram (기본 유지)
         "tg_enable_reports": True,  # 이벤트 알림(진입/청산 등)
         "tg_send_entry_reason": False,
+        # 알림 채널 선택: telegram | discord | both
+        "notification_channel": "telegram",
+        "discord_webhook_url": "",
         # ✅ 텔레그램 메시지 가독성(요구사항):
         # - 코인/선물 용어를 모르는 사람도 이해하도록 "쉬운 한글 + 핵심만" 모드(기본 ON)
         # - OFF면 기존(상세) 메시지를 유지
@@ -1787,6 +1811,18 @@ def load_settings() -> Dict[str, Any]:
                         changed = True
                 except Exception:
                     pass
+        # v19: Streamlit Cloud 싱글톤/알림 채널 선택/SQLite 상태저장 기본키 추가
+        if saved_ver < 19:
+            for k, v in {
+                "notification_channel": "telegram",
+                "discord_webhook_url": "",
+            }.items():
+                try:
+                    if k not in saved:
+                        cfg[k] = v
+                        changed = True
+                except Exception:
+                    pass
         cfg["settings_schema_version"] = base_ver
         if changed:
             try:
@@ -1801,6 +1837,264 @@ def save_settings(cfg: Dict[str, Any]) -> None:
 
 
 config = load_settings()
+
+
+# =========================================================
+# ✅ 로컬 DB(SQLite) - Streamlit Cloud 임시 고속 상태저장
+# - 영구 백업은 Google Sheets를 계속 사용
+# =========================================================
+_DB_SINGLETON: Optional["Database"] = None
+_DB_SINGLETON_LOCK = threading.RLock()
+
+
+class Database:
+    def __init__(self, db_path: str = SQLITE_DB_FILE):
+        self.db_path = str(db_path or SQLITE_DB_FILE)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA synchronous=NORMAL;")
+            self._conn.execute("PRAGMA temp_store=MEMORY;")
+        except Exception:
+            pass
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trade_journal (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  time_kst TEXT,
+                  coin TEXT,
+                  side TEXT,
+                  entry REAL,
+                  exit REAL,
+                  pnl_usdt REAL,
+                  pnl_percent REAL,
+                  balance_before_total REAL,
+                  balance_after_total REAL,
+                  balance_before_free REAL,
+                  balance_after_free REAL,
+                  reason TEXT,
+                  one_line TEXT,
+                  review TEXT,
+                  trade_id TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS event_log (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  time_kst TEXT,
+                  event_type TEXT,
+                  stage TEXT,
+                  symbol TEXT,
+                  trade_id TEXT,
+                  message TEXT,
+                  payload_json TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kv_state (
+                  k TEXT PRIMARY KEY,
+                  v TEXT
+                )
+                """
+            )
+            self._conn.commit()
+
+    def set_kv(self, key: str, value: Any) -> None:
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO kv_state(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                    (str(key or ""), safe_json_dumps(value)),
+                )
+                self._conn.commit()
+        except Exception:
+            pass
+
+    def get_kv(self, key: str, default: Any = None) -> Any:
+        try:
+            with self._lock:
+                cur = self._conn.execute("SELECT v FROM kv_state WHERE k=?", (str(key or ""),))
+                row = cur.fetchone()
+            if not row:
+                return default
+            try:
+                return json.loads(str(row[0] or ""))
+            except Exception:
+                return row[0]
+        except Exception:
+            return default
+
+    def write_trade_row(self, row_dict: Dict[str, Any]) -> None:
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    INSERT INTO trade_journal(
+                      time_kst, coin, side, entry, exit, pnl_usdt, pnl_percent,
+                      balance_before_total, balance_after_total, balance_before_free, balance_after_free,
+                      reason, one_line, review, trade_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(row_dict.get("Time", "")),
+                        str(row_dict.get("Coin", "")),
+                        str(row_dict.get("Side", "")),
+                        _to_float_or_none(row_dict.get("Entry")),
+                        _to_float_or_none(row_dict.get("Exit")),
+                        _to_float_or_none(row_dict.get("PnL_USDT")),
+                        _to_float_or_none(row_dict.get("PnL_Percent")),
+                        _to_float_or_none(row_dict.get("BalanceBefore_Total")),
+                        _to_float_or_none(row_dict.get("BalanceAfter_Total")),
+                        _to_float_or_none(row_dict.get("BalanceBefore_Free")),
+                        _to_float_or_none(row_dict.get("BalanceAfter_Free")),
+                        str(row_dict.get("Reason", "")),
+                        str(row_dict.get("OneLine", "")),
+                        str(row_dict.get("Review", "")),
+                        str(row_dict.get("TradeID", "")),
+                    ),
+                )
+                self._conn.commit()
+        except Exception:
+            pass
+
+    def write_event(
+        self,
+        event_type: str,
+        stage: str = "",
+        symbol: str = "",
+        trade_id: str = "",
+        message: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    INSERT INTO event_log(time_kst, event_type, stage, symbol, trade_id, message, payload_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        now_kst_str(),
+                        str(event_type or ""),
+                        str(stage or ""),
+                        str(symbol or ""),
+                        str(trade_id or ""),
+                        str(message or "")[:500],
+                        safe_json_dumps(payload or {}),
+                    ),
+                )
+                self._conn.commit()
+        except Exception:
+            pass
+
+    def bootstrap_from_gsheet(self, cfg: Optional[Dict[str, Any]] = None, max_rows: int = 500) -> Dict[str, Any]:
+        cfg = cfg or {}
+        out = {"ok": False, "rows": 0, "reason": ""}
+        try:
+            if not gsheet_is_enabled():
+                out["reason"] = "gsheet_disabled"
+                return out
+            sh = _gsheet_connect_spreadsheet()
+            if sh is None:
+                out["reason"] = "gsheet_connect_failed"
+                return out
+            sheets = _gsheet_prepare_trades_only_sheets(sh)
+            ws_trade = (sheets or {}).get("ws_trade")
+            if ws_trade is None:
+                out["reason"] = "ws_trade_missing"
+                return out
+
+            try:
+                vals = _call_with_timeout(lambda: ws_trade.get_all_values() or [], 15)  # type: ignore[name-defined]
+            except Exception:
+                vals = ws_trade.get_all_values() or []
+            if len(vals) <= 1:
+                out["reason"] = "no_rows"
+                out["ok"] = True
+                return out
+            header = [str(x or "").strip() for x in (vals[0] or [])]
+            body = vals[1:]
+            if len(body) > int(max_rows):
+                body = body[-int(max_rows):]
+            hidx = {h: i for i, h in enumerate(header)}
+
+            loaded = 0
+            for r in body:
+                def _v(k: str) -> Any:
+                    i = hidx.get(k, -1)
+                    if i < 0 or i >= len(r):
+                        return ""
+                    return r[i]
+
+                row_dict = {
+                    "Time": _v("시간") or _v("Time"),
+                    "Coin": _v("코인") or _v("Coin"),
+                    "Side": _v("방향") or _v("Side"),
+                    "Entry": _v("진입가") or _v("Entry"),
+                    "Exit": _v("청산가") or _v("Exit"),
+                    "PnL_USDT": _v("손익(USDT)") or _v("PnL_USDT"),
+                    "PnL_Percent": _v("수익률(%)") or _v("PnL_Percent"),
+                    "BalanceBefore_Total": _v("기존잔액(총)"),
+                    "BalanceAfter_Total": _v("청산후잔액(총)"),
+                    "BalanceBefore_Free": _v("기존잔액(가용)"),
+                    "BalanceAfter_Free": _v("청산후잔액(가용)"),
+                    "Reason": _v("사유") or _v("Reason"),
+                    "OneLine": _v("한줄평") or _v("OneLine"),
+                    "Review": _v("회고") or _v("Review"),
+                    "TradeID": _v("ID") or _v("TradeID"),
+                }
+                self.write_trade_row(row_dict)
+                loaded += 1
+
+            self.set_kv("boot.gsheet_last_sync_kst", now_kst_str())
+            self.set_kv("boot.gsheet_rows_loaded", loaded)
+            out["ok"] = True
+            out["rows"] = int(loaded)
+            out["reason"] = "loaded"
+            return out
+        except Exception as e:
+            out["reason"] = str(e)[:240]
+            return out
+
+    def latest_trade_rows(self, limit: int = 30) -> pd.DataFrame:
+        try:
+            with self._lock:
+                q = (
+                    "SELECT time_kst, coin, side, entry, exit, pnl_usdt, pnl_percent, reason, one_line, trade_id "
+                    "FROM trade_journal ORDER BY id DESC LIMIT ?"
+                )
+                df = pd.read_sql_query(q, self._conn, params=(int(max(1, limit)),))
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+
+def _to_float_or_none(v: Any) -> Optional[float]:
+    try:
+        s = str(v).strip()
+        if s == "":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+def get_local_db() -> Database:
+    global _DB_SINGLETON
+    with _DB_SINGLETON_LOCK:
+        if _DB_SINGLETON is None:
+            _DB_SINGLETON = Database(SQLITE_DB_FILE)
+        return _DB_SINGLETON
 
 
 # =========================================================
@@ -2253,6 +2547,12 @@ def log_trade(
             # 기존 파일 헤더와 컬럼 순서 맞춤(누락값은 공백)
             out = {c: row_dict.get(c, "") for c in cols}
             pd.DataFrame([out], columns=cols).to_csv(LOG_FILE, mode="a", header=False, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+    # SQLite 임시 저장(Cloud 재기동 전까지 빠른 조회/상태관리)
+    try:
+        get_local_db().write_trade_row(row_dict)
     except Exception:
         pass
 
@@ -5533,6 +5833,18 @@ def gsheet_enqueue(rec: Dict[str, Any]) -> None:
 
 
 def gsheet_log_trade(stage: str, symbol: str, trade_id: str = "", message: str = "", payload: Optional[Dict[str, Any]] = None):
+    # SQLite에는 항상 기록(고속 임시 상태 저장)
+    try:
+        get_local_db().write_event(
+            event_type="TRADE",
+            stage=str(stage or ""),
+            symbol=str(symbol or ""),
+            trade_id=str(trade_id or ""),
+            message=str(message or ""),
+            payload=payload or {},
+        )
+    except Exception:
+        pass
     # trades_only 모드: trade_log.csv 동기화 트리거만 수행(실제 append는 워커가 처리)
     if gsheet_mode() != "legacy":
         try:
@@ -5557,6 +5869,16 @@ def gsheet_log_trade(stage: str, symbol: str, trade_id: str = "", message: str =
 
 
 def gsheet_log_event(stage: str, message: str = "", payload: Optional[Dict[str, Any]] = None):
+    # SQLite에는 항상 기록(Cloud 재기동 전 임시 이벤트 버퍼)
+    try:
+        get_local_db().write_event(
+            event_type="EVENT",
+            stage=str(stage or ""),
+            message=str(message or ""),
+            payload=payload or {},
+        )
+    except Exception:
+        pass
     # trades_only 모드에서는 EVENT를 구글시트에 남기지 않음(사용자 요구)
     if gsheet_mode() != "legacy":
         return
@@ -5571,6 +5893,17 @@ def gsheet_log_event(stage: str, message: str = "", payload: Optional[Dict[str, 
 
 
 def gsheet_log_scan(stage: str, symbol: str, tf: str = "", signal: str = "", score: Any = "", message: str = "", payload: Optional[Dict[str, Any]] = None):
+    # SCAN도 SQLite에는 저장(구글시트는 정책상 생략 가능)
+    try:
+        get_local_db().write_event(
+            event_type="SCAN",
+            stage=str(stage or ""),
+            symbol=str(symbol or ""),
+            message=str(message or ""),
+            payload={"tf": tf, "signal": signal, "score": score, **(payload or {})},
+        )
+    except Exception:
+        pass
     # trades_only 모드에서는 SCAN을 구글시트에 남기지 않음(사용자 요구)
     if gsheet_mode() != "legacy":
         return
@@ -6286,6 +6619,25 @@ def safe_fetch_ohlcv(ex, sym: str, tf: str, limit: int = 220) -> Optional[List[L
         return None
 
 
+def safe_fetch_order_book(ex, sym: str, limit: int = 20) -> Optional[Dict[str, Any]]:
+    try:
+        lim = int(max(5, min(200, int(limit or 20))))
+        return _ccxt_call_with_timeout(
+            lambda: ex.fetch_order_book(sym, limit=lim),
+            CCXT_TIMEOUT_SEC_PUBLIC,
+            where="fetch_order_book",
+        )
+    except FuturesTimeoutError:
+        try:
+            setattr(ex, "_wonyoti_ccxt_timeout_epoch", time.time())
+            setattr(ex, "_wonyoti_ccxt_timeout_where", "fetch_order_book")
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+
+
 def clamp(v, lo, hi):
     try:
         return max(lo, min(hi, v))
@@ -6392,25 +6744,65 @@ def set_margin_mode_safe(ex, sym: str, mode: str) -> None:
         pass
 
 
-def market_order_safe(ex, sym: str, side: str, qty: float, params: Optional[Dict[str, Any]] = None) -> bool:
+def _is_retryable_trade_error(e: Exception) -> bool:
     try:
-        params = params or {}
-        q = to_precision_qty(ex, sym, float(qty or 0.0))
-        if q <= 0:
-            return False
-        # create_market_order는 거래소/ccxt 버전에 따라 params 지원이 다를 수 있어 표준 create_order로 호출
-        _ccxt_call_with_timeout(
-            lambda: ex.create_order(sym, "market", side, q, None, params),
-            CCXT_TIMEOUT_SEC_PRIVATE,
-            where="create_market_order",
-            context={"symbol": sym, "side": side, "qty": q, "params": params},
-        )
-        return True
+        if isinstance(
+            e,
+            (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectTimeout,
+            ),
+        ):
+            return True
     except Exception:
-        return False
+        pass
+    try:
+        retryable_ccxt = (
+            ccxt.NetworkError,
+            ccxt.RequestTimeout,
+            ccxt.ExchangeNotAvailable,
+            ccxt.DDoSProtection,
+            ccxt.RateLimitExceeded,
+        )
+        if isinstance(e, retryable_ccxt):
+            return True
+    except Exception:
+        pass
+    msg = str(e or "").lower()
+    if any(x in msg for x in ["timeout", "temporar", "network", "connection", "reset", "rate limit", "429", "503"]):
+        return True
+    return False
 
 
-def market_order_safe_ex(ex, sym: str, side: str, qty: float, params: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+def _run_trade_call_with_retry(fn, *, attempts: int = 3):
+    n = int(max(1, attempts))
+    if retry is not None and stop_after_attempt is not None and wait_exponential_jitter is not None and retry_if_exception is not None:
+        @retry(
+            stop=stop_after_attempt(n),
+            wait=wait_exponential_jitter(initial=0.35, max=1.8),
+            retry=retry_if_exception(_is_retryable_trade_error),
+            reraise=True,
+        )
+        def _do():
+            return fn()
+        return _do()
+    last: Optional[Exception] = None
+    for i in range(n):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if (not _is_retryable_trade_error(e)) or i >= (n - 1):
+                raise
+            time.sleep(0.2 * (i + 1))
+    if last is not None:
+        raise last
+    return fn()
+
+
+def _create_market_order_raw(ex, sym: str, side: str, qty: float, params: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
     try:
         params = params or {}
         q = to_precision_qty(ex, sym, float(qty or 0.0))
@@ -6425,6 +6817,161 @@ def market_order_safe_ex(ex, sym: str, side: str, qty: float, params: Optional[D
         return True, ""
     except Exception as e:
         return False, str(e)
+
+
+def smart_order_safe_ex(
+    ex,
+    sym: str,
+    side: str,
+    qty: float,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    prefer_limit: bool = True,
+    limit_timeout_sec: float = 5.0,
+) -> Tuple[bool, str]:
+    params = params or {}
+    try:
+        q = to_precision_qty(ex, sym, float(qty or 0.0))
+    except Exception:
+        q = float(qty or 0.0)
+    if q <= 0:
+        return False, "qty<=0"
+
+    if not bool(prefer_limit):
+        return _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+
+    order_id = ""
+    try:
+        ob = safe_fetch_order_book(ex, sym, limit=5)
+        best_bid = None
+        best_ask = None
+        try:
+            bids = (ob or {}).get("bids") or []
+            asks = (ob or {}).get("asks") or []
+            if bids:
+                best_bid = float((bids[0] or [0, 0])[0] or 0.0)
+            if asks:
+                best_ask = float((asks[0] or [0, 0])[0] or 0.0)
+        except Exception:
+            best_bid = None
+            best_ask = None
+
+        if str(side).lower() == "buy":
+            limit_px = float(best_bid or 0.0)
+            if limit_px <= 0 and best_ask:
+                limit_px = float(best_ask) * 0.9995
+        else:
+            limit_px = float(best_ask or 0.0)
+            if limit_px <= 0 and best_bid:
+                limit_px = float(best_bid) * 1.0005
+
+        if limit_px <= 0:
+            t = _ccxt_call_with_timeout(
+                lambda: ex.fetch_ticker(sym),
+                CCXT_TIMEOUT_SEC_PUBLIC,
+                where="fetch_ticker_smart_order",
+                context={"symbol": sym},
+            )
+            last_px = float((t or {}).get("last") or 0.0)
+            if last_px <= 0:
+                return _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+            limit_px = float(last_px * (0.9995 if str(side).lower() == "buy" else 1.0005))
+
+        try:
+            limit_px = float(ex.price_to_precision(sym, limit_px))
+        except Exception:
+            pass
+
+        params_limit = dict(params or {})
+        params_limit.setdefault("postOnly", True)
+        if "timeInForce" not in params_limit:
+            params_limit["timeInForce"] = "PO"
+
+        try:
+            od = _run_trade_call_with_retry(
+                lambda: _ccxt_call_with_timeout(
+                    lambda: ex.create_order(sym, "limit", side, q, limit_px, params_limit),
+                    CCXT_TIMEOUT_SEC_PRIVATE,
+                    where="create_limit_postonly_smart",
+                    context={"symbol": sym, "side": side, "qty": q, "price": limit_px, "postOnly": True},
+                ),
+                attempts=3,
+            )
+        except Exception as e_po:
+            msg_po = str(e_po or "").lower()
+            if any(x in msg_po for x in ["post only", "postonly", "timeinforce", "invalid"]):
+                od = _run_trade_call_with_retry(
+                    lambda: _ccxt_call_with_timeout(
+                        lambda: ex.create_order(sym, "limit", side, q, limit_px, dict(params or {})),
+                        CCXT_TIMEOUT_SEC_PRIVATE,
+                        where="create_limit_smart",
+                        context={"symbol": sym, "side": side, "qty": q, "price": limit_px},
+                    ),
+                    attempts=3,
+                )
+            else:
+                raise
+
+        order_id = str((od or {}).get("id") or "")
+        if not order_id:
+            return _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+
+        started = time.time()
+        while (time.time() - started) < float(max(2.0, limit_timeout_sec)):
+            try:
+                fo = _run_trade_call_with_retry(
+                    lambda: _ccxt_call_with_timeout(
+                        lambda: ex.fetch_order(order_id, sym),
+                        CCXT_TIMEOUT_SEC_PRIVATE,
+                        where="fetch_order_smart",
+                        context={"symbol": sym, "order_id": order_id},
+                    ),
+                    attempts=2,
+                )
+                stt = str((fo or {}).get("status") or "").lower()
+                remaining = float((fo or {}).get("remaining") or 0.0)
+                filled = float((fo or {}).get("filled") or 0.0)
+                if stt in ["closed", "filled"] or (remaining <= 0 and filled > 0):
+                    return True, ""
+            except Exception:
+                pass
+            time.sleep(0.75)
+
+        try:
+            _run_trade_call_with_retry(
+                lambda: _ccxt_call_with_timeout(
+                    lambda: ex.cancel_order(order_id, sym),
+                    CCXT_TIMEOUT_SEC_PRIVATE,
+                    where="cancel_order_smart",
+                    context={"symbol": sym, "order_id": order_id},
+                ),
+                attempts=2,
+            )
+        except Exception:
+            pass
+        return _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+    except Exception as e:
+        ok_m, err_m = _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+        if ok_m:
+            return True, ""
+        return False, (str(e) or err_m or "smart_order_failed")
+
+
+def market_order_safe(ex, sym: str, side: str, qty: float, params: Optional[Dict[str, Any]] = None, *, prefer_limit: bool = True) -> bool:
+    ok, _err = smart_order_safe_ex(ex, sym, side, qty, params=params, prefer_limit=prefer_limit, limit_timeout_sec=5.0)
+    return bool(ok)
+
+
+def market_order_safe_ex(
+    ex,
+    sym: str,
+    side: str,
+    qty: float,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    prefer_limit: bool = True,
+) -> Tuple[bool, str]:
+    return smart_order_safe_ex(ex, sym, side, qty, params=params, prefer_limit=prefer_limit, limit_timeout_sec=5.0)
 
 
 def close_position_market(ex, sym: str, pos_side: str, contracts: float) -> bool:
@@ -6470,7 +7017,7 @@ def close_position_market_ex(ex, sym: str, pos_side: str, contracts: float) -> T
 
     last_err = ""
     for params in params_try:
-        ok, err = market_order_safe_ex(ex, sym, side, qty, params=params)
+        ok, err = market_order_safe_ex(ex, sym, side, qty, params=params, prefer_limit=False)
         if ok:
             return True, ""
         last_err = err or last_err
@@ -7193,6 +7740,167 @@ def render_tradingview(symbol_ccxt: str, interval: str = "5", height: int = 560)
     </div>
     """
     components.html(html, height=height)
+
+
+def _parse_dt_any(v: Any):
+    try:
+        dt = pd.to_datetime(v, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt
+    except Exception:
+        return None
+
+
+def _trade_markers_for_symbol(symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    try:
+        df_log = read_trade_log()
+        if df_log.empty:
+            return rows
+        if "Coin" in df_log.columns:
+            df_log = df_log[df_log["Coin"].astype(str) == str(symbol)]
+        if df_log.empty:
+            return rows
+        if "Time" in df_log.columns:
+            df_log = df_log.sort_values("Time", ascending=False)
+
+        for _, r in df_log.head(int(max(1, limit))).iterrows():
+            side_raw = str(r.get("Side", "") or "").lower().strip()
+            side_norm = "long" if side_raw in ["buy", "long"] else ("short" if side_raw in ["sell", "short"] else side_raw)
+            pnl_pct = _as_float(r.get("PnL_Percent", 0.0), 0.0)
+            trade_id = str(r.get("TradeID", "") or "").strip()
+
+            entry_time = None
+            exit_time = _parse_dt_any(r.get("Time"))
+            entry_price = _as_float(r.get("Entry", 0.0), 0.0)
+            exit_price = _as_float(r.get("Exit", 0.0), 0.0)
+
+            if trade_id:
+                d = load_trade_detail(trade_id) or {}
+                if d:
+                    entry_time = _parse_dt_any(d.get("time") or d.get("entry_time"))
+                    exit_time = _parse_dt_any(d.get("exit_time")) or exit_time
+                    entry_price = _as_float(d.get("entry_price", entry_price), entry_price)
+                    exit_price = _as_float(d.get("exit_price", exit_price), exit_price)
+
+            if (entry_time is not None) and (entry_price > 0):
+                rows.append(
+                    {
+                        "time": entry_time,
+                        "price": float(entry_price),
+                        "type": "entry",
+                        "side": side_norm,
+                        "pnl_pct": float(pnl_pct),
+                        "trade_id": trade_id,
+                    }
+                )
+            if (exit_time is not None) and (exit_price > 0):
+                rows.append(
+                    {
+                        "time": exit_time,
+                        "price": float(exit_price),
+                        "type": "exit",
+                        "side": side_norm,
+                        "pnl_pct": float(pnl_pct),
+                        "trade_id": trade_id,
+                    }
+                )
+    except Exception:
+        return []
+    return rows
+
+
+def render_plotly_candles(
+    ex,
+    symbol: str,
+    timeframe: str = "5m",
+    *,
+    height: int = 560,
+    limit: int = 260,
+    marker_limit: int = 60,
+) -> bool:
+    if go is None:
+        return False
+    try:
+        ohlcv = safe_fetch_ohlcv(ex, symbol, str(timeframe or "5m"), limit=int(max(80, limit)))
+        if not ohlcv:
+            return False
+        df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
+        if df.empty:
+            return False
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+
+        fig = go.Figure(
+            data=[
+                go.Candlestick(
+                    x=df["time"],
+                    open=df["open"],
+                    high=df["high"],
+                    low=df["low"],
+                    close=df["close"],
+                    name=symbol,
+                    increasing_line_color="#00d084",
+                    decreasing_line_color="#ff4d4f",
+                    whiskerwidth=0.6,
+                )
+            ]
+        )
+
+        markers = _trade_markers_for_symbol(symbol, limit=int(max(10, marker_limit)))
+        if markers:
+            mdf = pd.DataFrame(markers)
+            mdf["time"] = pd.to_datetime(mdf["time"], errors="coerce")
+            mdf = mdf.dropna(subset=["time"])
+            if not mdf.empty:
+                mdf = mdf.sort_values("time")
+                long_entry = mdf[(mdf["type"] == "entry") & (mdf["side"] == "long")]
+                short_entry = mdf[(mdf["type"] == "entry") & (mdf["side"] == "short")]
+                take_exit = mdf[(mdf["type"] == "exit") & (mdf["pnl_pct"] >= 0)]
+                stop_exit = mdf[(mdf["type"] == "exit") & (mdf["pnl_pct"] < 0)]
+
+                def _add_trace(sub_df: pd.DataFrame, name: str, marker_symbol: str, color: str):
+                    if sub_df is None or sub_df.empty:
+                        return
+                    fig.add_trace(
+                        go.Scatter(
+                            x=sub_df["time"],
+                            y=sub_df["price"],
+                            mode="markers",
+                            name=name,
+                            marker=dict(size=10, color=color, symbol=marker_symbol, line=dict(width=1, color="#ffffff")),
+                            hovertemplate="%{x}<br>%{y:.6f}<extra>" + name + "</extra>",
+                        )
+                    )
+
+                _add_trace(long_entry, "Entry Long", "triangle-up", "#39d98a")
+                _add_trace(short_entry, "Entry Short", "triangle-down", "#ff6b6b")
+                _add_trace(take_exit, "Exit Profit", "circle", "#00e5ff")
+                _add_trace(stop_exit, "Exit Loss", "x", "#ff3b30")
+
+        fig.update_layout(
+            template="plotly_dark",
+            height=int(max(360, height)),
+            margin=dict(l=10, r=10, t=36, b=10),
+            xaxis=dict(title="", rangeslider=dict(visible=False), showspikes=True, spikemode="across"),
+            yaxis=dict(title="Price"),
+            hovermode="x unified",
+            dragmode="pan",
+            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+        )
+        fig.update_traces(selector=dict(type="candlestick"), hoverlabel=dict(namelength=0))
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+                "scrollZoom": True,
+                "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+            },
+        )
+        return True
+    except Exception:
+        return False
 
 
 # =========================================================
@@ -8734,6 +9442,275 @@ def current_volume_ratio(df: pd.DataFrame, period: int = 20) -> float:
         return 0.0
 
 
+def orderbook_pressure_summary(order_book: Optional[Dict[str, Any]], depth: int = 20) -> Dict[str, Any]:
+    out = {
+        "available": False,
+        "depth": int(depth),
+        "best_bid": None,
+        "best_ask": None,
+        "spread_pct": 0.0,
+        "bid_volume": 0.0,
+        "ask_volume": 0.0,
+        "imbalance": 0.0,
+        "pressure_side": "neutral",
+        "pressure_score": 0.0,
+        "buy_wall": False,
+        "sell_wall": False,
+        "reason": "",
+    }
+    try:
+        if not isinstance(order_book, dict):
+            return out
+        bids = order_book.get("bids") or []
+        asks = order_book.get("asks") or []
+        if (not isinstance(bids, list)) or (not isinstance(asks, list)) or (not bids) or (not asks):
+            return out
+        n = int(max(5, min(100, int(depth or 20))))
+        b = bids[:n]
+        a = asks[:n]
+        best_bid = float((b[0] or [0, 0])[0] or 0.0)
+        best_ask = float((a[0] or [0, 0])[0] or 0.0)
+        bid_vol = float(sum(float((x or [0, 0])[1] or 0.0) for x in b))
+        ask_vol = float(sum(float((x or [0, 0])[1] or 0.0) for x in a))
+        denom = bid_vol + ask_vol
+        imbalance = float((bid_vol - ask_vol) / denom) if denom > 0 else 0.0
+        mid = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else 0.0
+        spread_pct = float(((best_ask - best_bid) / mid) * 100.0) if mid > 0 else 0.0
+
+        bid_sizes = [float((x or [0, 0])[1] or 0.0) for x in b]
+        ask_sizes = [float((x or [0, 0])[1] or 0.0) for x in a]
+        avg_bid = float(np.mean(bid_sizes)) if bid_sizes else 0.0
+        avg_ask = float(np.mean(ask_sizes)) if ask_sizes else 0.0
+        buy_wall = bool(max(bid_sizes) >= avg_bid * 2.5) if avg_bid > 0 else False
+        sell_wall = bool(max(ask_sizes) >= avg_ask * 2.5) if avg_ask > 0 else False
+
+        side = "neutral"
+        if imbalance >= 0.12:
+            side = "buy"
+        elif imbalance <= -0.12:
+            side = "sell"
+        score = float(clamp((abs(imbalance) * 100.0) + (8.0 if (buy_wall or sell_wall) else 0.0) - (spread_pct * 50.0), 0.0, 100.0))
+        reason = f"imbalance {imbalance:+.2f}, spread {spread_pct:.3f}%"
+        if buy_wall:
+            reason += ", buy_wall"
+        if sell_wall:
+            reason += ", sell_wall"
+        out.update(
+            {
+                "available": True,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread_pct": spread_pct,
+                "bid_volume": bid_vol,
+                "ask_volume": ask_vol,
+                "imbalance": imbalance,
+                "pressure_side": side,
+                "pressure_score": score,
+                "buy_wall": buy_wall,
+                "sell_wall": sell_wall,
+                "reason": reason,
+            }
+        )
+        return out
+    except Exception:
+        return out
+
+
+def _trend_dir_from_text(txt: str) -> int:
+    s = str(txt or "")
+    if "상승" in s:
+        return 1
+    if "하락" in s:
+        return -1
+    return 0
+
+
+def build_full_spectrum_context(
+    ex,
+    symbol: str,
+    cfg: Dict[str, Any],
+    *,
+    base_tf: str = "",
+    base_df: Optional[pd.DataFrame] = None,
+    base_status: Optional[Dict[str, Any]] = None,
+    base_last: Optional[pd.Series] = None,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "symbol": symbol,
+        "tfs": list(FULL_SPECTRUM_TFS),
+        "timeframes": {},
+        "collected_kst": now_kst_str(),
+        "style_auto": "스캘핑",
+        "style_reason": "",
+        "market_regime": "unknown",
+        "scores": {"range": 0.0, "breakout": 0.0, "trend": 0.0},
+    }
+    try:
+        tf_limits = {"1m": 240, "5m": 240, "15m": 240, "1h": 260, "4h": 260, "1d": 260}
+        data_by_tf: Dict[str, Dict[str, Any]] = {}
+        for tf in FULL_SPECTRUM_TFS:
+            try:
+                if tf == str(base_tf or "") and base_df is not None and base_status is not None and base_last is not None:
+                    df2 = base_df
+                    st2 = dict(base_status or {})
+                    last2 = base_last
+                else:
+                    raw = safe_fetch_ohlcv(ex, symbol, tf, limit=int(tf_limits.get(tf, 220)))
+                    if not raw:
+                        continue
+                    dfx = pd.DataFrame(raw, columns=["time", "open", "high", "low", "close", "vol"])
+                    dfx["time"] = pd.to_datetime(dfx["time"], unit="ms")
+                    df2, st2, last2 = calc_indicators(dfx, cfg)
+                    if last2 is None:
+                        continue
+
+                close_now = float(last2.get("close", 0.0))
+                rsi_now = float(last2.get("RSI", 50.0)) if "RSI" in df2.columns else 50.0
+                adx_now = float(last2.get("ADX", 0.0)) if "ADX" in df2.columns else 0.0
+                atr_pct = float(_atr_price_pct(df2, 14))
+                sqz_bias = int(st2.get("_sqz_bias", 0) or 0)
+                sqz_mom = float(st2.get("_sqz_mom_pct", 0.0) or 0.0)
+                vol_ratio = float(current_volume_ratio(df2, period=int(cfg.get("ai_call_volume_spike_period", 20) or 20)))
+                pat_bias = int(st2.get("_pattern_bias", 0) or 0)
+                pat_str = float(st2.get("_pattern_strength", 0.0) or 0.0)
+                trend_txt = str(st2.get("추세", "") or "")
+
+                br_up = False
+                br_dn = False
+                try:
+                    if len(df2) >= 22:
+                        hi_n = float(pd.to_numeric(df2["high"], errors="coerce").tail(20).max())
+                        lo_n = float(pd.to_numeric(df2["low"], errors="coerce").tail(20).min())
+                        if hi_n > 0 and lo_n > 0:
+                            br_up = close_now >= (hi_n * 0.999)
+                            br_dn = close_now <= (lo_n * 1.001)
+                except Exception:
+                    br_up = False
+                    br_dn = False
+
+                data_by_tf[tf] = {
+                    "close": close_now,
+                    "trend": trend_txt,
+                    "trend_dir": _trend_dir_from_text(trend_txt),
+                    "rsi": rsi_now,
+                    "adx": adx_now,
+                    "atr_pct": atr_pct,
+                    "sqz_bias": sqz_bias,
+                    "sqz_mom_pct": sqz_mom,
+                    "vol_ratio": vol_ratio,
+                    "pattern_bias": pat_bias,
+                    "pattern_strength": pat_str,
+                    "breakout_up": bool(br_up),
+                    "breakout_down": bool(br_dn),
+                }
+            except Exception:
+                continue
+        out["timeframes"] = data_by_tf
+        return out
+    except Exception:
+        return out
+
+
+def choose_dynamic_style(
+    spectrum: Dict[str, Any],
+    orderbook_ctx: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    res = {
+        "style": "스캘핑",
+        "market_regime": "ranging",
+        "reason": "기본 스캘핑",
+        "scores": {"range": 0.0, "breakout": 0.0, "trend": 0.0},
+    }
+    try:
+        tfm = (spectrum or {}).get("timeframes", {}) if isinstance(spectrum, dict) else {}
+        t1 = tfm.get("1m", {}) if isinstance(tfm, dict) else {}
+        t5 = tfm.get("5m", {}) if isinstance(tfm, dict) else {}
+        t15 = tfm.get("15m", {}) if isinstance(tfm, dict) else {}
+        t1h = tfm.get("1h", {}) if isinstance(tfm, dict) else {}
+        t4h = tfm.get("4h", {}) if isinstance(tfm, dict) else {}
+        t1d = tfm.get("1d", {}) if isinstance(tfm, dict) else {}
+
+        def _g(d: Dict[str, Any], k: str, dv: float = 0.0) -> float:
+            try:
+                return float(d.get(k, dv) or dv)
+            except Exception:
+                return float(dv)
+
+        adx15 = _g(t15, "adx")
+        adx1h = _g(t1h, "adx")
+        adx4h = _g(t4h, "adx")
+        adx1d = _g(t1d, "adx")
+        atr15 = _g(t15, "atr_pct")
+        atr1h = _g(t1h, "atr_pct")
+        sqz5 = _g(t5, "sqz_mom_pct")
+        sqz15 = _g(t15, "sqz_mom_pct")
+        vol15 = _g(t15, "vol_ratio", 1.0)
+        vol1h = _g(t1h, "vol_ratio", 1.0)
+        tr4h = int(t4h.get("trend_dir", 0) or 0)
+        tr1d = int(t1d.get("trend_dir", 0) or 0)
+        tr1h = int(t1h.get("trend_dir", 0) or 0)
+
+        ob = orderbook_ctx or {}
+        ob_imb = float(ob.get("imbalance", 0.0) or 0.0)
+        ob_score = float(ob.get("pressure_score", 0.0) or 0.0)
+
+        range_score = 0.0
+        if adx15 > 0 and adx1h > 0 and adx15 < 18 and adx1h < 20:
+            range_score += 0.45
+        if max(atr15, atr1h) > 0 and max(atr15, atr1h) < 0.65:
+            range_score += 0.30
+        if abs(sqz5) < 0.08 and abs(sqz15) < 0.10:
+            range_score += 0.15
+        if abs(ob_imb) >= 0.12 and ob_score >= 18:
+            range_score += 0.10
+
+        breakout_score = 0.0
+        if bool(t15.get("breakout_up", False) or t15.get("breakout_down", False) or t1h.get("breakout_up", False) or t1h.get("breakout_down", False)):
+            breakout_score += 0.35
+        if abs(sqz15) >= 0.12 or abs(sqz5) >= 0.10:
+            breakout_score += 0.25
+        if max(vol15, vol1h) >= 1.35:
+            breakout_score += 0.20
+        if abs(ob_imb) >= 0.18 and ob_score >= 25:
+            breakout_score += 0.20
+
+        trend_score = 0.0
+        if tr4h != 0 and tr4h == tr1d:
+            trend_score += 0.50
+        if tr1h != 0 and tr1h == tr4h:
+            trend_score += 0.20
+        if min(adx4h, adx1d) >= 20:
+            trend_score += 0.30
+
+        range_score = float(clamp(range_score, 0.0, 1.0))
+        breakout_score = float(clamp(breakout_score, 0.0, 1.0))
+        trend_score = float(clamp(trend_score, 0.0, 1.0))
+
+        style = "스캘핑"
+        regime = "ranging"
+        reason = "횡보/저변동성 구간 → 스캘핑(1m/5m 반전 + 오더북 압력)"
+        if trend_score >= 0.62:
+            style = "스윙"
+            regime = "trend"
+            reason = "강한 추세 정렬(4h/1d) 확인 → 스윙 추세추종"
+        elif breakout_score >= 0.52:
+            style = "단타"
+            regime = "breakout"
+            reason = "변동성 확장/브레이크아웃 징후 → 단타(15m/1h 패턴)"
+
+        res.update(
+            {
+                "style": style,
+                "market_regime": regime,
+                "reason": reason,
+                "scores": {"range": range_score, "breakout": breakout_score, "trend": trend_score},
+            }
+        )
+        return res
+    except Exception:
+        return res
+
+
 def detect_event_entry_setup(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
     out = {
         "triggered": False,
@@ -10067,6 +11044,8 @@ def ai_decide_trade(
     trend_long: str = "",
     sr_context: Optional[Dict[str, Any]] = None,
     chart_style_hint: str = "",
+    mtf_context: Optional[Dict[str, Any]] = None,
+    orderbook_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     ✅ 기존 기능 유지: AI가 buy/sell/hold + entry/leverage/sl/tp/rr/근거(JSON)
@@ -10148,6 +11127,8 @@ def ai_decide_trade(
         },
         "chart_patterns_mtf": status.get("_pattern_mtf", {}) if isinstance(status.get("_pattern_mtf", {}), dict) else {},
         "ml_signals": status.get("_ml_signals", {}) if isinstance(status.get("_ml_signals", {}), dict) else {},
+        "full_spectrum": mtf_context if isinstance(mtf_context, dict) else {},
+        "order_book_l2": orderbook_context if isinstance(orderbook_context, dict) else {},
         "sr_context": sr_context or {},
         "chart_style_hint": str(chart_style_hint or ""),
         "external": (
@@ -10247,19 +11228,24 @@ def ai_decide_trade(
 				   - 거래량: OBV, CMF, VWMA
 				   - 변동성: ATR, Keltner, Bollinger
 				5) chart_patterns + chart_patterns_mtf + divergences/harmonics/candles를 함께 판단한다.
-				6) ml_signals.dir을 우선 따른다.
-				   - ml_signals.dir이 "buy"면 buy/hold만 허용
-				   - ml_signals.dir이 "sell"면 sell/hold만 허용
-				   - ml_signals.dir이 "hold"면 hold 우선
-				7) style_hint 기준 가중치:
-				   - 스캘핑: 1m/5m, SQZ·VWAP·OBV·캔들패턴 가중치↑, 장기지표 영향↓
-				   - 단타: 15m/1h, 추세+모멘텀 균형, 다이버전스 확인
-				   - 스윙: 4h/1d, Ichimoku·ADX·하모닉·MTF 패턴 가중치↑
-				8) 모드 규칙 반드시 준수:
-				   - 최소 확신도: {rule["min_conf"]}
-				   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
-				   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
-			{soft_entry_hint}
+					6) ml_signals.dir을 우선 따른다.
+					   - ml_signals.dir이 "buy"면 buy/hold만 허용
+					   - ml_signals.dir이 "sell"면 sell/hold만 허용
+					   - ml_signals.dir이 "hold"면 hold 우선
+					7) full_spectrum(1m/5m/15m/1h/4h/1d)와 order_book_l2를 함께 보고 스타일을 동적으로 해석:
+					   - 횡보/저변동성: 스캘핑 우선 (1m/5m 반전 + 오더북 압력)
+					   - 변동성 확대/브레이크아웃: 단타 우선 (15m/1h 패턴/다이버전스)
+					   - 강한 추세 정렬: 스윙 우선 (4h/1d 추세 추종)
+					   - 장기추세가 애매해도 바로 hold하지 말고, 1m/5m + 오더북 기반 단기 기회를 먼저 탐색
+					8) style_hint 기준 가중치:
+					   - 스캘핑: 1m/5m, SQZ·VWAP·OBV·캔들패턴 가중치↑, 장기지표 영향↓
+					   - 단타: 15m/1h, 추세+모멘텀 균형, 다이버전스 확인
+					   - 스윙: 4h/1d, Ichimoku·ADX·하모닉·MTF 패턴 가중치↑
+					9) 모드 규칙 반드시 준수:
+					   - 최소 확신도: {rule["min_conf"]}
+					   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
+					   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
+				{soft_entry_hint}
 
 	[중요]
 	- sl_pct / tp_pct는 ROI%(레버 반영 수익률)로 출력한다.
@@ -10273,6 +11259,9 @@ def ai_decide_trade(
 - 이 시스템은 손실 확대/과매매가 감지되면 자동매매를 강제 종료한다.
 - 영어 금지. 쉬운 한글.
 - 반드시 JSON만 출력.
+- reason_easy는 반드시 구체적으로 작성:
+  "{{패턴/셋업}} + {{지표 시그널}} on {{타임프레임}}" 형식
+  예) "1m W패턴 + 오더북 매수우위 on 1m/5m"
 - 하이리스크/하이리턴 모드: 추세가 있으면 적극적으로 진입해라. 과도한 hold는 기회 손실이다.
 - 안전모드: 확신이 애매하면 'hold'를 선택해라. (무리한 진입 금지)
 """
@@ -10290,12 +11279,12 @@ JSON 형식:
   "sl_pct": 0.3-50.0,
   "tp_pct": 0.5-150.0,
   "rr": 0.5-10.0,
-  "sl_price": number|null,
-  "tp_price": number|null,
-  "used_indicators": ["..."],
-  "reason_easy": "쉬운 한글"
-}}
-"""
+	  "sl_price": number|null,
+	  "tp_price": number|null,
+	  "used_indicators": ["..."],
+	  "reason_easy": "{{패턴/셋업}} + {{지표 시그널}} on {{타임프레임}}"
+	}}
+	"""
     try:
         # 모델 fallback (gpt-4o 미지원 계정/환경 대응)
         models = [
@@ -10375,7 +11364,32 @@ JSON 형식:
             used = status.get("_used_indicators", [])
         out["used_indicators"] = used
 
-        out["reason_easy"] = str(out.get("reason_easy", ""))[:500]
+        reason_txt = str(out.get("reason_easy", "") or "").strip()
+        # 너무 추상적인 사유는 포맷을 강제해 가독성 개선
+        try:
+            too_generic = (
+                (len(reason_txt) < 8)
+                or ("좋은" in reason_txt and "on " not in reason_txt and "패턴" not in reason_txt)
+                or ("조건" in reason_txt and "타임프레임" not in reason_txt and "on " not in reason_txt)
+            )
+            if too_generic:
+                pat_txt = str(((features.get("chart_patterns") or {}).get("summary") or "셋업 없음")).split("|")[0].strip()
+                ml_dir = str((features.get("ml_signals") or {}).get("dir", "hold") or "hold")
+                ob_side = str((features.get("order_book_l2") or {}).get("pressure_side", "neutral") or "neutral")
+                tf_txt = str(features.get("timeframe", "5m"))
+                sig_txt = "SQZ/ML 중립"
+                if ml_dir == "buy":
+                    sig_txt = "ML 롱 우위"
+                elif ml_dir == "sell":
+                    sig_txt = "ML 숏 우위"
+                if ob_side == "buy":
+                    sig_txt += " + 오더북 매수우위"
+                elif ob_side == "sell":
+                    sig_txt += " + 오더북 매도우위"
+                reason_txt = f"{pat_txt} + {sig_txt} on {tf_txt}"
+        except Exception:
+            pass
+        out["reason_easy"] = reason_txt[:500]
 
         # ✅ 이전에는 min_conf 미만이면 강제로 hold로 바꿨지만,
         # 사용자는 "조건이 애매해도 소액/보수적으로 진입"을 원하므로 여기서는 decision을 유지한다.
@@ -10896,6 +11910,161 @@ def mon_recent_events(mon: Dict[str, Any], within_min: int = 15) -> List[Dict[st
 
 
 # =========================================================
+# ✅ Notifier (Telegram / Discord / Both)
+# =========================================================
+def _notification_channel_of(cfg: Optional[Dict[str, Any]]) -> str:
+    try:
+        ch = str((cfg or {}).get("notification_channel", "telegram") or "telegram").strip().lower()
+        if ch not in ["telegram", "discord", "both"]:
+            return "telegram"
+        return ch
+    except Exception:
+        return "telegram"
+
+
+class Notifier:
+    def __init__(self):
+        self._lock = threading.RLock()
+
+    def should_send_telegram(self, cfg: Optional[Dict[str, Any]]) -> bool:
+        ch = _notification_channel_of(cfg)
+        return ch in ["telegram", "both"]
+
+    def should_send_discord(self, cfg: Optional[Dict[str, Any]]) -> bool:
+        ch = _notification_channel_of(cfg)
+        return ch in ["discord", "both"]
+
+    def _discord_webhook(self, cfg: Optional[Dict[str, Any]]) -> str:
+        try:
+            w = str((cfg or {}).get("discord_webhook_url", "") or "").strip()
+            if w:
+                return w
+            return str(st.secrets.get("DISCORD_WEBHOOK_URL", "") or "").strip()
+        except Exception:
+            return ""
+
+    def send_discord_embed(
+        self,
+        title: str,
+        description: str,
+        color: int,
+        fields: Optional[List[Dict[str, Any]]] = None,
+        target: str = "default",
+        cfg: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        try:
+            cfg = cfg or load_settings()
+            if not self.should_send_discord(cfg):
+                return False
+            webhook = self._discord_webhook(cfg)
+            if not webhook:
+                return False
+
+            ttl = str(title or "Trading Bot").strip()[:240]
+            desc = str(description or "").strip()
+            if len(desc) > 3800:
+                desc = desc[:3800]
+
+            rows = []
+            for r in (fields or []):
+                try:
+                    n = str((r or {}).get("name", "") or "").strip()
+                    v = str((r or {}).get("value", "") or "").strip()
+                    if (not n) or (not v):
+                        continue
+                    rows.append({"name": n[:256], "value": v[:1024], "inline": bool((r or {}).get("inline", False))})
+                except Exception:
+                    continue
+
+            if DiscordWebhook is not None and DiscordEmbed is not None:
+                wh = DiscordWebhook(url=webhook, rate_limit_retry=True, timeout=min(float(HTTP_TIMEOUT_SEC), 12.0))
+                emb = DiscordEmbed(title=ttl, description=desc, color=int(color))
+                for row in rows[:20]:
+                    emb.add_embed_field(name=row["name"], value=row["value"], inline=bool(row.get("inline", False)))
+                emb.set_footer(text=f"route={str(target or 'default')} | {now_kst_str()}")
+                wh.add_embed(emb)
+                wh.execute()
+                return True
+
+            payload = {
+                "embeds": [
+                    {
+                        "title": ttl,
+                        "description": desc,
+                        "color": int(color),
+                        "fields": rows[:20],
+                        "footer": {"text": f"route={str(target or 'default')} | {now_kst_str()}"},
+                    }
+                ]
+            }
+            timeout = (3.0, min(10.0, float(HTTP_TIMEOUT_SEC)))
+            requests.post(webhook, json=payload, timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    def send_discord_text(self, text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False) -> bool:
+        del silent
+        try:
+            cfg = cfg or load_settings()
+            if not self.should_send_discord(cfg):
+                return False
+            webhook = self._discord_webhook(cfg)
+            if not webhook:
+                return False
+            raw = str(text or "").strip()
+            if not raw:
+                return False
+            lines = [x for x in raw.splitlines() if str(x).strip()]
+            title = lines[0][:180] if lines else "Trading Bot"
+            desc_lines: List[str] = []
+            fields: List[Dict[str, Any]] = []
+            for ln in lines[1:]:
+                s = str(ln or "").strip()
+                if s.startswith("- "):
+                    body = s[2:].strip()
+                    if ":" in body:
+                        n, v = body.split(":", 1)
+                        n2 = str(n).strip()
+                        v2 = str(v).strip()
+                        if n2 and v2:
+                            fields.append({"name": n2, "value": v2, "inline": False})
+                            continue
+                desc_lines.append(s)
+            desc = "\n".join(desc_lines).strip()
+            if not desc:
+                desc = raw
+            color = 5814783
+            txt_l = raw.lower()
+            if ("손절" in raw) or ("loss" in txt_l) or ("🔴" in raw) or ("숏" in raw):
+                color = 15158332
+            elif ("익절" in raw) or ("profit" in txt_l) or ("🟢" in raw) or ("롱" in raw):
+                color = 5763719
+            return self.send_discord_embed(
+                title=title,
+                description=desc,
+                color=color,
+                fields=fields,
+                target=target,
+                cfg=cfg,
+            )
+        except Exception:
+            return False
+
+
+_NOTIFIER_SINGLETON: Optional[Notifier] = None
+_NOTIFIER_LOCK = threading.RLock()
+
+
+def get_notifier() -> Notifier:
+    global _NOTIFIER_SINGLETON
+    with _NOTIFIER_LOCK:
+        if _NOTIFIER_SINGLETON is None:
+            _NOTIFIER_SINGLETON = Notifier()
+        return _NOTIFIER_SINGLETON
+
+
+# =========================================================
 # ✅ 16) 텔레그램 유틸 (timeout/retry + 채널/그룹 라우팅)
 # =========================================================
 def _tg_post(url: str, data: Dict[str, Any], timeout_sec: Optional[float] = None):
@@ -11094,51 +12263,66 @@ def _tg_chat_id_by_target(target: str, cfg: Dict[str, Any]) -> List[str]:
 
 
 def tg_send(text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False, parse_mode: str = ""):
-    if not tg_token:
-        return
     # 요구사항: Telegram 상태/라우팅이 전역 config가 아니라 최신 load_settings() 기준으로 일치
     cfg = cfg or load_settings()
-    ids = _tg_chat_id_by_target(target, cfg)
-    pri = "high" if str(target or "").lower().strip() == "admin" else "normal"
-    for cid in ids:
-        if not cid:
-            continue
-        try:
-            data = {"chat_id": cid, "text": text}
-            if bool(silent):
-                data["disable_notification"] = True
-            pm = str(parse_mode or "").strip()
-            if pm:
-                data["parse_mode"] = pm
-            tg_enqueue("sendMessage", data, priority=pri)
-        except Exception:
-            pass
+    notifier = get_notifier()
+
+    # Telegram
+    if notifier.should_send_telegram(cfg) and tg_token:
+        ids = _tg_chat_id_by_target(target, cfg)
+        pri = "high" if str(target or "").lower().strip() == "admin" else "normal"
+        for cid in ids:
+            if not cid:
+                continue
+            try:
+                data = {"chat_id": cid, "text": text}
+                if bool(silent):
+                    data["disable_notification"] = True
+                pm = str(parse_mode or "").strip()
+                if pm:
+                    data["parse_mode"] = pm
+                tg_enqueue("sendMessage", data, priority=pri)
+            except Exception:
+                pass
+
+    # Discord Embed
+    try:
+        notifier.send_discord_text(text=str(text or ""), target=target, cfg=cfg, silent=silent)
+    except Exception:
+        pass
 
 
 def tg_send_photo(photo_path: str, caption: str = "", target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False):
-    if not tg_token:
-        return
     path = str(photo_path or "").strip()
     if (not path) or (not os.path.exists(path)):
         return
     cfg = cfg or load_settings()
-    ids = _tg_chat_id_by_target(target, cfg)
-    pri = "high" if str(target or "").lower().strip() == "admin" else "normal"
-    cap = str(caption or "").strip()
-    if len(cap) > 1000:
-        cap = cap[:1000]
-    for cid in ids:
-        if not cid:
-            continue
-        try:
-            data: Dict[str, Any] = {"chat_id": cid, "__file_path": path}
-            if cap:
-                data["caption"] = cap
-            if bool(silent):
-                data["disable_notification"] = True
-            tg_enqueue("sendPhoto", data, priority=pri)
-        except Exception:
-            continue
+    notifier = get_notifier()
+    if notifier.should_send_telegram(cfg) and tg_token:
+        ids = _tg_chat_id_by_target(target, cfg)
+        pri = "high" if str(target or "").lower().strip() == "admin" else "normal"
+        cap = str(caption or "").strip()
+        if len(cap) > 1000:
+            cap = cap[:1000]
+        for cid in ids:
+            if not cid:
+                continue
+            try:
+                data: Dict[str, Any] = {"chat_id": cid, "__file_path": path}
+                if cap:
+                    data["caption"] = cap
+                if bool(silent):
+                    data["disable_notification"] = True
+                tg_enqueue("sendPhoto", data, priority=pri)
+            except Exception:
+                continue
+    # Discord는 파일 업로드 대신 캡션 중심으로 Embed 전송
+    try:
+        cap2 = str(caption or "").strip()
+        if cap2:
+            notifier.send_discord_text(text=cap2, target=target, cfg=cfg, silent=silent)
+    except Exception:
+        pass
 
 
 def tg_send_photo_chat(chat_id: Any, photo_path: str, caption: str = "", *, silent: bool = False):
@@ -17482,6 +18666,50 @@ def telegram_thread(ex):
                             message=str(ml.get("detail", ""))[:120],
                         )
 
+                        # ✅ 풀스펙트럼 데이터 수집(1m/5m/15m/1h/4h/1d) + 오더북(L2)
+                        mtf_context: Dict[str, Any] = {}
+                        orderbook_context: Dict[str, Any] = {}
+                        dynamic_style_info: Dict[str, Any] = {"style": "스캘핑", "market_regime": "ranging", "reason": "", "scores": {}}
+                        try:
+                            mtf_context = build_full_spectrum_context(
+                                ex,
+                                sym,
+                                cfg,
+                                base_tf=str(cfg.get("timeframe", "5m")),
+                                base_df=df,
+                                base_status=stt,
+                                base_last=last,
+                            )
+                            ob_raw = safe_fetch_order_book(ex, sym, limit=20)
+                            orderbook_context = orderbook_pressure_summary(ob_raw, depth=20)
+                            dynamic_style_info = choose_dynamic_style(mtf_context, orderbook_context)
+
+                            cs["mtf_context"] = mtf_context
+                            cs["orderbook_pressure"] = orderbook_context
+                            cs["dynamic_style"] = str(dynamic_style_info.get("style", "스캘핑"))
+                            cs["market_regime"] = str(dynamic_style_info.get("market_regime", ""))
+                            cs["dynamic_style_reason"] = str(dynamic_style_info.get("reason", ""))[:180]
+                            cs["orderbook_side"] = str(orderbook_context.get("pressure_side", "neutral"))
+                            cs["orderbook_imbalance"] = float(orderbook_context.get("imbalance", 0.0) or 0.0)
+                            cs["orderbook_spread_pct"] = float(orderbook_context.get("spread_pct", 0.0) or 0.0)
+                            stt["_mtf_context"] = dict(mtf_context)
+                            stt["_orderbook_context"] = dict(orderbook_context)
+                            stt["_dynamic_style"] = str(dynamic_style_info.get("style", "스캘핑"))
+                            stt["_dynamic_style_reason"] = str(dynamic_style_info.get("reason", ""))
+                            stt["_market_regime"] = str(dynamic_style_info.get("market_regime", ""))
+                            mon_add_scan(
+                                mon,
+                                stage="full_spectrum",
+                                symbol=sym,
+                                tf="1m~1d",
+                                signal=str(dynamic_style_info.get("style", "스캘핑")),
+                                score=float(orderbook_context.get("pressure_score", 0.0) or 0.0),
+                                message=f"regime={dynamic_style_info.get('market_regime','')} | ob={orderbook_context.get('pressure_side','neutral')} {float(orderbook_context.get('imbalance',0.0) or 0.0):+.2f}",
+                            )
+                        except Exception as e:
+                            mtf_context = {"symbol": sym, "timeframes": {}, "error": str(e)[:120]}
+                            orderbook_context = {"available": False, "pressure_side": "neutral", "imbalance": 0.0, "error": str(e)[:120]}
+
                         # AI 호출 필터(완화 + 모드/추세 기반)
                         # - "해소 신호가 없으면 AI 자체를 안 부른다"가 너무 보수적이라 무포지션이 길어질 수 있음
                         # - 강한 시그널(눌림목/RSI해소/밴드이탈)은 우선 호출
@@ -17834,6 +19062,64 @@ def telegram_thread(ex):
                         except Exception:
                             forced_ai = False
 
+                        # ✅ 동적 활성화: 장기 추세가 애매해도 1m/5m + 오더북 기반 단기 기회를 잡기 위해 AI 호출 활성화
+                        try:
+                            if (not call_ai) and (not forced_ai):
+                                dyn_style = str(dynamic_style_info.get("style", "스캘핑") or "스캘핑")
+                                ob_side = str(orderbook_context.get("pressure_side", "neutral") or "neutral")
+                                ob_imb = float(orderbook_context.get("imbalance", 0.0) or 0.0)
+                                ob_score = float(orderbook_context.get("pressure_score", 0.0) or 0.0)
+                                tf1 = (mtf_context.get("timeframes", {}) or {}).get("1m", {})
+                                tf5 = (mtf_context.get("timeframes", {}) or {}).get("5m", {})
+                                sqz1 = float(tf1.get("sqz_mom_pct", 0.0) or 0.0)
+                                sqz5 = float(tf5.get("sqz_mom_pct", 0.0) or 0.0)
+                                pat1 = int(tf1.get("pattern_bias", 0) or 0)
+                                pat5 = int(tf5.get("pattern_bias", 0) or 0)
+
+                                dyn_call = False
+                                dyn_reason = ""
+                                if dyn_style == "스캘핑":
+                                    if ob_side in ["buy", "sell"] and abs(ob_imb) >= 0.12 and ob_score >= 18:
+                                        dyn_call = True
+                                        dyn_reason = f"오더북 {ob_side} 압력({ob_imb:+.2f})"
+                                    elif (abs(sqz1) >= 0.08 or abs(sqz5) >= 0.08) and ((pat1 != 0) or (pat5 != 0)):
+                                        dyn_call = True
+                                        dyn_reason = "1m/5m SQZ+패턴 수렴"
+                                elif dyn_style == "단타":
+                                    tf15 = (mtf_context.get("timeframes", {}) or {}).get("15m", {})
+                                    tf1h = (mtf_context.get("timeframes", {}) or {}).get("1h", {})
+                                    br = bool(tf15.get("breakout_up", False) or tf15.get("breakout_down", False) or tf1h.get("breakout_up", False) or tf1h.get("breakout_down", False))
+                                    adx15 = float(tf15.get("adx", 0.0) or 0.0)
+                                    if br or adx15 >= 18:
+                                        dyn_call = True
+                                        dyn_reason = "15m/1h 브레이크아웃/변동성 확장"
+                                else:
+                                    tf4 = (mtf_context.get("timeframes", {}) or {}).get("4h", {})
+                                    tfd = (mtf_context.get("timeframes", {}) or {}).get("1d", {})
+                                    tr4 = int(tf4.get("trend_dir", 0) or 0)
+                                    trd = int(tfd.get("trend_dir", 0) or 0)
+                                    adx4 = float(tf4.get("adx", 0.0) or 0.0)
+                                    adxd = float(tfd.get("adx", 0.0) or 0.0)
+                                    if tr4 != 0 and tr4 == trd and min(adx4, adxd) >= 20:
+                                        dyn_call = True
+                                        dyn_reason = "4h/1d 추세 정렬"
+
+                                if dyn_call:
+                                    call_ai = True
+                                    cs["skip_reason"] = ""
+                                    cs["dynamic_call_reason"] = dyn_reason
+                                    mon_add_scan(
+                                        mon,
+                                        stage="dynamic_activate",
+                                        symbol=sym,
+                                        tf="1m~1d",
+                                        signal=str(dyn_style),
+                                        score=ob_score,
+                                        message=str(dyn_reason)[:120],
+                                    )
+                        except Exception:
+                            pass
+
                         # ✅ rule_signal 단계 기록
                         try:
                             sigs = []
@@ -17960,23 +19246,27 @@ def telegram_thread(ex):
                                 tf=str(cfg.get("timeframe", "5m")),
                                 message=("AI 판단 요청(이벤트)" if bool(event_override) else "AI 판단 요청"),
                             )
-                        # ✅ 요구: 스윙 판단일 때만 외부시황을 AI에 제공(스캘핑/단기=차트만)
+                        # ✅ 동적 스타일 힌트(풀스펙트럼 + 오더북)
                         try:
-                            tr_s = str(stt.get("추세", "") or "")
-                            tr_l = str(htf_trend or "")
-                            same_dir = (("상승" in tr_s and "상승" in tr_l) or ("하락" in tr_s and "하락" in tr_l))
-                            mixed_dir = (("상승" in tr_s and "하락" in tr_l) or ("하락" in tr_s and "상승" in tr_l))
-                            if same_dir:
-                                chart_style_hint = "스윙"
-                            elif mixed_dir:
-                                chart_style_hint = "단타"
-                            else:
+                            chart_style_hint = normalize_style_name(dynamic_style_info.get("style", "스캘핑"))
+                            if chart_style_hint not in ["스캘핑", "단타", "스윙"]:
                                 chart_style_hint = "스캘핑"
                         except Exception:
                             chart_style_hint = "스캘핑"
                         cs["chart_style_hint"] = chart_style_hint
                         try:
-                            mon_add_scan(mon, stage="style_hint", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=chart_style_hint, message="차트 기반 스타일 힌트")
+                            cs["dynamic_style_reason"] = str(dynamic_style_info.get("reason", ""))[:180]
+                        except Exception:
+                            pass
+                        try:
+                            mon_add_scan(
+                                mon,
+                                stage="style_hint",
+                                symbol=sym,
+                                tf="1m~1d",
+                                signal=chart_style_hint,
+                                message=str(dynamic_style_info.get("reason", "풀스펙트럼 스타일 힌트"))[:120],
+                            )
                         except Exception:
                             pass
                         if bool(cfg.get("ai_cost_saver_strict", True)):
@@ -17994,6 +19284,8 @@ def telegram_thread(ex):
                                 trend_long=str(htf_trend or ""),
                                 sr_context=sr_ctx,
                                 chart_style_hint=chart_style_hint,
+                                mtf_context=mtf_context,
+                                orderbook_context=orderbook_context,
                             )
                             try:
                                 if bool(ai.get("_openai_model", "")):
@@ -20316,6 +21608,76 @@ def watchdog_thread():
 
 
 # =========================================================
+# ✅ Streamlit Cloud Singleton Bot
+# - rerun마다 같은 인스턴스를 재사용해 중복 스레드 생성을 방지
+# =========================================================
+class TradingBot:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.created_kst = now_kst_str()
+        self.config = load_settings()
+        self.exchange = create_exchange_client_uncached() or exchange
+        self.db = get_local_db()
+        self.notifier = get_notifier()
+        self.bootstrap_info: Dict[str, Any] = {}
+        try:
+            self.bootstrap_info = self.db.bootstrap_from_gsheet(self.config, max_rows=500)
+        except Exception as e:
+            self.bootstrap_info = {"ok": False, "rows": 0, "reason": str(e)[:160]}
+
+    @staticmethod
+    def _thread_alive(name: str) -> bool:
+        try:
+            for t in threading.enumerate():
+                if str(getattr(t, "name", "") or "") == str(name or "") and bool(t.is_alive()):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def start_background_loop(self) -> None:
+        with self._lock:
+            ensure_threads_started()
+            self.db.set_kv(
+                "bot.runtime",
+                {
+                    "started_kst": now_kst_str(),
+                    "tg_thread_alive": self._thread_alive("TG_THREAD"),
+                    "tg_poll_alive": self._thread_alive("TG_POLL_THREAD"),
+                    "gsheet_thread_alive": self._thread_alive("GSHEET_THREAD"),
+                    "watchdog_alive": self._thread_alive("WATCHDOG_THREAD"),
+                },
+            )
+
+    def monitor_state(self) -> Dict[str, Any]:
+        try:
+            return read_json_safe(MONITOR_FILE, {}) or {}
+        except Exception:
+            return {}
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        mon = self.monitor_state()
+        return {
+            "boot_kst": self.created_kst,
+            "bootstrap": self.bootstrap_info,
+            "threads": {
+                "TG_THREAD": self._thread_alive("TG_THREAD"),
+                "TG_POLL_THREAD": self._thread_alive("TG_POLL_THREAD"),
+                "GSHEET_THREAD": self._thread_alive("GSHEET_THREAD"),
+                "WATCHDOG_THREAD": self._thread_alive("WATCHDOG_THREAD"),
+            },
+            "monitor_heartbeat_kst": mon.get("last_heartbeat_kst", ""),
+        }
+
+
+@st.cache_resource
+def get_bot_instance() -> TradingBot:
+    bot = TradingBot()
+    bot.start_background_loop()
+    return bot
+
+
+# =========================================================
 # ✅ 18) 스레드 시작(중복 방지) - TG_THREAD + WATCHDOG
 # =========================================================
 def ensure_threads_started():
@@ -20325,15 +21687,15 @@ def ensure_threads_started():
     has_gs = False
     has_send = False
     for t in threading.enumerate():
-        if t.name == "TG_THREAD":
+        if t.name == "TG_THREAD" and t.is_alive():
             has_tg = True
-        if t.name == "TG_POLL_THREAD":
+        if t.name == "TG_POLL_THREAD" and t.is_alive():
             has_poll = True
-        if t.name == "GSHEET_THREAD":
+        if t.name == "GSHEET_THREAD" and t.is_alive():
             has_gs = True
-        if t.name == "TG_SEND_THREAD":
+        if t.name == "TG_SEND_THREAD" and t.is_alive():
             has_send = True
-        if t.name == "WATCHDOG_THREAD":
+        if t.name == "WATCHDOG_THREAD" and t.is_alive():
             has_wd = True
     if not has_send:
         # Telegram send worker (sendMessage) - 네트워크 블로킹으로 TG_THREAD가 멈추는 현상 완화
@@ -20363,7 +21725,7 @@ def ensure_threads_started():
 
 # 전역 예외 훅 설치(가능한 경우): 스레드/런타임에서 잡히지 않은 오류를 관리자 DM으로
 install_global_error_hooks()
-ensure_threads_started()
+bot = get_bot_instance()
 
 
 # =========================================================
@@ -20371,6 +21733,11 @@ ensure_threads_started()
 # =========================================================
 st.sidebar.title("🛠️ 제어판")
 st.sidebar.caption("Streamlit=제어/상태 확인용, Telegram=실시간 보고/조회용")
+with st.sidebar.expander("☁️ Bot Singleton 상태", expanded=False):
+    try:
+        st.json(bot.status_snapshot())
+    except Exception:
+        st.caption("singleton 상태 조회 실패")
 
 openai_key_secret = _sget_str("OPENAI_API_KEY")
 if not openai_key_secret and not config.get("openai_api_key"):
@@ -20418,6 +21785,24 @@ config["tg_simple_messages"] = st.sidebar.checkbox(
     "🧓 텔레그램 쉬운말(핵심만)",
     value=bool(config.get("tg_simple_messages", True)),
     help="진입/익절/손절/부분익절/추매 등 알림을 어려운 용어 없이 '핵심 정보'만 보내도록 합니다.",
+)
+st.sidebar.subheader("🔔 알림 채널")
+_notify_opts = ["telegram", "discord", "both"]
+_notify_now = str(config.get("notification_channel", "telegram") or "telegram").strip().lower()
+if _notify_now not in _notify_opts:
+    _notify_now = "telegram"
+config["notification_channel"] = st.sidebar.selectbox(
+    "알림 전송 채널",
+    _notify_opts,
+    index=_notify_opts.index(_notify_now),
+    help="telegram=기존 텔레그램, discord=웹훅 임베드, both=동시 전송",
+)
+_dc_default = str(config.get("discord_webhook_url", "") or "").strip()
+config["discord_webhook_url"] = st.sidebar.text_input(
+    "Discord Webhook URL(선택)",
+    value=_dc_default,
+    type="password",
+    help="Secrets의 DISCORD_WEBHOOK_URL 또는 여기에 입력한 값을 사용합니다.",
 )
 
 st.sidebar.subheader("🧠 AI 비용 절감")
@@ -21098,9 +22483,20 @@ symbol = st.selectbox("코인 선택", symbol_list, index=0)
 left, right = st.columns([2, 1], gap="large")
 
 with left:
-    st.subheader("📉 TradingView 차트 (다크모드)")
-    interval_map = {"1m": "1", "3m": "3", "5m": "5", "15m": "15", "1h": "60"}
-    render_tradingview(symbol, interval=interval_map.get(config.get("timeframe", "5m"), "5"), height=560)
+    st.subheader("📉 인터랙티브 캔들 차트 (Plotly)")
+    tf_now = str(config.get("timeframe", "5m"))
+    ok_plotly = render_plotly_candles(
+        exchange,
+        symbol,
+        tf_now,
+        height=560,
+        limit=280,
+        marker_limit=80,
+    )
+    if not ok_plotly:
+        st.caption("plotly 차트 로딩 실패 → TradingView 대체")
+        interval_map = {"1m": "1", "3m": "3", "5m": "5", "15m": "15", "1h": "60"}
+        render_tradingview(symbol, interval=interval_map.get(tf_now, "5"), height=560)
 
 with right:
     st.subheader("🧾 실시간 지표 요약")
@@ -21269,7 +22665,7 @@ with t1:
     except Exception:
         pass
 
-    mon = read_json_safe(MONITOR_FILE, None)
+    mon = bot.monitor_state()
     if not mon:
         st.warning("monitor_state.json이 아직 없습니다. (스레드 시작 확인)")
     else:
@@ -21451,14 +22847,18 @@ with t1:
                     except Exception:
                         pass
                     htf_trend = get_htf_trend_cached(exchange, symbol, "1h", int(config.get("ma_fast", 7)), int(config.get("ma_slow", 99)), int(config.get("trend_filter_cache_sec", 60)))
-                    tr_s = str(stt.get("추세", "") or "")
-                    tr_l = str(htf_trend or "")
-                    if (("상승" in tr_s and "상승" in tr_l) or ("하락" in tr_s and "하락" in tr_l)):
-                        chart_style_hint = "스윙"
-                    elif (("상승" in tr_s and "하락" in tr_l) or ("하락" in tr_s and "상승" in tr_l)):
-                        chart_style_hint = "단타"
-                    else:
-                        chart_style_hint = "스캘핑"
+                    mtf_ctx = build_full_spectrum_context(
+                        exchange,
+                        symbol,
+                        config,
+                        base_tf=str(config.get("timeframe", "5m")),
+                        base_df=df2,
+                        base_status=stt,
+                        base_last=last,
+                    )
+                    ob_ctx = orderbook_pressure_summary(safe_fetch_order_book(exchange, symbol, limit=20), depth=20)
+                    dyn_style = choose_dynamic_style(mtf_ctx, ob_ctx)
+                    chart_style_hint = normalize_style_name(dyn_style.get("style", "스캘핑"))
                     ai = ai_decide_trade(
                         df2,
                         stt,
@@ -21468,10 +22868,12 @@ with t1:
                         external=ext_now,
                         trend_long=str(htf_trend or ""),
                         chart_style_hint=chart_style_hint,
+                        mtf_context=mtf_ctx,
+                        orderbook_context=ob_ctx,
                     )
                     # 수동 분석에서도 스타일 힌트는 룰 기반만 사용(불필요한 추가 OpenAI 호출 방지)
                     style_info = _style_for_entry(symbol, ai.get("decision", "hold"), stt.get("추세", ""), htf_trend, config, allow_ai=False)
-                    st.json({"ai": ai, "style": style_info, "htf_trend": htf_trend})
+                    st.json({"ai": ai, "style": style_info, "dynamic_style": dyn_style, "orderbook": ob_ctx, "htf_trend": htf_trend})
             except Exception as e:
                 st.error(f"분석 오류: {e}")
                 notify_admin_error("UI:MANUAL_AI_ANALYSIS", e, context={"symbol": symbol, "tf": str(config.get("timeframe", ""))})
