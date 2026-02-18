@@ -12989,13 +12989,25 @@ class Notifier:
     def send_trade(self, data: Dict[str, Any], target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False) -> bool:
         cfg = cfg or load_settings()
         ok_any = False
+        event = str((data or {}).get("event", "") or "").upper().strip()
+        has_img = bool(self._image_path_from_data(data or {}))
+        wants_img = False
+        try:
+            if bool(cfg.get("tg_send_trade_images", True)):
+                if event in ["ENTRY", "OPEN"]:
+                    wants_img = bool(cfg.get("tg_send_entry_image", True))
+                elif event in ["EXIT_TP", "EXIT_SL", "EXIT_CLOSE", "TP", "TAKE", "PROFIT", "SL", "STOP", "LOSS", "PROTECT"]:
+                    wants_img = bool(cfg.get("tg_send_exit_image", True))
+        except Exception:
+            wants_img = False
+        defer_discord = bool(wants_img and (not has_img))
         try:
             if self.should_send_telegram(cfg):
                 ok_any = bool(self.send_telegram(data or {}, target=target, cfg=cfg, silent=bool(silent))) or ok_any
         except Exception:
             pass
         try:
-            if self.should_send_discord(cfg):
+            if self.should_send_discord(cfg) and (not defer_discord):
                 ok_any = bool(self.send_discord(data or {}, target=target, cfg=cfg, silent=bool(silent))) or ok_any
         except Exception:
             pass
@@ -18876,10 +18888,17 @@ def telegram_thread(ex):
                                                     get_notifier().send_discord(td_img, target="admin", cfg=cfg, silent=False)
                                             except Exception:
                                                 pass
-                                            if trade_id:
-                                                d0 = load_trade_detail(str(trade_id)) or {}
-                                                d0["exit_chart_image"] = str(img_path)
-                                                save_trade_detail(str(trade_id), d0)
+                                        else:
+                                            try:
+                                                get_notifier().send_discord(trade_data, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                                if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
+                                                    get_notifier().send_discord(trade_data, target="admin", cfg=cfg, silent=False)
+                                            except Exception:
+                                                pass
+                                        if img_path and trade_id:
+                                            d0 = load_trade_detail(str(trade_id)) or {}
+                                            d0["exit_chart_image"] = str(img_path)
+                                            save_trade_detail(str(trade_id), d0)
                                 except Exception:
                                     pass
 
@@ -19313,10 +19332,17 @@ def telegram_thread(ex):
                                                     get_notifier().send_discord(td_img, target="admin", cfg=cfg, silent=False)
                                             except Exception:
                                                 pass
-                                            if trade_id:
-                                                d0 = load_trade_detail(str(trade_id)) or {}
-                                                d0["exit_chart_image"] = str(img_path)
-                                                save_trade_detail(str(trade_id), d0)
+                                        else:
+                                            try:
+                                                get_notifier().send_discord(trade_data, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                                if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
+                                                    get_notifier().send_discord(trade_data, target="admin", cfg=cfg, silent=False)
+                                            except Exception:
+                                                pass
+                                        if img_path and trade_id:
+                                            d0 = load_trade_detail(str(trade_id)) or {}
+                                            d0["exit_chart_image"] = str(img_path)
+                                            save_trade_detail(str(trade_id), d0)
                                 except Exception:
                                     pass
 
@@ -21902,10 +21928,17 @@ def telegram_thread(ex):
                                                         get_notifier().send_discord(td_img, target="admin", cfg=cfg, silent=False)
                                                 except Exception:
                                                     pass
-                                                if trade_id:
-                                                    d0 = load_trade_detail(str(trade_id)) or {}
-                                                    d0["entry_chart_image"] = str(img_path)
-                                                    save_trade_detail(str(trade_id), d0)
+                                            else:
+                                                try:
+                                                    get_notifier().send_discord(trade_data, target=cfg.get("tg_route_events_to", "channel"), cfg=cfg, silent=False)
+                                                    if bool(cfg.get("tg_trade_alert_to_admin", True)) and tg_admin_chat_ids():
+                                                        get_notifier().send_discord(trade_data, target="admin", cfg=cfg, silent=False)
+                                                except Exception:
+                                                    pass
+                                            if img_path and trade_id:
+                                                d0 = load_trade_detail(str(trade_id)) or {}
+                                                d0["entry_chart_image"] = str(img_path)
+                                                save_trade_detail(str(trade_id), d0)
                                     except Exception:
                                         pass
 
