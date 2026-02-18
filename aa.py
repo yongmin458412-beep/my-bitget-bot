@@ -682,6 +682,27 @@ def style_rule(style: Any) -> Dict[str, Any]:
     return dict(STYLE_RULES.get(st, STYLE_RULES["스캘핑"]))
 
 
+def decision_tf_candidates_by_style(style: Any) -> List[str]:
+    st = normalize_style_name(style)
+    if st == "스윙":
+        return ["1h", "4h"]
+    if st == "단타":
+        return ["15m", "1h"]
+    return ["1m", "5m"]
+
+
+def normalize_decision_tf(tf: Any, style: Any, default_tf: str = "5m") -> str:
+    st = normalize_style_name(style)
+    allowed = decision_tf_candidates_by_style(st)
+    raw = str(tf or "").strip().lower()
+    if raw in allowed:
+        return raw
+    dft = str(default_tf or "5m").strip().lower()
+    if dft in allowed:
+        return dft
+    return allowed[0] if allowed else "5m"
+
+
 def hard_roi_limits_by_style(style: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
     st = normalize_style_name(style)
     sr = style_rule(st)
@@ -9661,10 +9682,22 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
             if math.isfinite(px0) and math.isfinite(cloud_top) and math.isfinite(cloud_bot):
                 if px0 > cloud_top and conv >= base:
                     status["ICHI"] = "🟢 구름 위(상승 우세)"
+                    status["ICHI_PRICE_CLOUD"] = "above_cloud"
                 elif px0 < cloud_bot and conv <= base:
                     status["ICHI"] = "🔴 구름 아래(하락 우세)"
+                    status["ICHI_PRICE_CLOUD"] = "below_cloud"
                 else:
                     status["ICHI"] = "⚪ 구름 내부/혼조"
+                    status["ICHI_PRICE_CLOUD"] = "inside_cloud"
+                status["_ichi_detail"] = {
+                    "conversion": float(conv),
+                    "base": float(base),
+                    "span_a": float(span_a),
+                    "span_b": float(span_b),
+                    "cloud_top": float(cloud_top),
+                    "cloud_bottom": float(cloud_bot),
+                    "price": float(px0),
+                }
         except Exception:
             pass
 
@@ -11636,6 +11669,12 @@ def ai_decide_trade(
         "mode": mode,
         "timeframe": str(cfg.get("timeframe", "5m")),
         "style_hint": normalize_style_name(chart_style_hint or "스캘핑"),
+        "decision_tf_candidates": decision_tf_candidates_by_style(chart_style_hint or "스캘핑"),
+        "decision_tf_default": normalize_decision_tf(
+            cfg.get("timeframe", "5m"),
+            chart_style_hint or "스캘핑",
+            default_tf=str(cfg.get("timeframe", "5m") or "5m"),
+        ),
         "style_rule": style_rule(chart_style_hint or "스캘핑"),
         "price": float(last["close"]),
         "rsi_prev": float(prev.get("RSI", 50)) if "RSI" in df.columns else None,
@@ -11659,6 +11698,8 @@ def ai_decide_trade(
         },
         "super_indicators": {
             "ichimoku": str(status.get("ICHI", "") or ""),
+            "ichimoku_price_vs_cloud": str(status.get("ICHI_PRICE_CLOUD", "") or ""),
+            "ichimoku_detail": status.get("_ichi_detail", {}) if isinstance(status.get("_ichi_detail", {}), dict) else {},
             "psar": str(status.get("PSAR", "") or ""),
             "vwap": str(status.get("VWAP", "") or ""),
             "stochrsi": str(status.get("STOCHRSI", "") or ""),
@@ -11802,6 +11843,10 @@ def ai_decide_trade(
 				{soft_entry_hint}
 
 	[중요]
+	- 반드시 decision_tf를 선택해서 출력해라.
+	  - 스캘핑: "1m" 또는 "5m"
+	  - 단타: "15m" 또는 "1h"
+	  - 스윙: "1h" 또는 "4h"
 	- sl_pct / tp_pct는 ROI%(레버 반영 수익률)로 출력한다.
 	- style_rule의 TP/SL 범위는 "고정값"이 아니라 탐색 가이드다. 반드시 SR/매물대/오더북(스캘핑)에서 목표가를 찾고, 없을 때만 범위 중앙값으로 대체하라.
 	- SR 레벨에 TP를 둘 때는 약간 앞당겨(front-run) 잡고, SL은 레벨 바깥으로 약간 여유(breathing room)를 둬라.
@@ -11835,6 +11880,7 @@ JSON 형식:
   "sl_pct": 0.3-50.0,
   "tp_pct": 0.5-150.0,
   "rr": 0.5-10.0,
+  "decision_tf": "1m"|"5m"|"15m"|"1h"|"4h",
 	  "sl_price": number|null,
 	  "tp_price": number|null,
 	  "used_indicators": ["..."],
@@ -11883,6 +11929,12 @@ JSON 형식:
 
         out["leverage"] = int(_as_int(out.get("leverage", rule["lev_min"]), int(rule["lev_min"])))
         out["leverage"] = int(clamp(out["leverage"], rule["lev_min"], rule["lev_max"]))
+        style_for_tf = normalize_style_name(chart_style_hint or out.get("style", "스캘핑"))
+        out["decision_tf"] = normalize_decision_tf(
+            out.get("decision_tf", cfg.get("timeframe", "5m")),
+            style_for_tf,
+            default_tf=str(cfg.get("timeframe", "5m") or "5m"),
+        )
 
         out["sl_pct"] = float(_as_float(out.get("sl_pct", 1.2), 1.2))
         out["tp_pct"] = float(_as_float(out.get("tp_pct", 3.0), 3.0))
@@ -11932,7 +11984,7 @@ JSON 형식:
                 pat_txt = str(((features.get("chart_patterns") or {}).get("summary") or "셋업 없음")).split("|")[0].strip()
                 ml_dir = str((features.get("ml_signals") or {}).get("dir", "hold") or "hold")
                 ob_side = str((features.get("order_book_l2") or {}).get("pressure_side", "neutral") or "neutral")
-                tf_txt = str(features.get("timeframe", "5m"))
+                tf_txt = str(out.get("decision_tf", features.get("timeframe", "5m")) or "5m")
                 sig_txt = "SQZ/ML 중립"
                 if ml_dir == "buy":
                     sig_txt = "ML 롱 우위"
@@ -11943,6 +11995,9 @@ JSON 형식:
                 elif ob_side == "sell":
                     sig_txt += " + 오더북 매도우위"
                 reason_txt = f"{pat_txt} + {sig_txt} on {tf_txt}"
+            tf_need = str(out.get("decision_tf", "") or "").strip()
+            if tf_need and (f"on {tf_need}" not in reason_txt):
+                reason_txt = f"{reason_txt} on {tf_need}".strip()
         except Exception:
             pass
         out["reason_easy"] = reason_txt[:500]
@@ -12800,6 +12855,7 @@ class Notifier:
             side_kr = "-"
         style = str(d.get("style", "-") or "-")
         mode = str(d.get("mode", "-") or "-")
+        decision_tf = str(d.get("decision_tf", "") or "").strip()
         reason = str(d.get("reason", "") or "").strip()
         if len(reason) > 360:
             reason = reason[:360] + "..."
@@ -12813,6 +12869,8 @@ class Notifier:
         strategy_lines: List[str] = []
         strategy_lines.append(f"스타일: `{style}`")
         strategy_lines.append(f"포지션: `{side_kr}`")
+        if decision_tf:
+            strategy_lines.append(f"기준봉: `{decision_tf}`")
         if mode and mode != "-":
             strategy_lines.append(f"모드: `{mode}`")
         if d.get("leverage") is not None:
@@ -12905,6 +12963,7 @@ class Notifier:
         side = html.escape(side)
         style = html.escape(str(d.get("style", "") or ""))
         mode = html.escape(str(d.get("mode", "") or ""))
+        decision_tf = html.escape(str(d.get("decision_tf", "") or ""))
         reason = html.escape(str(d.get("reason", "") or "").strip())
         if len(reason) > 260:
             reason = reason[:260] + "..."
@@ -12921,6 +12980,8 @@ class Notifier:
         lines.append("────────────────")
         lines.append(f"🪙 <b>코인:</b> {_code(symbol)}")
         lines.append(f"🧭 <b>포지션:</b> {_code(side)}")
+        if decision_tf and decision_tf != "-":
+            lines.append(f"🕒 <b>기준봉:</b> {_code(decision_tf)}")
         if mode and mode != "-":
             lines.append(f"🎛️ <b>모드:</b> {_code(mode)}")
         if d.get("price") is not None:
@@ -14214,6 +14275,7 @@ def tg_send_position_chart_images(
                 pattern_hint="",
                 mtf_pattern={},
                 trade_id=str((tgt0 or {}).get("trade_id", "") or ""),
+                decision_tf=str((tgt0 or {}).get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
             )
             if not img_path:
                 continue
@@ -14727,11 +14789,16 @@ def build_trade_event_image(
     pattern_hint: str = "",
     mtf_pattern: Optional[Dict[str, Any]] = None,
     trade_id: str = "",
+    decision_tf: Optional[str] = None,
 ) -> Optional[str]:
     if plt is None or mdates is None or Rectangle is None:
         return None
     try:
-        tf = str(cfg.get("timeframe", "5m") or "5m")
+        tf = normalize_decision_tf(
+            decision_tf if str(decision_tf or "").strip() else cfg.get("timeframe", "5m"),
+            style,
+            default_tf=str(cfg.get("timeframe", "5m") or "5m"),
+        )
         bars = int(cfg.get("tg_image_chart_bars", 140) or 140)
         bars = int(clamp(bars, 80, 500))
         ohlcv = safe_fetch_ohlcv(ex, sym, tf, limit=max(120, bars))
@@ -15985,6 +16052,11 @@ def _maybe_switch_style_for_open_position(
             tgt["style"] = rec_style
             tgt["style_confidence"] = int(rec.get("confidence", 0))
             tgt["style_reason"] = str(rec.get("reason", ""))[:240]
+            tgt["decision_tf"] = normalize_decision_tf(
+                tgt.get("decision_tf", cfg.get("timeframe", "5m")),
+                rec_style,
+                default_tf=str(cfg.get("timeframe", "5m") or "5m"),
+            )
             tgt["style_last_switch_epoch"] = time.time()
             try:
                 tgt["_last_style_switch_snap_token"] = str(trend_snap_token or "")
@@ -18824,6 +18896,7 @@ def telegram_thread(ex):
                                     "sl_pct": float(tgt.get("sl", 0.0) or 0.0),
                                     "roi_pct": float(roi),
                                     "pnl_usdt": float(pnl_usdt_snapshot),
+                                    "decision_tf": str(tgt.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                     "balance_total": float(total_after),
                                     "balance_free": float(free_after),
                                     "reason": f"{reason_ko} | {one}",
@@ -18870,6 +18943,7 @@ def telegram_thread(ex):
                                             pattern_hint=str(_fmt_indicator_line_for_reason(entry_snap, snap_now)),
                                             mtf_pattern={},
                                             trade_id=str(trade_id or ""),
+                                            decision_tf=str(tgt.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                         )
                                         if img_path:
                                             cap = (
@@ -19268,6 +19342,7 @@ def telegram_thread(ex):
                                     "sl_pct": float(tgt.get("sl", 0.0) or 0.0),
                                     "roi_pct": float(roi),
                                     "pnl_usdt": float(pnl_usdt_snapshot),
+                                    "decision_tf": str(tgt.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                     "balance_total": float(total_after),
                                     "balance_free": float(free_after),
                                     "reason": f"{take_reason_ko} | {one}",
@@ -19314,6 +19389,7 @@ def telegram_thread(ex):
                                             pattern_hint=str(_fmt_indicator_line_for_reason(entry_snap, snap_now)),
                                             mtf_pattern={},
                                             trade_id=str(trade_id or ""),
+                                            decision_tf=str(tgt.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                         )
                                         if img_path:
                                             cap = (
@@ -20757,10 +20833,11 @@ def telegram_thread(ex):
                                 "ai_confidence": conf,
                                 "ai_entry_pct": float(ai.get("entry_pct", rule["entry_pct_min"])),
                                 "ai_leverage": int(ai.get("leverage", rule["lev_min"])),
-                                "ai_sl_pct": float(ai.get("sl_pct", 1.2)),
-                                "ai_tp_pct": float(ai.get("tp_pct", 3.0)),
-                                "ai_rr": float(ai.get("rr", 1.5)),
-                                "ai_used": ", ".join(ai.get("used_indicators", [])),
+                            "ai_sl_pct": float(ai.get("sl_pct", 1.2)),
+                            "ai_tp_pct": float(ai.get("tp_pct", 3.0)),
+                            "ai_rr": float(ai.get("rr", 1.5)),
+                            "ai_decision_tf": str(ai.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
+                            "ai_used": ", ".join(ai.get("used_indicators", [])),
                                 "ai_reason_easy": ai.get("reason_easy", ""),
                                 "pattern": stt.get("패턴", ""),
                                 "pattern_bias": int(stt.get("_pattern_bias", 0) or 0),
@@ -21033,6 +21110,11 @@ def telegram_thread(ex):
 
                             # 스타일별 envelope + 리스크가드레일
                             ai2 = apply_style_envelope(ai, style, cfg, rule)
+                            ai2["decision_tf"] = normalize_decision_tf(
+                                ai2.get("decision_tf", cfg.get("timeframe", "5m")),
+                                style,
+                                default_tf=str(cfg.get("timeframe", "5m") or "5m"),
+                            )
                             # ✅ ATR 기반 레버리지(요구): 변동성이 크면 레버↓(손절/익절 가격폭 일관성을 위해, risk_guardrail 이전에 결정)
                             try:
                                 if (not bool(cfg.get("fixed_leverage_enable", False))) and bool(cfg.get("atr_leverage_enable", True)):
@@ -21216,11 +21298,12 @@ def telegram_thread(ex):
                                 pass
 
                             # ✅ 외부시황 위험 감산은 스윙에서만 적용
-                            # - 스윙 진입금(FNG 기반)을 별도로 쓰는 경우에는 FNG 감산을 중복 적용하지 않도록,
-                            #   여기서는 "이벤트/브리핑" 요인만 반영한 multiplier를 사용한다.
-                            entry_risk_mul = float(risk_mul) if str(style) == "스윙" else 1.0
+                            # - 단, 하이리스크/하이리턴 + 스윙은 고정 20%(총자산)/20x를 강제하므로
+                            #   여기서 감산을 적용하지 않는다.
+                            highrisk_swing_fixed = bool(str(mode) == "하이리스크/하이리턴" and str(style) == "스윙")
+                            entry_risk_mul = float(risk_mul) if (str(style) == "스윙" and (not highrisk_swing_fixed)) else 1.0
                             try:
-                                if str(style) == "스윙" and bool(cfg.get("swing_fng_entry_pct_enable", True)):
+                                if str(style) == "스윙" and (not highrisk_swing_fixed) and bool(cfg.get("swing_fng_entry_pct_enable", True)):
                                     entry_risk_mul = float(external_risk_multiplier(ext, cfg, include_fng=False))
                             except Exception:
                                 entry_risk_mul = entry_risk_mul
@@ -21231,6 +21314,8 @@ def telegram_thread(ex):
                             try:
                                 if str(mode) == "하이리스크/하이리턴" and bool(cfg.get("highrisk_fixed_size_enable", True)):
                                     lev_fix = int(cfg.get("highrisk_fixed_leverage", 20) or 20)
+                                    if highrisk_swing_fixed:
+                                        lev_fix = 20
                                     lev_fix = int(clamp(lev_fix, 1, 125))
                                     lev = int(lev_fix)
                                     ai2["leverage"] = int(lev)
@@ -21238,10 +21323,12 @@ def telegram_thread(ex):
                                     lev_src = "HIGHRISK_FIXED"
 
                                     pct_total = float(cfg.get("highrisk_fixed_entry_pct_total", 20.0) or 20.0)
+                                    if highrisk_swing_fixed:
+                                        pct_total = 20.0
                                     pct_total = float(clamp(pct_total, 0.5, 95.0))
                                     try:
-                                        # ✅ 요구: 스윙이면 공포/탐욕 지수(FNG)에 따라 총자산 8~15% 진입
-                                        if str(style) == "스윙":
+                                        # ✅ 일반 스윙에서만 FNG 진입비중 보정
+                                        if str(style) == "스윙" and (not highrisk_swing_fixed):
                                             pct_fng = swing_entry_pct_total_by_fng(ext, cfg)
                                             if pct_fng is not None:
                                                 pct_total = float(pct_fng)
@@ -21253,7 +21340,7 @@ def telegram_thread(ex):
                                     entry_usdt_target = float(base_eq) * (float(pct_total) / 100.0)
                                     # 스윙: 외부 리스크(이벤트/브리핑) 감산만 반영(공포/탐욕은 pct_total로 이미 반영)
                                     try:
-                                        if str(style) == "스윙" and bool(cfg.get("swing_fng_entry_pct_enable", True)):
+                                        if str(style) == "스윙" and (not highrisk_swing_fixed) and bool(cfg.get("swing_fng_entry_pct_enable", True)):
                                             # 최종 pct_total은 8~15% 범위 내로 고정
                                             pmin = float(cfg.get("swing_fng_entry_pct_min", 8.0) or 8.0)
                                             pmax = float(cfg.get("swing_fng_entry_pct_max", 15.0) or 15.0)
@@ -21264,9 +21351,14 @@ def telegram_thread(ex):
                                             entry_usdt = float(base_eq) * (float(pct_eff) / 100.0)
                                             ai2["entry_pct_total_effective"] = float(pct_eff)
                                         else:
-                                            entry_usdt = float(entry_usdt_target) * float(entry_risk_mul)
+                                            if highrisk_swing_fixed:
+                                                entry_usdt = float(entry_usdt_target)
+                                                ai2["entry_pct_total_source"] = "HIGHRISK_SWING_FORCED_20"
+                                                ai2["entry_risk_mul_applied"] = 1.0
+                                            else:
+                                                entry_usdt = float(entry_usdt_target) * float(entry_risk_mul)
                                     except Exception:
-                                        entry_usdt = float(entry_usdt_target) * float(entry_risk_mul)
+                                        entry_usdt = float(entry_usdt_target) if highrisk_swing_fixed else float(entry_usdt_target) * float(entry_risk_mul)
                                     # free를 넘으면 주문 실패 → free 내로 제한
                                     entry_usdt = float(min(entry_usdt, float(free_usdt) * 0.99))
                                     ai2["entry_usdt_target_total"] = float(entry_usdt_target)
@@ -21592,6 +21684,7 @@ def telegram_thread(ex):
                                     "style": style,
                                     "style_confidence": int(cs.get("style_confidence", 0)),
                                     "style_reason": str(cs.get("style_reason", ""))[:240],
+                                    "decision_tf": str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                     "entry_epoch": time.time(),
                                     "style_last_switch_epoch": time.time(),
                                 }
@@ -21650,6 +21743,7 @@ def telegram_thread(ex):
                                         "style": style,
                                         "style_confidence": int(cs.get("style_confidence", 0)),
                                         "style_reason": str(cs.get("style_reason", ""))[:240],
+                                        "decision_tf": str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                         "events": [],
                                         "external_used": (
                                             {
@@ -21851,6 +21945,7 @@ def telegram_thread(ex):
                                         "sl_pct": float(slp) if slp is not None else None,
                                         "reason": str(locals().get("one_line0", "") or ai2.get("reason_easy", "") or "").strip(),
                                         "trade_id": str(trade_id or ""),
+                                        "decision_tf": str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                         "balance_total": (
                                             float(locals().get("ba_total"))
                                             if (locals().get("ba_total", None) is not None and str(locals().get("ba_total")) != "")
@@ -21910,6 +22005,7 @@ def telegram_thread(ex):
                                                 pattern_hint=str(stt.get("패턴", "") or ""),
                                                 mtf_pattern=(stt.get("_pattern_mtf", {}) if isinstance(stt.get("_pattern_mtf", {}), dict) else {}),
                                                 trade_id=str(trade_id),
+                                                decision_tf=str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                             )
                                             if img_path:
                                                 cap = (
