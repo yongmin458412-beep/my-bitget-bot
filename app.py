@@ -12234,6 +12234,8 @@ class Notifier:
         fields: Optional[List[Dict[str, Any]]] = None,
         target: str = "default",
         cfg: Optional[Dict[str, Any]] = None,
+        *,
+        silent: bool = False,
     ) -> bool:
         try:
             cfg = cfg or load_settings()
@@ -12259,6 +12261,25 @@ class Notifier:
                 except Exception:
                     continue
 
+            timeout = (3.0, min(10.0, float(HTTP_TIMEOUT_SEC)))
+            # Discord 무음 전송(알림 배너 억제)
+            # flags=4096 (SUPPRESS_NOTIFICATIONS)
+            if bool(silent):
+                payload = {
+                    "flags": 4096,
+                    "embeds": [
+                        {
+                            "title": ttl,
+                            "description": desc,
+                            "color": int(color),
+                            "fields": rows[:20],
+                            "footer": {"text": f"route={str(target or 'default')} | {now_kst_str()}"},
+                        }
+                    ],
+                }
+                requests.post(webhook, json=payload, timeout=timeout)
+                return True
+
             if DiscordWebhook is not None and DiscordEmbed is not None:
                 wh = DiscordWebhook(url=webhook, rate_limit_retry=True, timeout=min(float(HTTP_TIMEOUT_SEC), 12.0))
                 emb = DiscordEmbed(title=ttl, description=desc, color=int(color))
@@ -12280,7 +12301,6 @@ class Notifier:
                     }
                 ]
             }
-            timeout = (3.0, min(10.0, float(HTTP_TIMEOUT_SEC)))
             requests.post(webhook, json=payload, timeout=timeout)
             return True
         except Exception:
@@ -12330,6 +12350,7 @@ class Notifier:
                 fields=fields,
                 target=target,
                 cfg=cfg,
+                silent=bool(silent),
             )
         except Exception:
             return False
@@ -12545,10 +12566,54 @@ def _tg_chat_id_by_target(target: str, cfg: Dict[str, Any]) -> List[str]:
     return [tg_id_default] if tg_id_default else []
 
 
+def _is_entry_or_exit_message(text: Any) -> bool:
+    try:
+        raw = str(text or "").strip()
+        if not raw:
+            return False
+        head = raw.splitlines()[0].strip()
+        hard_heads = [
+            "🎯 진입",
+            "🎉 익절",
+            "🩸 손절",
+            "🟡 부분익절",
+            "⚖️ 본절",
+            "🚫 강제청산",
+            "⏱️ 시간초과 청산",
+            "🛑 전량 청산",
+        ]
+        for h in hard_heads:
+            if head.startswith(h):
+                return True
+        s = raw.replace(" ", "")
+        if ("진입" in s) and ("코인:" in raw):
+            return True
+        if ("익절" in s) or ("손절" in s):
+            return True
+        if ("청산" in s) and (("코인:" in raw) or ("수익률" in raw) or ("손익" in raw)):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _event_silent_policy(cfg: Optional[Dict[str, Any]], explicit_silent: bool, text_hint: Any) -> bool:
+    try:
+        if bool(explicit_silent):
+            return True
+        cfg = cfg or {}
+        if bool(cfg.get("tg_notify_entry_exit_only", True)):
+            return (not _is_entry_or_exit_message(text_hint))
+        return False
+    except Exception:
+        return bool(explicit_silent)
+
+
 def tg_send(text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False, parse_mode: str = ""):
     # 요구사항: Telegram 상태/라우팅이 전역 config가 아니라 최신 load_settings() 기준으로 일치
     cfg = cfg or load_settings()
     notifier = get_notifier()
+    effective_silent = _event_silent_policy(cfg, bool(silent), text)
 
     # Telegram
     if notifier.should_send_telegram(cfg) and tg_token:
@@ -12559,7 +12624,7 @@ def tg_send(text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = 
                 continue
             try:
                 data = {"chat_id": cid, "text": text}
-                if bool(silent):
+                if bool(effective_silent):
                     data["disable_notification"] = True
                 pm = str(parse_mode or "").strip()
                 if pm:
@@ -12570,7 +12635,7 @@ def tg_send(text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = 
 
     # Discord Embed
     try:
-        notifier.send_discord_text(text=str(text or ""), target=target, cfg=cfg, silent=silent)
+        notifier.send_discord_text(text=str(text or ""), target=target, cfg=cfg, silent=bool(effective_silent))
     except Exception:
         pass
 
@@ -12581,6 +12646,7 @@ def tg_send_photo(photo_path: str, caption: str = "", target: str = "default", c
         return
     cfg = cfg or load_settings()
     notifier = get_notifier()
+    effective_silent = _event_silent_policy(cfg, bool(silent), caption)
     if notifier.should_send_telegram(cfg) and tg_token:
         ids = _tg_chat_id_by_target(target, cfg)
         pri = "high" if str(target or "").lower().strip() == "admin" else "normal"
@@ -12594,7 +12660,7 @@ def tg_send_photo(photo_path: str, caption: str = "", target: str = "default", c
                 data: Dict[str, Any] = {"chat_id": cid, "__file_path": path}
                 if cap:
                     data["caption"] = cap
-                if bool(silent):
+                if bool(effective_silent):
                     data["disable_notification"] = True
                 tg_enqueue("sendPhoto", data, priority=pri)
             except Exception:
@@ -12603,12 +12669,12 @@ def tg_send_photo(photo_path: str, caption: str = "", target: str = "default", c
     try:
         cap2 = str(caption or "").strip()
         if cap2:
-            notifier.send_discord_text(text=cap2, target=target, cfg=cfg, silent=silent)
+            notifier.send_discord_text(text=cap2, target=target, cfg=cfg, silent=bool(effective_silent))
     except Exception:
         pass
 
 
-def tg_send_photo_chat(chat_id: Any, photo_path: str, caption: str = "", *, silent: bool = False):
+def tg_send_photo_chat(chat_id: Any, photo_path: str, caption: str = "", *, silent: bool = False, cfg: Optional[Dict[str, Any]] = None):
     if not tg_token:
         return
     if chat_id is None:
@@ -12619,12 +12685,14 @@ def tg_send_photo_chat(chat_id: Any, photo_path: str, caption: str = "", *, sile
     cid = str(chat_id).strip()
     if not cid:
         return
+    cfg = cfg or load_settings()
+    effective_silent = _event_silent_policy(cfg, bool(silent), caption)
     try:
         data: Dict[str, Any] = {"chat_id": cid, "__file_path": path}
         cap = str(caption or "").strip()
         if cap:
             data["caption"] = cap[:1000]
-        if bool(silent):
+        if bool(effective_silent):
             data["disable_notification"] = True
         tg_enqueue("sendPhoto", data, priority="normal")
     except Exception:
