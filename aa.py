@@ -601,9 +601,9 @@ MODE_RULES = {
     "공격모드": {"min_conf": 75, "entry_pct_min": 7, "entry_pct_max": 22, "lev_min": 4, "lev_max": 12},
     "하이리스크/하이리턴": {"min_conf": 72, "entry_pct_min": 18, "entry_pct_max": 40, "lev_min": 12, "lev_max": 25},
     # Streamlit Cloud 단일 스크립트 운용에서도 선택 가능하도록 스타일 모드를 MODE_RULES에 추가(기존 구조 유지)
-    "스캘핑": {"min_conf": 68, "entry_pct_min": 3, "entry_pct_max": 16, "lev_min": 10, "lev_max": 30},
-    "단타": {"min_conf": 72, "entry_pct_min": 5, "entry_pct_max": 20, "lev_min": 5, "lev_max": 10},
-    "스윙": {"min_conf": 78, "entry_pct_min": 6, "entry_pct_max": 22, "lev_min": 1, "lev_max": 5},
+    "스캘핑": {"min_conf": 68, "entry_pct_min": 3, "entry_pct_max": 16, "lev_min": 10, "lev_max": 30, "tp_roi_cap": 2.5},
+    "단타": {"min_conf": 72, "entry_pct_min": 5, "entry_pct_max": 20, "lev_min": 5, "lev_max": 10, "tp_roi_cap": 12.0},
+    "스윙": {"min_conf": 78, "entry_pct_min": 6, "entry_pct_max": 22, "lev_min": 1, "lev_max": 5, "tp_roi_min": 10.0, "tp_roi_cap": 0.0},
 }
 
 # =========================================================
@@ -620,12 +620,12 @@ STYLE_RULES = {
         "lev_max": 30,
         # 가이드(고정값 아님): 최종 목표는 SR/오더북에서 동적으로 결정
         "tp_roi_min": 0.5,
-        "tp_roi_max": 2.0,
+        "tp_roi_max": 2.5,
         "sl_roi_min": 0.4,
         "sl_roi_max": 1.8,
         # 가격 변동폭(%) 기준 탐색 범위
         "tp_price_min": 0.5,
-        "tp_price_max": 2.0,
+        "tp_price_max": 2.5,
         "sl_price_min": 0.3,
         "sl_price_max": 1.2,
         "preferred_tfs": ["1m", "5m"],
@@ -637,11 +637,11 @@ STYLE_RULES = {
         "lev_min": 5,
         "lev_max": 10,
         "tp_roi_min": 2.0,
-        "tp_roi_max": 10.0,
+        "tp_roi_max": 12.0,
         "sl_roi_min": 1.0,
         "sl_roi_max": 4.0,
         "tp_price_min": 2.0,
-        "tp_price_max": 10.0,
+        "tp_price_max": 12.0,
         "sl_price_min": 1.0,
         "sl_price_max": 4.5,
         "preferred_tfs": ["15m", "1h"],
@@ -653,11 +653,11 @@ STYLE_RULES = {
         "lev_min": 1,
         "lev_max": 5,
         "tp_roi_min": 10.0,
-        "tp_roi_max": 35.0,
+        "tp_roi_max": 999.0,
         "sl_roi_min": 2.0,
         "sl_roi_max": 12.0,
         "tp_price_min": 10.0,
-        "tp_price_max": 35.0,
+        "tp_price_max": 999.0,
         "sl_price_min": 3.0,
         "sl_price_max": 15.0,
         "preferred_tfs": ["4h", "1d"],
@@ -679,6 +679,75 @@ def normalize_style_name(style: Any) -> str:
 def style_rule(style: Any) -> Dict[str, Any]:
     st = normalize_style_name(style)
     return dict(STYLE_RULES.get(st, STYLE_RULES["스캘핑"]))
+
+
+def hard_roi_limits_by_style(style: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    st = normalize_style_name(style)
+    sr = style_rule(st)
+    try:
+        if st == "스캘핑":
+            return {
+                "tp_min": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_tp_min_roi", sr.get("tp_roi_min", 0.5)), sr.get("tp_roi_min", 0.5)))),
+                "tp_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_tp_roi", 2.5), 2.5))),
+                "sl_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_sl_roi", sr.get("sl_roi_max", 1.8)), sr.get("sl_roi_max", 1.8)))),
+            }
+        if st == "단타":
+            return {
+                "tp_min": float(max(0.5, _as_float(cfg.get("hard_cap_day_tp_min_roi", sr.get("tp_roi_min", 2.0)), sr.get("tp_roi_min", 2.0)))),
+                "tp_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_tp_roi", 12.0), 12.0))),
+                "sl_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_sl_roi", sr.get("sl_roi_max", 4.0)), sr.get("sl_roi_max", 4.0)))),
+            }
+        return {
+            "tp_min": float(max(10.0, _as_float(cfg.get("hard_cap_swing_tp_min_roi", 10.0), 10.0))),
+            "tp_cap": None,
+            "sl_cap": float(max(1.0, _as_float(cfg.get("hard_cap_swing_sl_roi", sr.get("sl_roi_max", 12.0)), sr.get("sl_roi_max", 12.0)))),
+        }
+    except Exception:
+        if st == "스윙":
+            return {"tp_min": 10.0, "tp_cap": None, "sl_cap": float(sr.get("sl_roi_max", 12.0))}
+        if st == "단타":
+            return {"tp_min": float(sr.get("tp_roi_min", 2.0)), "tp_cap": 12.0, "sl_cap": float(sr.get("sl_roi_max", 4.0))}
+        return {"tp_min": float(sr.get("tp_roi_min", 0.5)), "tp_cap": 2.5, "sl_cap": float(sr.get("sl_roi_max", 1.8))}
+
+
+def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    res = dict(out or {})
+    try:
+        st = normalize_style_name(style)
+        lim = hard_roi_limits_by_style(st, cfg)
+        tp_min = float(max(0.0, _as_float(lim.get("tp_min", 0.0), 0.0)))
+        tp_cap_raw = lim.get("tp_cap", None)
+        tp_cap = float(tp_cap_raw) if tp_cap_raw is not None else None
+        sl_cap_raw = lim.get("sl_cap", None)
+        sl_cap = float(sl_cap_raw) if sl_cap_raw is not None else None
+
+        tp = abs(float(_as_float(res.get("tp_pct", 0.0), 0.0)))
+        sl = abs(float(_as_float(res.get("sl_pct", 0.0), 0.0)))
+
+        if tp_cap is not None and tp_cap > 0:
+            tp = min(tp, tp_cap)
+        if tp_min > 0:
+            tp = max(tp, tp_min)
+
+        if sl_cap is not None and sl_cap > 0:
+            sl = min(sl, sl_cap)
+
+        res["tp_pct"] = float(tp)
+        res["sl_pct"] = float(sl)
+        try:
+            lev = float(max(1.0, abs(_as_float(res.get("leverage", 1), 1.0))))
+            res["tp_price_pct"] = float(tp / lev)
+            res["sl_price_pct"] = float(sl / lev)
+        except Exception:
+            pass
+        try:
+            res["rr"] = float(float(res["tp_pct"]) / max(abs(float(res["sl_pct"])), 0.01))
+        except Exception:
+            pass
+        res["_hard_roi_caps"] = {"style": st, "tp_min": tp_min, "tp_cap": tp_cap, "sl_cap": sl_cap}
+    except Exception:
+        return res
+    return res
 
 
 # =========================================================
@@ -7519,9 +7588,30 @@ def _style_target_guidelines(style: str, cfg: Dict[str, Any]) -> Dict[str, float
         sl_max = float(cfg.get("day_sl_price_pct_max", sr.get("sl_price_max", 4.5)) or sr.get("sl_price_max", 4.5))
     else:
         tp_min = float(cfg.get("swing_tp_price_pct_min", sr.get("tp_price_min", 10.0)) or sr.get("tp_price_min", 10.0))
-        tp_max = float(cfg.get("swing_tp_price_pct_max", sr.get("tp_price_max", 35.0)) or sr.get("tp_price_max", 35.0))
+        # 스윙은 TP 상한을 두지 않는다(하한만 유지). 설정값이 낮아도 스타일 기본값 이상으로 확장.
+        tp_max_cfg = float(cfg.get("swing_tp_price_pct_max", sr.get("tp_price_max", 999.0)) or sr.get("tp_price_max", 999.0))
+        tp_max = float(max(tp_max_cfg, float(sr.get("tp_price_max", 999.0))))
         sl_min = float(cfg.get("swing_sl_price_pct_min", sr.get("sl_price_min", 3.0)) or sr.get("sl_price_min", 3.0))
         sl_max = float(cfg.get("swing_sl_price_pct_max", sr.get("sl_price_max", 15.0)) or sr.get("sl_price_max", 15.0))
+
+    # ✅ 스타일별 하드캡: 사용자 설정값이 있어도 절대 상한/하한을 넘기지 않도록 강제
+    lim = hard_roi_limits_by_style(st, cfg)
+    try:
+        tp_min = float(max(tp_min, float(lim.get("tp_min", 0.0) or 0.0)))
+    except Exception:
+        pass
+    try:
+        tp_cap = lim.get("tp_cap", None)
+        if tp_cap is not None:
+            tp_max = float(min(tp_max, float(tp_cap)))
+    except Exception:
+        pass
+    try:
+        sl_cap = lim.get("sl_cap", None)
+        if sl_cap is not None:
+            sl_max = float(min(sl_max, float(sl_cap)))
+    except Exception:
+        pass
 
     tp_min = float(max(0.05, min(tp_min, tp_max)))
     tp_max = float(max(tp_min, tp_max))
@@ -8422,8 +8512,8 @@ def detect_chart_patterns(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, An
                 retr = max(0.0, (h_avg - valley) / h_avg)
                 if sim <= tol_pct and retr >= retrace_pct:
                     is_break = float(close[-1]) <= float(valley) * (1.0 - breakout_buf)
-                    _add("M자형(쌍봉)", -1, 1.35 if is_break else 0.75)
-                    _add("쌍봉(Double Top)", -1, 1.25 if is_break else 0.70)
+                    _add("M자형(쌍봉)", -1, 1.35 if is_break else 0.65)
+                    _add("쌍봉(Double Top)", -1, 1.25 if is_break else 0.60)
 
         t2 = _pick_last_n_with_min_sep(lows_idx, 2, min_sep)
         if len(t2) == 2:
@@ -8436,8 +8526,8 @@ def detect_chart_patterns(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, An
                 retr = max(0.0, (peak - l_avg) / max(peak, 1e-9))
                 if sim <= tol_pct and retr >= retrace_pct:
                     is_break = float(close[-1]) >= float(peak) * (1.0 + breakout_buf)
-                    _add("W자형(쌍바닥)", 1, 1.35 if is_break else 0.75)
-                    _add("쌍바닥(Double Bottom)", 1, 1.25 if is_break else 0.70)
+                    _add("W자형(쌍바닥)", 1, 1.35 if is_break else 0.65)
+                    _add("쌍바닥(Double Bottom)", 1, 1.25 if is_break else 0.60)
 
         p3 = _pick_last_n_with_min_sep(highs_idx, 3, min_sep)
         if len(p3) == 3:
@@ -8492,6 +8582,16 @@ def detect_chart_patterns(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, An
                 neck = (n1 + n2) * 0.5
                 is_break = float(close[-1]) >= float(neck) * (1.0 + breakout_buf)
                 _add("역헤드앤숄더", 1, 1.55 if is_break else 0.85)
+
+        # ✅ 우선순위: 3피크/3바닥 기반 H&S가 있으면 같은 방향 쌍봉/쌍바닥은 1차 근거에서 제외
+        if any(nm == "헤드앤숄더" for nm, _ in bear_items):
+            drop = {"M자형(쌍봉)", "쌍봉(Double Top)"}
+            bear_items = [(nm, sc) for (nm, sc) in bear_items if nm not in drop]
+            out["detected"] = [nm for nm in out["detected"] if nm not in drop]
+        if any(nm == "역헤드앤숄더" for nm, _ in bull_items):
+            drop = {"W자형(쌍바닥)", "쌍바닥(Double Bottom)"}
+            bull_items = [(nm, sc) for (nm, sc) in bull_items if nm not in drop]
+            out["detected"] = [nm for nm in out["detected"] if nm not in drop]
 
         hi_recent = _pick_last_n_with_min_sep(highs_idx, min(6, len(highs_idx)), min_sep)
         lo_recent = _pick_last_n_with_min_sep(lows_idx, min(6, len(lows_idx)), min_sep)
@@ -8565,8 +8665,11 @@ def detect_chart_patterns(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, An
                 else:
                     _add("하락쐐기", 1, 0.70)
 
-        bull_score = float(sum(x[1] for x in bull_items))
-        bear_score = float(sum(x[1] for x in bear_items))
+        # ✅ 저신뢰 패턴(<0.70)은 1차 진입 근거 점수에서 제외(관찰용으로만 유지)
+        bull_primary = [(nm, sc) for (nm, sc) in bull_items if float(sc) >= 0.70]
+        bear_primary = [(nm, sc) for (nm, sc) in bear_items if float(sc) >= 0.70]
+        bull_score = float(sum(x[1] for x in bull_primary))
+        bear_score = float(sum(x[1] for x in bear_primary))
         diff = bull_score - bear_score
         if diff >= 0.35:
             out["bias"] = 1
@@ -8581,14 +8684,23 @@ def detect_chart_patterns(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, An
         out["strength"] = float(strength)
         out["score_long"] = float(bull_score)
         out["score_short"] = float(bear_score)
-        out["bullish"] = [x[0] for x in bull_items[:8]]
-        out["bearish"] = [x[0] for x in bear_items[:8]]
-        out["neutral"] = [x[0] for x in neutral_items[:8]]
+        bull_sorted = sorted(bull_items, key=lambda x: float(x[1]), reverse=True)
+        bear_sorted = sorted(bear_items, key=lambda x: float(x[1]), reverse=True)
+        neutral_sorted = sorted(neutral_items, key=lambda x: float(x[1]), reverse=True)
+        out["bullish"] = [x[0] for x in bull_sorted[:8]]
+        out["bearish"] = [x[0] for x in bear_sorted[:8]]
+        out["neutral"] = [x[0] for x in neutral_sorted[:8]]
+        det_sorted = sorted((bull_items + bear_items + neutral_items), key=lambda x: float(x[1]), reverse=True)
+        out["detected"] = [x[0] for x in det_sorted[:16]]
         if not out["detected"]:
             out["summary"] = "패턴 없음"
         else:
-            side_txt = "롱 우세" if out["bias"] == 1 else ("숏 우세" if out["bias"] == -1 else "중립")
-            out["summary"] = f"{side_txt} | " + ", ".join(out["detected"][:3])
+            if bull_score <= 0 and bear_score <= 0:
+                out["summary"] = "저신뢰 패턴만 감지(관망 권장)"
+            else:
+                side_txt = "롱 우세" if out["bias"] == 1 else ("숏 우세" if out["bias"] == -1 else "중립")
+                primary_tags = [nm for (nm, sc) in det_sorted if float(sc) >= 0.70]
+                out["summary"] = f"{side_txt} | " + ", ".join((primary_tags or out["detected"])[:3])
         return out
     except Exception:
         return out
@@ -11778,6 +11890,49 @@ JSON 형식:
             pass
         out["reason_easy"] = reason_txt[:500]
 
+        # ✅ 스타일별 TP/SL 하드캡(과도한 목표 방지)
+        try:
+            style_for_caps = normalize_style_name(chart_style_hint or out.get("style", "스캘핑"))
+            out = apply_hard_roi_caps(out, style_for_caps, cfg)
+        except Exception:
+            pass
+
+        # ✅ 역추세 숏 엄격 필터:
+        # - 단기 추세(7/99) 상승일 때 숏은
+        #   (1) 명확한 약세 다이버전스 + (2) SQZ 음모멘텀 + (3) 종가 MA7 하향 이탈
+        #   3개 모두 충족 시에만 허용
+        try:
+            if str(out.get("decision", "hold")) == "sell":
+                close_now = float(last["close"])
+                ma_fast = float(last.get("MA_fast")) if ("MA_fast" in df.columns and pd.notna(last.get("MA_fast"))) else None
+                ma_slow = float(last.get("MA_slow")) if ("MA_slow" in df.columns and pd.notna(last.get("MA_slow"))) else None
+
+                trend_up = bool("상승" in str(status.get("추세", "") or ""))
+                if (ma_fast is not None) and (ma_slow is not None):
+                    trend_up = bool(float(ma_fast) > float(ma_slow))
+
+                divs = [str(x) for x in (status.get("_pattern_divergences", []) or [])]
+                clear_bear_div = any(("정규 약세 다이버전스" in d) or ("regular bearish divergence" in d.lower()) for d in divs)
+                sqz_thr = float(max(0.01, abs(float(cfg.get("sqz_mom_threshold_pct", 0.05) or 0.05))))
+                sqz_mom = float(status.get("_sqz_mom_pct", 0.0) or 0.0)
+                sqz_neg = bool(sqz_mom <= -sqz_thr)
+                close_below_fast = bool((ma_fast is not None) and (close_now < float(ma_fast)))
+
+                if trend_up and (not (clear_bear_div and sqz_neg and close_below_fast)):
+                    miss = []
+                    if not clear_bear_div:
+                        miss.append("약세다이버전스")
+                    if not sqz_neg:
+                        miss.append("SQZ음전환")
+                    if not close_below_fast:
+                        miss.append("MA7하향이탈")
+                    out["decision"] = "hold"
+                    out["reason_easy"] = f"상승추세 역숏 차단: 반전신호 약함({','.join(miss)})"
+                    out["_reversal_blocked"] = True
+                    out["_reversal_block_reason"] = "trend_up_short_block"
+        except Exception:
+            pass
+
         # ✅ 이전에는 min_conf 미만이면 강제로 hold로 바꿨지만,
         # 사용자는 "조건이 애매해도 소액/보수적으로 진입"을 원하므로 여기서는 decision을 유지한다.
         # (실제 주문은 스캔 루프에서 soft-entry/포지션 제한으로 제어)
@@ -11979,7 +12134,8 @@ def apply_style_envelope(ai: Dict[str, Any], style: str, cfg: Dict[str, Any], ru
             entry_pct = float(clamp(entry_pct * float(cfg.get("swing_entry_pct_mult", 1.0)), rule["entry_pct_min"], rule["entry_pct_max"]))
             lev = int(min(lev, int(cfg.get("swing_lev_cap", rule["lev_max"]))))
             sl = float(clamp(sl, float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 35.0))))
-            tp = float(clamp(tp, float(cfg.get("swing_tp_roi_min", 10.0)), float(cfg.get("swing_tp_roi_max", 35.0))))
+            swing_tp_max = float(max(float(cfg.get("swing_tp_roi_max", sr.get("tp_roi_max", 999.0)) or sr.get("tp_roi_max", 999.0)), float(sr.get("tp_roi_max", 999.0))))
+            tp = float(clamp(tp, float(cfg.get("swing_tp_roi_min", 10.0)), swing_tp_max))
 
         # 스타일 범위(요청 스펙) 재보정
         entry_pct = float(clamp(entry_pct, entry_lo, entry_hi))
@@ -11993,6 +12149,11 @@ def apply_style_envelope(ai: Dict[str, Any], style: str, cfg: Dict[str, Any], ru
         else:
             sl = float(clamp(sl, float(sr.get("sl_roi_min", 2.0)), float(sr.get("sl_roi_max", 12.0))))
             tp = float(clamp(tp, float(sr.get("tp_roi_min", 10.0)), float(sr.get("tp_roi_max", 35.0))))
+
+        # ✅ 스타일별 하드캡(우선순위): 스캘핑/단타 TP 상한, 스윙 TP 하한(10%+) 강제
+        tmp_caps = apply_hard_roi_caps({"tp_pct": tp, "sl_pct": sl, "leverage": lev}, st, cfg)
+        tp = float(_as_float(tmp_caps.get("tp_pct", tp), tp))
+        sl = float(_as_float(tmp_caps.get("sl_pct", sl), sl))
 
         out["entry_pct"] = entry_pct
         out["leverage"] = lev
@@ -20329,6 +20490,46 @@ def telegram_thread(ex):
                                     cs["style_reco"] = "스캘핑"
                                     cs["style_reason"] = f"장기추세({htf_tf}) 상승 → 역추세는 스캘핑만"
 
+                            # ✅ 역추세 숏 하드 필터(최종 주문 직전):
+                            # 단기 상승추세에서 숏은 3조건(약세다이버전스+SQZ음전환+MA7하향이탈) 미충족 시 차단
+                            try:
+                                if str(decision) == "sell":
+                                    ma_fast_cur = float(last.get("MA_fast")) if ("MA_fast" in df.columns and pd.notna(last.get("MA_fast"))) else None
+                                    ma_slow_cur = float(last.get("MA_slow")) if ("MA_slow" in df.columns and pd.notna(last.get("MA_slow"))) else None
+                                    close_cur = float(last["close"])
+                                    trend_short_up = bool("상승" in str(stt.get("추세", "") or ""))
+                                    if (ma_fast_cur is not None) and (ma_slow_cur is not None):
+                                        trend_short_up = bool(float(ma_fast_cur) > float(ma_slow_cur))
+
+                                    divs2 = [str(x) for x in (stt.get("_pattern_divergences", []) or [])]
+                                    clear_bear_div2 = any(("정규 약세 다이버전스" in d) or ("regular bearish divergence" in d.lower()) for d in divs2)
+                                    sqz_thr2 = float(max(0.01, abs(float(cfg.get("sqz_mom_threshold_pct", 0.05) or 0.05))))
+                                    sqz_neg2 = bool(float(stt.get("_sqz_mom_pct", 0.0) or 0.0) <= -sqz_thr2)
+                                    below_fast2 = bool((ma_fast_cur is not None) and (close_cur < float(ma_fast_cur)))
+
+                                    if trend_short_up and not (clear_bear_div2 and sqz_neg2 and below_fast2):
+                                        missing2: List[str] = []
+                                        if not clear_bear_div2:
+                                            missing2.append("약세다이버전스")
+                                        if not sqz_neg2:
+                                            missing2.append("SQZ음전환")
+                                        if not below_fast2:
+                                            missing2.append("MA7하향이탈")
+                                        cs["skip_reason"] = f"상승추세 역숏 차단({','.join(missing2)})"
+                                        mon_add_scan(
+                                            mon,
+                                            stage="trade_skipped",
+                                            symbol=sym,
+                                            tf=str(cfg.get("timeframe", "5m")),
+                                            signal="sell",
+                                            score=int(conf),
+                                            message=str(cs.get("skip_reason", ""))[:140],
+                                            extra={"trend_short": str(stt.get("추세", "")), "sqz_mom_pct": float(stt.get("_sqz_mom_pct", 0.0) or 0.0)},
+                                        )
+                                        continue
+                            except Exception:
+                                pass
+
                             # ✅ 왜 스캘핑/스윙인지(단기/장기 추세 포함) 더 직관적으로 남김
                             try:
                                 r0 = str(cs.get("style_reason", "") or "").strip()
@@ -20413,6 +20614,8 @@ def telegram_thread(ex):
                             # ✅ 스캘핑: 레버가 높을 때 TP/SL이 과도해지는 문제(익절 미발동 등) 방지
                             if str(style) == "스캘핑":
                                 ai2 = apply_scalp_price_guardrails(ai2, df, cfg, rule)
+                            # ✅ 최종 하드캡(절대 상한/하한): 스타일별 TP/SL 한도를 넘지 않도록 마지막에 강제
+                            ai2 = apply_hard_roi_caps(ai2, style, cfg)
 
                             entry_pct = float(ai2.get("entry_pct", rule["entry_pct_min"]))
                             lev = int(ai2.get("leverage", rule["lev_min"]))
