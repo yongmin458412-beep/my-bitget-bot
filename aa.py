@@ -732,6 +732,20 @@ def hard_roi_limits_by_style(style: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
         return {"tp_min": 0.0, "tp_cap": 2.5, "sl_cap": 5.0}
 
 
+def _rr_floor_by_style(style: Any, cfg: Dict[str, Any]) -> float:
+    st = normalize_style_name(style)
+    try:
+        if st == "스캘핑":
+            return float(max(1.0, _as_float(cfg.get("scalp_rr_floor", 1.5), 1.5)))
+        if st == "단타":
+            return float(max(1.0, _as_float(cfg.get("day_rr_floor", 2.0), 2.0)))
+        if st == "스윙":
+            return float(max(1.0, _as_float(cfg.get("swing_rr_floor", 3.0), 3.0)))
+    except Exception:
+        pass
+    return 1.5
+
+
 def _style_hard_tp_cap_roi(style: Any, cfg: Dict[str, Any]) -> Optional[float]:
     st = normalize_style_name(style)
     try:
@@ -756,6 +770,7 @@ def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) ->
         tp_cap = float(tp_cap_raw) if tp_cap_raw is not None else None
         sl_cap_raw = lim.get("sl_cap", None)
         sl_cap = float(sl_cap_raw) if sl_cap_raw is not None else None
+        rr_floor = float(_rr_floor_by_style(st, cfg))
 
         lev = float(max(1.0, abs(_as_float(res.get("leverage", 1), 1.0))))
         tp = abs(float(_as_float(res.get("tp_pct", 0.0), 0.0)))
@@ -785,6 +800,28 @@ def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) ->
         if sl_cap is not None and sl_cap > 0:
             sl = min(sl, sl_cap)
 
+        # ✅ RR 강제: 목표손절이 목표익절보다 커지지 않도록 보정
+        if sl <= 0:
+            sl = max(0.2, tp / max(rr_floor, 1.0))
+        if rr_floor > 1.0:
+            tp_need = float(sl * rr_floor)
+            if tp < tp_need:
+                if (tp_cap is None) or (tp_need <= float(tp_cap)):
+                    tp = float(tp_need)
+                    res["_rr_guard_note"] = f"RR 하한({rr_floor:.2f}) 충족 위해 TP 상향"
+                else:
+                    tp = float(min(tp, float(tp_cap)))
+                    sl = float(min(sl, max(0.2, tp / rr_floor)))
+                    res["_rr_guard_note"] = f"TP 상한 내에서 RR 하한({rr_floor:.2f}) 충족하도록 SL 축소"
+
+        if tp_cap is not None and tp_cap > 0:
+            tp = float(min(tp, tp_cap))
+        if sl_cap is not None and sl_cap > 0:
+            sl = float(min(sl, sl_cap))
+
+        if rr_floor > 1.0 and tp < (sl * rr_floor):
+            sl = float(min(sl, max(0.2, tp / rr_floor)))
+
         res["tp_pct"] = float(tp)
         res["sl_pct"] = float(sl)
         try:
@@ -801,6 +838,7 @@ def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) ->
             "tp_min": tp_min,
             "tp_cap": tp_cap,
             "sl_cap": sl_cap,
+            "rr_floor": rr_floor,
             "style_hard_tp_cap": hard_style_cap,
         }
     except Exception:
@@ -1340,6 +1378,10 @@ def default_settings() -> Dict[str, Any]:
         "day_tp_price_pct_max": 15.0,
         "day_sl_price_pct_min": 1.0,
         "day_sl_price_pct_max": 4.5,
+        # ✅ 스타일별 RR 하한(목표손절이 목표익절보다 커지는 케이스 방지)
+        "scalp_rr_floor": 1.5,
+        "day_rr_floor": 2.0,
+        "swing_rr_floor": 3.0,
         "day_entry_pct_mult": 0.85,
         "day_lev_cap": 10,
         # ✅ 스캘핑: "가격 변동폭(%)" 기준 가드레일(레버가 높아도 TP/SL이 과도해지지 않게)
@@ -8083,6 +8125,36 @@ def _dynamic_sr_targets_in_zone(
                 out["sl_price"] = float(sl_cands[0][0])
                 out["sl_source"] = str(sl_cands[0][1])
 
+        try:
+            rr_floor = float(_rr_floor_by_style(style, cfg))
+            if rr_floor > 1.0 and out.get("sl_price") is not None and out.get("tp_price") is not None:
+                tp_pct_now = float(_pct_from_entry(px, s, float(out.get("tp_price")), is_tp=True))
+                sl_pct_now = float(_pct_from_entry(px, s, float(out.get("sl_price")), is_tp=False))
+                if tp_pct_now > 0 and sl_pct_now > 0 and tp_pct_now < (sl_pct_now * rr_floor):
+                    tp_need = float(sl_pct_now * rr_floor)
+                    tp_new_pct = float(tp_need)
+                    if tp_cap > 0:
+                        tp_new_pct = float(min(tp_new_pct, tp_cap))
+                    if tp_new_pct > tp_pct_now:
+                        if s == "buy":
+                            out["tp_price"] = float(px * (1.0 + tp_new_pct / 100.0))
+                        else:
+                            out["tp_price"] = float(px * (1.0 - tp_new_pct / 100.0))
+                        out["tp_source"] = (str(out.get("tp_source", "") or "").strip() + "+RR").strip("+")
+                        out["tp_reason"] = (str(out.get("tp_reason", "") or "").strip() + f" | RR 하한 {rr_floor:.2f} 맞춤").strip(" |")
+                        tp_pct_now = float(tp_new_pct)
+                    if tp_pct_now < (sl_pct_now * rr_floor):
+                        sl_new_pct = float(max(0.2, tp_pct_now / rr_floor))
+                        if sl_cap > 0:
+                            sl_new_pct = float(min(sl_new_pct, sl_cap))
+                        if s == "buy":
+                            out["sl_price"] = float(px * (1.0 - sl_new_pct / 100.0))
+                        else:
+                            out["sl_price"] = float(px * (1.0 + sl_new_pct / 100.0))
+                        out["sl_source"] = (str(out.get("sl_source", "") or "").strip() + "+RR").strip("+")
+                        out["sl_reason"] = (str(out.get("sl_reason", "") or "").strip() + f" | RR 하한 {rr_floor:.2f} 맞춤").strip(" |")
+        except Exception:
+            pass
         out["ok"] = bool(out.get("sl_price") is not None and out.get("tp_price") is not None)
         return out
     except Exception:
@@ -12008,11 +12080,11 @@ def _rr_min_by_style(style: str) -> float:
     # 스타일별 최소 손익비 가이드
     st = normalize_style_name(style)
     if st == "스캘핑":
-        return 1.2
+        return 1.5
     if st == "단타":
-        return 1.8
+        return 2.0
     if st == "스윙":
-        return 2.6
+        return 3.0
     return 1.4
 
 
@@ -17071,6 +17143,7 @@ def _try_reverse_switch_after_stop(
         active_targets[sym] = {
             "sl": float(slp),
             "tp": float(tpp),
+            "rr": float(float(tpp) / max(abs(float(slp)), 0.01)),
             "entry_usdt": float(entry_usdt),
             "entry_pct": float(entry_pct),
             "entry_confidence": int(max(0, min(100, 50 + score * 5))),
@@ -17120,6 +17193,7 @@ def _try_reverse_switch_after_stop(
                 "lev": int(lev),
                 "sl_pct_roi": float(slp),
                 "tp_pct_roi": float(tpp),
+                "rr": float(float(tpp) / max(abs(float(slp)), 0.01)),
                 "sl_price_sr": sl_price,
                 "tp_price_sr": tp_price,
                 "sl_price_reason_ai": str(ai_like.get("sl_price_reason", "") or ""),
@@ -22621,6 +22695,7 @@ def telegram_thread(ex):
                                 active_targets[sym] = {
                                     "sl": slp,
                                     "tp": tpp,
+                                    "rr": float(float(tpp) / max(abs(float(slp)), 0.01)),
                                     "entry_usdt": entry_usdt,
                                     "entry_pct": entry_pct,
                                     "entry_confidence": int(conf),
@@ -22703,6 +22778,7 @@ def telegram_thread(ex):
                                         "balance_after_free": active_targets.get(sym, {}).get("bal_entry_after_free", ""),
                                         "sl_pct_roi": slp,
                                         "tp_pct_roi": tpp,
+                                        "rr": float(float(tpp) / max(abs(float(slp)), 0.01)),
                                         "sl_price_sr": sl_price,
                                         "tp_price_sr": tp_price,
                                         "sl_price_reason_ai": str(ai2.get("sl_price_reason", "") or ""),
