@@ -893,6 +893,12 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 사용자 요구: AI 시야 리포트(자동 전송)는 기본 OFF (필요할 때만 /vision 으로 조회)
         "tg_enable_hourly_vision_report": False,
         "vision_report_interval_min": 60,
+        # ✅ 하트비트 정체 감지(초) - false positive 완화
+        "ui_heartbeat_stale_min_sec": 90,
+        "watchdog_hb_warn_sec": 120,
+        "watchdog_hb_clear_sec": 45,
+        "watchdog_hb_restart_sec": 180,
+        "watchdog_restart_cooldown_sec": 120,
         # ✅ 진입/청산 이벤트 차트 이미지 전송
         "tg_send_trade_images": True,
         "tg_send_entry_image": True,
@@ -1389,6 +1395,9 @@ def default_settings() -> Dict[str, Any]:
         "pullback_distance_pct_day": 0.80,
         "pullback_wait_candles_min": 3,
         "pullback_wait_candles_max": 5,
+        # ✅ 지정가 대기 상한(초): 긴 블로킹으로 하트비트 정체되는 문제 방지
+        "pullback_wait_timeout_sec_min": 6,
+        "pullback_wait_timeout_sec_max": 25,
         # ✅ 거래량/OBV 확인(페이크아웃 차단)
         "volume_confirm_min_ratio": 1.15,
         # ✅ 스타일별 RR 하한(목표손절이 목표익절보다 커지는 케이스 방지)
@@ -18326,6 +18335,14 @@ def telegram_thread(ex):
 
                     # ✅ 포지션 관리는 "항상" 수행해야 함(자동매매 OFF/일시정지/주말이어도 청산은 계속 필요)
                     for sym in TARGET_COINS:
+                        try:
+                            mon["loop_stage"] = f"MANAGE_POS:{sym}"
+                            mon["loop_stage_kst"] = now_kst_str()
+                            mon["last_heartbeat_epoch"] = time.time()
+                            mon["last_heartbeat_kst"] = mon["loop_stage_kst"]
+                            monitor_write_throttled(mon, 0.35)
+                        except Exception:
+                            pass
                         p = pos_by_sym.get(sym)
                         if not p:
                             continue
@@ -20768,6 +20785,14 @@ def telegram_thread(ex):
                         skip_scan_loop = False
 
                     for sym in (TARGET_COINS if (not skip_scan_loop) else []):
+                        try:
+                            mon["loop_stage"] = f"SCAN:{sym}"
+                            mon["loop_stage_kst"] = now_kst_str()
+                            mon["last_heartbeat_epoch"] = time.time()
+                            mon["last_heartbeat_kst"] = mon["loop_stage_kst"]
+                            monitor_write_throttled(mon, 0.35)
+                        except Exception:
+                            pass
                         # 포지션 있으면 스킵
                         if sym in active_syms:
                             mon_add_scan(mon, stage="in_position", symbol=sym, tf=str(cfg.get("timeframe", "")), message="이미 포지션 보유")
@@ -22966,10 +22991,13 @@ def telegram_thread(ex):
                                         th_now = float(max(0.01, _as_float(pb.get("threshold_pct", 0.0), 0.0)))
                                         scale = float(clamp(dist_now / th_now, 1.0, float(max_c)))
                                         wait_c = int(clamp(int(math.ceil(scale)), min_c, max_c))
+                                        tmin_sec = float(max(2.0, _as_float(cfg.get("pullback_wait_timeout_sec_min", 6), 6)))
+                                        tmax_sec = float(max(tmin_sec, _as_float(cfg.get("pullback_wait_timeout_sec_max", 25), 25)))
                                         use_pullback = True
                                         pullback_limit_price = float(_as_float(pb.get("limit_price", None), 0.0))
                                         pullback_wait_candles = int(wait_c)
-                                        pullback_timeout_sec = float(max(2.0, tf_sec_now * wait_c))
+                                        pullback_timeout_raw = float(max(2.0, tf_sec_now * wait_c))
+                                        pullback_timeout_sec = float(clamp(pullback_timeout_raw, tmin_sec, tmax_sec))
                                         pullback_reason = str(pb.get("reason", "") or "")
                                         cs["pullback_entry"] = True
                                         cs["pullback_limit_price"] = float(pullback_limit_price)
@@ -23690,7 +23718,11 @@ def telegram_thread(ex):
                             if (not active_syms) and (idle_min >= float(min_idle_min)) and (not bool(force_scan_pending)):
                                 scan_lag_sec = max(0.0, time.time() - float(mon.get("last_scan_epoch", 0) or 0))
                                 scan_cycle_sec = float(mon.get("scan_cycle_sec", 0.0) or 0.0)
-                                stale_thresh = max(90.0, float(scan_cycle_sec) * 4.0) if scan_cycle_sec > 0 else 90.0
+                                try:
+                                    stale_min_cfg = float(clamp(float(_as_float(cfg.get("ui_heartbeat_stale_min_sec", 90), 90.0)), 45.0, 900.0))
+                                except Exception:
+                                    stale_min_cfg = 90.0
+                                stale_thresh = max(float(stale_min_cfg), float(scan_cycle_sec) * 4.0) if scan_cycle_sec > 0 else float(stale_min_cfg)
                                 analyzing = bool(scan_lag_sec <= stale_thresh)
 
                                 lines = [
@@ -24502,7 +24534,11 @@ def watchdog_thread():
             hb = float(mon.get("last_heartbeat_epoch", 0) or 0)
             age = (time.time() - hb) if hb else 9999
             cfg = load_settings()
-            if age >= 60 and not warned:
+            warn_sec = float(clamp(float(_as_float(cfg.get("watchdog_hb_warn_sec", 120), 120.0)), 30.0, 900.0))
+            clear_sec = float(clamp(float(_as_float(cfg.get("watchdog_hb_clear_sec", 45), 45.0)), 10.0, max(10.0, warn_sec)))
+            restart_sec = float(clamp(float(_as_float(cfg.get("watchdog_hb_restart_sec", 180), 180.0)), max(warn_sec + 1.0, 45.0), 1800.0))
+            restart_cooldown_cfg = float(clamp(float(_as_float(cfg.get("watchdog_restart_cooldown_sec", 120), 120.0)), 30.0, 1800.0))
+            if age >= warn_sec and not warned:
                 warned = True
                 msg = f"🧯 워치독 경고: 하트비트 {age:.0f}초 정체(스레드 멈춤 의심)"
                 tg_send(msg, target="channel", cfg=cfg)
@@ -24531,12 +24567,12 @@ def watchdog_thread():
                         tg_send(text2, target="admin", cfg=cfg)
                 except Exception:
                     pass
-            if age < 30:
+            if age < clear_sec:
                 warned = False
 
             # ✅ 하트비트가 오래 정체되면(살아있어도) 워커를 revoke + recovery 스레드를 띄워 복구
             try:
-                if age >= 90 and (time.time() - float(last_restart_epoch or 0.0)) >= 180:
+                if age >= restart_sec and (time.time() - float(last_restart_epoch or 0.0)) >= restart_cooldown_cfg:
                     wid = str(mon.get("worker_id", "") or "").strip()
                     if wid:
                         runtime_worker_revoke(wid, reason=f"watchdog_stale_{int(age)}s")
@@ -24574,7 +24610,7 @@ def watchdog_thread():
                     alive = True
                 if nm.startswith("TG_THREAD_RECOVERY") and t.is_alive():
                     has_recovery_alive = True
-            restart_cooldown_sec = 90.0
+            restart_cooldown_sec = float(restart_cooldown_cfg)
             if (not alive) and ((time.time() - float(last_plain_restart_epoch or 0.0)) >= restart_cooldown_sec):
                 try:
                     ex2 = create_exchange_client_uncached() or exchange
@@ -25770,7 +25806,11 @@ with t1:
         except Exception:
             scan_cycle_sec = 0.0
         # 요구사항: heartbeat lag가 scan_interval*4 이상이면 '멈춤 의심'
-        stale_thresh = max(60.0, float(scan_cycle_sec) * 4.0) if scan_cycle_sec > 0 else 60.0
+        try:
+            stale_min_cfg = float(clamp(float(_as_float(config.get("ui_heartbeat_stale_min_sec", 90), 90.0)), 45.0, 900.0))
+        except Exception:
+            stale_min_cfg = 90.0
+        stale_thresh = max(float(stale_min_cfg), float(scan_cycle_sec) * 4.0) if scan_cycle_sec > 0 else float(stale_min_cfg)
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("자동매매", "ON" if mon.get("auto_trade") else "OFF")
