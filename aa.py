@@ -1378,6 +1378,18 @@ def default_settings() -> Dict[str, Any]:
         "day_tp_price_pct_max": 15.0,
         "day_sl_price_pct_min": 1.0,
         "day_sl_price_pct_max": 4.5,
+        # ✅ 저유동/휩쏘 구간 대응: ATR 기반 SL 여유(지지/저항 바깥 1.5*ATR)
+        "atr_sl_breath_mult_scalp": 1.5,
+        "atr_sl_breath_mult_day": 1.5,
+        "atr_sl_breath_mult_swing": 1.0,
+        # ✅ 눌림목 지정가 진입(시장가 추격 방지)
+        "pullback_entry_enable": True,
+        "pullback_distance_pct_scalp": 0.35,
+        "pullback_distance_pct_day": 0.80,
+        "pullback_wait_candles_min": 3,
+        "pullback_wait_candles_max": 5,
+        # ✅ 거래량/OBV 확인(페이크아웃 차단)
+        "volume_confirm_min_ratio": 1.15,
         # ✅ 스타일별 RR 하한(목표손절이 목표익절보다 커지는 케이스 방지)
         "scalp_rr_floor": 1.5,
         "day_rr_floor": 2.0,
@@ -7369,6 +7381,8 @@ def smart_order_safe_ex(
     *,
     prefer_limit: bool = True,
     limit_timeout_sec: float = 5.0,
+    limit_price_override: Optional[float] = None,
+    fallback_to_market: bool = True,
 ) -> Tuple[bool, str]:
     params = params or {}
     try:
@@ -7397,14 +7411,16 @@ def smart_order_safe_ex(
             best_bid = None
             best_ask = None
 
-        if str(side).lower() == "buy":
-            limit_px = float(best_bid or 0.0)
-            if limit_px <= 0 and best_ask:
-                limit_px = float(best_ask) * 0.9995
-        else:
-            limit_px = float(best_ask or 0.0)
-            if limit_px <= 0 and best_bid:
-                limit_px = float(best_bid) * 1.0005
+        limit_px = float(_as_float(limit_price_override, 0.0))
+        if limit_px <= 0:
+            if str(side).lower() == "buy":
+                limit_px = float(best_bid or 0.0)
+                if limit_px <= 0 and best_ask:
+                    limit_px = float(best_ask) * 0.9995
+            else:
+                limit_px = float(best_ask or 0.0)
+                if limit_px <= 0 and best_bid:
+                    limit_px = float(best_bid) * 1.0005
 
         if limit_px <= 0:
             t = _ccxt_call_with_timeout(
@@ -7415,7 +7431,9 @@ def smart_order_safe_ex(
             )
             last_px = float((t or {}).get("last") or 0.0)
             if last_px <= 0:
-                return _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+                if bool(fallback_to_market):
+                    return _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+                return False, "limit_price_unavailable"
             limit_px = float(last_px * (0.9995 if str(side).lower() == "buy" else 1.0005))
 
         try:
@@ -7490,12 +7508,16 @@ def smart_order_safe_ex(
             )
         except Exception:
             pass
-        return _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+        if bool(fallback_to_market):
+            return _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+        return False, "limit_not_filled"
     except Exception as e:
-        ok_m, err_m = _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
-        if ok_m:
-            return True, ""
-        return False, (str(e) or err_m or "smart_order_failed")
+        if bool(fallback_to_market):
+            ok_m, err_m = _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+            if ok_m:
+                return True, ""
+            return False, (str(e) or err_m or "smart_order_failed")
+        return False, (str(e) or "smart_limit_failed")
 
 
 def market_order_safe(ex, sym: str, side: str, qty: float, params: Optional[Dict[str, Any]] = None, *, prefer_limit: bool = True) -> bool:
@@ -7935,6 +7957,65 @@ def _pct_from_entry(entry_price: float, side: str, target_price: float, *, is_tp
     return max(0.0, ((tg - px) / px) * 100.0)
 
 
+def select_pullback_limit_price(
+    *,
+    decision: str,
+    current_price: float,
+    style: str,
+    cfg: Dict[str, Any],
+    supports: Optional[List[float]] = None,
+    resistances: Optional[List[float]] = None,
+    volume_nodes: Optional[List[float]] = None,
+) -> Dict[str, Any]:
+    out = {
+        "use_pullback": False,
+        "limit_price": None,
+        "distance_pct": 0.0,
+        "threshold_pct": 0.0,
+        "reason": "",
+    }
+    try:
+        if not bool(cfg.get("pullback_entry_enable", True)):
+            return out
+        st = normalize_style_name(style)
+        if st not in ["스캘핑", "단타"]:
+            return out
+        px = float(current_price or 0.0)
+        if px <= 0:
+            return out
+        dec = str(decision or "").lower().strip()
+        if dec not in ["buy", "sell"]:
+            return out
+        if st == "스캘핑":
+            dist_th = float(max(0.05, _as_float(cfg.get("pullback_distance_pct_scalp", 0.35), 0.35)))
+        else:
+            dist_th = float(max(0.10, _as_float(cfg.get("pullback_distance_pct_day", 0.80), 0.80)))
+        sups = [float(x) for x in (supports or []) if x is not None and math.isfinite(float(x))]
+        ress = [float(x) for x in (resistances or []) if x is not None and math.isfinite(float(x))]
+        vps = [float(x) for x in (volume_nodes or []) if x is not None and math.isfinite(float(x))]
+        if dec == "buy":
+            cands = [x for x in set(sups + vps) if x < px]
+            if not cands:
+                return out
+            lv = float(max(cands))
+            dist = float(((px - lv) / px) * 100.0)
+        else:
+            cands = [x for x in set(ress + vps) if x > px]
+            if not cands:
+                return out
+            lv = float(min(cands))
+            dist = float(((lv - px) / px) * 100.0)
+        out["distance_pct"] = float(dist)
+        out["threshold_pct"] = float(dist_th)
+        if dist >= dist_th:
+            out["use_pullback"] = True
+            out["limit_price"] = float(lv)
+            out["reason"] = f"추격진입 방지: 현재가↔레벨 거리 {dist:.2f}% (기준 {dist_th:.2f}%)"
+        return out
+    except Exception:
+        return out
+
+
 def _dynamic_sr_targets_in_zone(
     *,
     entry_price: float,
@@ -7945,6 +8026,7 @@ def _dynamic_sr_targets_in_zone(
     resistances: List[float],
     volume_nodes: Optional[List[float]] = None,
     orderbook_ctx: Optional[Dict[str, Any]] = None,
+    atr_value: Optional[float] = None,
 ) -> Dict[str, Any]:
     out = {
         "ok": False,
@@ -8000,6 +8082,13 @@ def _dynamic_sr_targets_in_zone(
         sl_anchor = float(clamp(sl_anchor_cfg, 0.2, max(0.2, sl_cap)))
         tp_band = float(max(0.30, tp_anchor * band_ratio))
         sl_band = float(max(0.20, sl_anchor * band_ratio))
+        atr_v = float(max(0.0, _as_float(atr_value, 0.0)))
+        if st == "스캘핑":
+            atr_sl_mult = float(max(0.0, _as_float(cfg.get("atr_sl_breath_mult_scalp", 1.5), 1.5)))
+        elif st == "단타":
+            atr_sl_mult = float(max(0.0, _as_float(cfg.get("atr_sl_breath_mult_day", 1.5), 1.5)))
+        else:
+            atr_sl_mult = float(max(0.0, _as_float(cfg.get("atr_sl_breath_mult_swing", 1.0), 1.0)))
 
         vps = [float(x) for x in (volume_nodes or []) if x is not None and math.isfinite(float(x))]
         sups = [float(x) for x in (supports or []) if x is not None and math.isfinite(float(x))]
@@ -8069,14 +8158,20 @@ def _dynamic_sr_targets_in_zone(
             if sl_levels:
                 picked_sl = _pick_level_near_anchor(sl_levels, is_tp=False)
                 sl_base = float(picked_sl[0] if picked_sl is not None else sl_levels[-1])
-                sl_adj = float(sl_base * (1.0 - sl_breath_bps / 10000.0))
+                sl_adj_bps = float(sl_base * (1.0 - sl_breath_bps / 10000.0))
+                sl_adj = float(sl_adj_bps)
+                if atr_v > 0 and atr_sl_mult > 0:
+                    sl_adj = float(min(sl_adj_bps, sl_base - (atr_v * atr_sl_mult)))
                 sl_pct = float(_pct_from_entry(px, s, sl_adj, is_tp=False))
                 if sl_cap > 0 and sl_pct > sl_cap:
                     sl_adj = float(px * (1.0 - sl_cap / 100.0))
                     out["sl_reason"] = f"구조 지지({sl_base:.6g})까지 거리 과대 → 하드 손절상한({sl_cap:.2f}%) 적용"
                     out["sl_source"] = "SR+HARD_CAP"
                 else:
-                    out["sl_reason"] = f"기준SL {sl_anchor:.2f}% 근처 지지({sl_base:.6g}) 이탈 확인용 여유 손절"
+                    if atr_v > 0 and atr_sl_mult > 0:
+                        out["sl_reason"] = f"기준SL {sl_anchor:.2f}% 근처 지지({sl_base:.6g}) + ATR({atr_sl_mult:.1f}x) 여유 손절"
+                    else:
+                        out["sl_reason"] = f"기준SL {sl_anchor:.2f}% 근처 지지({sl_base:.6g}) 이탈 확인용 여유 손절"
                     out["sl_source"] = "SR"
                 sl_cands.append((float(sl_adj), out["sl_source"]))
 
@@ -8107,14 +8202,20 @@ def _dynamic_sr_targets_in_zone(
             if sl_levels:
                 picked_sl = _pick_level_near_anchor(sl_levels, is_tp=False)
                 sl_base = float(picked_sl[0] if picked_sl is not None else sl_levels[0])
-                sl_adj = float(sl_base * (1.0 + sl_breath_bps / 10000.0))
+                sl_adj_bps = float(sl_base * (1.0 + sl_breath_bps / 10000.0))
+                sl_adj = float(sl_adj_bps)
+                if atr_v > 0 and atr_sl_mult > 0:
+                    sl_adj = float(max(sl_adj_bps, sl_base + (atr_v * atr_sl_mult)))
                 sl_pct = float(_pct_from_entry(px, s, sl_adj, is_tp=False))
                 if sl_cap > 0 and sl_pct > sl_cap:
                     sl_adj = float(px * (1.0 + sl_cap / 100.0))
                     out["sl_reason"] = f"구조 저항({sl_base:.6g})까지 거리 과대 → 하드 손절상한({sl_cap:.2f}%) 적용"
                     out["sl_source"] = "SR+HARD_CAP"
                 else:
-                    out["sl_reason"] = f"기준SL {sl_anchor:.2f}% 근처 저항({sl_base:.6g}) 돌파 확인용 여유 손절"
+                    if atr_v > 0 and atr_sl_mult > 0:
+                        out["sl_reason"] = f"기준SL {sl_anchor:.2f}% 근처 저항({sl_base:.6g}) + ATR({atr_sl_mult:.1f}x) 여유 손절"
+                    else:
+                        out["sl_reason"] = f"기준SL {sl_anchor:.2f}% 근처 저항({sl_base:.6g}) 돌파 확인용 여유 손절"
                     out["sl_source"] = "SR"
                 sl_cands.append((float(sl_adj), out["sl_source"]))
 
@@ -8397,6 +8498,7 @@ def sr_prices_for_style(
             resistances=list(resistances or []),
             volume_nodes=list(vp_nodes or []),
             orderbook_ctx=orderbook_ctx if isinstance(orderbook_ctx, dict) else None,
+            atr_value=float(atr),
         )
 
         if bool(zone_pick.get("ok", False)):
@@ -9551,6 +9653,50 @@ def merge_pattern_bias(base_bias: int, base_strength: float, mtf_bias: int, mtf_
     return b0, float(clamp(score0, 0.0, 1.0))
 
 
+def detect_obv_divergence_signal(df: pd.DataFrame, lookback: int = 28) -> int:
+    """
+    OBV 다이버전스 간이 판별
+    return: 1(강세), -1(약세), 0(중립)
+    """
+    try:
+        if df is None or df.empty or len(df) < max(20, lookback):
+            return 0
+        if "close" not in df.columns:
+            return 0
+        close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+        if "OBV" in df.columns:
+            obv = pd.to_numeric(df["OBV"], errors="coerce").astype(float)
+        else:
+            vol = pd.to_numeric(df.get("vol", pd.Series(index=df.index, dtype=float)), errors="coerce").fillna(0.0).astype(float)
+            obv = (np.sign(close.diff().fillna(0.0)) * vol).cumsum()
+        d = pd.DataFrame({"close": close, "obv": obv}).dropna()
+        if len(d) < max(20, lookback):
+            return 0
+        d = d.tail(int(max(20, lookback)))
+        mid = len(d) // 2
+        if mid < 5 or (len(d) - mid) < 5:
+            return 0
+        a = d.iloc[:mid]
+        b = d.iloc[mid:]
+        p_low_a = float(a["close"].min())
+        p_low_b = float(b["close"].min())
+        p_high_a = float(a["close"].max())
+        p_high_b = float(b["close"].max())
+        o_low_a = float(a["obv"].min())
+        o_low_b = float(b["obv"].min())
+        o_high_a = float(a["obv"].max())
+        o_high_b = float(b["obv"].max())
+        bull = (p_low_b < p_low_a) and (o_low_b > o_low_a)
+        bear = (p_high_b > p_high_a) and (o_high_b < o_high_a)
+        if bull and (not bear):
+            return 1
+        if bear and (not bull):
+            return -1
+        return 0
+    except Exception:
+        return 0
+
+
 def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Optional[pd.Series]]:
     status: Dict[str, Any] = {}
     if df is None or df.empty or len(df) < 120:
@@ -10125,6 +10271,19 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
                 status["OBV"] = "🟢 누적매수 우세" if obv_now >= obv_prev else "🔴 누적매도 우세"
         except Exception:
             pass
+        try:
+            obv_div = int(detect_obv_divergence_signal(df2, lookback=28))
+        except Exception:
+            obv_div = 0
+        status["_obv_divergence"] = int(obv_div)
+        status["_obv_div_bull"] = bool(obv_div == 1)
+        status["_obv_div_bear"] = bool(obv_div == -1)
+        if obv_div == 1:
+            status["OBV_DIV"] = "🟢 OBV 강세 다이버전스"
+        elif obv_div == -1:
+            status["OBV_DIV"] = "🔴 OBV 약세 다이버전스"
+        else:
+            status["OBV_DIV"] = "⚪ OBV 다이버전스 없음"
 
     if bool(cfg.get("use_cmf", True)) and ("CMF" in df2.columns):
         used.append("CMF")
@@ -10627,6 +10786,24 @@ def build_full_spectrum_context(
                 pat_bias = int(st2.get("_pattern_bias", 0) or 0)
                 pat_str = float(st2.get("_pattern_strength", 0.0) or 0.0)
                 trend_txt = str(st2.get("추세", "") or "")
+                ema_dir = 0
+                macd_dir = 0
+                try:
+                    cser = pd.to_numeric(df2["close"], errors="coerce").astype(float)
+                    ema_fast = float(cser.ewm(span=20, adjust=False).mean().iloc[-1])
+                    ema_slow = float(cser.ewm(span=50, adjust=False).mean().iloc[-1])
+                    if math.isfinite(ema_fast) and math.isfinite(ema_slow):
+                        ema_dir = 1 if ema_fast > ema_slow else (-1 if ema_fast < ema_slow else 0)
+                except Exception:
+                    ema_dir = 0
+                try:
+                    if all(c in df2.columns for c in ["MACD", "MACD_signal"]):
+                        m0 = float(pd.to_numeric(df2["MACD"], errors="coerce").iloc[-1])
+                        s0 = float(pd.to_numeric(df2["MACD_signal"], errors="coerce").iloc[-1])
+                        if math.isfinite(m0) and math.isfinite(s0):
+                            macd_dir = 1 if m0 > s0 else (-1 if m0 < s0 else 0)
+                except Exception:
+                    macd_dir = 0
 
                 br_up = False
                 br_dn = False
@@ -10653,6 +10830,8 @@ def build_full_spectrum_context(
                     "vol_ratio": vol_ratio,
                     "pattern_bias": pat_bias,
                     "pattern_strength": pat_str,
+                    "ema_dir": int(ema_dir),
+                    "macd_dir": int(macd_dir),
                     "breakout_up": bool(br_up),
                     "breakout_down": bool(br_dn),
                 }
@@ -10662,6 +10841,32 @@ def build_full_spectrum_context(
         return out
     except Exception:
         return out
+
+
+def htf_bearish_bias_for_intraday(mtf_context: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+    try:
+        tfm = (mtf_context or {}).get("timeframes", {}) if isinstance(mtf_context, dict) else {}
+        t1h = tfm.get("1h", {}) if isinstance(tfm, dict) else {}
+        t4h = tfm.get("4h", {}) if isinstance(tfm, dict) else {}
+
+        def _bear(tf: Dict[str, Any]) -> bool:
+            tr = int(tf.get("trend_dir", 0) or 0)
+            em = int(tf.get("ema_dir", 0) or 0)
+            mc = int(tf.get("macd_dir", 0) or 0)
+            return bool((tr < 0) or (em < 0) or (mc < 0))
+
+        b1 = _bear(t1h)
+        b4 = _bear(t4h)
+        if b1 or b4:
+            reasons: List[str] = []
+            if b1:
+                reasons.append("1h(MACD/EMA 약세)")
+            if b4:
+                reasons.append("4h(MACD/EMA 약세)")
+            return True, " + ".join(reasons)
+    except Exception:
+        pass
+    return False, ""
 
 
 def choose_dynamic_style(
@@ -12229,6 +12434,9 @@ def ai_decide_trade(
             "vwap": str(status.get("VWAP", "") or ""),
             "stochrsi": str(status.get("STOCHRSI", "") or ""),
             "obv": str(status.get("OBV", "") or ""),
+            "obv_div": str(status.get("OBV_DIV", "") or ""),
+            "obv_div_bull": bool(status.get("_obv_div_bull", False)),
+            "obv_div_bear": bool(status.get("_obv_div_bear", False)),
             "cmf": str(status.get("CMF", "") or ""),
             "vwma": str(status.get("VWMA", "") or ""),
             "keltner": str(status.get("KC", "") or ""),
@@ -12338,14 +12546,16 @@ def ai_decide_trade(
 				1) RSI 과매도/과매수 '상태'에 즉시 진입하지 말고, '해소되는 시점'을 우선한다.
 				2) 상승추세에서는 롱 우선, 하락추세에서는 숏 우선. 역추세는 확신/사이즈를 낮춘다.
 				3) SQZ(스퀴즈 모멘텀) 신호는 항상 최상위 가중치로 본다.
-				4) super_indicators를 반드시 참고:
-				   - 추세: Ichimoku, PSAR, ADX, VWAP
-				   - 모멘텀: RSI, StochRSI, CCI, Williams %R, MFI, MACD
-				   - 거래량: OBV, CMF, VWMA
+					4) super_indicators를 반드시 참고:
+					   - 추세: Ichimoku, PSAR, ADX, VWAP
+					   - 모멘텀: RSI, StochRSI, CCI, Williams %R, MFI, MACD
+					   - 거래량: OBV, CMF, VWMA
 				   - 변동성: ATR, Keltner, Bollinger
 				   - 인트라데이(스캘핑/단타) 진입은 Ichimoku 구름 방향(ICHI_PRICE_CLOUD)을 1차 필터로 적용한다.
-				     · buy는 below_cloud면 금지
-				     · sell은 above_cloud면 금지
+					     · buy는 below_cloud면 금지
+					     · sell은 above_cloud면 금지
+                       - 스캘핑/단타에서 롱 진입은 1h/4h MACD 또는 EMA가 약세면 금지(역추세 롱 차단)
+                       - 스캘핑/단타는 거래량 급증 또는 OBV 다이버전스가 없으면 진입 신뢰도를 낮게 본다.
 				5) chart_patterns + chart_patterns_mtf + divergences/harmonics/candles를 함께 판단한다.
 					6) ml_signals.dir을 우선 따른다.
 					   - ml_signals.dir이 "buy"면 buy/hold만 허용
@@ -12383,8 +12593,9 @@ def ai_decide_trade(
 		  - 단타 TP 상한: 15%
 		  - 스윙 TP 상한: 50%
 		- style_rule의 TP/SL 범위는 "고정값"이 아니라 탐색 가이드다. 반드시 SR/매물대/오더북(스캘핑)에서 목표가를 찾고, 없을 때만 범위 중앙값으로 대체하라.
-	- SR 레벨에 TP를 둘 때는 약간 앞당겨(front-run) 잡고, SL은 레벨 바깥으로 약간 여유(breathing room)를 둬라.
-	- 변동성(atr_price_pct)이 작으면 손절을 너무 타이트하게 잡지 마라.
+		- SR 레벨에 TP를 둘 때는 약간 앞당겨(front-run) 잡고, SL은 레벨 바깥으로 약간 여유(breathing room)를 둬라.
+        - 스캘핑/단타는 추격 진입을 피하고, 현재가가 SR에서 멀면 눌림목 지정가(limit) 진입을 우선으로 제안하라.
+		- 변동성(atr_price_pct)이 작으면 손절을 너무 타이트하게 잡지 마라.
 	- sr_context(지지/저항) 정보를 참고해, 가능하면 sl_price/tp_price(가격)를 함께 지정해라.
 	  - buy(롱): sl_price는 price보다 낮게, tp_price는 price보다 높게
 	  - sell(숏): sl_price는 price보다 높게, tp_price는 price보다 낮게
@@ -12553,6 +12764,39 @@ JSON 형식:
         try:
             style_for_caps = style_mandatory
             out = apply_hard_roi_caps(out, style_for_caps, cfg)
+        except Exception:
+            pass
+
+        # ✅ 인트라데이(스캘핑/단타) HTF 정렬 필수:
+        # - 1h/4h MACD 또는 EMA 약세면 롱 차단
+        try:
+            if style_mandatory in ["스캘핑", "단타"] and str(out.get("decision", "hold")) == "buy":
+                is_bear, bear_reason = htf_bearish_bias_for_intraday(mtf_context if isinstance(mtf_context, dict) else {})
+                if is_bear:
+                    out["decision"] = "hold"
+                    out["reason_easy"] = f"HTF 역방향 차단: {bear_reason}"
+                    out["_htf_blocked"] = True
+                    out["_htf_block_reason"] = str(bear_reason)
+        except Exception:
+            pass
+
+        # ✅ 거래량/OBV 확인:
+        # - 거래량 급증 or 방향성 OBV 다이버전스가 없으면 페이크아웃 위험으로 진입 차단
+        try:
+            dec0 = str(out.get("decision", "hold"))
+            if style_mandatory in ["스캘핑", "단타"] and dec0 in ["buy", "sell"]:
+                vol_ratio_now = float(current_volume_ratio(df, period=int(cfg.get("ai_call_volume_spike_period", 20) or 20)))
+                vol_min = float(max(1.0, _as_float(cfg.get("volume_confirm_min_ratio", 1.15), 1.15)))
+                vol_ok = bool(vol_ratio_now >= vol_min)
+                obv_bull = bool(status.get("_obv_div_bull", False))
+                obv_bear = bool(status.get("_obv_div_bear", False))
+                obv_ok = bool(obv_bull if dec0 == "buy" else obv_bear)
+                if not (vol_ok or obv_ok):
+                    out["decision"] = "hold"
+                    out["reason_easy"] = f"거래량/OBV 확인 미충족(거래량 {vol_ratio_now:.2f}x, OBV 다이버전스 없음)"
+                    out["_volume_blocked"] = True
+                    out["_volume_ratio_now"] = float(vol_ratio_now)
+                    out["_volume_ratio_need"] = float(vol_min)
         except Exception:
             pass
 
@@ -21928,6 +22172,53 @@ def telegram_thread(ex):
                                     cs["style_reco"] = "스캘핑"
                                     cs["style_reason"] = f"장기추세({htf_tf}) 상승 → 역추세는 스캘핑만"
 
+                            # ✅ 스캘핑/단타 HTF 정렬 강제:
+                            # - 1h/4h MACD 또는 EMA 약세이면 롱 차단
+                            try:
+                                if str(style) in ["스캘핑", "단타"] and str(decision) == "buy":
+                                    htf_block, htf_reason = htf_bearish_bias_for_intraday(mtf_context if isinstance(mtf_context, dict) else {})
+                                    if bool(htf_block):
+                                        cs["skip_reason"] = f"HTF 역추세 차단({htf_reason})"
+                                        mon_add_scan(
+                                            mon,
+                                            stage="trade_skipped",
+                                            symbol=sym,
+                                            tf="1h/4h",
+                                            signal=str(decision),
+                                            score=int(conf),
+                                            message="htf_alignment_block",
+                                            extra={"style": str(style), "reason": str(htf_reason)},
+                                        )
+                                        continue
+                            except Exception:
+                                pass
+
+                            # ✅ 거래량/OBV 확인: 스캘핑/단타는 둘 중 하나가 있어야 진입 허용
+                            try:
+                                if str(style) in ["스캘핑", "단타"] and str(decision) in ["buy", "sell"]:
+                                    try:
+                                        vol_now = float(vol_ratio) if vol_ratio is not None else float(current_volume_ratio(df, period=int(cfg.get("ai_call_volume_spike_period", 20) or 20)))
+                                    except Exception:
+                                        vol_now = 0.0
+                                    vol_min = float(max(1.0, _as_float(cfg.get("volume_confirm_min_ratio", 1.15), 1.15)))
+                                    vol_ok = bool(vol_now >= vol_min)
+                                    obv_ok = bool(stt.get("_obv_div_bull", False)) if str(decision) == "buy" else bool(stt.get("_obv_div_bear", False))
+                                    if not (vol_ok or obv_ok):
+                                        cs["skip_reason"] = f"거래량/OBV 미충족(vol {vol_now:.2f}x < {vol_min:.2f}x)"
+                                        mon_add_scan(
+                                            mon,
+                                            stage="trade_skipped",
+                                            symbol=sym,
+                                            tf=str(cfg.get("timeframe", "5m")),
+                                            signal=str(decision),
+                                            score=int(conf),
+                                            message="volume_obv_gate",
+                                            extra={"style": str(style), "vol_ratio": float(vol_now), "vol_need": float(vol_min), "obv_ok": bool(obv_ok)},
+                                        )
+                                        continue
+                            except Exception:
+                                pass
+
                             # ✅ 역추세 숏 하드 필터(최종 주문 직전):
                             # 단기 상승추세에서 숏은 3조건(약세다이버전스+SQZ음전환+MA7하향이탈) 미충족 시 차단
                             try:
@@ -22487,9 +22778,95 @@ def telegram_thread(ex):
                             except Exception:
                                 pass
 
-                            ok, err_order = market_order_safe_ex(ex, sym, decision, qty)
+                            use_pullback = False
+                            pullback_limit_price = None
+                            pullback_timeout_sec = 0.0
+                            pullback_wait_candles = 0
+                            pullback_reason = ""
+                            try:
+                                if str(style) in ["스캘핑", "단타"] and str(decision) in ["buy", "sell"]:
+                                    sr_for_entry = ai2.get("_pre_sr_used", {}) if isinstance(ai2.get("_pre_sr_used", {}), dict) else {}
+                                    pb = select_pullback_limit_price(
+                                        decision=str(decision),
+                                        current_price=float(px),
+                                        style=str(style),
+                                        cfg=cfg,
+                                        supports=list(sr_for_entry.get("supports", []) or []),
+                                        resistances=list(sr_for_entry.get("resistances", []) or []),
+                                        volume_nodes=list(sr_for_entry.get("volume_nodes", []) or []),
+                                    )
+                                    if bool(pb.get("use_pullback", False)):
+                                        tf_now = str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m"))
+                                        tf_sec_now = int(max(30, _timeframe_seconds(tf_now, 300)))
+                                        min_c = int(max(1, _as_int(cfg.get("pullback_wait_candles_min", 3), 3)))
+                                        max_c = int(max(min_c, _as_int(cfg.get("pullback_wait_candles_max", 5), 5)))
+                                        dist_now = float(max(0.0, _as_float(pb.get("distance_pct", 0.0), 0.0)))
+                                        th_now = float(max(0.01, _as_float(pb.get("threshold_pct", 0.0), 0.0)))
+                                        scale = float(clamp(dist_now / th_now, 1.0, float(max_c)))
+                                        wait_c = int(clamp(int(math.ceil(scale)), min_c, max_c))
+                                        use_pullback = True
+                                        pullback_limit_price = float(_as_float(pb.get("limit_price", None), 0.0))
+                                        pullback_wait_candles = int(wait_c)
+                                        pullback_timeout_sec = float(max(2.0, tf_sec_now * wait_c))
+                                        pullback_reason = str(pb.get("reason", "") or "")
+                                        cs["pullback_entry"] = True
+                                        cs["pullback_limit_price"] = float(pullback_limit_price)
+                                        cs["pullback_timeout_sec"] = float(pullback_timeout_sec)
+                                        cs["pullback_wait_candles"] = int(pullback_wait_candles)
+                                        cs["pullback_reason"] = str(pullback_reason)[:200]
+                                        mon_add_scan(
+                                            mon,
+                                            stage="pullback_wait",
+                                            symbol=sym,
+                                            tf=tf_now,
+                                            signal=str(decision),
+                                            score=int(conf),
+                                            message=f"지정가 대기 {wait_c}캔들 @ {float(pullback_limit_price):.6g}",
+                                            extra={
+                                                "style": str(style),
+                                                "distance_pct": float(dist_now),
+                                                "threshold_pct": float(th_now),
+                                                "timeout_sec": float(pullback_timeout_sec),
+                                            },
+                                        )
+                            except Exception:
+                                use_pullback = False
+
+                            if use_pullback and float(_as_float(pullback_limit_price, 0.0)) > 0:
+                                ok, err_order = smart_order_safe_ex(
+                                    ex,
+                                    sym,
+                                    decision,
+                                    qty,
+                                    prefer_limit=True,
+                                    limit_timeout_sec=float(max(2.0, pullback_timeout_sec)),
+                                    limit_price_override=float(pullback_limit_price),
+                                    fallback_to_market=False,
+                                )
+                            else:
+                                ok, err_order = market_order_safe_ex(ex, sym, decision, qty)
                             if not ok:
                                 try:
+                                    if use_pullback and str(err_order or "").lower().strip() == "limit_not_filled":
+                                        tf_now = str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m"))
+                                        msg0 = f"눌림목 지정가 미체결({int(max(1, pullback_wait_candles))}캔들 대기 후 취소)"
+                                        cs["skip_reason"] = msg0
+                                        mon_add_scan(
+                                            mon,
+                                            stage="trade_skipped",
+                                            symbol=sym,
+                                            tf=tf_now,
+                                            signal=str(decision),
+                                            score=conf,
+                                            message=msg0,
+                                            extra={
+                                                "style": str(style),
+                                                "limit_price": float(_as_float(pullback_limit_price, 0.0)),
+                                                "timeout_sec": float(max(2.0, pullback_timeout_sec)),
+                                                "reason": str(pullback_reason)[:160],
+                                            },
+                                        )
+                                        continue
                                     msg0 = f"주문 실패: {str(err_order or '')}".strip()
                                     if len(msg0) > 160:
                                         msg0 = msg0[:160] + "..."
