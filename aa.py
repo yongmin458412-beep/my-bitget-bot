@@ -1176,18 +1176,18 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 진입 필터 강화(요구): 거래량(스파이크) + 이격도(Disparity) 조건
         # - 횡보 박스(거래량 없음)에서 RSI 해소만 보고 진입하는 실수를 줄이기 위해 AI 호출 자체를 제한한다.
         # - /scan 강제스캔은 이 필터를 우회(사용자 의도)한다.
-        "ai_call_require_volume_spike": False,
+        "ai_call_require_volume_spike": True,   # ✅ 비용 절감: 거래량 스파이크 없으면 AI 호출 안 함
         "ai_call_volume_spike_mul": 1.3,
         "ai_call_volume_spike_period": 20,
-        "ai_call_require_disparity": False,
+        "ai_call_require_disparity": True,      # ✅ 비용 절감: 이격도 과다 시 AI 호출 안 함
         "ai_call_disparity_ma_period": 20,
         "ai_call_disparity_max_abs_pct": 6.0,
         # ✅ 진입이 너무 안 되는 경우를 대비한 완화 옵션
         # - 0이면 모드별 기본값(안전 20 / 공격 17 / 하이리스크 15)을 사용
         "ai_call_adx_threshold": 0,
-        # - True면 volume/disparity 조건 미달 시 "AI 호출 자체"를 막음(비용↓, 보수↑)
-        # - False면 AI는 호출하되(캐시/봉당 1회), 결과에 따라 entry를 줄이거나 hold를 기대(진입 기회↑)
-        "ai_call_filters_block_ai": False,
+        # ✅ 비용 절감: volume/disparity 조건 미달 시 AI 호출 자체를 막음(비용↓)
+        # - 수렴 조건 통과 + 거래량/이격도 조건 통과 시에만 AI 호출 → 대폭 비용 절감
+        "ai_call_filters_block_ai": True,       # ✅ 비용 절감: 필터 미달 시 AI 호출 완전 차단
         # ✅ AI가 buy/sell을 유지할 수 있는 최소 확신 바닥값(그 이하면 강제 hold)
         "ai_decision_min_conf_floor": 50,
 
@@ -1202,15 +1202,15 @@ def default_settings() -> Dict[str, Any]:
         # - 예산 초과 시 남은 헤드라인은 룰 기반 보정(_translate_ko_rule)만 적용
         "news_translate_budget_sec": 10,
         "external_koreanize_enable": True,
-        "external_ai_translate_enable": False,  # 외부시황 번역에 AI 사용(비용↑, 기본 OFF)
+        "external_ai_translate_enable": False,  # 외부시황 번역에 AI 사용(비용↑, 기본 OFF) ✅ 비용절감: 항상 OFF 권장
 
         # ✅ 매일 아침 BTC 경제뉴스 5개 브리핑
-        # ✅ 아침 브리핑(기본 OFF): 사용자 요구
+        # ✅ 아침 브리핑(기본 OFF): 뉴스는 스캘핑에 불필요, 비용 절감을 위해 OFF 유지
         "daily_btc_brief_enable": False,
         "daily_btc_brief_hour_kst": 9,
         "daily_btc_brief_minute_kst": 0,
         "daily_btc_brief_max_items": 5,
-        "daily_btc_brief_ai_summarize": True,  # OpenAI 키 있을 때만 동작
+        "daily_btc_brief_ai_summarize": False,  # ✅ 비용 절감: 브리핑 AI 요약 기본 OFF (브리핑 자체도 OFF이므로 이중 안전장치)
 
         # ✅ 스타일(스캘핑/단타/스윙) 자동 선택/전환
         # - regime_mode: Telegram /mode로도 변경 가능(auto|scalping|daytrading|swing)
@@ -11925,12 +11925,13 @@ def ai_decide_trade(
         "order_book_l2": orderbook_context if isinstance(orderbook_context, dict) else {},
         "sr_context": sr_context or {},
         "chart_style_hint": str(chart_style_hint or ""),
+        # ✅ 비용 절감: 스윙 시에도 공포탐욕 + 경제캘린더만 제공, 뉴스 브리핑은 제외
         "external": (
             {
                 "fear_greed": ext.get("fear_greed"),
                 "high_impact_events_soon": (ext.get("high_impact_events_soon") or [])[:3],
                 "global": ext.get("global"),
-                "daily_btc_brief": daily_brief,
+                # daily_btc_brief 제거: 뉴스는 스캘핑/스윙 모두 불필요, 토큰 절감
             }
             if ext_enabled
             else {}
@@ -11953,15 +11954,10 @@ def ai_decide_trade(
     except Exception:
         ev_txt = ""
 
-    brief_txt = ""
-    try:
-        items = (daily_brief or {}).get("items") or []
-        if items:
-            brief_txt = "- 오늘 아침 BTC 브리핑(요약): " + " / ".join([str(i.get("title", ""))[:40] for i in items[:3]])
-    except Exception:
-        brief_txt = ""
+    # ✅ 비용 절감: brief_txt 제거 (뉴스 브리핑은 AI 프롬프트에서 완전 제외)
+    brief_txt = ""  # 항상 빈 문자열 유지 (토큰 절감)
 
-    ext_hdr = "[외부 시황(참고)]\n" + "\n".join([x for x in [fg_txt, ev_txt, brief_txt] if x]) if ext_enabled else "[외부 시황] (스캘핑/단기 판단: 적용하지 않음)"
+    ext_hdr = "[외부 시황(참고)]\n" + "\n".join([x for x in [fg_txt, ev_txt] if x]) if ext_enabled else "[외부 시황] (스캘핑/단기 판단: 적용하지 않음)"
 
     # ✅ 소액 탐색 진입(soft entry) 힌트: 확신이 min_conf에 조금 못 미쳐도, 아주 작게/보수적으로 진입 가능
     soft_entry_hint = ""
@@ -12583,7 +12579,7 @@ JSON 형식:
     try:
         models = [
             str(cfg.get("openai_model_review", "") or "").strip(),
-            "gpt-4o-mini",
+            "gpt-4o-mini",   # ✅ 비용 절감: 사후 리뷰는 mini로 충분
             "gpt-4.1-mini",
             "gpt-4o",
             "gpt-4.1",
