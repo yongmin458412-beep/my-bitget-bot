@@ -1347,7 +1347,7 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 스윙 순환매(Cycle Trading): 1차 50% 익절 ROI+15%, 2차 트레일링/저항
         "swing_partial_tp_enable": True,
         # ─ 1차: ROI +15% 도달 시 포지션 50% 청산 (확정 수익 확보)
-        "swing_partial_tp1_at_tp_frac": 0.0,   # tp_frac 기반 대신 절대 ROI 기준 사용
+        "swing_partial_tp1_at_tp_frac": 0.35,  # UI 호환용(실제 1차 트리거는 swing_partial_tp1_roi_abs 우선)
         "swing_partial_tp1_roi_abs": 15.0,      # ✅ ROI +15% 도달 시 1차 익절
         "swing_partial_tp1_close_pct": 50,      # ✅ 50% 청산 (절반 확정)
         # ─ 2차: 나머지 50%는 트레일링 스탑 또는 주저항 도달까지 보유
@@ -23998,15 +23998,17 @@ st.sidebar.caption("※ 요구사항 반영: 시간 기반 최소유지기간은
 st.sidebar.subheader("🧩 스윙 분할익절/순환")
 config["swing_partial_tp_enable"] = st.sidebar.checkbox("스윙: 1/2/3차 분할익절", value=bool(config.get("swing_partial_tp_enable", True)))
 with st.sidebar.expander("분할익절 상세 설정"):
+    st.caption("📌 1차: ROI 절대값 기준 (+15% 도달 시 50% 청산) | 2/3차: TP 비율 기준")
     p1a, p1b = st.columns(2)
-    config["swing_partial_tp1_at_tp_frac"] = p1a.number_input("1차: TP비율", 0.05, 0.95, float(config.get("swing_partial_tp1_at_tp_frac", 0.35)), step=0.05)
-    config["swing_partial_tp1_close_pct"] = p1b.number_input("1차: 청산%", 1, 90, int(config.get("swing_partial_tp1_close_pct", 33)))
+    # 1차는 절대 ROI 기준(swing_partial_tp1_roi_abs)으로 관리, tp_frac은 내부 호환용
+    config["swing_partial_tp1_roi_abs"] = p1a.number_input("1차: 목표ROI(%)", 1.0, 100.0, float(config.get("swing_partial_tp1_roi_abs", 15.0) or 15.0), step=1.0)
+    config["swing_partial_tp1_close_pct"] = p1b.number_input("1차: 청산%", 1, 90, int(config.get("swing_partial_tp1_close_pct", 50)))
     p2a, p2b = st.columns(2)
-    config["swing_partial_tp2_at_tp_frac"] = p2a.number_input("2차: TP비율", 0.05, 0.95, float(config.get("swing_partial_tp2_at_tp_frac", 0.60)), step=0.05)
-    config["swing_partial_tp2_close_pct"] = p2b.number_input("2차: 청산%", 1, 90, int(config.get("swing_partial_tp2_close_pct", 33)))
+    config["swing_partial_tp2_at_tp_frac"] = p2a.number_input("2차: TP비율", 0.05, 0.99, float(max(0.05, config.get("swing_partial_tp2_at_tp_frac", 0.85))), step=0.05)
+    config["swing_partial_tp2_close_pct"] = p2b.number_input("2차: 청산%", 1, 100, int(config.get("swing_partial_tp2_close_pct", 50)))
     p3a, p3b = st.columns(2)
-    config["swing_partial_tp3_at_tp_frac"] = p3a.number_input("3차: TP비율", 0.05, 0.99, float(config.get("swing_partial_tp3_at_tp_frac", 0.85)), step=0.05)
-    config["swing_partial_tp3_close_pct"] = p3b.number_input("3차: 청산%", 1, 95, int(config.get("swing_partial_tp3_close_pct", 34)))
+    config["swing_partial_tp3_at_tp_frac"] = p3a.number_input("3차: TP비율", 0.05, 1.00, float(max(0.05, config.get("swing_partial_tp3_at_tp_frac", 1.00))), step=0.05)
+    config["swing_partial_tp3_close_pct"] = p3b.number_input("3차: 청산%", 1, 100, int(config.get("swing_partial_tp3_close_pct", 100)))
     st.caption("※ (선택) 아래 USDT(마진) 값을 0보다 크게 설정하면, 해당 단계는 '청산%' 대신 USDT 기준으로 청산합니다.")
     u1, u2, u3 = st.columns(3)
     config["swing_partial_tp1_close_usdt"] = u1.number_input("1차: 청산 USDT", 0.0, 1000000.0, float(config.get("swing_partial_tp1_close_usdt", 0.0) or 0.0), step=5.0)
