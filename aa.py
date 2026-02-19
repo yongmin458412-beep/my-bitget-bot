@@ -899,7 +899,8 @@ def default_settings() -> Dict[str, Any]:
         "tg_send_exit_image": True,
         "tg_image_chart_bars": 140,
         "tg_image_sr_lines": 3,
-        "tg_image_volume_nodes": 4,
+        "tg_image_volume_nodes": 6,
+        "tg_image_volume_node_label_count": 3,
         "tg_image_show_indicators": True,
         "tg_image_show_pattern_overlay": True,
 
@@ -1411,6 +1412,12 @@ def default_settings() -> Dict[str, Any]:
         # - 고정 TP/SL이 아니라, 아래 기준값 "근처"의 구조 레벨을 우선 선택
         "sr_anchor_tp_pct": 15.0,
         "sr_anchor_sl_pct": 4.0,
+        "sr_anchor_tp_pct_scalp": 1.6,
+        "sr_anchor_sl_pct_scalp": 0.8,
+        "sr_anchor_tp_pct_day": 8.0,
+        "sr_anchor_sl_pct_day": 3.0,
+        "sr_anchor_tp_pct_swing": 15.0,
+        "sr_anchor_sl_pct_swing": 4.0,
         "sr_anchor_band_ratio": 0.55,
         # ✅ 스캘핑: 하드 익절(ROI%) - TP가 비정상적으로 커져도 이 값 이상이면 익절
         "scalp_hard_take_enable": True,
@@ -8074,8 +8081,19 @@ def _dynamic_sr_targets_in_zone(
         sl_breath_bps = float(cfg.get("sr_sl_breathing_bps", 10.0) or 10.0)
         front_run_bps = float(clamp(front_run_bps, 0.0, 30.0))
         sl_breath_bps = float(clamp(sl_breath_bps, 0.0, 40.0))
-        tp_anchor_cfg = float(_as_float(cfg.get("sr_anchor_tp_pct", 15.0), 15.0))
-        sl_anchor_cfg = float(_as_float(cfg.get("sr_anchor_sl_pct", 4.0), 4.0))
+        st_key = "scalp" if st == "스캘핑" else ("day" if st == "단타" else "swing")
+        tp_anchor_cfg = float(
+            _as_float(
+                cfg.get(f"sr_anchor_tp_pct_{st_key}", cfg.get("sr_anchor_tp_pct", 15.0)),
+                float(_as_float(cfg.get("sr_anchor_tp_pct", 15.0), 15.0)),
+            )
+        )
+        sl_anchor_cfg = float(
+            _as_float(
+                cfg.get(f"sr_anchor_sl_pct_{st_key}", cfg.get("sr_anchor_sl_pct", 4.0)),
+                float(_as_float(cfg.get("sr_anchor_sl_pct", 4.0), 4.0)),
+            )
+        )
         band_ratio = float(_as_float(cfg.get("sr_anchor_band_ratio", 0.55), 0.55))
         band_ratio = float(clamp(band_ratio, 0.10, 1.50))
         tp_anchor = float(clamp(tp_anchor_cfg, max(0.2, tp_pref_min), max(0.2, tp_cap)))
@@ -8089,6 +8107,15 @@ def _dynamic_sr_targets_in_zone(
             atr_sl_mult = float(max(0.0, _as_float(cfg.get("atr_sl_breath_mult_day", 1.5), 1.5)))
         else:
             atr_sl_mult = float(max(0.0, _as_float(cfg.get("atr_sl_breath_mult_swing", 1.0), 1.0)))
+        atr_pct_now = float((atr_v / px) * 100.0) if (atr_v > 0 and px > 0) else 0.0
+
+        def _cap_fallback_pct(cap_val: float, *, is_tp: bool) -> float:
+            cap_v = float(max(0.2, cap_val))
+            if is_tp:
+                buf = max(0.12, cap_v * 0.03, min(1.2, atr_pct_now * 0.35))
+            else:
+                buf = max(0.08, cap_v * 0.02, min(0.9, atr_pct_now * 0.25))
+            return float(max(0.2, cap_v - buf))
 
         vps = [float(x) for x in (volume_nodes or []) if x is not None and math.isfinite(float(x))]
         sups = [float(x) for x in (supports or []) if x is not None and math.isfinite(float(x))]
@@ -8147,9 +8174,25 @@ def _dynamic_sr_targets_in_zone(
                 tp_adj = float(tp_base * (1.0 - front_run_bps / 10000.0))
                 tp_pct = float(_pct_from_entry(px, s, tp_adj, is_tp=True))
                 if tp_cap > 0 and tp_pct > tp_cap:
-                    tp_adj = float(px * (1.0 + tp_cap / 100.0))
-                    out["tp_reason"] = f"구조 저항({tp_base:.6g})이 상한을 넘어 TP 상한({tp_cap:.2f}%)으로 제한"
-                    out["tp_source"] = "SR+CAP"
+                    tp_in_cap: List[Tuple[float, float]] = []
+                    for lv2 in tp_levels:
+                        try:
+                            lv2_adj = float(float(lv2) * (1.0 - front_run_bps / 10000.0))
+                            pct2 = float(_pct_from_entry(px, s, lv2_adj, is_tp=True))
+                            if pct2 > 0 and pct2 <= float(tp_cap):
+                                tp_in_cap.append((pct2, lv2_adj))
+                        except Exception:
+                            continue
+                    if tp_in_cap:
+                        best_tp = max(tp_in_cap, key=lambda x: x[0])
+                        tp_adj = float(best_tp[1])
+                        out["tp_reason"] = f"TP 상한({tp_cap:.2f}%) 이내 저항/매물대에서 선익절"
+                        out["tp_source"] = "SR+CAP_NEAR"
+                    else:
+                        tp_eff = _cap_fallback_pct(float(tp_cap), is_tp=True)
+                        tp_adj = float(px * (1.0 + tp_eff / 100.0))
+                        out["tp_reason"] = f"구조 저항 부족 → TP 상한({tp_cap:.2f}%) 직전({tp_eff:.2f}%) 선익절"
+                        out["tp_source"] = "CAP_FALLBACK"
                 else:
                     out["tp_reason"] = f"기준TP {tp_anchor:.2f}% 근처 저항/매물대({tp_base:.6g}) 앞 선익절"
                     out["tp_source"] = "SR"
@@ -8164,9 +8207,28 @@ def _dynamic_sr_targets_in_zone(
                     sl_adj = float(min(sl_adj_bps, sl_base - (atr_v * atr_sl_mult)))
                 sl_pct = float(_pct_from_entry(px, s, sl_adj, is_tp=False))
                 if sl_cap > 0 and sl_pct > sl_cap:
-                    sl_adj = float(px * (1.0 - sl_cap / 100.0))
-                    out["sl_reason"] = f"구조 지지({sl_base:.6g})까지 거리 과대 → 하드 손절상한({sl_cap:.2f}%) 적용"
-                    out["sl_source"] = "SR+HARD_CAP"
+                    sl_in_cap: List[Tuple[float, float]] = []
+                    for lv2 in sl_levels:
+                        try:
+                            lv2_bps = float(float(lv2) * (1.0 - sl_breath_bps / 10000.0))
+                            lv2_adj = float(lv2_bps)
+                            if atr_v > 0 and atr_sl_mult > 0:
+                                lv2_adj = float(min(lv2_bps, float(lv2) - (atr_v * atr_sl_mult)))
+                            pct2 = float(_pct_from_entry(px, s, lv2_adj, is_tp=False))
+                            if pct2 > 0 and pct2 <= float(sl_cap):
+                                sl_in_cap.append((pct2, lv2_adj))
+                        except Exception:
+                            continue
+                    if sl_in_cap:
+                        best_sl = max(sl_in_cap, key=lambda x: x[0])
+                        sl_adj = float(best_sl[1])
+                        out["sl_reason"] = f"손절상한({sl_cap:.2f}%) 이내 지지/매물대 이탈 기준으로 설정"
+                        out["sl_source"] = "SR+CAP_NEAR"
+                    else:
+                        sl_eff = _cap_fallback_pct(float(sl_cap), is_tp=False)
+                        sl_adj = float(px * (1.0 - sl_eff / 100.0))
+                        out["sl_reason"] = f"구조 지지 부족 → 하드손절 상한({sl_cap:.2f}%) 직전({sl_eff:.2f}%)"
+                        out["sl_source"] = "CAP_FALLBACK"
                 else:
                     if atr_v > 0 and atr_sl_mult > 0:
                         out["sl_reason"] = f"기준SL {sl_anchor:.2f}% 근처 지지({sl_base:.6g}) + ATR({atr_sl_mult:.1f}x) 여유 손절"
@@ -8191,9 +8253,25 @@ def _dynamic_sr_targets_in_zone(
                 tp_adj = float(tp_base * (1.0 + front_run_bps / 10000.0))
                 tp_pct = float(_pct_from_entry(px, s, tp_adj, is_tp=True))
                 if tp_cap > 0 and tp_pct > tp_cap:
-                    tp_adj = float(px * (1.0 - tp_cap / 100.0))
-                    out["tp_reason"] = f"구조 지지({tp_base:.6g})까지 거리 과대 → TP 상한({tp_cap:.2f}%)으로 제한"
-                    out["tp_source"] = "SR+CAP"
+                    tp_in_cap: List[Tuple[float, float]] = []
+                    for lv2 in tp_levels:
+                        try:
+                            lv2_adj = float(float(lv2) * (1.0 + front_run_bps / 10000.0))
+                            pct2 = float(_pct_from_entry(px, s, lv2_adj, is_tp=True))
+                            if pct2 > 0 and pct2 <= float(tp_cap):
+                                tp_in_cap.append((pct2, lv2_adj))
+                        except Exception:
+                            continue
+                    if tp_in_cap:
+                        best_tp = max(tp_in_cap, key=lambda x: x[0])
+                        tp_adj = float(best_tp[1])
+                        out["tp_reason"] = f"TP 상한({tp_cap:.2f}%) 이내 지지/매물대에서 선익절"
+                        out["tp_source"] = "SR+CAP_NEAR"
+                    else:
+                        tp_eff = _cap_fallback_pct(float(tp_cap), is_tp=True)
+                        tp_adj = float(px * (1.0 - tp_eff / 100.0))
+                        out["tp_reason"] = f"구조 지지 부족 → TP 상한({tp_cap:.2f}%) 직전({tp_eff:.2f}%) 선익절"
+                        out["tp_source"] = "CAP_FALLBACK"
                 else:
                     out["tp_reason"] = f"기준TP {tp_anchor:.2f}% 근처 지지/매물대({tp_base:.6g}) 앞 선익절"
                     out["tp_source"] = "SR"
@@ -8208,9 +8286,28 @@ def _dynamic_sr_targets_in_zone(
                     sl_adj = float(max(sl_adj_bps, sl_base + (atr_v * atr_sl_mult)))
                 sl_pct = float(_pct_from_entry(px, s, sl_adj, is_tp=False))
                 if sl_cap > 0 and sl_pct > sl_cap:
-                    sl_adj = float(px * (1.0 + sl_cap / 100.0))
-                    out["sl_reason"] = f"구조 저항({sl_base:.6g})까지 거리 과대 → 하드 손절상한({sl_cap:.2f}%) 적용"
-                    out["sl_source"] = "SR+HARD_CAP"
+                    sl_in_cap: List[Tuple[float, float]] = []
+                    for lv2 in sl_levels:
+                        try:
+                            lv2_bps = float(float(lv2) * (1.0 + sl_breath_bps / 10000.0))
+                            lv2_adj = float(lv2_bps)
+                            if atr_v > 0 and atr_sl_mult > 0:
+                                lv2_adj = float(max(lv2_bps, float(lv2) + (atr_v * atr_sl_mult)))
+                            pct2 = float(_pct_from_entry(px, s, lv2_adj, is_tp=False))
+                            if pct2 > 0 and pct2 <= float(sl_cap):
+                                sl_in_cap.append((pct2, lv2_adj))
+                        except Exception:
+                            continue
+                    if sl_in_cap:
+                        best_sl = max(sl_in_cap, key=lambda x: x[0])
+                        sl_adj = float(best_sl[1])
+                        out["sl_reason"] = f"손절상한({sl_cap:.2f}%) 이내 저항/매물대 돌파 기준으로 설정"
+                        out["sl_source"] = "SR+CAP_NEAR"
+                    else:
+                        sl_eff = _cap_fallback_pct(float(sl_cap), is_tp=False)
+                        sl_adj = float(px * (1.0 + sl_eff / 100.0))
+                        out["sl_reason"] = f"구조 저항 부족 → 하드손절 상한({sl_cap:.2f}%) 직전({sl_eff:.2f}%)"
+                        out["sl_source"] = "CAP_FALLBACK"
                 else:
                     if atr_v > 0 and atr_sl_mult > 0:
                         out["sl_reason"] = f"기준SL {sl_anchor:.2f}% 근처 저항({sl_base:.6g}) + ATR({atr_sl_mult:.1f}x) 여유 손절"
@@ -8225,6 +8322,27 @@ def _dynamic_sr_targets_in_zone(
             if sl_cands:
                 out["sl_price"] = float(sl_cands[0][0])
                 out["sl_source"] = str(sl_cands[0][1])
+
+        if out.get("tp_price") is None and tp_cap > 0:
+            tp_eff = _cap_fallback_pct(float(tp_cap), is_tp=True)
+            if s == "buy":
+                out["tp_price"] = float(px * (1.0 + tp_eff / 100.0))
+            else:
+                out["tp_price"] = float(px * (1.0 - tp_eff / 100.0))
+            if not str(out.get("tp_source", "") or "").strip():
+                out["tp_source"] = "CAP_FALLBACK"
+            if not str(out.get("tp_reason", "") or "").strip():
+                out["tp_reason"] = f"구조 레벨 부족 → 기준 TP 상한({tp_cap:.2f}%) 직전({tp_eff:.2f}%) 설정"
+        if out.get("sl_price") is None and sl_cap > 0:
+            sl_eff = _cap_fallback_pct(float(sl_cap), is_tp=False)
+            if s == "buy":
+                out["sl_price"] = float(px * (1.0 - sl_eff / 100.0))
+            else:
+                out["sl_price"] = float(px * (1.0 + sl_eff / 100.0))
+            if not str(out.get("sl_source", "") or "").strip():
+                out["sl_source"] = "CAP_FALLBACK"
+            if not str(out.get("sl_reason", "") or "").strip():
+                out["sl_reason"] = f"구조 레벨 부족 → 기준 SL 상한({sl_cap:.2f}%) 직전({sl_eff:.2f}%) 설정"
 
         try:
             rr_floor = float(_rr_floor_by_style(style, cfg))
@@ -14471,6 +14589,8 @@ def tg_msg_entry_simple(
     bal_before_free: Optional[float],
     bal_after_free: Optional[float],
     one_line: str,
+    tp_reason: str = "",
+    sl_reason: str = "",
     trade_id: str,
     exit_policy_line: str = "",
 ) -> str:
@@ -14525,6 +14645,16 @@ def tg_msg_entry_simple(
     q = _tg_quote_block(one_line)
     if not q:
         q = "  └ -"
+    tp_q = _tg_quote_block(f"익절: {str(tp_reason or '').strip()}") if str(tp_reason or "").strip() else ""
+    sl_q = _tg_quote_block(f"손절: {str(sl_reason or '').strip()}") if str(sl_reason or "").strip() else ""
+    reason_block = ""
+    if tp_q or sl_q:
+        rr_lines: List[str] = []
+        if tp_q:
+            rr_lines.append(tp_q)
+        if sl_q:
+            rr_lines.append(sl_q)
+        reason_block = "\n- 목표가 근거:\n" + "\n".join(rr_lines)
     target_label = "목표손익비(익절/손절)"
     return (
         "🎯 진입\n"
@@ -14537,6 +14667,7 @@ def tg_msg_entry_simple(
         f"- {target_label}: 익절 {tp_txt} / 손절 {sl_txt}\n"
         f"- 진입전 사용가능 금액: {bf_txt} USDT\n"
         f"- 진입후 사용가능 금액: {af_txt} USDT\n"
+        f"{reason_block}\n"
         "\n"
         "- 한줄:\n"
         f"{q}\n"
@@ -15693,6 +15824,7 @@ def build_trade_event_image(
         except Exception:
             pass
 
+        vp_nodes_drawn: List[float] = []
         try:
             vp_n = int(cfg.get("tg_image_volume_nodes", 4) or 4)
             vp_n = int(clamp(vp_n, 0, 8))
@@ -15700,7 +15832,9 @@ def build_trade_event_image(
                 vp_nodes = volume_profile_nodes(d, bins=60, top_n=vp_n)
                 for lv in (vp_nodes or [])[:vp_n]:
                     if math.isfinite(float(lv)):
-                        ax.axhline(float(lv), color="#b388ff", linewidth=0.7, linestyle="-.", alpha=0.40)
+                        lvf = float(lv)
+                        vp_nodes_drawn.append(lvf)
+                        ax.axhline(lvf, color="#c084fc", linewidth=1.15, linestyle=(0, (6, 3)), alpha=0.68, zorder=6)
         except Exception:
             pass
 
@@ -15806,6 +15940,27 @@ def build_trade_event_image(
                         color="#fde68a",
                         bbox={"boxstyle": "round,pad=0.18", "facecolor": "#2d1b05", "edgecolor": "#92400e", "alpha": 0.88},
                     )
+                try:
+                    if vp_nodes_drawn:
+                        vp_lbl_n = int(cfg.get("tg_image_volume_node_label_count", 3) or 3)
+                        vp_lbl_n = int(clamp(vp_lbl_n, 0, 6))
+                        for i, lv in enumerate(vp_nodes_drawn[:vp_lbl_n]):
+                            if not math.isfinite(float(lv)):
+                                continue
+                            lbl = f"매물대{i+1} {float(lv):.6g}" if has_kr_font else f"VP{i+1} {float(lv):.6g}"
+                            ax.text(
+                                0.005,
+                                float(lv),
+                                lbl,
+                                transform=trans,
+                                va="center",
+                                ha="left",
+                                fontsize=7.5,
+                                color="#f5d0fe",
+                                bbox={"boxstyle": "round,pad=0.16", "facecolor": "#2a103e", "edgecolor": "#7c3aed", "alpha": 0.72},
+                            )
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -15992,6 +16147,13 @@ def build_trade_event_image(
                 info_lines.append(f"잔액(가용) {float(remain_free):.2f}" if has_kr_font else f"Balance (free) {float(remain_free):.2f}")
         if ind_txt and (not show_indicator_panels):
             info_lines.append(f"지표: {ind_txt}" if has_kr_font else f"Indicators: {ind_txt}")
+        try:
+            if vp_nodes_drawn:
+                vp_txt = ", ".join([f"{float(v):.6g}" for v in vp_nodes_drawn[:4]])
+                if vp_txt:
+                    info_lines.append(f"매물대: {vp_txt}" if has_kr_font else f"Volume Nodes: {vp_txt}")
+        except Exception:
+            pass
         pat_info = ", ".join(detected_patterns[:4]) if detected_patterns else pat_txt
         pat_info = _plot_text_sanitize(pat_info, has_kr_font=has_kr_font, max_len=160)
         if pat_info:
@@ -23296,6 +23458,8 @@ def telegram_thread(ex):
                                             bal_before_free=bb_free,
                                             bal_after_free=ba_free,
                                             one_line=one_line0,
+                                            tp_reason=str(tp_price_reason or ""),
+                                            sl_reason=str(sl_price_reason or ""),
                                             trade_id=str(trade_id),
                                         )
                                         try:
@@ -23343,6 +23507,12 @@ def telegram_thread(ex):
                                             except Exception:
                                                 src_txt = ""
                                             msg += f"- SR기준가: TP {tp_price:.6g} / SL {sl_price:.6g}{src_txt}\n"
+                                        if str(tp_price_reason or "").strip() or str(sl_price_reason or "").strip():
+                                            msg += "- 목표가 근거:\n"
+                                            if str(tp_price_reason or "").strip():
+                                                msg += f"  └ 익절: {str(tp_price_reason)[:180]}\n"
+                                            if str(sl_price_reason or "").strip():
+                                                msg += f"  └ 손절: {str(sl_price_reason)[:180]}\n"
                                         try:
                                             if str(style) == "스윙":
                                                 p1 = _as_float((active_targets.get(sym, {}) or {}).get("partial_tp1_price", None), float("nan"))
