@@ -709,27 +709,27 @@ def hard_roi_limits_by_style(style: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
     try:
         if st == "스캘핑":
             return {
-                "tp_min": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_tp_min_roi", sr.get("tp_roi_min", 0.5)), sr.get("tp_roi_min", 0.5)))),
+                "tp_min": float(max(0.0, _as_float(cfg.get("hard_cap_scalp_tp_min_roi", 0.0), 0.0))),
                 "tp_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_tp_roi", 2.5), 2.5))),
-                "sl_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_sl_roi", sr.get("sl_roi_max", 1.8)), sr.get("sl_roi_max", 1.8)))),
+                "sl_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_sl_roi", 5.0), 5.0))),
             }
         if st == "단타":
             return {
-                "tp_min": float(max(0.5, _as_float(cfg.get("hard_cap_day_tp_min_roi", sr.get("tp_roi_min", 2.0)), sr.get("tp_roi_min", 2.0)))),
+                "tp_min": float(max(0.0, _as_float(cfg.get("hard_cap_day_tp_min_roi", 0.0), 0.0))),
                 "tp_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_tp_roi", 15.0), 15.0))),
-                "sl_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_sl_roi", sr.get("sl_roi_max", 4.0)), sr.get("sl_roi_max", 4.0)))),
+                "sl_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_sl_roi", 5.0), 5.0))),
             }
         return {
-            "tp_min": float(max(10.0, _as_float(cfg.get("hard_cap_swing_tp_min_roi", 10.0), 10.0))),
+            "tp_min": float(max(0.0, _as_float(cfg.get("hard_cap_swing_tp_min_roi", 0.0), 0.0))),
             "tp_cap": float(max(10.0, _as_float(cfg.get("hard_cap_swing_tp_roi", 50.0), 50.0))),
-            "sl_cap": float(max(1.0, _as_float(cfg.get("hard_cap_swing_sl_roi", sr.get("sl_roi_max", 12.0)), sr.get("sl_roi_max", 12.0)))),
+            "sl_cap": float(max(1.0, _as_float(cfg.get("hard_cap_swing_sl_roi", 7.0), 7.0))),
         }
     except Exception:
         if st == "스윙":
-            return {"tp_min": 10.0, "tp_cap": 50.0, "sl_cap": float(sr.get("sl_roi_max", 12.0))}
+            return {"tp_min": 0.0, "tp_cap": 50.0, "sl_cap": 7.0}
         if st == "단타":
-            return {"tp_min": float(sr.get("tp_roi_min", 2.0)), "tp_cap": 15.0, "sl_cap": float(sr.get("sl_roi_max", 4.0))}
-        return {"tp_min": float(sr.get("tp_roi_min", 0.5)), "tp_cap": 2.5, "sl_cap": float(sr.get("sl_roi_max", 1.8))}
+            return {"tp_min": 0.0, "tp_cap": 15.0, "sl_cap": 5.0}
+        return {"tp_min": 0.0, "tp_cap": 2.5, "sl_cap": 5.0}
 
 
 def _style_hard_tp_cap_roi(style: Any, cfg: Dict[str, Any]) -> Optional[float]:
@@ -775,8 +775,8 @@ def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) ->
             else:
                 tp_cap = float(min(tp_cap, hard_style_cap))
 
-        if tp_min > 0:
-            tp = max(tp, tp_min)
+        if tp <= 0:
+            tp = max(float(tp_min), 0.2)
         if tp_cap is not None and tp_cap > 0:
             tp = min(tp, tp_cap)
         if hard_style_cap is not None and hard_style_cap > 0:
@@ -7755,13 +7755,28 @@ def sr_stop_take(
     }
 
 
-def _sr_params_for_style(style: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _sr_params_for_style(style: str, cfg: Dict[str, Any], decision_tf: Optional[str] = None) -> Dict[str, Any]:
     """
     스타일별 SR 파라미터를 반환한다.
     - 스윙: 더 큰 매물대/완만한 버퍼(손절/익절이 너무 타이트해지는 문제 완화)
     - 스캘핑: 기존(기본) SR
     """
     st = normalize_style_name(style)
+    tf_override = str(decision_tf or "").strip().lower()
+    if tf_override in ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"]:
+        base = {
+            "tf": tf_override,
+            "lookback": int(cfg.get("sr_lookback", 220) or 220),
+            "pivot_order": int(cfg.get("sr_pivot_order", 6) or 6),
+            "buffer_atr_mult": float(cfg.get("sr_buffer_atr_mult", 0.25) or 0.25),
+            "rr_min": float(cfg.get("sr_rr_min", 1.5) or 1.5),
+        }
+        if st == "스윙":
+            base["lookback"] = int(cfg.get("sr_lookback_swing", max(260, base["lookback"])) or max(260, base["lookback"]))
+            base["pivot_order"] = int(cfg.get("sr_pivot_order_swing", max(7, base["pivot_order"])) or max(7, base["pivot_order"]))
+            base["buffer_atr_mult"] = float(cfg.get("sr_buffer_atr_mult_swing", max(0.35, base["buffer_atr_mult"])) or max(0.35, base["buffer_atr_mult"]))
+            base["rr_min"] = float(cfg.get("sr_rr_min_swing", max(1.8, base["rr_min"])) or max(1.8, base["rr_min"]))
+        return base
     if st == "스윙":
         return {
             "tf": str(cfg.get("sr_timeframe_swing", "1h") or "1h"),
@@ -7881,7 +7896,15 @@ def _dynamic_sr_targets_in_zone(
     volume_nodes: Optional[List[float]] = None,
     orderbook_ctx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    out = {"ok": False, "sl_price": None, "tp_price": None, "sl_source": "", "tp_source": ""}
+    out = {
+        "ok": False,
+        "sl_price": None,
+        "tp_price": None,
+        "sl_source": "",
+        "tp_source": "",
+        "sl_reason": "",
+        "tp_reason": "",
+    }
     try:
         px = float(entry_price or 0.0)
         if px <= 0:
@@ -7891,10 +7914,29 @@ def _dynamic_sr_targets_in_zone(
             return out
 
         g = _style_target_guidelines(style, cfg)
-        tp_min = float(g["tp_min"])
-        tp_max = float(g["tp_max"])
-        sl_min = float(g["sl_min"])
-        sl_max = float(g["sl_max"])
+        tp_pref_min = float(max(0.0, g.get("tp_min", 0.0)))
+        tp_cap = float(max(0.2, g.get("tp_max", 999.0)))
+        sl_cap = float(max(0.2, g.get("sl_max", 999.0)))
+        lim = hard_roi_limits_by_style(style, cfg)
+        try:
+            tp_lim = lim.get("tp_cap", None)
+            if tp_lim is not None:
+                tp_cap = float(min(float(tp_cap), float(tp_lim)))
+        except Exception:
+            pass
+        try:
+            sl_lim = lim.get("sl_cap", None)
+            if sl_lim is not None:
+                sl_cap = float(min(float(sl_cap), float(sl_lim)))
+        except Exception:
+            pass
+
+        st = normalize_style_name(style)
+        if st == "스윙":
+            flash_sl_cap = float(max(0.5, _as_float(cfg.get("hard_sl_flash_cap_swing_roi", 7.0), 7.0)))
+        else:
+            flash_sl_cap = float(max(0.5, _as_float(cfg.get("hard_sl_flash_cap_intraday_roi", 5.0), 5.0)))
+        sl_cap = float(min(float(sl_cap), float(flash_sl_cap)))
 
         front_run_bps = float(cfg.get("sr_front_run_bps", 5.0) or 5.0)
         sl_breath_bps = float(cfg.get("sr_sl_breathing_bps", 10.0) or 10.0)
@@ -7923,43 +7965,79 @@ def _dynamic_sr_targets_in_zone(
         sl_cands: List[Tuple[float, str]] = []
 
         if s == "buy":
-            for lv in sorted(set(ress + vps)):
-                if lv <= px:
-                    continue
-                pct = _pct_from_entry(px, s, lv, is_tp=True)
-                if tp_min <= pct <= tp_max:
-                    tp_adj = float(lv * (1.0 - front_run_bps / 10000.0))
-                    tp_cands.append((tp_adj, "SR_ZONE"))
-            for lv in sorted(set(sups + vps)):
-                if lv >= px:
-                    continue
-                pct = _pct_from_entry(px, s, lv, is_tp=False)
-                if sl_min <= pct <= sl_max:
-                    sl_adj = float(lv * (1.0 - sl_breath_bps / 10000.0))
-                    sl_cands.append((sl_adj, "SR_ZONE"))
+            tp_levels = sorted([lv for lv in set(ress + vps) if lv > px])
+            sl_levels = sorted([lv for lv in set(sups + vps) if lv < px])
+
+            if tp_levels:
+                pref = [lv for lv in tp_levels if _pct_from_entry(px, s, lv, is_tp=True) >= tp_pref_min]
+                tp_base = float(pref[0] if pref else tp_levels[0])
+                tp_adj = float(tp_base * (1.0 - front_run_bps / 10000.0))
+                tp_pct = float(_pct_from_entry(px, s, tp_adj, is_tp=True))
+                if tp_cap > 0 and tp_pct > tp_cap:
+                    tp_adj = float(px * (1.0 + tp_cap / 100.0))
+                    out["tp_reason"] = f"구조 저항({tp_base:.6g})이 상한을 넘어 TP 상한({tp_cap:.2f}%)으로 제한"
+                    out["tp_source"] = "SR+CAP"
+                else:
+                    out["tp_reason"] = f"결정봉 저항/매물대({tp_base:.6g}) 앞에서 선익절(front-run)"
+                    out["tp_source"] = "SR"
+                tp_cands.append((float(tp_adj), out["tp_source"]))
+
+            if sl_levels:
+                sl_base = float(sl_levels[-1])
+                sl_adj = float(sl_base * (1.0 - sl_breath_bps / 10000.0))
+                sl_pct = float(_pct_from_entry(px, s, sl_adj, is_tp=False))
+                if sl_cap > 0 and sl_pct > sl_cap:
+                    sl_adj = float(px * (1.0 - sl_cap / 100.0))
+                    out["sl_reason"] = f"구조 지지({sl_base:.6g})까지 거리 과대 → 하드 손절상한({sl_cap:.2f}%) 적용"
+                    out["sl_source"] = "SR+HARD_CAP"
+                else:
+                    out["sl_reason"] = f"결정봉 지지({sl_base:.6g}) 이탈 확인용 여유 손절(breathing room)"
+                    out["sl_source"] = "SR"
+                sl_cands.append((float(sl_adj), out["sl_source"]))
+
             if tp_cands:
-                out["tp_price"], out["tp_source"] = min(tp_cands, key=lambda x: x[0])[0], "SR_ZONE"
+                out["tp_price"] = float(tp_cands[0][0])
+                out["tp_source"] = str(tp_cands[0][1])
             if sl_cands:
-                out["sl_price"], out["sl_source"] = max(sl_cands, key=lambda x: x[0])[0], "SR_ZONE"
+                out["sl_price"] = float(sl_cands[0][0])
+                out["sl_source"] = str(sl_cands[0][1])
         else:
-            for lv in sorted(set(sups + vps), reverse=True):
-                if lv >= px:
-                    continue
-                pct = _pct_from_entry(px, s, lv, is_tp=True)
-                if tp_min <= pct <= tp_max:
-                    tp_adj = float(lv * (1.0 + front_run_bps / 10000.0))
-                    tp_cands.append((tp_adj, "SR_ZONE"))
-            for lv in sorted(set(ress + vps)):
-                if lv <= px:
-                    continue
-                pct = _pct_from_entry(px, s, lv, is_tp=False)
-                if sl_min <= pct <= sl_max:
-                    sl_adj = float(lv * (1.0 + sl_breath_bps / 10000.0))
-                    sl_cands.append((sl_adj, "SR_ZONE"))
+            tp_levels = sorted([lv for lv in set(sups + vps) if lv < px], reverse=True)
+            sl_levels = sorted([lv for lv in set(ress + vps) if lv > px])
+
+            if tp_levels:
+                pref = [lv for lv in tp_levels if _pct_from_entry(px, s, lv, is_tp=True) >= tp_pref_min]
+                tp_base = float(pref[0] if pref else tp_levels[0])
+                tp_adj = float(tp_base * (1.0 + front_run_bps / 10000.0))
+                tp_pct = float(_pct_from_entry(px, s, tp_adj, is_tp=True))
+                if tp_cap > 0 and tp_pct > tp_cap:
+                    tp_adj = float(px * (1.0 - tp_cap / 100.0))
+                    out["tp_reason"] = f"구조 지지({tp_base:.6g})까지 거리 과대 → TP 상한({tp_cap:.2f}%)으로 제한"
+                    out["tp_source"] = "SR+CAP"
+                else:
+                    out["tp_reason"] = f"결정봉 지지/매물대({tp_base:.6g}) 앞에서 선익절(front-run)"
+                    out["tp_source"] = "SR"
+                tp_cands.append((float(tp_adj), out["tp_source"]))
+
+            if sl_levels:
+                sl_base = float(sl_levels[0])
+                sl_adj = float(sl_base * (1.0 + sl_breath_bps / 10000.0))
+                sl_pct = float(_pct_from_entry(px, s, sl_adj, is_tp=False))
+                if sl_cap > 0 and sl_pct > sl_cap:
+                    sl_adj = float(px * (1.0 + sl_cap / 100.0))
+                    out["sl_reason"] = f"구조 저항({sl_base:.6g})까지 거리 과대 → 하드 손절상한({sl_cap:.2f}%) 적용"
+                    out["sl_source"] = "SR+HARD_CAP"
+                else:
+                    out["sl_reason"] = f"결정봉 저항({sl_base:.6g}) 돌파 확인용 여유 손절(breathing room)"
+                    out["sl_source"] = "SR"
+                sl_cands.append((float(sl_adj), out["sl_source"]))
+
             if tp_cands:
-                out["tp_price"], out["tp_source"] = max(tp_cands, key=lambda x: x[0])[0], "SR_ZONE"
+                out["tp_price"] = float(tp_cands[0][0])
+                out["tp_source"] = str(tp_cands[0][1])
             if sl_cands:
-                out["sl_price"], out["sl_source"] = min(sl_cands, key=lambda x: x[0])[0], "SR_ZONE"
+                out["sl_price"] = float(sl_cands[0][0])
+                out["sl_source"] = str(sl_cands[0][1])
 
         out["ok"] = bool(out.get("sl_price") is not None and out.get("tp_price") is not None)
         return out
@@ -8138,6 +8216,7 @@ def sr_prices_for_style(
     ai_sl_price: Optional[float] = None,
     ai_tp_price: Optional[float] = None,
     orderbook_ctx: Optional[Dict[str, Any]] = None,
+    decision_tf: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     최종 SL/TP 가격을 계산(SR 기반 + AI 후보 + ROI 바운드 보정).
@@ -8159,11 +8238,13 @@ def sr_prices_for_style(
         "resistances": [],
         "volume_nodes": [],
         "zone_used": False,
+        "tp_reason": "",
+        "sl_reason": "",
     }
     if not sym:
         return out
     try:
-        params = _sr_params_for_style(style, cfg)
+        params = _sr_params_for_style(style, cfg, decision_tf=decision_tf)
         sr_tf = str(params.get("tf") or "")
         sr_lb = int(params.get("lookback") or 0)
         piv = int(params.get("pivot_order") or 0)
@@ -8207,6 +8288,8 @@ def sr_prices_for_style(
             out["tp_price"] = zone_pick.get("tp_price", None)
             out["sl_source"] = str(zone_pick.get("sl_source", "SR_ZONE") or "SR_ZONE")
             out["tp_source"] = str(zone_pick.get("tp_source", "SR_ZONE") or "SR_ZONE")
+            out["tp_reason"] = str(zone_pick.get("tp_reason", "") or "")
+            out["sl_reason"] = str(zone_pick.get("sl_reason", "") or "")
             out["zone_used"] = True
         else:
             # 2) zone에서 유의미한 레벨이 없으면 기존 ROI 바운드 + AI 후보 fallback
@@ -12220,6 +12303,8 @@ JSON 형식:
   "decision_tf": "1m"|"5m"|"15m"|"30m"|"1h",
 	  "sl_price": number|null,
 	  "tp_price": number|null,
+	  "sl_price_reason": "가격형 손절 근거(지지/저항/오더북)",
+	  "tp_price_reason": "가격형 익절 근거(지지/저항/오더북)",
 	  "used_indicators": ["..."],
 	  "reason_easy": "{{패턴/셋업}} + {{지표 시그널}} on {{타임프레임}}"
 	}}
@@ -12305,6 +12390,8 @@ JSON 형식:
         except Exception:
             out["sl_price"] = None
             out["tp_price"] = None
+        out["sl_price_reason"] = str(out.get("sl_price_reason", "") or "")[:220]
+        out["tp_price_reason"] = str(out.get("tp_price_reason", "") or "")[:220]
 
         used = out.get("used_indicators", status.get("_used_indicators", []))
         if not isinstance(used, list):
@@ -16482,12 +16569,15 @@ def _maybe_switch_style_for_open_position(
                             tp_price_pct=float(tp_price_pct0),
                             ai_sl_price=None,
                             ai_tp_price=None,
+                            decision_tf=str(tgt.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                         )
                         if isinstance(sr_res2, dict):
                             tgt["sl_price"] = sr_res2.get("sl_price", tgt.get("sl_price"))
                             tgt["tp_price"] = sr_res2.get("tp_price", tgt.get("tp_price"))
                             tgt["sl_price_source"] = str(sr_res2.get("sl_source", "") or "")
                             tgt["tp_price_source"] = str(sr_res2.get("tp_source", "") or "")
+                            tgt["sl_price_reason"] = str(sr_res2.get("sl_reason", "") or "")
+                            tgt["tp_price_reason"] = str(sr_res2.get("tp_reason", "") or "")
                             tgt["sr_used"] = {
                                 "tf": sr_res2.get("tf", ""),
                                 "lookback": sr_res2.get("lookback", 0),
@@ -16858,6 +16948,8 @@ def _try_reverse_switch_after_stop(
         tp_price = None
         sl_source = "ROI"
         tp_source = "ROI"
+        sl_reason = ""
+        tp_reason = ""
         sl_price_pct = float(slp / max(lev, 1))
         tp_price_pct = float(tpp / max(lev, 1))
         sr_used: Dict[str, Any] = {}
@@ -16874,12 +16966,15 @@ def _try_reverse_switch_after_stop(
                     tp_price_pct=float(tp_price_pct),
                     ai_sl_price=None,
                     ai_tp_price=None,
+                    decision_tf=normalize_decision_tf(cfg.get("timeframe", "5m"), style, default_tf=str(cfg.get("timeframe", "5m") or "5m")),
                 )
                 if isinstance(sr_res, dict):
                     sl_price = sr_res.get("sl_price", None)
                     tp_price = sr_res.get("tp_price", None)
                     sl_source = str(sr_res.get("sl_source", sl_source) or sl_source)
                     tp_source = str(sr_res.get("tp_source", tp_source) or tp_source)
+                    sl_reason = str(sr_res.get("sl_reason", "") or "")
+                    tp_reason = str(sr_res.get("tp_reason", "") or "")
                     sr_used = {
                         "tf": sr_res.get("tf", ""),
                         "lookback": sr_res.get("lookback", 0),
@@ -16894,8 +16989,12 @@ def _try_reverse_switch_after_stop(
                 slb, tpb = _sr_price_bounds_from_price_pct(float(px), str(decision), float(sl_price_pct), float(tp_price_pct))
                 if sl_price is None:
                     sl_price = float(slb)
+                    if not sl_reason:
+                        sl_reason = "구조 레벨 미검출 → ROI 하드캡 기준 손절"
                 if tp_price is None:
                     tp_price = float(tpb)
+                    if not tp_reason:
+                        tp_reason = "구조 레벨 미검출 → ROI 하드캡 기준 익절"
             except Exception:
                 pass
 
@@ -16927,6 +17026,8 @@ def _try_reverse_switch_after_stop(
             "tp_price_pct": float(tp_price_pct),
             "sl_price_source": str(sl_source),
             "tp_price_source": str(tp_source),
+            "sl_price_reason": str(sl_reason),
+            "tp_price_reason": str(tp_reason),
             "sr_used": sr_used,
         }
 
@@ -16953,8 +17054,12 @@ def _try_reverse_switch_after_stop(
                 "tp_pct_roi": float(tpp),
                 "sl_price_sr": sl_price,
                 "tp_price_sr": tp_price,
+                "sl_price_reason_ai": str(ai_like.get("sl_price_reason", "") or ""),
+                "tp_price_reason_ai": str(ai_like.get("tp_price_reason", "") or ""),
                 "sl_price_source": str(sl_source),
                 "tp_price_source": str(tp_source),
+                "sl_price_reason": str(sl_reason),
+                "tp_price_reason": str(tp_reason),
                 "reason_easy": str(reason)[:240],
                 "style": str(style),
                 "style_reason": str(style_rec.get("reason", "") or "")[:240],
@@ -17867,12 +17972,15 @@ def telegram_thread(ex):
                                                     tp_price_pct=float(tgt.get("tp_price_pct", 0.0) or 0.0),
                                                     ai_sl_price=None,
                                                     ai_tp_price=None,
+                                                    decision_tf=str(tgt.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                                 )
                                                 if isinstance(sr_res2, dict):
                                                     tgt["sl_price"] = sr_res2.get("sl_price", tgt.get("sl_price"))
                                                     tgt["tp_price"] = sr_res2.get("tp_price", tgt.get("tp_price"))
                                                     tgt["sl_price_source"] = str(sr_res2.get("sl_source", "") or "")
                                                     tgt["tp_price_source"] = str(sr_res2.get("tp_source", "") or "")
+                                                    tgt["sl_price_reason"] = str(sr_res2.get("sl_reason", "") or "")
+                                                    tgt["tp_price_reason"] = str(sr_res2.get("tp_reason", "") or "")
                                                     tgt["sr_used"] = {
                                                         "tf": sr_res2.get("tf", ""),
                                                         "lookback": sr_res2.get("lookback", 0),
@@ -17954,12 +18062,15 @@ def telegram_thread(ex):
                                                     tp_price_pct=float(tp_price_pct),
                                                     ai_sl_price=tgt.get("sl_price_ai", None),
                                                     ai_tp_price=tgt.get("tp_price_ai", None),
+                                                    decision_tf=str(tgt.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                                 )
                                                 if isinstance(sr_res2, dict):
                                                     tgt["sl_price"] = sr_res2.get("sl_price", tgt.get("sl_price"))
                                                     tgt["tp_price"] = sr_res2.get("tp_price", tgt.get("tp_price"))
                                                     tgt["sl_price_source"] = str(sr_res2.get("sl_source", "") or "")
                                                     tgt["tp_price_source"] = str(sr_res2.get("tp_source", "") or "")
+                                                    tgt["sl_price_reason"] = str(sr_res2.get("sl_reason", "") or "")
+                                                    tgt["tp_price_reason"] = str(sr_res2.get("tp_reason", "") or "")
                                                     tgt["sr_used"] = {
                                                         "tf": sr_res2.get("tf", ""),
                                                         "lookback": sr_res2.get("lookback", 0),
@@ -18391,12 +18502,15 @@ def telegram_thread(ex):
                                                 tp_price_pct=float(tp_price_pct0),
                                                 ai_sl_price=None,
                                                 ai_tp_price=None,
+                                                decision_tf=str(tgt.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                             )
                                             if isinstance(sr_res2, dict):
                                                 tgt["sl_price"] = sr_res2.get("sl_price", tgt.get("sl_price"))
                                                 tgt["tp_price"] = sr_res2.get("tp_price", tgt.get("tp_price"))
                                                 tgt["sl_price_source"] = str(sr_res2.get("sl_source", "") or "")
                                                 tgt["tp_price_source"] = str(sr_res2.get("tp_source", "") or "")
+                                                tgt["sl_price_reason"] = str(sr_res2.get("sl_reason", "") or "")
+                                                tgt["tp_price_reason"] = str(sr_res2.get("tp_reason", "") or "")
                                                 tgt["sr_used"] = {
                                                     "tf": sr_res2.get("tf", ""),
                                                     "lookback": sr_res2.get("lookback", 0),
@@ -22080,6 +22194,88 @@ def telegram_thread(ex):
                             except Exception:
                                 pass
 
+                            # ✅ 주문 전 동적 목표가 계산(S/R + 오더북 우선)
+                            # - 고정 ROI%는 하드캡/페일세이프로만 사용
+                            # - 실제 TP/SL은 decision_tf 구조에서 역산
+                            try:
+                                if bool(cfg.get("use_sr_stop", True)) and str(decision) in ["buy", "sell"] and float(px) > 0:
+                                    lev_pre = float(max(1, int(lev)))
+                                    sl_price_pct_pre = float(_as_float(ai2.get("sl_price_pct", abs(float(slp)) / max(lev_pre, 1.0)), abs(float(slp)) / max(lev_pre, 1.0)))
+                                    tp_price_pct_pre = float(_as_float(ai2.get("tp_price_pct", abs(float(tpp)) / max(lev_pre, 1.0)), abs(float(tpp)) / max(lev_pre, 1.0)))
+                                    sr_pre = sr_prices_for_style(
+                                        ex,
+                                        sym,
+                                        entry_price=float(px),
+                                        side=str(decision),
+                                        style=str(style),
+                                        cfg=cfg,
+                                        sl_price_pct=float(sl_price_pct_pre),
+                                        tp_price_pct=float(tp_price_pct_pre),
+                                        ai_sl_price=ai2.get("sl_price", None),
+                                        ai_tp_price=ai2.get("tp_price", None),
+                                        orderbook_ctx=orderbook_context if isinstance(orderbook_context, dict) else None,
+                                        decision_tf=str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
+                                    )
+                                    if isinstance(sr_pre, dict) and bool(sr_pre.get("ok", False)):
+                                        pre_sl_price = sr_pre.get("sl_price", None)
+                                        pre_tp_price = sr_pre.get("tp_price", None)
+                                        if (pre_sl_price is not None) and (pre_tp_price is not None):
+                                            px0_pre = float(px)
+                                            if str(decision) == "buy":
+                                                sl_price_pct_sync_pre = max(0.0, ((px0_pre - float(pre_sl_price)) / px0_pre) * 100.0)
+                                                tp_price_pct_sync_pre = max(0.0, ((float(pre_tp_price) - px0_pre) / px0_pre) * 100.0)
+                                            else:
+                                                sl_price_pct_sync_pre = max(0.0, ((float(pre_sl_price) - px0_pre) / px0_pre) * 100.0)
+                                                tp_price_pct_sync_pre = max(0.0, ((px0_pre - float(pre_tp_price)) / px0_pre) * 100.0)
+                                            if sl_price_pct_sync_pre > 0 and tp_price_pct_sync_pre > 0:
+                                                slp = float(sl_price_pct_sync_pre * lev_pre)
+                                                tpp = float(tp_price_pct_sync_pre * lev_pre)
+                                                ai2["sl_pct"] = float(slp)
+                                                ai2["tp_pct"] = float(tpp)
+                                                ai2["sl_price_pct"] = float(sl_price_pct_sync_pre)
+                                                ai2["tp_price_pct"] = float(tp_price_pct_sync_pre)
+                                                ai2["rr"] = float(float(tpp) / max(abs(float(slp)), 0.01))
+                                        ai2["_pre_sr_used"] = dict(sr_pre)
+                                        ai2["_pre_sr_sl_price"] = pre_sl_price
+                                        ai2["_pre_sr_tp_price"] = pre_tp_price
+                                        ai2["_pre_sr_sl_source"] = str(sr_pre.get("sl_source", "") or "")
+                                        ai2["_pre_sr_tp_source"] = str(sr_pre.get("tp_source", "") or "")
+                                        ai2["_pre_sr_sl_reason"] = str(sr_pre.get("sl_reason", "") or "")
+                                        ai2["_pre_sr_tp_reason"] = str(sr_pre.get("tp_reason", "") or "")
+                                        ai2["sl_price_reason"] = str(sr_pre.get("sl_reason", "") or ai2.get("sl_price_reason", ""))
+                                        ai2["tp_price_reason"] = str(sr_pre.get("tp_reason", "") or ai2.get("tp_price_reason", ""))
+                                        # 하드캡은 최대한도/급변 페일세이프로만 최종 적용
+                                        capped_pre = apply_hard_roi_caps(
+                                            {
+                                                "tp_pct": float(tpp),
+                                                "sl_pct": float(slp),
+                                                "leverage": int(lev),
+                                                "tp_price_pct": float(ai2.get("tp_price_pct", 0.0) or 0.0),
+                                                "sl_price_pct": float(ai2.get("sl_price_pct", 0.0) or 0.0),
+                                            },
+                                            style,
+                                            cfg,
+                                        )
+                                        tpp = float(_as_float(capped_pre.get("tp_pct", tpp), tpp))
+                                        slp = float(_as_float(capped_pre.get("sl_pct", slp), slp))
+                                        tp_price_pct_pre = float(_as_float(capped_pre.get("tp_price_pct", ai2.get("tp_price_pct", 0.0)), ai2.get("tp_price_pct", 0.0)))
+                                        sl_price_pct_pre = float(_as_float(capped_pre.get("sl_price_pct", ai2.get("sl_price_pct", 0.0)), ai2.get("sl_price_pct", 0.0)))
+                                        ai2["tp_pct"] = float(tpp)
+                                        ai2["sl_pct"] = float(slp)
+                                        ai2["tp_price_pct"] = float(tp_price_pct_pre)
+                                        ai2["sl_price_pct"] = float(sl_price_pct_pre)
+                                        ai2["rr"] = float(float(tpp) / max(abs(float(slp)), 0.01))
+                                        slb_pre, tpb_pre = _sr_price_bounds_from_price_pct(
+                                            float(px),
+                                            str(decision),
+                                            float(sl_price_pct_pre),
+                                            float(tp_price_pct_pre),
+                                        )
+                                        ai2["_pre_sr_sl_price"] = float(slb_pre)
+                                        ai2["_pre_sr_tp_price"] = float(tpb_pre)
+                            except Exception:
+                                pass
+
                             # entry_pct는 최종 entry_usdt 기준으로 다시 계산(표시/일지 일관성)
                             try:
                                 if free_usdt > 0:
@@ -22194,11 +22390,13 @@ def telegram_thread(ex):
                                     pass
 
                                 # ✅ SL/TP 가격 라인(지지/저항 + AI 후보 + ROI 바운드)
-                                sl_price = None
-                                tp_price = None
-                                sl_price_source = ""
-                                tp_price_source = ""
-                                sr_used: Dict[str, Any] = {}
+                                sl_price = ai2.get("_pre_sr_sl_price", None)
+                                tp_price = ai2.get("_pre_sr_tp_price", None)
+                                sl_price_source = str(ai2.get("_pre_sr_sl_source", "") or "")
+                                tp_price_source = str(ai2.get("_pre_sr_tp_source", "") or "")
+                                sl_price_reason = str(ai2.get("_pre_sr_sl_reason", ai2.get("sl_price_reason", "")) or "")
+                                tp_price_reason = str(ai2.get("_pre_sr_tp_reason", ai2.get("tp_price_reason", "")) or "")
+                                sr_used: Dict[str, Any] = dict(ai2.get("_pre_sr_used", {}) or {}) if isinstance(ai2.get("_pre_sr_used", {}), dict) else {}
                                 ai_sl_price = ai2.get("sl_price", None)
                                 ai_tp_price = ai2.get("tp_price", None)
                                 try:
@@ -22209,7 +22407,7 @@ def telegram_thread(ex):
                                     tp_price_pct = float(ai2.get("tp_price_pct", float(tpp) / max(int(lev), 1)))
                                 except Exception:
                                     tp_price_pct = float(tpp) / max(int(lev), 1)
-                                if cfg.get("use_sr_stop", True):
+                                if cfg.get("use_sr_stop", True) and (sl_price is None or tp_price is None):
                                     try:
                                         sr_res = sr_prices_for_style(
                                             ex,
@@ -22223,6 +22421,7 @@ def telegram_thread(ex):
                                             ai_sl_price=ai_sl_price,
                                             ai_tp_price=ai_tp_price,
                                             orderbook_ctx=orderbook_context if isinstance(orderbook_context, dict) else None,
+                                            decision_tf=str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                         )
                                         if isinstance(sr_res, dict):
                                             sr_used = dict(sr_res)
@@ -22230,6 +22429,8 @@ def telegram_thread(ex):
                                             tp_price = sr_res.get("tp_price", None)
                                             sl_price_source = str(sr_res.get("sl_source", "") or "")
                                             tp_price_source = str(sr_res.get("tp_source", "") or "")
+                                            sl_price_reason = str(sr_res.get("sl_reason", "") or sl_price_reason)
+                                            tp_price_reason = str(sr_res.get("tp_reason", "") or tp_price_reason)
                                     except Exception:
                                         pass
                                 # SR 계산 실패/값 비정상 시에도 최소한 "가격 기준 SL/TP"는 ROI 바운드로 확보
@@ -22242,6 +22443,10 @@ def telegram_thread(ex):
                                             sl_price_source = "ROI"
                                         if not tp_price_source:
                                             tp_price_source = "ROI"
+                                        if not sl_price_reason:
+                                            sl_price_reason = "구조 레벨 미검출 → ROI 하드캡 기준 손절"
+                                        if not tp_price_reason:
+                                            tp_price_reason = "구조 레벨 미검출 → ROI 하드캡 기준 익절"
                                     except Exception:
                                         pass
 
@@ -22378,6 +22583,8 @@ def telegram_thread(ex):
                                     "tp_price_pct": float(tp_price_pct),
                                     "sl_price_source": sl_price_source,
                                     "tp_price_source": tp_price_source,
+                                    "sl_price_reason": sl_price_reason,
+                                    "tp_price_reason": tp_price_reason,
                                     "sr_used": {"tf": sr_used.get("tf", ""), "lookback": sr_used.get("lookback", 0), "pivot_order": sr_used.get("pivot_order", 0), "buffer_atr_mult": sr_used.get("buffer_atr_mult", 0.0), "rr_min": sr_used.get("rr_min", 0.0)},
                                     "partial_tp1_price": partial_tp1_price,
                                     "partial_tp2_price": partial_tp2_price,
@@ -22430,10 +22637,14 @@ def telegram_thread(ex):
                                         "tp_pct_roi": tpp,
                                         "sl_price_sr": sl_price,
                                         "tp_price_sr": tp_price,
+                                        "sl_price_reason_ai": str(ai2.get("sl_price_reason", "") or ""),
+                                        "tp_price_reason_ai": str(ai2.get("tp_price_reason", "") or ""),
                                         "sl_price_ai": ai_sl_price,
                                         "tp_price_ai": ai_tp_price,
                                         "sl_price_source": sl_price_source,
                                         "tp_price_source": tp_price_source,
+                                        "sl_price_reason": sl_price_reason,
+                                        "tp_price_reason": tp_price_reason,
                                         "sr_used": {"tf": sr_used.get("tf", ""), "lookback": sr_used.get("lookback", 0), "pivot_order": sr_used.get("pivot_order", 0), "buffer_atr_mult": sr_used.get("buffer_atr_mult", 0.0), "rr_min": sr_used.get("rr_min", 0.0)},
                                         "partial_tp1_price": partial_tp1_price,
                                         "partial_tp2_price": partial_tp2_price,
