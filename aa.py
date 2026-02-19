@@ -7409,7 +7409,8 @@ def smart_order_safe_ex(
         return False, "qty<=0"
 
     if not bool(prefer_limit):
-        return _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+        ok_m, err_m = _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+        return (True, "MARKET_DIRECT") if bool(ok_m) else (False, str(err_m or "market_order_failed"))
 
     order_id = ""
     try:
@@ -7448,7 +7449,8 @@ def smart_order_safe_ex(
             last_px = float((t or {}).get("last") or 0.0)
             if last_px <= 0:
                 if bool(fallback_to_market):
-                    return _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+                    ok_m, err_m = _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+                    return (True, "MARKET_FALLBACK") if bool(ok_m) else (False, str(err_m or "market_fallback_failed"))
                 return False, "limit_price_unavailable"
             limit_px = float(last_px * (0.9995 if str(side).lower() == "buy" else 1.0005))
 
@@ -7489,7 +7491,8 @@ def smart_order_safe_ex(
 
         order_id = str((od or {}).get("id") or "")
         if not order_id:
-            return _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+            ok_m, err_m = _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+            return (True, "MARKET_FALLBACK") if bool(ok_m) else (False, str(err_m or "market_fallback_failed"))
 
         started = time.time()
         while (time.time() - started) < float(max(2.0, limit_timeout_sec)):
@@ -7507,7 +7510,7 @@ def smart_order_safe_ex(
                 remaining = float((fo or {}).get("remaining") or 0.0)
                 filled = float((fo or {}).get("filled") or 0.0)
                 if stt in ["closed", "filled"] or (remaining <= 0 and filled > 0):
-                    return True, ""
+                    return True, "LIMIT_FILLED"
             except Exception:
                 pass
             time.sleep(0.75)
@@ -7525,13 +7528,14 @@ def smart_order_safe_ex(
         except Exception:
             pass
         if bool(fallback_to_market):
-            return _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+            ok_m, err_m = _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
+            return (True, "MARKET_FALLBACK") if bool(ok_m) else (False, str(err_m or "market_fallback_failed"))
         return False, "limit_not_filled"
     except Exception as e:
         if bool(fallback_to_market):
             ok_m, err_m = _run_trade_call_with_retry(lambda: _create_market_order_raw(ex, sym, side, q, params=params), attempts=3)
             if ok_m:
-                return True, ""
+                return True, "MARKET_FALLBACK"
             return False, (str(e) or err_m or "smart_order_failed")
         return False, (str(e) or "smart_limit_failed")
 
@@ -13793,6 +13797,9 @@ class Notifier:
             strategy_lines.append(f"모드: `{mode}`")
         if d.get("leverage") is not None:
             strategy_lines.append(f"레버리지: `x{_as_float(d.get('leverage'), 0.0):.0f}`")
+        order_mode = str(d.get("entry_order_mode", "") or "").strip()
+        if order_mode:
+            strategy_lines.append(f"주문방식: `{order_mode}`")
         _add("🧩 전략", "\n".join(strategy_lines), True)
 
         fin_lines: List[str] = [f"심볼: `{symbol}`"]
@@ -13823,6 +13830,15 @@ class Notifier:
             target_lines.append(f"가용자산: `{_as_float(d.get('balance_free'), 0.0):,.2f} USDT`")
         if target_lines:
             _add("🎯 목표/포지션", "\n".join(target_lines), True)
+        target_reason_lines: List[str] = []
+        tp_reason = str(d.get("tp_reason", "") or "").strip()
+        sl_reason = str(d.get("sl_reason", "") or "").strip()
+        if tp_reason:
+            target_reason_lines.append(f"익절: {tp_reason[:220]}")
+        if sl_reason:
+            target_reason_lines.append(f"손절: {sl_reason[:220]}")
+        if target_reason_lines:
+            _add("📝 목표근거", "\n".join(target_reason_lines), False)
 
         if reason:
             _add("💡 근거", reason, False)
@@ -13918,10 +13934,19 @@ class Notifier:
         if d.get("leverage") is not None:
             lev_txt = f"x{_as_float(d.get('leverage'), 0.0):.0f}"
             lines.append(f"⚡ <b>레버리지:</b> {_code(lev_txt)}")
+        order_mode = html.escape(str(d.get("entry_order_mode", "") or "").strip())
+        if order_mode:
+            lines.append(f"🧾 <b>주문방식:</b> {_code(order_mode)}")
         if d.get("tp_pct") is not None or d.get("sl_pct") is not None:
             tp = _as_float(d.get("tp_pct"), 0.0)
             sl = _as_float(d.get("sl_pct"), 0.0)
             lines.append(f"🎯 <b>목표:</b> {_code(f'익절 +{abs(tp):.2f}%')} / {_code(f'손절 -{abs(sl):.2f}%')}")
+        tp_reason = html.escape(str(d.get("tp_reason", "") or "").strip()[:220])
+        sl_reason = html.escape(str(d.get("sl_reason", "") or "").strip()[:220])
+        if tp_reason:
+            lines.append(f"📌 <b>익절근거:</b> {tp_reason}")
+        if sl_reason:
+            lines.append(f"🛡️ <b>손절근거:</b> {sl_reason}")
         if d.get("roi_pct") is not None:
             roi_txt = f"{_as_float(d.get('roi_pct'), 0.0):+.2f}%"
             lines.append(f"📈 <b>수익률:</b> {_code(roi_txt)}")
@@ -14600,6 +14625,7 @@ def tg_msg_entry_simple(
     one_line: str,
     tp_reason: str = "",
     sl_reason: str = "",
+    entry_order_mode: str = "",
     trade_id: str,
     exit_policy_line: str = "",
 ) -> str:
@@ -14656,6 +14682,7 @@ def tg_msg_entry_simple(
         q = "  └ -"
     tp_q = _tg_quote_block(f"익절: {str(tp_reason or '').strip()}") if str(tp_reason or "").strip() else ""
     sl_q = _tg_quote_block(f"손절: {str(sl_reason or '').strip()}") if str(sl_reason or "").strip() else ""
+    order_mode_line = f"- 주문방식: {str(entry_order_mode).strip()}\n" if str(entry_order_mode).strip() else ""
     reason_block = ""
     if tp_q or sl_q:
         rr_lines: List[str] = []
@@ -14671,6 +14698,7 @@ def tg_msg_entry_simple(
         f"- 방식: {_tg_style_easy(style)}\n"
         f"- 포지션: {_tg_dir_easy(decision)}\n"
         f"- 레버리지: x{lev}\n"
+        f"{order_mode_line}"
         "\n"
         f"- 진입금액(마진): {entry_usdt_f:.2f} USDT{pct_txt}\n"
         f"- {target_label}: 익절 {tp_txt} / 손절 {sl_txt}\n"
@@ -15061,6 +15089,9 @@ def _fmt_pos_block(
         lev_txt = f"x{str(lev)}"
     tp_txt = _tg_fmt_target_roi(tgt.get("tp", None), sign="+", min_visible=0.05)
     sl_txt = _tg_fmt_target_roi(tgt.get("sl", None), sign="-", min_visible=0.05)
+    order_mode_txt = str(tgt.get("entry_order_mode", "") or "").strip()
+    tp_reason_txt = str(tgt.get("tp_price_reason", "") or "").strip()
+    sl_reason_txt = str(tgt.get("sl_price_reason", "") or "").strip()
     rr_txt = "-"
     try:
         tp_v = float(_as_float(tgt.get("tp", None), float("nan")))
@@ -15110,13 +15141,24 @@ def _fmt_pos_block(
         target_line += f" (RR {rr_txt})"
     if tp_txt == "-" and sl_txt == "-":
         target_line += " (목표 미동기화)"
+    target_reason_line = ""
+    if tp_reason_txt or sl_reason_txt:
+        r_parts: List[str] = []
+        if tp_reason_txt:
+            r_parts.append(f"익절:{tp_reason_txt[:90]}")
+        if sl_reason_txt:
+            r_parts.append(f"손절:{sl_reason_txt[:90]}")
+        target_reason_line = f"\n- 목표가 근거: {' | '.join(r_parts)}"
+    order_line = f"- 진입방식: {order_mode_txt}\n" if order_mode_txt else ""
     return (
         f"{emo} {sym}\n"
         f"- 방식: {style_txt}\n"
         f"- 포지션: {side_txt} | 레버리지: {lev_txt}\n"
+        f"{order_line}"
         f"- 수익률: {_tg_fmt_pct(roi)} (손익 {_tg_fmt_usdt(upnl)} USDT)\n"
         f"{target_line}\n"
         f"{entry_line}"
+        f"{target_reason_line}"
     )
 
 
@@ -17497,6 +17539,16 @@ def _try_reverse_switch_after_stop(
         ok, err = market_order_safe_ex(ex, sym, decision, qty)
         if not ok:
             return False, f"order_fail:{err}"
+        try:
+            ord_tag_sw = str(err or "").strip().upper()
+            if ord_tag_sw == "LIMIT_FILLED":
+                entry_order_mode_sw = "지정가(메이커 체결)"
+            elif ord_tag_sw in ["MARKET_FALLBACK", "MARKET_DIRECT"]:
+                entry_order_mode_sw = "시장가(폴백 체결)"
+            else:
+                entry_order_mode_sw = "스마트(지정가우선→시장가)"
+        except Exception:
+            entry_order_mode_sw = "스마트(지정가우선→시장가)"
 
         trade_id = uuid.uuid4().hex[:10]
         sl_price = None
@@ -17509,34 +17561,33 @@ def _try_reverse_switch_after_stop(
         tp_price_pct = float(tpp / max(lev, 1))
         sr_used: Dict[str, Any] = {}
         try:
-            if bool(cfg.get("use_sr_stop", True)):
-                sr_res = sr_prices_for_style(
-                    ex,
-                    sym,
-                    entry_price=float(px),
-                    side=str(decision),
-                    style=str(style),
-                    cfg=cfg,
-                    sl_price_pct=float(sl_price_pct),
-                    tp_price_pct=float(tp_price_pct),
-                    ai_sl_price=None,
-                    ai_tp_price=None,
-                    decision_tf=normalize_decision_tf(cfg.get("timeframe", "5m"), style, default_tf=str(cfg.get("timeframe", "5m") or "5m")),
-                )
-                if isinstance(sr_res, dict):
-                    sl_price = sr_res.get("sl_price", None)
-                    tp_price = sr_res.get("tp_price", None)
-                    sl_source = str(sr_res.get("sl_source", sl_source) or sl_source)
-                    tp_source = str(sr_res.get("tp_source", tp_source) or tp_source)
-                    sl_reason = str(sr_res.get("sl_reason", "") or "")
-                    tp_reason = str(sr_res.get("tp_reason", "") or "")
-                    sr_used = {
-                        "tf": sr_res.get("tf", ""),
-                        "lookback": sr_res.get("lookback", 0),
-                        "pivot_order": sr_res.get("pivot_order", 0),
-                        "buffer_atr_mult": sr_res.get("buffer_atr_mult", 0.0),
-                        "rr_min": sr_res.get("rr_min", 0.0),
-                    }
+            sr_res = sr_prices_for_style(
+                ex,
+                sym,
+                entry_price=float(px),
+                side=str(decision),
+                style=str(style),
+                cfg=cfg,
+                sl_price_pct=float(sl_price_pct),
+                tp_price_pct=float(tp_price_pct),
+                ai_sl_price=None,
+                ai_tp_price=None,
+                decision_tf=normalize_decision_tf(cfg.get("timeframe", "5m"), style, default_tf=str(cfg.get("timeframe", "5m") or "5m")),
+            )
+            if isinstance(sr_res, dict):
+                sl_price = sr_res.get("sl_price", None)
+                tp_price = sr_res.get("tp_price", None)
+                sl_source = str(sr_res.get("sl_source", sl_source) or sl_source)
+                tp_source = str(sr_res.get("tp_source", tp_source) or tp_source)
+                sl_reason = str(sr_res.get("sl_reason", "") or "")
+                tp_reason = str(sr_res.get("tp_reason", "") or "")
+                sr_used = {
+                    "tf": sr_res.get("tf", ""),
+                    "lookback": sr_res.get("lookback", 0),
+                    "pivot_order": sr_res.get("pivot_order", 0),
+                    "buffer_atr_mult": sr_res.get("buffer_atr_mult", 0.0),
+                    "rr_min": sr_res.get("rr_min", 0.0),
+                }
         except Exception:
             pass
         if sl_price is None or tp_price is None:
@@ -17563,6 +17614,7 @@ def _try_reverse_switch_after_stop(
             "entry_pct": float(entry_pct),
             "entry_confidence": int(max(0, min(100, 50 + score * 5))),
             "lev": int(lev),
+            "entry_order_mode": str(entry_order_mode_sw),
             "entry_price": float(px),
             "entry_snapshot": dict(now_snap or {}),
             "bal_entry_total": float(total_usdt) if total_usdt > 0 else "",
@@ -22818,7 +22870,7 @@ def telegram_thread(ex):
                             # - 고정 ROI%는 하드캡/페일세이프로만 사용
                             # - 실제 TP/SL은 decision_tf 구조에서 역산
                             try:
-                                if bool(cfg.get("use_sr_stop", True)) and str(decision) in ["buy", "sell"] and float(px) > 0:
+                                if str(decision) in ["buy", "sell"] and float(px) > 0:
                                     lev_pre = float(max(1, int(lev)))
                                     sl_price_pct_pre = float(_as_float(ai2.get("sl_price_pct", abs(float(slp)) / max(lev_pre, 1.0)), abs(float(slp)) / max(lev_pre, 1.0)))
                                     tp_price_pct_pre = float(_as_float(ai2.get("tp_price_pct", abs(float(tpp)) / max(lev_pre, 1.0)), abs(float(tpp)) / max(lev_pre, 1.0)))
@@ -22970,6 +23022,7 @@ def telegram_thread(ex):
                             pullback_timeout_sec = 0.0
                             pullback_wait_candles = 0
                             pullback_reason = ""
+                            entry_order_mode = "스마트(지정가우선→시장가)"
                             try:
                                 if str(style) in ["스캘핑", "단타"] and str(decision) in ["buy", "sell"]:
                                     sr_for_entry = ai2.get("_pre_sr_used", {}) if isinstance(ai2.get("_pre_sr_used", {}), dict) else {}
@@ -23033,6 +23086,7 @@ def telegram_thread(ex):
                                     limit_price_override=float(pullback_limit_price),
                                     fallback_to_market=False,
                                 )
+                                entry_order_mode = "지정가(눌림목)"
                             else:
                                 ok, err_order = market_order_safe_ex(ex, sym, decision, qty)
                             if not ok:
@@ -23075,7 +23129,19 @@ def telegram_thread(ex):
                                 except Exception:
                                     pass
                                 continue
-                            else:
+                            try:
+                                ord_tag = str(err_order or "").strip().upper()
+                                if use_pullback:
+                                    entry_order_mode = "지정가(눌림목 체결)"
+                                elif ord_tag == "LIMIT_FILLED":
+                                    entry_order_mode = "지정가(메이커 체결)"
+                                elif ord_tag in ["MARKET_FALLBACK", "MARKET_DIRECT"]:
+                                    entry_order_mode = "시장가(폴백 체결)"
+                                else:
+                                    entry_order_mode = "스마트(지정가우선→시장가)"
+                            except Exception:
+                                entry_order_mode = "스마트(지정가우선→시장가)"
+                            if True:
                                 trade_id = uuid.uuid4().hex[:10]
                                 mon_add_scan(
                                     mon,
@@ -23116,7 +23182,7 @@ def telegram_thread(ex):
                                     tp_price_pct = float(ai2.get("tp_price_pct", float(tpp) / max(int(lev), 1)))
                                 except Exception:
                                     tp_price_pct = float(tpp) / max(int(lev), 1)
-                                if cfg.get("use_sr_stop", True) and (sl_price is None or tp_price is None):
+                                if sl_price is None or tp_price is None:
                                     try:
                                         sr_res = sr_prices_for_style(
                                             ex,
@@ -23140,6 +23206,41 @@ def telegram_thread(ex):
                                             tp_price_source = str(sr_res.get("tp_source", "") or "")
                                             sl_price_reason = str(sr_res.get("sl_reason", "") or sl_price_reason)
                                             tp_price_reason = str(sr_res.get("tp_reason", "") or tp_price_reason)
+                                    except Exception:
+                                        pass
+                                # SR 계산 실패 시: 현재 스캔 프레임의 로컬 구조(피벗+매물대)로 1회 보강
+                                if sl_price is None or tp_price is None:
+                                    try:
+                                        if isinstance(df, pd.DataFrame) and (not df.empty) and len(df) >= 60:
+                                            piv_local = int(max(3, _as_int(cfg.get("sr_pivot_order", 6), 6)))
+                                            su_local, re_local = pivot_levels(df, order=piv_local)
+                                            vp_local = volume_profile_nodes(df, bins=50, top_n=8)
+                                            atr_local = calc_atr(df, int(_as_int(cfg.get("sr_atr_period", 14), 14)))
+                                            local_zone = _dynamic_sr_targets_in_zone(
+                                                entry_price=float(px),
+                                                side=str(decision),
+                                                style=str(style),
+                                                cfg=cfg,
+                                                supports=list(su_local or []),
+                                                resistances=list(re_local or []),
+                                                volume_nodes=list(vp_local or []),
+                                                orderbook_ctx=orderbook_context if isinstance(orderbook_context, dict) else None,
+                                                atr_value=float(atr_local),
+                                            )
+                                            if isinstance(local_zone, dict) and bool(local_zone.get("ok", False)):
+                                                sl_price = local_zone.get("sl_price", sl_price)
+                                                tp_price = local_zone.get("tp_price", tp_price)
+                                                sl_price_source = str(local_zone.get("sl_source", "") or "LOCAL_SR")
+                                                tp_price_source = str(local_zone.get("tp_source", "") or "LOCAL_SR")
+                                                sl_price_reason = str(local_zone.get("sl_reason", "") or sl_price_reason)
+                                                tp_price_reason = str(local_zone.get("tp_reason", "") or tp_price_reason)
+                                                if not isinstance(sr_used, dict):
+                                                    sr_used = {}
+                                                sr_used["tf"] = str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m"))
+                                                sr_used["supports"] = list(su_local or [])
+                                                sr_used["resistances"] = list(re_local or [])
+                                                sr_used["volume_nodes"] = list(vp_local or [])
+                                                sr_used["atr"] = float(atr_local)
                                     except Exception:
                                         pass
                                 # SR 계산 실패/값 비정상 시에도 최소한 "가격 기준 SL/TP"는 ROI 바운드로 확보
@@ -23207,17 +23308,63 @@ def telegram_thread(ex):
                                     ai2["tp_price_pct"] = float(tp_price_pct)
                                     ai2["sl_price_pct"] = float(sl_price_pct)
                                     ai2["rr"] = float(float(tpp) / max(abs(float(slp)), 0.01))
-
-                                    slb_cap, tpb_cap = _sr_price_bounds_from_price_pct(
-                                        float(px),
-                                        str(decision),
-                                        float(sl_price_pct),
-                                        float(tp_price_pct),
-                                    )
-                                    sl_price = float(slb_cap)
-                                    tp_price = float(tpb_cap)
-                                    sl_price_source = (str(sl_price_source or "").strip() + "+CAP").strip("+")
-                                    tp_price_source = (str(tp_price_source or "").strip() + "+CAP").strip("+")
+                                except Exception:
+                                    pass
+                                try:
+                                    px_cap = float(px)
+                                    s_cap = str(decision)
+                                    need_realign = bool((sl_price is None) or (tp_price is None))
+                                    if (not need_realign) and px_cap > 0:
+                                        sl_now_pct = float(_pct_from_entry(px_cap, s_cap, float(sl_price), is_tp=False))
+                                        tp_now_pct = float(_pct_from_entry(px_cap, s_cap, float(tp_price), is_tp=True))
+                                        drift_th = float(clamp(_as_float(cfg.get("sr_sync_drift_pct", 0.12), 0.12), 0.02, 2.0))
+                                        if abs(sl_now_pct - float(sl_price_pct)) > drift_th or abs(tp_now_pct - float(tp_price_pct)) > drift_th:
+                                            need_realign = True
+                                    if need_realign and isinstance(sr_used, dict):
+                                        su_sync = list(sr_used.get("supports", []) or [])
+                                        re_sync = list(sr_used.get("resistances", []) or [])
+                                        vp_sync = list(sr_used.get("volume_nodes", []) or [])
+                                        if su_sync or re_sync or vp_sync:
+                                            st_key_sync = "scalp" if normalize_style_name(style) == "스캘핑" else ("day" if normalize_style_name(style) == "단타" else "swing")
+                                            cfg_sync = dict(cfg)
+                                            cfg_sync[f"sr_anchor_tp_pct_{st_key_sync}"] = float(tp_price_pct)
+                                            cfg_sync[f"sr_anchor_sl_pct_{st_key_sync}"] = float(sl_price_pct)
+                                            cfg_sync["sr_anchor_band_ratio"] = float(clamp(_as_float(cfg.get("sr_anchor_band_ratio_cap_sync", 0.30), 0.30), 0.10, 1.20))
+                                            zone_sync = _dynamic_sr_targets_in_zone(
+                                                entry_price=float(px_cap),
+                                                side=str(s_cap),
+                                                style=str(style),
+                                                cfg=cfg_sync,
+                                                supports=su_sync,
+                                                resistances=re_sync,
+                                                volume_nodes=vp_sync,
+                                                orderbook_ctx=orderbook_context if isinstance(orderbook_context, dict) else None,
+                                                atr_value=float(_as_float(sr_used.get("atr", 0.0), 0.0)),
+                                            )
+                                            if isinstance(zone_sync, dict) and bool(zone_sync.get("ok", False)):
+                                                sl_price = zone_sync.get("sl_price", sl_price)
+                                                tp_price = zone_sync.get("tp_price", tp_price)
+                                                sl_price_source = str(zone_sync.get("sl_source", "") or sl_price_source or "SR")
+                                                tp_price_source = str(zone_sync.get("tp_source", "") or tp_price_source or "SR")
+                                                sl_r0 = str(zone_sync.get("sl_reason", "") or "").strip()
+                                                tp_r0 = str(zone_sync.get("tp_reason", "") or "").strip()
+                                                if sl_r0:
+                                                    sl_price_reason = sl_r0
+                                                if tp_r0:
+                                                    tp_price_reason = tp_r0
+                                    if sl_price is None or tp_price is None:
+                                        slb_cap, tpb_cap = _sr_price_bounds_from_price_pct(
+                                            float(px_cap),
+                                            str(s_cap),
+                                            float(sl_price_pct),
+                                            float(tp_price_pct),
+                                        )
+                                        if sl_price is None:
+                                            sl_price = float(slb_cap)
+                                            sl_price_source = (str(sl_price_source or "").strip() + "+CAP").strip("+") or "ROI+CAP"
+                                        if tp_price is None:
+                                            tp_price = float(tpb_cap)
+                                            tp_price_source = (str(tp_price_source or "").strip() + "+CAP").strip("+") or "ROI+CAP"
                                 except Exception:
                                     pass
 
@@ -23269,6 +23416,7 @@ def telegram_thread(ex):
                                     "entry_prefilter_note": " / ".join(filter_msgs)[:180] if isinstance(filter_msgs, list) and filter_msgs else "",
                                     "entry_tier": "SOFT" if bool(is_soft_entry) else "STRICT",
                                     "lev": lev,
+                                    "entry_order_mode": str(entry_order_mode),
                                     "entry_price": float(px),
                                     "entry_snapshot": {
                                         "time_kst": now_kst_str(),
@@ -23339,6 +23487,7 @@ def telegram_thread(ex):
                                         "entry_usdt": entry_usdt,
                                         "entry_pct": entry_pct,
                                         "lev": lev,
+                                        "entry_order_mode": str(entry_order_mode),
                                         "balance_before_total": float(total_usdt) if "total_usdt" in locals() else "",
                                         "balance_before_free": float(free_usdt) if "free_usdt" in locals() else "",
                                         "balance_after_total": active_targets.get(sym, {}).get("bal_entry_after_total", ""),
@@ -23488,6 +23637,7 @@ def telegram_thread(ex):
                                             one_line=one_line0,
                                             tp_reason=str(tp_price_reason or ""),
                                             sl_reason=str(sl_price_reason or ""),
+                                            entry_order_mode=str(entry_order_mode or ""),
                                             trade_id=str(trade_id),
                                         )
                                         try:
@@ -23520,6 +23670,7 @@ def telegram_thread(ex):
                                         msg = (
                                             f"🎯 진입\n- 코인: {sym}\n- 스타일: {style}\n- 방향: {direction}\n"
                                             f"- 스타일이유: {str(cs.get('style_reason','') or '').strip()[:180]}\n"
+                                            f"- 주문방식: {str(entry_order_mode)}\n"
                                             f"- 진입금: {entry_usdt:.2f} USDT (잔고 {entry_pct:.1f}%)\n"
                                             f"- 레버리지: x{lev}\n"
                                             f"- 목표손익비(익절/손절): 익절 +{tpp:.2f}% / 손절 -{slp:.2f}% | (참고) RR {rr0:.2f}\n"
@@ -23574,8 +23725,11 @@ def telegram_thread(ex):
                                         "entry_usdt": float(entry_usdt) if entry_usdt is not None else None,
                                         "entry_pct": float(entry_pct) if entry_pct is not None else None,
                                         "leverage": float(lev) if lev is not None else None,
+                                        "entry_order_mode": str(entry_order_mode or ""),
                                         "tp_pct": float(tpp) if tpp is not None else None,
                                         "sl_pct": float(slp) if slp is not None else None,
+                                        "tp_reason": str(tp_price_reason or ""),
+                                        "sl_reason": str(sl_price_reason or ""),
                                         "reason": str(locals().get("one_line0", "") or ai2.get("reason_easy", "") or "").strip(),
                                         "trade_id": str(trade_id or ""),
                                         "decision_tf": str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
