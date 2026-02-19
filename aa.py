@@ -861,13 +861,14 @@ def default_settings() -> Dict[str, Any]:
         "sqz_mom_length": 20,
         # SQZ 모멘텀을 "가격 대비 %"로 환산한 기준(너무 크면 신호가 안 나고, 너무 작으면 과다신호)
         "sqz_mom_threshold_pct": 0.05,
-        # SQZ를 최우선으로 반영(요구: 80% 이상 의존)
+        # ✅ SQZ 가중치 완화: 단독 지배 → 여러 지표 중 하나로 조정
+        # - 0.80(지배적)에서 0.50(동등)으로 낮춰 다른 지표들이 수렴할 때 진입 가능하게
         "sqz_dependency_enable": True,
-        "sqz_dependency_weight": 0.80,      # 0~1 (기본 0.80)
-        "sqz_dependency_gate_entry": True,  # SQZ가 중립이면 진입 억제
-        "sqz_dependency_override_ai": True, # SQZ가 반대면 AI buy/sell을 hold로 강제
-        # ✅ SQZ 최우선 진입(요구): SQZ "막 시작(fire)" 신호에서만 진입 허용
-        "sqz_priority_entry_strict": True,
+        "sqz_dependency_weight": 0.50,      # ✅ 0.80 → 0.50: SQZ는 참고 지표, 단독 지배 해제
+        "sqz_dependency_gate_entry": False, # ✅ True → False: SQZ 중립이어도 다른 지표 수렴 시 진입 허용
+        "sqz_dependency_override_ai": False, # ✅ True → False: SQZ 반대여도 AI 판단 존중
+        # ✅ SQZ strict 모드 해제: fire 신호 없어도 다른 지표 수렴 시 진입 허용
+        "sqz_priority_entry_strict": False,  # ✅ True → False: strict 해제
         # ✅ SQZ 최우선이더라도, 다른 신호가 매우 강하면 예외 진입 허용
         "sqz_strict_override_enable": True,
         "sqz_strict_override_ml_votes": 4,
@@ -10957,33 +10958,78 @@ def ml_signals_and_convergence(
         except Exception:
             pass
 
-    # votes
-    sigs = {
-        "RSI": int(out.get("rsi_sig", 0) or 0),
-        "SQZ": int(out.get("sqz_sig", 0) or 0),
-        "MACD": int(out.get("macd_sig", 0) or 0),
-        "MA": int(out.get("ma_sig", 0) or 0),
-        "KNN": int(out.get("knn_sig", 0) or 0),
-        "LOR": int(out.get("lor_sig", 0) or 0),
-        "LOGIT": int(out.get("logit_sig", 0) or 0),
+    # ✅ 가중 투표 시스템
+    # - 주력 지표(RSI, SQZ, MACD, MA, PATTERN): 각 1표
+    # - ML 3개(KNN, LOR, LOGIT): 3개 합산 → 최대 0.5표 (독립성 낮아 과대평가 방지)
+    # - 일목균형표(ICHI): 전환선/기준선/구름대 방향 → 1표 (신규 추가)
+
+    # ── 주력 지표 투표 (각 1표) ──────────────────────────────
+    main_sigs = {
+        "RSI":     int(out.get("rsi_sig",     0) or 0),
+        "SQZ":     int(out.get("sqz_sig",     0) or 0),
+        "MACD":    int(out.get("macd_sig",    0) or 0),
+        "MA":      int(out.get("ma_sig",      0) or 0),
     }
     if bool(cfg.get("use_chart_patterns", True)):
-        sigs["PATTERN"] = int(out.get("pattern_sig", 0) or 0)
-    v_long = sum(1 for v in sigs.values() if int(v) == 1)
-    v_short = sum(1 for v in sigs.values() if int(v) == -1)
-    out["votes_long"] = int(v_long)
-    out["votes_short"] = int(v_short)
-    out["votes_max"] = int(max(v_long, v_short))
+        main_sigs["PATTERN"] = int(out.get("pattern_sig", 0) or 0)
+
+    # ── 일목균형표 투표 (1표) ─────────────────────────────────
+    # _ichi_detail은 calc_indicators() 에서 status["_ichi_detail"]={conversion,base,span_a,...}로 저장됨
+    ichi_sig = 0
     try:
-        need = int(cfg.get("entry_convergence_min_votes", 2) or 2)
+        if bool(cfg.get("use_ichimoku", True)):
+            ichi_d = status.get("_ichi_detail") or {}
+            ichi_conv   = float(ichi_d.get("conversion", 0.0) or 0.0)
+            ichi_base   = float(ichi_d.get("base",       0.0) or 0.0)
+            kumo_top    = float(ichi_d.get("cloud_top",    0.0) or 0.0)
+            kumo_bottom = float(ichi_d.get("cloud_bottom", 0.0) or 0.0)
+            price_now   = float(ichi_d.get("price",        0.0) or 0.0)
+            if ichi_conv > 0 and ichi_base > 0 and price_now > 0:
+                tk_cross_up   = bool(ichi_conv > ichi_base)   # 전환선 > 기준선 → 상승
+                tk_cross_down = bool(ichi_conv < ichi_base)   # 전환선 < 기준선 → 하락
+                above_cloud   = bool(kumo_top > 0    and price_now > kumo_top)
+                below_cloud   = bool(kumo_bottom > 0 and price_now < kumo_bottom)
+                if tk_cross_up and above_cloud:
+                    ichi_sig = 1    # 전환선 골든크로스 + 구름 위 → 강한 롱
+                elif tk_cross_up:
+                    ichi_sig = 1    # 전환선 골든크로스만 → 롱
+                elif tk_cross_down and below_cloud:
+                    ichi_sig = -1   # 전환선 데드크로스 + 구름 아래 → 강한 숏
+                elif tk_cross_down:
+                    ichi_sig = -1   # 전환선 데드크로스만 → 숏
     except Exception:
-        need = 2
+        ichi_sig = 0
+    out["ichi_sig"] = int(ichi_sig)
+    main_sigs["ICHI"] = int(ichi_sig)
+
+    # ── ML 3개 합산 → 0.5표 (신뢰도 낮은 보조 지표) ──────────
+    ml_knn   = int(out.get("knn_sig",   0) or 0)
+    ml_lor   = int(out.get("lor_sig",   0) or 0)
+    ml_logit = int(out.get("logit_sig", 0) or 0)
+    ml_long_cnt  = sum(1 for s in [ml_knn, ml_lor, ml_logit] if s == 1)
+    ml_short_cnt = sum(1 for s in [ml_knn, ml_lor, ml_logit] if s == -1)
+    # ML 다수결 방향 결정 후 0.5표만 부여 (독립성 낮아 1표씩 주면 과대평가)
+    ml_combined_long  = 0.5 if ml_long_cnt  > ml_short_cnt else 0.0
+    ml_combined_short = 0.5 if ml_short_cnt > ml_long_cnt  else 0.0
+
+    # ── 최종 투표 집계 ────────────────────────────────────────
+    v_long  = float(sum(1.0 for v in main_sigs.values() if int(v) == 1))  + ml_combined_long
+    v_short = float(sum(1.0 for v in main_sigs.values() if int(v) == -1)) + ml_combined_short
+
+    out["votes_long"]  = v_long
+    out["votes_short"] = v_short
+    out["votes_max"]   = float(max(v_long, v_short))
+    try:
+        need = float(cfg.get("entry_convergence_min_votes", 2) or 2)
+    except Exception:
+        need = 2.0
     if v_long >= need and v_long > v_short:
         out["dir"] = "buy"
     elif v_short >= need and v_short > v_long:
         out["dir"] = "sell"
     else:
         out["dir"] = "hold"
+
     # detail
     try:
         def _sg(x: int) -> str:
@@ -10992,12 +11038,13 @@ def ml_signals_and_convergence(
         out["detail"] = (
             f"RSI:{_sg(int(out.get('rsi_sig',0)))} | SQZ:{_sg(int(out.get('sqz_sig',0)))} | "
             f"MACD:{_sg(int(out.get('macd_sig',0)))} | MA:{_sg(int(out.get('ma_sig',0)))} | "
-            f"PATTERN:{_sg(int(out.get('pattern_sig',0)))} | "
-            f"KNN:{_sg(int(out.get('knn_sig',0)))}({float(out.get('knn_prob',0.5)):.2f}) | "
-            f"LOR:{_sg(int(out.get('lor_sig',0)))}({float(out.get('lor_prob',0.5)):.2f}) | "
-            f"LOGIT:{_sg(int(out.get('logit_sig',0)))}({float(out.get('logit_prob',0.5)):.2f}) | "
-            f"VOTE L{v_long}/S{v_short}"
-        )[:240]
+            f"PATTERN:{_sg(int(out.get('pattern_sig',0)))} | ICHI:{_sg(int(out.get('ichi_sig',0)))} | "
+            f"ML합산(0.5표)→{'롱' if ml_combined_long>0 else ('숏' if ml_combined_short>0 else '중립')} "
+            f"[KNN:{_sg(ml_knn)}({float(out.get('knn_prob',0.5)):.2f}) "
+            f"LOR:{_sg(ml_lor)}({float(out.get('lor_prob',0.5)):.2f}) "
+            f"LOGIT:{_sg(ml_logit)}({float(out.get('logit_prob',0.5)):.2f})] | "
+            f"VOTE L{v_long:.1f}/S{v_short:.1f}"
+        )[:300]
     except Exception:
         out["detail"] = ""
 
