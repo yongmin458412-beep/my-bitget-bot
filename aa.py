@@ -710,7 +710,7 @@ def hard_roi_limits_by_style(style: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
         if st == "스캘핑":
             return {
                 "tp_min": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_tp_min_roi", sr.get("tp_roi_min", 0.5)), sr.get("tp_roi_min", 0.5)))),
-                "tp_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_tp_roi", 3.0), 3.0))),
+                "tp_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_tp_roi", 2.5), 2.5))),
                 "sl_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_sl_roi", sr.get("sl_roi_max", 1.8)), sr.get("sl_roi_max", 1.8)))),
             }
         if st == "단타":
@@ -729,7 +729,21 @@ def hard_roi_limits_by_style(style: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
             return {"tp_min": 10.0, "tp_cap": 50.0, "sl_cap": float(sr.get("sl_roi_max", 12.0))}
         if st == "단타":
             return {"tp_min": float(sr.get("tp_roi_min", 2.0)), "tp_cap": 15.0, "sl_cap": float(sr.get("sl_roi_max", 4.0))}
-        return {"tp_min": float(sr.get("tp_roi_min", 0.5)), "tp_cap": 3.0, "sl_cap": float(sr.get("sl_roi_max", 1.8))}
+        return {"tp_min": float(sr.get("tp_roi_min", 0.5)), "tp_cap": 2.5, "sl_cap": float(sr.get("sl_roi_max", 1.8))}
+
+
+def _style_hard_tp_cap_roi(style: Any, cfg: Dict[str, Any]) -> Optional[float]:
+    st = normalize_style_name(style)
+    try:
+        if st == "스캘핑":
+            return 2.5
+        if st == "단타":
+            return float(max(0.5, _as_float(cfg.get("hard_cap_day_tp_roi", 15.0), 15.0)))
+        if st == "스윙":
+            return float(max(10.0, _as_float(cfg.get("hard_cap_swing_tp_roi", 50.0), 50.0)))
+    except Exception:
+        return None
+    return None
 
 
 def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -743,13 +757,30 @@ def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) ->
         sl_cap_raw = lim.get("sl_cap", None)
         sl_cap = float(sl_cap_raw) if sl_cap_raw is not None else None
 
+        lev = float(max(1.0, abs(_as_float(res.get("leverage", 1), 1.0))))
         tp = abs(float(_as_float(res.get("tp_pct", 0.0), 0.0)))
         sl = abs(float(_as_float(res.get("sl_pct", 0.0), 0.0)))
+        tp_price_pct_raw = abs(float(_as_float(res.get("tp_price_pct", 0.0), 0.0)))
+        sl_price_pct_raw = abs(float(_as_float(res.get("sl_price_pct", 0.0), 0.0)))
 
-        if tp_cap is not None and tp_cap > 0:
-            tp = min(tp, tp_cap)
+        if tp_price_pct_raw > 0:
+            tp = float(tp_price_pct_raw * lev)
+        if sl_price_pct_raw > 0:
+            sl = float(sl_price_pct_raw * lev)
+
+        hard_style_cap = _style_hard_tp_cap_roi(st, cfg)
+        if hard_style_cap is not None and hard_style_cap > 0:
+            if tp_cap is None or tp_cap <= 0:
+                tp_cap = float(hard_style_cap)
+            else:
+                tp_cap = float(min(tp_cap, hard_style_cap))
+
         if tp_min > 0:
             tp = max(tp, tp_min)
+        if tp_cap is not None and tp_cap > 0:
+            tp = min(tp, tp_cap)
+        if hard_style_cap is not None and hard_style_cap > 0:
+            tp = min(tp, float(hard_style_cap))
 
         if sl_cap is not None and sl_cap > 0:
             sl = min(sl, sl_cap)
@@ -757,7 +788,6 @@ def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) ->
         res["tp_pct"] = float(tp)
         res["sl_pct"] = float(sl)
         try:
-            lev = float(max(1.0, abs(_as_float(res.get("leverage", 1), 1.0))))
             res["tp_price_pct"] = float(tp / lev)
             res["sl_price_pct"] = float(sl / lev)
         except Exception:
@@ -766,7 +796,13 @@ def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) ->
             res["rr"] = float(float(res["tp_pct"]) / max(abs(float(res["sl_pct"])), 0.01))
         except Exception:
             pass
-        res["_hard_roi_caps"] = {"style": st, "tp_min": tp_min, "tp_cap": tp_cap, "sl_cap": sl_cap}
+        res["_hard_roi_caps"] = {
+            "style": st,
+            "tp_min": tp_min,
+            "tp_cap": tp_cap,
+            "sl_cap": sl_cap,
+            "style_hard_tp_cap": hard_style_cap,
+        }
     except Exception:
         return res
     return res
@@ -11920,6 +11956,7 @@ def ai_decide_trade(
     chart_style_hint: str = "",
     mtf_context: Optional[Dict[str, Any]] = None,
     orderbook_context: Optional[Dict[str, Any]] = None,
+    calculated_style: str = "",
 ) -> Dict[str, Any]:
     """
     ✅ 기존 기능 유지: AI가 buy/sell/hold + entry/leverage/sl/tp/rr/근거(JSON)
@@ -11937,6 +11974,7 @@ def ai_decide_trade(
         return {"decision": "hold", "confidence": 0, "reason_easy": "데이터 부족", "used_indicators": status.get("_used_indicators", [])}
 
     rule = MODE_RULES.get(mode, MODE_RULES["안전모드"])
+    style_mandatory = normalize_style_name(calculated_style or chart_style_hint or "스캘핑")
     last = df.iloc[-1]
     prev = df.iloc[-2]
     past_mistakes = get_past_mistakes_text(5)
@@ -11955,14 +11993,15 @@ def ai_decide_trade(
         "symbol": symbol,
         "mode": mode,
         "timeframe": str(cfg.get("timeframe", "5m")),
-        "style_hint": normalize_style_name(chart_style_hint or "스캘핑"),
-        "decision_tf_candidates": decision_tf_candidates_by_style(chart_style_hint or "스캘핑"),
+        "style_hint": style_mandatory,
+        "style_mandatory": style_mandatory,
+        "decision_tf_candidates": decision_tf_candidates_by_style(style_mandatory),
         "decision_tf_default": normalize_decision_tf(
             cfg.get("timeframe", "5m"),
-            chart_style_hint or "스캘핑",
+            style_mandatory,
             default_tf=str(cfg.get("timeframe", "5m") or "5m"),
         ),
-        "style_rule": style_rule(chart_style_hint or "스캘핑"),
+        "style_rule": style_rule(style_mandatory),
         "price": float(last["close"]),
         "rsi_prev": float(prev.get("RSI", 50)) if "RSI" in df.columns else None,
         "rsi_now": float(last.get("RSI", 50)) if "RSI" in df.columns else None,
@@ -12012,7 +12051,7 @@ def ai_decide_trade(
         "full_spectrum": mtf_context if isinstance(mtf_context, dict) else {},
         "order_book_l2": orderbook_context if isinstance(orderbook_context, dict) else {},
         "sr_context": sr_context or {},
-        "chart_style_hint": str(chart_style_hint or ""),
+        "chart_style_hint": str(style_mandatory or ""),
         # ✅ 비용 절감: 스윙 시에도 공포탐욕 + 경제캘린더만 제공, 뉴스 브리핑은 제외
         "external": (
             {
@@ -12113,22 +12152,25 @@ def ai_decide_trade(
 					   - ml_signals.dir이 "buy"면 buy/hold만 허용
 					   - ml_signals.dir이 "sell"면 sell/hold만 허용
 					   - ml_signals.dir이 "hold"면 hold 우선
-						7) full_spectrum(1m/5m/15m/1h/4h/1d)와 order_book_l2를 함께 보고 스타일을 동적으로 해석:
+					7) full_spectrum(1m/5m/15m/1h/4h/1d)와 order_book_l2를 함께 보고 스타일을 동적으로 해석:
 						   - 횡보/저변동성: 스캘핑 우선 (1m/5m 반전 + 오더북 압력)
 						   - 변동성 확대/브레이크아웃: 단타 우선 (15m/30m 패턴/다이버전스)
 						   - 메가추세(ADX>=30) 정렬: 스윙 우선 (1h 중심 추세 추종)
 						   - 장기추세가 애매해도 바로 hold하지 말고, 1m/5m + 오더북 기반 단기 기회를 먼저 탐색
-						8) style_hint 기준 가중치:
-						   - 스캘핑: 1m/5m, SQZ·VWAP·OBV·캔들패턴 가중치↑, 장기지표 영향↓
-						   - 단타: 15m/30m, 추세+모멘텀 균형, 다이버전스 확인
-						   - 스윙: 1h, Ichimoku·ADX·하모닉·MTF 패턴 가중치↑
-						9) 모드 규칙 반드시 준수:
-						   - 최소 확신도: {rule["min_conf"]}
-						   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
-						   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
-                        10) 스타일별 진입 확신도 기준:
-                           - 스캘핑: 55~60%도 허용(지표 수렴 강하면 적극 진입)
-                           - 단타/스윙: 70% 이상에서만 진입
+						8) style_mandatory(강제 스타일) 준수:
+						   - 반드시 style_mandatory="{style_mandatory}" 기준으로 판단한다.
+						   - 숨은 스타일/임의 스타일 전환을 금지한다.
+						9) style_hint 기준 가중치:
+							   - 스캘핑: 1m/5m, SQZ·VWAP·OBV·캔들패턴 가중치↑, 장기지표 영향↓
+							   - 단타: 15m/30m, 추세+모멘텀 균형, 다이버전스 확인
+							   - 스윙: 1h, Ichimoku·ADX·하모닉·MTF 패턴 가중치↑
+						10) 모드 규칙 반드시 준수:
+							   - 최소 확신도: {rule["min_conf"]}
+							   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
+							   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
+	                        11) 스타일별 진입 확신도 기준:
+	                           - 스캘핑: 55~60%도 허용(지표 수렴 강하면 적극 진입)
+	                           - 단타/스윙: 70% 이상에서만 진입
 					{soft_entry_hint}
 
 		[중요]
@@ -12224,7 +12266,9 @@ JSON 형식:
 
         out["leverage"] = int(_as_int(out.get("leverage", rule["lev_min"]), int(rule["lev_min"])))
         out["leverage"] = int(clamp(out["leverage"], rule["lev_min"], rule["lev_max"]))
-        style_for_tf = normalize_style_name(chart_style_hint or out.get("style", "스캘핑"))
+        out["_ai_style_raw"] = str(out.get("style", "") or "")
+        out["style"] = style_mandatory
+        style_for_tf = style_mandatory
         out["decision_tf"] = normalize_decision_tf(
             out.get("decision_tf", cfg.get("timeframe", "5m")),
             style_for_tf,
@@ -12304,7 +12348,7 @@ JSON 형식:
 
         # ✅ 스타일별 TP/SL 하드캡(과도한 목표 방지)
         try:
-            style_for_caps = normalize_style_name(chart_style_hint or out.get("style", "스캘핑"))
+            style_for_caps = style_mandatory
             out = apply_hard_roi_caps(out, style_for_caps, cfg)
         except Exception:
             pass
@@ -21001,6 +21045,7 @@ def telegram_thread(ex):
                                 chart_style_hint=chart_style_hint,
                                 mtf_context=mtf_context,
                                 orderbook_context=orderbook_context,
+                                calculated_style=chart_style_hint,
                             )
                             try:
                                 if bool(ai.get("_openai_model", "")):
@@ -21015,6 +21060,17 @@ def telegram_thread(ex):
                                 cs["ai_tp_price"] = ai.get("tp_price", None)
                             except Exception:
                                 pass
+                        # ✅ Pre-Execution ROI Clamp (필수)
+                        # - AI 응답 직후 즉시 스타일 하드캡 적용(주문 전)
+                        try:
+                            calculated_style_now = normalize_style_name(chart_style_hint or "스캘핑")
+                            ai_tp_raw = abs(float(_as_float((ai or {}).get("tp_pct", 0.0), 0.0)))
+                            ai = apply_hard_roi_caps(ai, calculated_style_now, cfg)
+                            ai["_style_mandatory"] = calculated_style_now
+                            ai["_style_check_ai_target_tp_pct"] = float(ai_tp_raw)
+                            ai["_style_check_clamped_tp_pct"] = float(abs(float(_as_float(ai.get("tp_pct", ai_tp_raw), ai_tp_raw))))
+                        except Exception:
+                            pass
                         decision = ai.get("decision", "hold")
                         conf = int(ai.get("confidence", 0))
                         mon_add_scan(mon, stage="ai_result", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=conf, message=str(ai.get("reason_easy", ""))[:80])
@@ -21745,8 +21801,12 @@ def telegram_thread(ex):
                             # ✅ 스캘핑: 레버가 높을 때 TP/SL이 과도해지는 문제(익절 미발동 등) 방지
                             if str(style) == "스캘핑":
                                 ai2 = apply_scalp_price_guardrails(ai2, df, cfg, rule)
+                            pre_style_ai_tp = abs(float(_as_float(ai2.get("tp_pct", 0.0), 0.0)))
                             # ✅ 최종 하드캡(절대 상한/하한): 스타일별 TP/SL 한도를 넘지 않도록 마지막에 강제
                             ai2 = apply_hard_roi_caps(ai2, style, cfg)
+                            ai2["_style_check_target_style"] = str(style)
+                            ai2["_style_check_ai_target_tp_pct"] = float(pre_style_ai_tp)
+                            ai2["_style_check_clamped_tp_pct"] = float(abs(float(_as_float(ai2.get("tp_pct", pre_style_ai_tp), pre_style_ai_tp))))
 
                             entry_pct = float(ai2.get("entry_pct", rule["entry_pct_min"]))
                             lev = int(ai2.get("leverage", rule["lev_min"]))
@@ -22061,6 +22121,34 @@ def telegram_thread(ex):
                             except Exception:
                                 pass
 
+                            try:
+                                style_check_target = str(ai2.get("_style_check_target_style", style))
+                                style_check_ai_tp = float(_as_float(ai2.get("_style_check_ai_target_tp_pct", 0.0), 0.0))
+                                style_check_clamped_tp = float(_as_float(ai2.get("_style_check_clamped_tp_pct", tpp), tpp))
+                                style_check_msg = (
+                                    f"[STYLE CHECK] Target Style: {style_check_target} | "
+                                    f"AI Target: {style_check_ai_tp:.2f}% | "
+                                    f"Clamped Target: {style_check_clamped_tp:.2f}%"
+                                )
+                                cs["style_check_last"] = style_check_msg
+                                mon_add_scan(
+                                    mon,
+                                    stage="style_check",
+                                    symbol=sym,
+                                    tf=str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
+                                    signal=str(style_check_target),
+                                    score=int(conf),
+                                    message=style_check_msg[:180],
+                                    extra={
+                                        "style": style_check_target,
+                                        "ai_tp_pct": float(style_check_ai_tp),
+                                        "clamped_tp_pct": float(style_check_clamped_tp),
+                                        "lev": int(lev),
+                                    },
+                                )
+                            except Exception:
+                                pass
+
                             ok, err_order = market_order_safe_ex(ex, sym, decision, qty)
                             if not ok:
                                 try:
@@ -22180,6 +22268,42 @@ def telegram_thread(ex):
                                                 ai2["sl_price_pct"] = float(sl_price_pct)
                                                 ai2["tp_price_pct"] = float(tp_price_pct)
                                                 ai2["rr"] = float(float(tpp) / max(abs(float(slp)), 0.01))
+                                except Exception:
+                                    pass
+
+                                # ✅ 최종 ROI 하드캡 재강제(SR 역산 이후에도 스타일 상한 유지)
+                                try:
+                                    capped_sync = apply_hard_roi_caps(
+                                        {
+                                            "tp_pct": float(tpp),
+                                            "sl_pct": float(slp),
+                                            "leverage": int(lev),
+                                            "tp_price_pct": float(tp_price_pct),
+                                            "sl_price_pct": float(sl_price_pct),
+                                        },
+                                        style,
+                                        cfg,
+                                    )
+                                    tpp = float(_as_float(capped_sync.get("tp_pct", tpp), tpp))
+                                    slp = float(_as_float(capped_sync.get("sl_pct", slp), slp))
+                                    tp_price_pct = float(_as_float(capped_sync.get("tp_price_pct", tp_price_pct), tp_price_pct))
+                                    sl_price_pct = float(_as_float(capped_sync.get("sl_price_pct", sl_price_pct), sl_price_pct))
+                                    ai2["tp_pct"] = float(tpp)
+                                    ai2["sl_pct"] = float(slp)
+                                    ai2["tp_price_pct"] = float(tp_price_pct)
+                                    ai2["sl_price_pct"] = float(sl_price_pct)
+                                    ai2["rr"] = float(float(tpp) / max(abs(float(slp)), 0.01))
+
+                                    slb_cap, tpb_cap = _sr_price_bounds_from_price_pct(
+                                        float(px),
+                                        str(decision),
+                                        float(sl_price_pct),
+                                        float(tp_price_pct),
+                                    )
+                                    sl_price = float(slb_cap)
+                                    tp_price = float(tpb_cap)
+                                    sl_price_source = (str(sl_price_source or "").strip() + "+CAP").strip("+")
+                                    tp_price_source = (str(tp_price_source or "").strip() + "+CAP").strip("+")
                                 except Exception:
                                     pass
 
@@ -24906,6 +25030,7 @@ with t1:
                         chart_style_hint=chart_style_hint,
                         mtf_context=mtf_ctx,
                         orderbook_context=ob_ctx,
+                        calculated_style=chart_style_hint,
                     )
                     # 수동 분석에서도 스타일 힌트는 룰 기반만 사용(불필요한 추가 OpenAI 호출 방지)
                     style_info = _style_for_entry(symbol, ai.get("decision", "hold"), stt.get("추세", ""), htf_trend, config, allow_ai=False)
