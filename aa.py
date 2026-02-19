@@ -1353,6 +1353,11 @@ def default_settings() -> Dict[str, Any]:
         # - 브리딩룸: 손절을 레벨 바깥으로 약간 여유
         "sr_front_run_bps": 5.0,
         "sr_sl_breathing_bps": 10.0,
+        # ✅ 기준점(앵커) 기반 동적 SR 타깃
+        # - 고정 TP/SL이 아니라, 아래 기준값 "근처"의 구조 레벨을 우선 선택
+        "sr_anchor_tp_pct": 15.0,
+        "sr_anchor_sl_pct": 4.0,
+        "sr_anchor_band_ratio": 0.55,
         # ✅ 스캘핑: 하드 익절(ROI%) - TP가 비정상적으로 커져도 이 값 이상이면 익절
         "scalp_hard_take_enable": True,
         "scalp_hard_take_roi_pct": 25.0,
@@ -6073,7 +6078,10 @@ def _render_gsheet_table_image(
         ts = now_kst().strftime("%Y%m%d_%H%M%S")
         fname = f"{ts}_gsheet_{re.sub(r'[^A-Za-z0-9]+', '_', str(tag or 'sheet'))[:24]}_{uuid.uuid4().hex[:6]}.png"
         out_path = os.path.join(EVENT_IMAGE_DIR, fname)
-        fig.tight_layout(pad=0.9)
+        try:
+            fig.subplots_adjust(left=0.02, right=0.985, top=0.94, bottom=0.04)
+        except Exception:
+            pass
         fig.savefig(out_path, dpi=130, bbox_inches="tight")
         plt.close(fig)
         _cleanup_event_images()
@@ -7942,6 +7950,14 @@ def _dynamic_sr_targets_in_zone(
         sl_breath_bps = float(cfg.get("sr_sl_breathing_bps", 10.0) or 10.0)
         front_run_bps = float(clamp(front_run_bps, 0.0, 30.0))
         sl_breath_bps = float(clamp(sl_breath_bps, 0.0, 40.0))
+        tp_anchor_cfg = float(_as_float(cfg.get("sr_anchor_tp_pct", 15.0), 15.0))
+        sl_anchor_cfg = float(_as_float(cfg.get("sr_anchor_sl_pct", 4.0), 4.0))
+        band_ratio = float(_as_float(cfg.get("sr_anchor_band_ratio", 0.55), 0.55))
+        band_ratio = float(clamp(band_ratio, 0.10, 1.50))
+        tp_anchor = float(clamp(tp_anchor_cfg, max(0.2, tp_pref_min), max(0.2, tp_cap)))
+        sl_anchor = float(clamp(sl_anchor_cfg, 0.2, max(0.2, sl_cap)))
+        tp_band = float(max(0.30, tp_anchor * band_ratio))
+        sl_band = float(max(0.20, sl_anchor * band_ratio))
 
         vps = [float(x) for x in (volume_nodes or []) if x is not None and math.isfinite(float(x))]
         sups = [float(x) for x in (supports or []) if x is not None and math.isfinite(float(x))]
@@ -7964,13 +7980,39 @@ def _dynamic_sr_targets_in_zone(
         tp_cands: List[Tuple[float, str]] = []
         sl_cands: List[Tuple[float, str]] = []
 
+        def _pick_level_near_anchor(levels: List[float], *, is_tp: bool) -> Optional[Tuple[float, float]]:
+            if not levels:
+                return None
+            cap = float(tp_cap if is_tp else sl_cap)
+            anchor = float(tp_anchor if is_tp else sl_anchor)
+            band = float(tp_band if is_tp else sl_band)
+            cands: List[Tuple[float, float, float]] = []
+            for lv in levels:
+                try:
+                    pct = float(_pct_from_entry(px, s, float(lv), is_tp=is_tp))
+                except Exception:
+                    continue
+                if pct <= 0:
+                    continue
+                if is_tp and pct < max(0.0, tp_pref_min * 0.60):
+                    continue
+                if cap > 0 and pct > (cap * 2.0):
+                    continue
+                cands.append((abs(pct - anchor), pct, float(lv)))
+            if not cands:
+                return None
+            in_band = [c for c in cands if c[0] <= band]
+            pool = in_band if in_band else cands
+            pick = min(pool, key=lambda x: (x[0], abs(x[1] - anchor), x[1]))
+            return float(pick[2]), float(pick[1])
+
         if s == "buy":
             tp_levels = sorted([lv for lv in set(ress + vps) if lv > px])
             sl_levels = sorted([lv for lv in set(sups + vps) if lv < px])
 
             if tp_levels:
-                pref = [lv for lv in tp_levels if _pct_from_entry(px, s, lv, is_tp=True) >= tp_pref_min]
-                tp_base = float(pref[0] if pref else tp_levels[0])
+                picked_tp = _pick_level_near_anchor(tp_levels, is_tp=True)
+                tp_base = float(picked_tp[0] if picked_tp is not None else tp_levels[0])
                 tp_adj = float(tp_base * (1.0 - front_run_bps / 10000.0))
                 tp_pct = float(_pct_from_entry(px, s, tp_adj, is_tp=True))
                 if tp_cap > 0 and tp_pct > tp_cap:
@@ -7978,12 +8020,13 @@ def _dynamic_sr_targets_in_zone(
                     out["tp_reason"] = f"구조 저항({tp_base:.6g})이 상한을 넘어 TP 상한({tp_cap:.2f}%)으로 제한"
                     out["tp_source"] = "SR+CAP"
                 else:
-                    out["tp_reason"] = f"결정봉 저항/매물대({tp_base:.6g}) 앞에서 선익절(front-run)"
+                    out["tp_reason"] = f"기준TP {tp_anchor:.2f}% 근처 저항/매물대({tp_base:.6g}) 앞 선익절"
                     out["tp_source"] = "SR"
                 tp_cands.append((float(tp_adj), out["tp_source"]))
 
             if sl_levels:
-                sl_base = float(sl_levels[-1])
+                picked_sl = _pick_level_near_anchor(sl_levels, is_tp=False)
+                sl_base = float(picked_sl[0] if picked_sl is not None else sl_levels[-1])
                 sl_adj = float(sl_base * (1.0 - sl_breath_bps / 10000.0))
                 sl_pct = float(_pct_from_entry(px, s, sl_adj, is_tp=False))
                 if sl_cap > 0 and sl_pct > sl_cap:
@@ -7991,7 +8034,7 @@ def _dynamic_sr_targets_in_zone(
                     out["sl_reason"] = f"구조 지지({sl_base:.6g})까지 거리 과대 → 하드 손절상한({sl_cap:.2f}%) 적용"
                     out["sl_source"] = "SR+HARD_CAP"
                 else:
-                    out["sl_reason"] = f"결정봉 지지({sl_base:.6g}) 이탈 확인용 여유 손절(breathing room)"
+                    out["sl_reason"] = f"기준SL {sl_anchor:.2f}% 근처 지지({sl_base:.6g}) 이탈 확인용 여유 손절"
                     out["sl_source"] = "SR"
                 sl_cands.append((float(sl_adj), out["sl_source"]))
 
@@ -8006,8 +8049,8 @@ def _dynamic_sr_targets_in_zone(
             sl_levels = sorted([lv for lv in set(ress + vps) if lv > px])
 
             if tp_levels:
-                pref = [lv for lv in tp_levels if _pct_from_entry(px, s, lv, is_tp=True) >= tp_pref_min]
-                tp_base = float(pref[0] if pref else tp_levels[0])
+                picked_tp = _pick_level_near_anchor(tp_levels, is_tp=True)
+                tp_base = float(picked_tp[0] if picked_tp is not None else tp_levels[0])
                 tp_adj = float(tp_base * (1.0 + front_run_bps / 10000.0))
                 tp_pct = float(_pct_from_entry(px, s, tp_adj, is_tp=True))
                 if tp_cap > 0 and tp_pct > tp_cap:
@@ -8015,12 +8058,13 @@ def _dynamic_sr_targets_in_zone(
                     out["tp_reason"] = f"구조 지지({tp_base:.6g})까지 거리 과대 → TP 상한({tp_cap:.2f}%)으로 제한"
                     out["tp_source"] = "SR+CAP"
                 else:
-                    out["tp_reason"] = f"결정봉 지지/매물대({tp_base:.6g}) 앞에서 선익절(front-run)"
+                    out["tp_reason"] = f"기준TP {tp_anchor:.2f}% 근처 지지/매물대({tp_base:.6g}) 앞 선익절"
                     out["tp_source"] = "SR"
                 tp_cands.append((float(tp_adj), out["tp_source"]))
 
             if sl_levels:
-                sl_base = float(sl_levels[0])
+                picked_sl = _pick_level_near_anchor(sl_levels, is_tp=False)
+                sl_base = float(picked_sl[0] if picked_sl is not None else sl_levels[0])
                 sl_adj = float(sl_base * (1.0 + sl_breath_bps / 10000.0))
                 sl_pct = float(_pct_from_entry(px, s, sl_adj, is_tp=False))
                 if sl_cap > 0 and sl_pct > sl_cap:
@@ -8028,7 +8072,7 @@ def _dynamic_sr_targets_in_zone(
                     out["sl_reason"] = f"구조 저항({sl_base:.6g})까지 거리 과대 → 하드 손절상한({sl_cap:.2f}%) 적용"
                     out["sl_source"] = "SR+HARD_CAP"
                 else:
-                    out["sl_reason"] = f"결정봉 저항({sl_base:.6g}) 돌파 확인용 여유 손절(breathing room)"
+                    out["sl_reason"] = f"기준SL {sl_anchor:.2f}% 근처 저항({sl_base:.6g}) 돌파 확인용 여유 손절"
                     out["sl_source"] = "SR"
                 sl_cands.append((float(sl_adj), out["sl_source"]))
 
@@ -14858,7 +14902,7 @@ def _draw_candles_simple(ax, df: pd.DataFrame) -> None:
     d = d.dropna(subset=["time", "open", "high", "low", "close"])
     if d.empty:
         return
-    x = mdates.date2num(d["time"].dt.to_pydatetime())
+    x = _mdates_num_from_time(d["time"])
     if len(x) <= 1:
         width = 0.00045
     else:
@@ -15004,12 +15048,30 @@ def _plot_text_sanitize(text: Any, *, has_kr_font: bool, max_len: int = 220) -> 
         return ""
     if not s:
         return ""
+    try:
+        s = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", "", s)
+    except Exception:
+        pass
     if not has_kr_font:
         s = re.sub(r"[^\x20-\x7E]+", " ", s)
         s = re.sub(r"\s+", " ", s).strip()
     if len(s) > int(max_len):
         return s[: int(max_len)] + "…"
     return s
+
+
+def _mdates_num_from_time(values: Any) -> np.ndarray:
+    try:
+        dt = pd.to_datetime(values)
+        if isinstance(dt, pd.Series):
+            arr = dt.to_numpy(dtype="datetime64[ns]")
+        elif isinstance(dt, pd.DatetimeIndex):
+            arr = dt.to_numpy(dtype="datetime64[ns]")
+        else:
+            arr = np.asarray(pd.to_datetime(dt), dtype="datetime64[ns]")
+        return mdates.date2num(arr)
+    except Exception:
+        return np.array([], dtype=float)
 
 
 def _style_plot_label(style: str, has_kr_font: bool) -> str:
@@ -15068,7 +15130,7 @@ def _draw_pattern_overlay(
         low = d["low"].astype(float).values
         close = d["close"].astype(float).values
         time_vals = pd.to_datetime(d["time"])
-        x_num = mdates.date2num(time_vals.dt.to_pydatetime())
+        x_num = _mdates_num_from_time(time_vals)
         order = int(cfg.get("pattern_pivot_order", 4) or 4)
         order = int(clamp(order, 3, 12))
         hi_idx, lo_idx = _pivot_indices_for_plot(high, low, order=order)
@@ -15162,7 +15224,7 @@ def _draw_pattern_overlay(
                     xx = np.arange(max(0, len(close) - 80), len(close), dtype=float)
                     y_top = sh * xx + ih
                     y_bot = sl * xx + il
-                    xplot = mdates.date2num(time_vals.iloc[xx.astype(int)].dt.to_pydatetime())
+                    xplot = _mdates_num_from_time(time_vals.iloc[xx.astype(int)])
                     ax.plot(xplot, y_top, color="#f59e0b", linewidth=2.0, linestyle="--", alpha=0.86, zorder=8)
                     ax.plot(xplot, y_bot, color="#38bdf8", linewidth=2.0, linestyle="--", alpha=0.86, zorder=8)
                     try:
@@ -15436,7 +15498,7 @@ def build_trade_event_image(
             try:
                 px_df = px_df.copy()
                 px_df["time"] = pd.to_datetime(px_df["time"])
-                x = mdates.date2num(px_df["time"].dt.to_pydatetime())
+                x = _mdates_num_from_time(px_df["time"])
             except Exception:
                 x = np.array([], dtype=float)
                 px_df = pd.DataFrame()
@@ -15641,7 +15703,13 @@ def build_trade_event_image(
         tid = re.sub(r"[^A-Za-z0-9]+", "", str(trade_id or ""))[:16]
         fname = f"{ts}_{sid}_{str(event_type).lower()}_{tid or uuid.uuid4().hex[:8]}.png"
         out_path = os.path.join(EVENT_IMAGE_DIR, fname)
-        fig.tight_layout()
+        try:
+            if show_indicator_panels:
+                fig.subplots_adjust(left=0.05, right=0.985, top=0.93, bottom=0.07, hspace=0.04)
+            else:
+                fig.subplots_adjust(left=0.05, right=0.985, top=0.93, bottom=0.08)
+        except Exception:
+            pass
         fig.savefig(out_path, dpi=130, bbox_inches="tight")
         plt.close(fig)
         _cleanup_event_images()
