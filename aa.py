@@ -602,9 +602,9 @@ MODE_RULES = {
     "공격모드": {"min_conf": 75, "entry_pct_min": 7, "entry_pct_max": 22, "lev_min": 4, "lev_max": 12},
     "하이리스크/하이리턴": {"min_conf": 72, "entry_pct_min": 18, "entry_pct_max": 40, "lev_min": 12, "lev_max": 25},
     # Streamlit Cloud 단일 스크립트 운용에서도 선택 가능하도록 스타일 모드를 MODE_RULES에 추가(기존 구조 유지)
-    "스캘핑": {"min_conf": 68, "entry_pct_min": 3, "entry_pct_max": 16, "lev_min": 10, "lev_max": 30, "tp_roi_cap": 2.5},
-    "단타": {"min_conf": 72, "entry_pct_min": 5, "entry_pct_max": 20, "lev_min": 5, "lev_max": 10, "tp_roi_cap": 12.0},
-    "스윙": {"min_conf": 78, "entry_pct_min": 6, "entry_pct_max": 22, "lev_min": 1, "lev_max": 5, "tp_roi_min": 10.0, "tp_roi_cap": 0.0},
+    "스캘핑": {"min_conf": 60, "entry_pct_min": 3, "entry_pct_max": 18, "lev_min": 10, "lev_max": 30, "tp_roi_cap": 3.0},
+    "단타": {"min_conf": 60, "entry_pct_min": 5, "entry_pct_max": 22, "lev_min": 5, "lev_max": 10, "tp_roi_cap": 15.0},
+    "스윙": {"min_conf": 74, "entry_pct_min": 6, "entry_pct_max": 24, "lev_min": 1, "lev_max": 5, "tp_roi_min": 10.0, "tp_roi_cap": 50.0},
 }
 
 # =========================================================
@@ -614,14 +614,14 @@ MODE_RULES = {
 # =========================================================
 STYLE_RULES = {
     "스캘핑": {
-        "min_conf": 68,
+        "min_conf": 60,
         "entry_pct_min": 3,
-        "entry_pct_max": 16,
+        "entry_pct_max": 18,
         "lev_min": 10,
         "lev_max": 30,
         # 가이드(고정값 아님): 최종 목표는 SR/오더북에서 동적으로 결정
         "tp_roi_min": 0.5,
-        "tp_roi_max": 2.5,
+        "tp_roi_max": 3.0,
         "sl_roi_min": 0.4,
         "sl_roi_max": 1.8,
         # 가격 변동폭(%) 기준 탐색 범위
@@ -632,36 +632,36 @@ STYLE_RULES = {
         "preferred_tfs": ["1m", "5m"],
     },
     "단타": {
-        "min_conf": 72,
+        "min_conf": 60,
         "entry_pct_min": 5,
-        "entry_pct_max": 20,
+        "entry_pct_max": 22,
         "lev_min": 5,
         "lev_max": 10,
         "tp_roi_min": 2.0,
-        "tp_roi_max": 12.0,
+        "tp_roi_max": 15.0,
         "sl_roi_min": 1.0,
         "sl_roi_max": 4.0,
         "tp_price_min": 2.0,
-        "tp_price_max": 12.0,
+        "tp_price_max": 15.0,
         "sl_price_min": 1.0,
         "sl_price_max": 4.5,
-        "preferred_tfs": ["15m", "1h"],
+        "preferred_tfs": ["15m", "30m"],
     },
     "스윙": {
-        "min_conf": 78,
+        "min_conf": 74,
         "entry_pct_min": 6,
-        "entry_pct_max": 22,
+        "entry_pct_max": 24,
         "lev_min": 1,
         "lev_max": 5,
         "tp_roi_min": 10.0,
-        "tp_roi_max": 999.0,
+        "tp_roi_max": 50.0,
         "sl_roi_min": 2.0,
         "sl_roi_max": 12.0,
         "tp_price_min": 10.0,
-        "tp_price_max": 999.0,
+        "tp_price_max": 50.0,
         "sl_price_min": 3.0,
         "sl_price_max": 15.0,
-        "preferred_tfs": ["4h", "1d"],
+        "preferred_tfs": ["1h"],
     },
 }
 
@@ -685,9 +685,9 @@ def style_rule(style: Any) -> Dict[str, Any]:
 def decision_tf_candidates_by_style(style: Any) -> List[str]:
     st = normalize_style_name(style)
     if st == "스윙":
-        return ["1h", "4h"]
+        return ["1h"]
     if st == "단타":
-        return ["15m", "1h"]
+        return ["15m", "30m"]
     return ["1m", "5m"]
 
 
@@ -710,26 +710,26 @@ def hard_roi_limits_by_style(style: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
         if st == "스캘핑":
             return {
                 "tp_min": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_tp_min_roi", sr.get("tp_roi_min", 0.5)), sr.get("tp_roi_min", 0.5)))),
-                "tp_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_tp_roi", 2.5), 2.5))),
+                "tp_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_tp_roi", 3.0), 3.0))),
                 "sl_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_sl_roi", sr.get("sl_roi_max", 1.8)), sr.get("sl_roi_max", 1.8)))),
             }
         if st == "단타":
             return {
                 "tp_min": float(max(0.5, _as_float(cfg.get("hard_cap_day_tp_min_roi", sr.get("tp_roi_min", 2.0)), sr.get("tp_roi_min", 2.0)))),
-                "tp_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_tp_roi", 12.0), 12.0))),
+                "tp_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_tp_roi", 15.0), 15.0))),
                 "sl_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_sl_roi", sr.get("sl_roi_max", 4.0)), sr.get("sl_roi_max", 4.0)))),
             }
         return {
             "tp_min": float(max(10.0, _as_float(cfg.get("hard_cap_swing_tp_min_roi", 10.0), 10.0))),
-            "tp_cap": None,
+            "tp_cap": float(max(10.0, _as_float(cfg.get("hard_cap_swing_tp_roi", 50.0), 50.0))),
             "sl_cap": float(max(1.0, _as_float(cfg.get("hard_cap_swing_sl_roi", sr.get("sl_roi_max", 12.0)), sr.get("sl_roi_max", 12.0)))),
         }
     except Exception:
         if st == "스윙":
-            return {"tp_min": 10.0, "tp_cap": None, "sl_cap": float(sr.get("sl_roi_max", 12.0))}
+            return {"tp_min": 10.0, "tp_cap": 50.0, "sl_cap": float(sr.get("sl_roi_max", 12.0))}
         if st == "단타":
-            return {"tp_min": float(sr.get("tp_roi_min", 2.0)), "tp_cap": 12.0, "sl_cap": float(sr.get("sl_roi_max", 4.0))}
-        return {"tp_min": float(sr.get("tp_roi_min", 0.5)), "tp_cap": 2.5, "sl_cap": float(sr.get("sl_roi_max", 1.8))}
+            return {"tp_min": float(sr.get("tp_roi_min", 2.0)), "tp_cap": 15.0, "sl_cap": float(sr.get("sl_roi_max", 4.0))}
+        return {"tp_min": float(sr.get("tp_roi_min", 0.5)), "tp_cap": 3.0, "sl_cap": float(sr.get("sl_roi_max", 1.8))}
 
 
 def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -778,7 +778,7 @@ def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) ->
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 21,
+        "settings_schema_version": 22,
         "openai_api_key": "",
         "openai_model_trade": "gpt-4o-mini",
         "openai_model_style": "gpt-4o-mini",
@@ -1011,6 +1011,18 @@ def default_settings() -> Dict[str, Any]:
         "time_exit_target_frac": 0.3,    # 목표 수익의 30% 미만이면 정리
         "time_exit_partial_enable": True,  # 전량 청산 대신 50% 부분 청산
         "time_exit_partial_close_pct": 50.0,  # 시간 초과 시 부분 청산 비율(%)
+        # ✅ 인트라데이 강제 청산(오버나잇 금지)
+        # - 20시간 경과: 반대 시그널 청산을 더 민감하게 본다.
+        # - 23시간 경과: 손익과 무관하게 시장가 정리.
+        "intraday_force_close_enable": True,
+        "intraday_aggressive_exit_hours": 20.0,
+        "intraday_force_close_hours": 23.0,
+        "intraday_aggressive_exit_score_relax": 2,
+        # ✅ 인트라데이 활성화 파라미터
+        "intra_day_scalp_day_min_conf": 60,
+        "intra_day_mega_trend_adx": 30.0,
+        # 메인 루프 주기(초): 짧을수록 빠르게 반응
+        "scan_loop_sleep_sec": 0.5,
 
         # ✅ Fail-safe(요구: "수익을 못 내거나 전부 잃으면 AI는 꺼진다")
         # - 실제로 "수익 보장"은 불가능하므로, 현실적인 안전장치로 자동매매를 강제 종료한다.
@@ -1211,8 +1223,9 @@ def default_settings() -> Dict[str, Any]:
         # - OFF(기본)이면 스캘핑 진입도 허용하되, 모드의 레버/진입비중 범위는 유지
         "highrisk_entry_requires_swing": False,
         # ✅ 포지션 제한(요구): 총 포지션 5개까지 + 낮은 확신 포지션은 최대 2개
-        "max_open_positions_total": 5,
-        "max_open_positions_low_conf": 2,
+        "max_open_positions_total": 7,
+        "max_open_positions_intraday": 9,
+        "max_open_positions_low_conf": 3,
         # "낮은 확신" 기준(%) - 이 값 미만이면 low-conf로 카운트
         # - 기본: 80 (하이리스크/하이리턴 min_conf=72 기준, 72~79를 low로 보고 2개까지만 허용)
         "low_conf_position_threshold": 80,
@@ -1272,12 +1285,12 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 단타(데이 트레이딩) 기본 envelope
         # - 요청: 15m/1h 기반, 목표 2~5%, 레버 5~10x
         "day_tp_roi_min": 2.0,
-        "day_tp_roi_max": 10.0,
+        "day_tp_roi_max": 15.0,
         "day_sl_roi_min": 1.0,
         "day_sl_roi_max": 4.0,
         # 단타 TP/SL 가격변동폭 가이드(고정값이 아니라 SR 탐색 범위)
         "day_tp_price_pct_min": 2.0,
-        "day_tp_price_pct_max": 10.0,
+        "day_tp_price_pct_max": 15.0,
         "day_sl_price_pct_min": 1.0,
         "day_sl_price_pct_max": 4.5,
         "day_entry_pct_mult": 0.85,
@@ -1308,13 +1321,13 @@ def default_settings() -> Dict[str, Any]:
         "sr_trigger_tp_buffer_pct": 0.08,
 
         "swing_tp_roi_min": 10.0,
-        "swing_tp_roi_max": 35.0,
+        "swing_tp_roi_max": 50.0,
         # ✅ 스윙 손절(ROI%)은 너무 짧으면 휩쏘로 잘리는 문제가 커서 기본을 더 넓게(요구사항)
         "swing_sl_roi_min": 12.0,
         "swing_sl_roi_max": 35.0,
         # 스윙 TP/SL 가격변동폭 가이드(고정값이 아니라 SR 탐색 범위)
         "swing_tp_price_pct_min": 10.0,
-        "swing_tp_price_pct_max": 35.0,
+        "swing_tp_price_pct_max": 50.0,
         "swing_sl_price_pct_min": 3.0,
         "swing_sl_price_pct_max": 15.0,
         "swing_entry_pct_mult": 1.0,
@@ -1353,7 +1366,7 @@ def default_settings() -> Dict[str, Any]:
         "sr_rr_min": 1.5,
         "sr_levels_cache_sec": 60,
         # ✅ 단타(데이) 전용 SR 파라미터
-        "sr_timeframe_day": "1h",
+        "sr_timeframe_day": "30m",
         "sr_lookback_day": 260,
         "sr_pivot_order_day": 7,
         "sr_buffer_atr_mult_day": 0.35,
@@ -1501,8 +1514,8 @@ def load_settings() -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                if float(cfg.get("swing_tp_roi_max", 0.0) or 0.0) == 50.0:
-                    cfg["swing_tp_roi_max"] = 35.0
+                if float(cfg.get("swing_tp_roi_max", 0.0) or 0.0) == 35.0:
+                    cfg["swing_tp_roi_max"] = 50.0
                     changed = True
             except Exception:
                 pass
@@ -1995,7 +2008,7 @@ def load_settings() -> Dict[str, Any]:
                 "swing_tp_price_pct_max": 35.0,
                 "swing_sl_price_pct_min": 3.0,
                 "swing_sl_price_pct_max": 15.0,
-                "sr_timeframe_day": "1h",
+                "sr_timeframe_day": "30m",
                 "sr_lookback_day": 260,
                 "sr_pivot_order_day": 7,
                 "sr_buffer_atr_mult_day": 0.35,
@@ -2051,6 +2064,24 @@ def load_settings() -> Dict[str, Any]:
                 "ai_budget_low_vol_ratio": 0.90,
                 "ai_budget_low_bb_width_pct": 1.20,
                 "ai_budget_low_sqz_abs_pct": 0.06,
+                }.items():
+                    try:
+                        if k not in saved:
+                            cfg[k] = v
+                            changed = True
+                    except Exception:
+                        pass
+        # v22: 인트라데이 전용 피벗(24h 이내 정리/현실적 TP 상한/스캔 활성화)
+        if saved_ver < 22:
+            for k, v in {
+                "intraday_force_close_enable": True,
+                "intraday_aggressive_exit_hours": 20.0,
+                "intraday_force_close_hours": 23.0,
+                "intraday_aggressive_exit_score_relax": 2,
+                "intra_day_scalp_day_min_conf": 60,
+                "intra_day_mega_trend_adx": 30.0,
+                "scan_loop_sleep_sec": 0.5,
+                "max_open_positions_intraday": 9,
             }.items():
                 try:
                     if k not in saved:
@@ -2058,6 +2089,42 @@ def load_settings() -> Dict[str, Any]:
                         changed = True
                 except Exception:
                     pass
+            try:
+                if float(cfg.get("day_tp_roi_max", 0.0) or 0.0) == 10.0:
+                    cfg["day_tp_roi_max"] = 15.0
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if float(cfg.get("day_tp_price_pct_max", 0.0) or 0.0) == 10.0:
+                    cfg["day_tp_price_pct_max"] = 15.0
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if float(cfg.get("swing_tp_roi_max", 0.0) or 0.0) == 35.0:
+                    cfg["swing_tp_roi_max"] = 50.0
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if float(cfg.get("swing_tp_price_pct_max", 0.0) or 0.0) == 35.0:
+                    cfg["swing_tp_price_pct_max"] = 50.0
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if int(cfg.get("max_open_positions_total", 0) or 0) == 5:
+                    cfg["max_open_positions_total"] = 7
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if int(cfg.get("max_open_positions_low_conf", 0) or 0) == 2:
+                    cfg["max_open_positions_low_conf"] = 3
+                    changed = True
+            except Exception:
+                pass
         cfg["settings_schema_version"] = base_ver
         if changed:
             try:
@@ -7621,7 +7688,7 @@ def _sr_params_for_style(style: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         }
     if st == "단타":
         return {
-            "tf": str(cfg.get("sr_timeframe_day", "1h") or "1h"),
+            "tf": str(cfg.get("sr_timeframe_day", "30m") or "30m"),
             "lookback": int(cfg.get("sr_lookback_day", 260) or 260),
             "pivot_order": int(cfg.get("sr_pivot_order_day", 7) or 7),
             "buffer_atr_mult": float(cfg.get("sr_buffer_atr_mult_day", 0.35) or 0.35),
@@ -10272,18 +10339,28 @@ def choose_dynamic_style(
         range_score = float(clamp(range_score, 0.0, 1.0))
         breakout_score = float(clamp(breakout_score, 0.0, 1.0))
         trend_score = float(clamp(trend_score, 0.0, 1.0))
+        mega_trend_adx = float(max(adx1h, adx4h, adx1d))
+        mega_trend = bool(mega_trend_adx >= 30.0)
 
         style = "스캘핑"
         regime = "ranging"
         reason = "횡보/저변동성 구간 → 스캘핑(1m/5m 반전 + 오더북 압력)"
-        if trend_score >= 0.62:
+        if trend_score >= 0.62 and mega_trend:
             style = "스윙"
             regime = "trend"
-            reason = "강한 추세 정렬(4h/1d) 확인 → 스윙 추세추종"
+            reason = "메가추세(ADX≥30) + 상위 TF 정렬 → 스윙 추세추종"
         elif breakout_score >= 0.52:
             style = "단타"
             regime = "breakout"
-            reason = "변동성 확장/브레이크아웃 징후 → 단타(15m/1h 패턴)"
+            reason = "변동성 확장/브레이크아웃 징후 → 단타(15m/30m 패턴)"
+        elif (not mega_trend) and (breakout_score >= 0.35):
+            style = "단타"
+            regime = "intraday"
+            reason = "메가추세 아님(ADX<30) → 스윙 대신 단타 우선"
+        elif (not mega_trend) and (range_score < 0.45):
+            style = "단타"
+            regime = "intraday"
+            reason = "메가추세 아님(ADX<30) + 기회구간 → 단타 우선"
 
         res.update(
             {
@@ -11822,33 +11899,40 @@ def ai_decide_trade(
 				   - 모멘텀: RSI, StochRSI, CCI, Williams %R, MFI, MACD
 				   - 거래량: OBV, CMF, VWMA
 				   - 변동성: ATR, Keltner, Bollinger
+				   - 인트라데이(스캘핑/단타) 진입은 Ichimoku 구름 방향(ICHI_PRICE_CLOUD)을 1차 필터로 적용한다.
+				     · buy는 below_cloud면 금지
+				     · sell은 above_cloud면 금지
 				5) chart_patterns + chart_patterns_mtf + divergences/harmonics/candles를 함께 판단한다.
 					6) ml_signals.dir을 우선 따른다.
 					   - ml_signals.dir이 "buy"면 buy/hold만 허용
 					   - ml_signals.dir이 "sell"면 sell/hold만 허용
 					   - ml_signals.dir이 "hold"면 hold 우선
-					7) full_spectrum(1m/5m/15m/1h/4h/1d)와 order_book_l2를 함께 보고 스타일을 동적으로 해석:
-					   - 횡보/저변동성: 스캘핑 우선 (1m/5m 반전 + 오더북 압력)
-					   - 변동성 확대/브레이크아웃: 단타 우선 (15m/1h 패턴/다이버전스)
-					   - 강한 추세 정렬: 스윙 우선 (4h/1d 추세 추종)
-					   - 장기추세가 애매해도 바로 hold하지 말고, 1m/5m + 오더북 기반 단기 기회를 먼저 탐색
-					8) style_hint 기준 가중치:
-					   - 스캘핑: 1m/5m, SQZ·VWAP·OBV·캔들패턴 가중치↑, 장기지표 영향↓
-					   - 단타: 15m/1h, 추세+모멘텀 균형, 다이버전스 확인
-					   - 스윙: 4h/1d, Ichimoku·ADX·하모닉·MTF 패턴 가중치↑
+						7) full_spectrum(1m/5m/15m/1h/4h/1d)와 order_book_l2를 함께 보고 스타일을 동적으로 해석:
+						   - 횡보/저변동성: 스캘핑 우선 (1m/5m 반전 + 오더북 압력)
+						   - 변동성 확대/브레이크아웃: 단타 우선 (15m/30m 패턴/다이버전스)
+						   - 메가추세(ADX>=30) 정렬: 스윙 우선 (1h 중심 추세 추종)
+						   - 장기추세가 애매해도 바로 hold하지 말고, 1m/5m + 오더북 기반 단기 기회를 먼저 탐색
+						8) style_hint 기준 가중치:
+						   - 스캘핑: 1m/5m, SQZ·VWAP·OBV·캔들패턴 가중치↑, 장기지표 영향↓
+						   - 단타: 15m/30m, 추세+모멘텀 균형, 다이버전스 확인
+						   - 스윙: 1h, Ichimoku·ADX·하모닉·MTF 패턴 가중치↑
 					9) 모드 규칙 반드시 준수:
 					   - 최소 확신도: {rule["min_conf"]}
 					   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
 					   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
 				{soft_entry_hint}
 
-	[중요]
-	- 반드시 decision_tf를 선택해서 출력해라.
-	  - 스캘핑: "1m" 또는 "5m"
-	  - 단타: "15m" 또는 "1h"
-	  - 스윙: "1h" 또는 "4h"
-	- sl_pct / tp_pct는 ROI%(레버 반영 수익률)로 출력한다.
-	- style_rule의 TP/SL 범위는 "고정값"이 아니라 탐색 가이드다. 반드시 SR/매물대/오더북(스캘핑)에서 목표가를 찾고, 없을 때만 범위 중앙값으로 대체하라.
+		[중요]
+		- 반드시 decision_tf를 선택해서 출력해라.
+		  - 스캘핑: "1m" 또는 "5m"
+		  - 단타: "15m" 또는 "30m"
+		  - 스윙: "1h"
+		- sl_pct / tp_pct는 ROI%(레버 반영 수익률)로 출력한다.
+		- 목표는 "고확률 인트라데이 수익" 우선이다. 비현실적인 장기 대박(문샷) 목표를 금지한다.
+		  - 스캘핑 TP 상한: 3%
+		  - 단타 TP 상한: 15%
+		  - 스윙 TP 상한: 50%
+		- style_rule의 TP/SL 범위는 "고정값"이 아니라 탐색 가이드다. 반드시 SR/매물대/오더북(스캘핑)에서 목표가를 찾고, 없을 때만 범위 중앙값으로 대체하라.
 	- SR 레벨에 TP를 둘 때는 약간 앞당겨(front-run) 잡고, SL은 레벨 바깥으로 약간 여유(breathing room)를 둬라.
 	- 변동성(atr_price_pct)이 작으면 손절을 너무 타이트하게 잡지 마라.
 	- sr_context(지지/저항) 정보를 참고해, 가능하면 sl_price/tp_price(가격)를 함께 지정해라.
@@ -11878,9 +11962,9 @@ JSON 형식:
   "entry_pct": {rule["entry_pct_min"]}-{rule["entry_pct_max"]},
   "leverage": {rule["lev_min"]}-{rule["lev_max"]},
   "sl_pct": 0.3-50.0,
-  "tp_pct": 0.5-150.0,
+  "tp_pct": 0.5-80.0,
   "rr": 0.5-10.0,
-  "decision_tf": "1m"|"5m"|"15m"|"1h"|"4h",
+  "decision_tf": "1m"|"5m"|"15m"|"30m"|"1h",
 	  "sl_price": number|null,
 	  "tp_price": number|null,
 	  "used_indicators": ["..."],
@@ -12240,13 +12324,13 @@ def apply_style_envelope(ai: Dict[str, Any], style: str, cfg: Dict[str, Any], ru
             day_cap = int(cfg.get("day_lev_cap", sr.get("lev_max", 10)) or sr.get("lev_max", 10))
             lev = int(clamp(lev, lev_lo, min(lev_hi, int(day_cap))))
             sl = float(clamp(sl, float(cfg.get("day_sl_roi_min", sr.get("sl_roi_min", 1.0))), float(cfg.get("day_sl_roi_max", sr.get("sl_roi_max", 4.0)))))
-            tp = float(clamp(tp, float(cfg.get("day_tp_roi_min", sr.get("tp_roi_min", 2.0))), float(cfg.get("day_tp_roi_max", sr.get("tp_roi_max", 10.0)))))
+            tp = float(clamp(tp, float(cfg.get("day_tp_roi_min", sr.get("tp_roi_min", 2.0))), float(cfg.get("day_tp_roi_max", sr.get("tp_roi_max", 15.0)))))
 
         elif st == "스윙":
             entry_pct = float(clamp(entry_pct * float(cfg.get("swing_entry_pct_mult", 1.0)), rule["entry_pct_min"], rule["entry_pct_max"]))
             lev = int(min(lev, int(cfg.get("swing_lev_cap", rule["lev_max"]))))
             sl = float(clamp(sl, float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 35.0))))
-            swing_tp_max = float(max(float(cfg.get("swing_tp_roi_max", sr.get("tp_roi_max", 999.0)) or sr.get("tp_roi_max", 999.0)), float(sr.get("tp_roi_max", 999.0))))
+            swing_tp_max = float(max(float(cfg.get("swing_tp_roi_max", sr.get("tp_roi_max", 50.0)) or sr.get("tp_roi_max", 50.0)), float(sr.get("tp_roi_max", 50.0))))
             tp = float(clamp(tp, float(cfg.get("swing_tp_roi_min", 10.0)), swing_tp_max))
 
         # 스타일 범위(요청 스펙) 재보정
@@ -12257,10 +12341,10 @@ def apply_style_envelope(ai: Dict[str, Any], style: str, cfg: Dict[str, Any], ru
             tp = float(clamp(tp, float(sr.get("tp_roi_min", 0.5)), float(sr.get("tp_roi_max", 2.0))))
         elif st == "단타":
             sl = float(clamp(sl, float(sr.get("sl_roi_min", 1.0)), float(sr.get("sl_roi_max", 4.0))))
-            tp = float(clamp(tp, float(sr.get("tp_roi_min", 2.0)), float(sr.get("tp_roi_max", 10.0))))
+            tp = float(clamp(tp, float(sr.get("tp_roi_min", 2.0)), float(sr.get("tp_roi_max", 15.0))))
         else:
             sl = float(clamp(sl, float(sr.get("sl_roi_min", 2.0)), float(sr.get("sl_roi_max", 12.0))))
-            tp = float(clamp(tp, float(sr.get("tp_roi_min", 10.0)), float(sr.get("tp_roi_max", 35.0))))
+            tp = float(clamp(tp, float(sr.get("tp_roi_min", 10.0)), float(sr.get("tp_roi_max", 50.0))))
 
         # ✅ 스타일별 하드캡(우선순위): 스캘핑/단타 TP 상한, 스윙 TP 하한(10%+) 강제
         tmp_caps = apply_hard_roi_caps({"tp_pct": tp, "sl_pct": sl, "leverage": lev}, st, cfg)
@@ -12834,7 +12918,7 @@ class Notifier:
     def _image_path_from_data(self, data: Dict[str, Any]) -> str:
         try:
             d = dict(data or {})
-            for k in ["image_path", "chart_image", "entry_chart_image", "exit_chart_image", "snapshot_image", "photo_path"]:
+            for k in ["image_path", "img_path", "chart_image", "entry_chart_image", "exit_chart_image", "snapshot_image", "photo_path", "image_file", "chart_path"]:
                 p = str(d.get(k, "") or "").strip()
                 if p and os.path.isfile(p):
                     return p
@@ -16072,11 +16156,11 @@ def _maybe_switch_style_for_open_position(
                 tgt["sl"] = float(clamp(float(tgt.get("sl", 2.0)), float(cfg.get("scalp_sl_roi_min", 0.8)), float(cfg.get("scalp_sl_roi_max", 5.0))))
                 tgt["scalp_exit_mode"] = True
             elif rec_style == "단타":
-                tgt["tp"] = float(clamp(float(tgt.get("tp", 3.5)), float(cfg.get("day_tp_roi_min", 2.0)), float(cfg.get("day_tp_roi_max", 10.0))))
+                tgt["tp"] = float(clamp(float(tgt.get("tp", 3.5)), float(cfg.get("day_tp_roi_min", 2.0)), float(cfg.get("day_tp_roi_max", 15.0))))
                 tgt["sl"] = float(clamp(float(tgt.get("sl", 1.8)), float(cfg.get("day_sl_roi_min", 1.0)), float(cfg.get("day_sl_roi_max", 4.0))))
                 tgt["scalp_exit_mode"] = False
             else:
-                tgt["tp"] = float(clamp(float(tgt.get("tp", 6.0)), float(cfg.get("swing_tp_roi_min", 10.0)), float(cfg.get("swing_tp_roi_max", 35.0))))
+                tgt["tp"] = float(clamp(float(tgt.get("tp", 6.0)), float(cfg.get("swing_tp_roi_min", 10.0)), float(cfg.get("swing_tp_roi_max", 50.0))))
                 tgt["sl"] = float(clamp(float(tgt.get("sl", 3.0)), float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 35.0))))
                 tgt["scalp_exit_mode"] = False
                 # ✅ 스윙은 스캘핑보다 RR/목표폭이 "확연히" 커야 하므로,
@@ -16088,7 +16172,7 @@ def _maybe_switch_style_for_open_position(
                     tp_now = float(tgt.get("tp", 0) or 0.0)
                     tp_need = abs(sl_now) * float(rr_min_now)
                     if tp_now < tp_need:
-                        tp_cap = float(cfg.get("swing_tp_roi_max", 35.0))
+                        tp_cap = float(cfg.get("swing_tp_roi_max", 50.0))
                         tgt["tp"] = float(clamp(tp_need, float(cfg.get("swing_tp_roi_min", 10.0)), tp_cap))
                 except Exception:
                     pass
@@ -17407,6 +17491,29 @@ def telegram_thread(ex):
                             tgt["exit_trailing_protect_enable"] = bool(forced_exit)
                         except Exception:
                             pass
+                        try:
+                            entry_epoch = float(tgt.get("entry_epoch", 0) or 0.0)
+                        except Exception:
+                            entry_epoch = 0.0
+                        if entry_epoch <= 0:
+                            entry_epoch = float(time.time())
+                            tgt["entry_epoch"] = float(entry_epoch)
+                        open_hours = float(max(0.0, (time.time() - float(entry_epoch)) / 3600.0))
+                        try:
+                            intra_fc_enable = bool(cfg.get("intraday_force_close_enable", True))
+                            aggr_h = float(cfg.get("intraday_aggressive_exit_hours", 20.0) or 20.0)
+                            force_h = float(cfg.get("intraday_force_close_hours", 23.0) or 23.0)
+                            intra_aggressive_exit = bool(intra_fc_enable and (open_hours >= aggr_h))
+                            intra_force_close = bool(intra_fc_enable and (open_hours >= force_h))
+                        except Exception:
+                            intra_aggressive_exit = False
+                            intra_force_close = False
+                        try:
+                            tgt["open_hours"] = float(open_hours)
+                            tgt["intra_aggressive_exit"] = bool(intra_aggressive_exit)
+                            tgt["intra_force_close"] = bool(intra_force_close)
+                        except Exception:
+                            pass
 
                         # 저장(스레드 재시작 대비)
                         rt.setdefault("open_targets", {})[sym] = tgt
@@ -17453,7 +17560,7 @@ def telegram_thread(ex):
                                 rr_min_now = max(float(_rr_min_by_mode(str(mode))), float(_rr_min_by_style("스윙")))
                                 tp_need = abs(float(sl)) * float(rr_min_now)
                                 if tp < float(tp_need):
-                                    tp_cap = float(cfg.get("swing_tp_roi_max", 35.0))
+                                    tp_cap = float(cfg.get("swing_tp_roi_max", 50.0))
                                     tp_new = float(clamp(tp_need, float(cfg.get("swing_tp_roi_min", 10.0)), tp_cap))
                                     tp = float(tp_new)
                                     tgt["tp"] = float(tp_new)
@@ -17953,7 +18060,7 @@ def telegram_thread(ex):
                                 except Exception:
                                     pass
                                 # 스윙 목표로 확장
-                                tgt["tp"] = float(clamp(max(tp, float(cfg.get("swing_tp_roi_min", 10.0))), float(cfg.get("swing_tp_roi_min", 10.0)), float(cfg.get("swing_tp_roi_max", 35.0))))
+                                tgt["tp"] = float(clamp(max(tp, float(cfg.get("swing_tp_roi_min", 10.0))), float(cfg.get("swing_tp_roi_min", 10.0)), float(cfg.get("swing_tp_roi_max", 50.0))))
                                 tgt["sl"] = float(clamp(max(sl, float(cfg.get("swing_sl_roi_min", 12.0))), float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 35.0))))
                                 # ✅ 스윙 전환이면 "손절폭을 넓힌 만큼 익절도 같이" 늘려서 손익비가 나빠지지 않게 한다.
                                 # - (중요) 손절만 넓히고 익절은 그대로면, 이미 수익 중인 포지션에서 되레 수익 반납 리스크만 커질 수 있음
@@ -17964,7 +18071,7 @@ def telegram_thread(ex):
                                     tp_now = float(tgt.get("tp", 0) or 0.0)
                                     tp_need = abs(sl_now) * float(rr_min_now)
                                     if tp_now < tp_need:
-                                        tp_cap = float(cfg.get("swing_tp_roi_max", 35.0))
+                                        tp_cap = float(cfg.get("swing_tp_roi_max", 50.0))
                                         tgt["tp"] = float(clamp(tp_need, float(cfg.get("swing_tp_roi_min", 10.0)), tp_cap))
                                 except Exception:
                                     pass
@@ -18506,10 +18613,17 @@ def telegram_thread(ex):
                                         hard_take = True
                             except Exception:
                                 hard_take = False
+                        time_force_close_hit = False
+                        if bool(intra_force_close):
+                            time_force_close_hit = True
+                            force_take_reason = "시간초과 강제청산(23h)"
+                            force_take_detail = f"보유 {open_hours:.1f}시간 경과"
+                            tgt["force_take_reason"] = force_take_reason
+                            tgt["force_take_detail"] = force_take_detail
 
-                        # 사용자 요청: "시간초과 강제청산" 비활성화
-                        # - 목표 TP/SL(및 SR 가격 트리거)이 올 때까지 홀딩한다.
-                        # - 기존 설정 키(time_exit_*)는 호환을 위해 유지하지만, 강제청산은 실행하지 않는다.
+                        # 인트라데이 정책:
+                        # - 20시간 경과: 반대 시그널 청산 감도를 높임
+                        # - 23시간 경과: 손익과 무관하게 강제 청산(오버나잇 금지)
 
                         # ✅ ROI 손절은 "확인 n회"로 한 번 더 생각(휩쏘 방지)
                         roi_stop_hit = bool(ai_targets_ready and (float(roi) <= -abs(float(sl))))
@@ -18561,6 +18675,21 @@ def telegram_thread(ex):
                                     style=str(style_now),
                                     current_roi=float(roi),
                                 )
+                                if (not bool(hit0)) and bool(intra_aggressive_exit):
+                                    try:
+                                        if str(normalize_style_name(style_now)) == "스윙":
+                                            need0 = int(_as_int(cfg.get("exit_signal_flex_score_swing_min", cfg.get("exit_signal_flex_score_min", 9)), 9))
+                                        elif str(normalize_style_name(style_now)) == "단타":
+                                            need0 = int(_as_int(cfg.get("exit_signal_flex_score_day_min", cfg.get("exit_signal_flex_score_min", 7)), 7))
+                                        else:
+                                            need0 = int(_as_int(cfg.get("exit_signal_flex_score_scalp_min", cfg.get("exit_signal_flex_score_min", 5)), 5))
+                                        relax_n = int(_as_int(cfg.get("intraday_aggressive_exit_score_relax", 2), 2))
+                                        need_aggr = int(max(2, int(need0) - int(max(0, relax_n))))
+                                        if int(score0) >= int(need_aggr):
+                                            hit0 = True
+                                            note0 = f"{str(note0)} | 인트라데이 가속청산({open_hours:.1f}h)"
+                                    except Exception:
+                                        pass
                                 if bool(hit0):
                                     signal_take_hit = True
                                     signal_take_score = int(score0)
@@ -18573,12 +18702,12 @@ def telegram_thread(ex):
 
                         if ai_exit_only:
                             do_stop = bool(roi_stop_hit)
-                            do_take = bool(ai_targets_ready and (float(roi) >= float(tp))) or bool(signal_take_hit)
+                            do_take = bool(ai_targets_ready and (float(roi) >= float(tp))) or bool(signal_take_hit) or bool(time_force_close_hit)
                             sl_from_ai = True
                             tp_from_ai = True
                         else:
                             do_stop = bool(hit_sl_by_price) or bool(roi_stop_confirmed)
-                            do_take = hit_tp_by_price or hard_take or (roi >= tp) or bool(signal_take_hit)
+                            do_take = hit_tp_by_price or hard_take or (roi >= tp) or bool(signal_take_hit) or bool(time_force_close_hit)
 
                         # 손절
                         if do_stop:
@@ -20352,7 +20481,7 @@ def telegram_thread(ex):
                                     adx15 = float(tf15.get("adx", 0.0) or 0.0)
                                     if br or adx15 >= 18:
                                         dyn_call = True
-                                        dyn_reason = "15m/1h 브레이크아웃/변동성 확장"
+                                        dyn_reason = "15m/30m 브레이크아웃/변동성 확장"
                                 else:
                                     tf4 = (mtf_context.get("timeframes", {}) or {}).get("4h", {})
                                     tfd = (mtf_context.get("timeframes", {}) or {}).get("1d", {})
@@ -20856,6 +20985,7 @@ def telegram_thread(ex):
                         min_conf_strict = int(rule.get("min_conf", 0) or 0)
                         min_conf_soft = int(min_conf_strict)
                         min_conf_effective = int(min_conf_strict)
+                        min_conf_gate = int(min_conf_strict)
                         is_soft_entry = False
                         try:
                             if decision in ["buy", "sell"] and bool(cfg.get("soft_entry_enable", True)):
@@ -20882,14 +21012,31 @@ def telegram_thread(ex):
                             cs["entry_relax_conf_bonus"] = float(relax_conf_bonus)
                         except Exception:
                             pass
+                        try:
+                            pre_style_hint = normalize_style_name(cs.get("chart_style_hint", dynamic_style_info.get("style", "스캘핑")))
+                        except Exception:
+                            pre_style_hint = "스캘핑"
+                        try:
+                            if pre_style_hint in ["스캘핑", "단타"]:
+                                min_scalp_day = int(cfg.get("intra_day_scalp_day_min_conf", 60) or 60)
+                                min_conf_gate = int(min(int(min_conf_effective), int(max(0, min_scalp_day))))
+                            else:
+                                min_conf_gate = int(min_conf_effective)
+                        except Exception:
+                            min_conf_gate = int(min_conf_effective)
+                        try:
+                            cs["min_conf_gate"] = int(min_conf_gate)
+                            cs["min_conf_gate_style_hint"] = str(pre_style_hint)
+                        except Exception:
+                            pass
 
                         # ✅ buy/sell인데 확신도가 낮아 진입을 못 하면, 스킵 사유를 남겨 원인 파악을 쉽게 한다.
                         try:
-                            if decision in ["buy", "sell"] and int(conf) < int(min_conf_effective):
-                                if int(min_conf_effective) != int(min_conf_soft):
-                                    cs["skip_reason"] = f"확신도 부족({int(conf)}% < {int(min_conf_effective)}%, 완화적용)"
+                            if decision in ["buy", "sell"] and int(conf) < int(min_conf_gate):
+                                if int(min_conf_gate) != int(min_conf_soft):
+                                    cs["skip_reason"] = f"확신도 부족({int(conf)}% < {int(min_conf_gate)}%, 완화적용)"
                                 else:
-                                    cs["skip_reason"] = f"확신도 부족({int(conf)}% < {int(min_conf_effective)}%)"
+                                    cs["skip_reason"] = f"확신도 부족({int(conf)}% < {int(min_conf_gate)}%)"
                                 mon_add_scan(
                                     mon,
                                     stage="trade_skipped",
@@ -20902,13 +21049,14 @@ def telegram_thread(ex):
                                         "min_conf_strict": int(min_conf_strict),
                                         "min_conf_soft": int(min_conf_soft),
                                         "min_conf_effective": int(min_conf_effective),
+                                        "min_conf_gate": int(min_conf_gate),
                                         "relax_conf_bonus": float(relax_conf_bonus),
                                     },
                                 )
                         except Exception:
                             pass
 
-                        if decision in ["buy", "sell"] and conf >= int(min_conf_effective):
+                        if decision in ["buy", "sell"] and conf >= int(min_conf_gate):
                             is_soft_entry = bool(int(conf) < int(min_conf_strict))
                             # ✅ 강제스캔(scan_only) 또는 auto_trade OFF/정지/주말이면 신규진입 금지
                             if (not entry_allowed_global) or (forced_ai and force_scan_only):
@@ -20938,8 +21086,16 @@ def telegram_thread(ex):
                                 continue
                             # ✅ 포지션 제한: 총 포지션 수 / 낮은 확신 포지션 수
                             try:
-                                if len(active_syms) >= max(1, int(max_pos_total)):
-                                    cs["skip_reason"] = f"포지션 제한({len(active_syms)}/{int(max_pos_total)})"
+                                max_pos_total_eff = int(max_pos_total)
+                                try:
+                                    hint_style = normalize_style_name(cs.get("chart_style_hint", dynamic_style_info.get("style", "스캘핑")))
+                                    if hint_style in ["스캘핑", "단타"]:
+                                        intraday_cap = int(cfg.get("max_open_positions_intraday", max_pos_total_eff) or max_pos_total_eff)
+                                        max_pos_total_eff = int(max(max_pos_total_eff, intraday_cap))
+                                except Exception:
+                                    max_pos_total_eff = int(max_pos_total)
+                                if len(active_syms) >= max(1, int(max_pos_total_eff)):
+                                    cs["skip_reason"] = f"포지션 제한({len(active_syms)}/{int(max_pos_total_eff)})"
                                     mon_add_scan(
                                         mon,
                                         stage="trade_skipped",
@@ -20948,7 +21104,7 @@ def telegram_thread(ex):
                                         signal=str(decision),
                                         score=conf,
                                         message="max_open_positions_total",
-                                        extra={"active": len(active_syms), "max": int(max_pos_total)},
+                                        extra={"active": len(active_syms), "max": int(max_pos_total_eff)},
                                     )
                                     continue
                             except Exception:
@@ -21008,6 +21164,64 @@ def telegram_thread(ex):
                                 cs["style_reco"] = "스윙"
                                 cs["style_confidence"] = 100
                                 cs["style_reason"] = "레짐 강제: swing"
+
+                            # ✅ 인트라데이 우선: 메가추세(ADX>=30)가 아니면 스윙보다 스캘핑/단타 우선
+                            try:
+                                adx_anchor = 0.0
+                                tfm0 = (mtf_context.get("timeframes", {}) if isinstance(mtf_context, dict) else {}) or {}
+                                adx_15 = float(_as_float(((tfm0.get("15m", {}) or {}).get("adx", 0.0)), 0.0))
+                                adx_1h = float(_as_float(((tfm0.get("1h", {}) or {}).get("adx", 0.0)), 0.0))
+                                adx_anchor = float(max(adx_15, adx_1h))
+                                mega_adx = float(cfg.get("intra_day_mega_trend_adx", 30.0) or 30.0)
+                                if (
+                                    str(regime_mode) == "auto"
+                                    and str(style) == "스윙"
+                                    and float(adx_anchor) < float(mega_adx)
+                                ):
+                                    dyn_st = normalize_style_name(dynamic_style_info.get("style", "단타"))
+                                    style = dyn_st if dyn_st in ["스캘핑", "단타"] else "단타"
+                                    cs["style_reco"] = style
+                                    cs["style_reason"] = f"ADX {adx_anchor:.1f}<{mega_adx:.1f} (메가추세 아님) → 인트라데이 우선"
+                            except Exception:
+                                pass
+
+                            # ✅ 인트라데이(스캘핑/단타) 확신도 하한: 60%
+                            try:
+                                style_conf_gate = int(min_conf_gate)
+                                if str(style) in ["스캘핑", "단타"]:
+                                    style_floor = int(cfg.get("intra_day_scalp_day_min_conf", 60) or 60)
+                                    style_conf_gate = int(min(int(min_conf_gate), max(0, int(style_floor))))
+                                if int(conf) < int(style_conf_gate):
+                                    cs["skip_reason"] = f"확신도 부족({int(conf)}% < {int(style_conf_gate)}%, 스타일={style})"
+                                    mon_add_scan(
+                                        mon,
+                                        stage="trade_skipped",
+                                        symbol=sym,
+                                        tf=str(cfg.get("timeframe", "5m")),
+                                        signal=str(decision),
+                                        score=int(conf),
+                                        message="style_min_conf_gate",
+                                        extra={"style": str(style), "gate": int(style_conf_gate), "conf": int(conf)},
+                                    )
+                                    continue
+                            except Exception:
+                                pass
+
+                            # ✅ 인트라데이 진입 1차 필터: 이치모쿠 구름 방향
+                            # - 롱: below_cloud 금지 / 숏: above_cloud 금지
+                            try:
+                                ichi_pos = str(stt.get("ICHI_PRICE_CLOUD", "") or "").strip().lower()
+                                if str(style) in ["스캘핑", "단타"]:
+                                    if (str(decision) == "buy") and (ichi_pos == "below_cloud"):
+                                        cs["skip_reason"] = "이치모쿠 구름 역방향(롱 차단)"
+                                        mon_add_scan(mon, stage="trade_skipped", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=int(conf), message="ichimoku_primary_filter")
+                                        continue
+                                    if (str(decision) == "sell") and (ichi_pos == "above_cloud"):
+                                        cs["skip_reason"] = "이치모쿠 구름 역방향(숏 차단)"
+                                        mon_add_scan(mon, stage="trade_skipped", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=int(conf), message="ichimoku_primary_filter")
+                                        continue
+                            except Exception:
+                                pass
 
                             # ✅ 추세 필터 정책(기존 "금지" 기능 유지 + 새로운 "허용-스캘핑" 추가)
                             if cfg.get("trend_filter_enabled", True) and cfg.get("trend_filter_policy", "ALLOW_SCALP") == "STRICT":
@@ -22855,7 +23069,11 @@ def telegram_thread(ex):
 
             monitor_write_throttled(mon, 2.0)
             backoff_sec = 1.0
-            time.sleep(0.8)
+            try:
+                loop_sleep = float(cfg.get("scan_loop_sleep_sec", 0.8) or 0.8)
+            except Exception:
+                loop_sleep = 0.8
+            time.sleep(float(clamp(loop_sleep, 0.25, 2.0)))
 
         except Exception as e:
             # 스레드가 죽지 않도록 backoff
