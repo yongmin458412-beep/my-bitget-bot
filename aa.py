@@ -602,9 +602,9 @@ MODE_RULES = {
     "공격모드": {"min_conf": 75, "entry_pct_min": 7, "entry_pct_max": 22, "lev_min": 4, "lev_max": 12},
     "하이리스크/하이리턴": {"min_conf": 72, "entry_pct_min": 18, "entry_pct_max": 40, "lev_min": 12, "lev_max": 25},
     # Streamlit Cloud 단일 스크립트 운용에서도 선택 가능하도록 스타일 모드를 MODE_RULES에 추가(기존 구조 유지)
-    "스캘핑": {"min_conf": 60, "entry_pct_min": 3, "entry_pct_max": 18, "lev_min": 10, "lev_max": 30, "tp_roi_cap": 3.0},
-    "단타": {"min_conf": 60, "entry_pct_min": 5, "entry_pct_max": 22, "lev_min": 5, "lev_max": 10, "tp_roi_cap": 15.0},
-    "스윙": {"min_conf": 74, "entry_pct_min": 6, "entry_pct_max": 24, "lev_min": 1, "lev_max": 5, "tp_roi_min": 10.0, "tp_roi_cap": 50.0},
+    "스캘핑": {"min_conf": 58, "entry_pct_min": 3, "entry_pct_max": 18, "lev_min": 10, "lev_max": 30, "tp_roi_cap": 3.0},
+    "단타": {"min_conf": 70, "entry_pct_min": 5, "entry_pct_max": 22, "lev_min": 5, "lev_max": 10, "tp_roi_cap": 15.0},
+    "스윙": {"min_conf": 70, "entry_pct_min": 6, "entry_pct_max": 24, "lev_min": 1, "lev_max": 5, "tp_roi_min": 10.0, "tp_roi_cap": 50.0},
 }
 
 # =========================================================
@@ -614,7 +614,7 @@ MODE_RULES = {
 # =========================================================
 STYLE_RULES = {
     "스캘핑": {
-        "min_conf": 60,
+        "min_conf": 58,
         "entry_pct_min": 3,
         "entry_pct_max": 18,
         "lev_min": 10,
@@ -632,7 +632,7 @@ STYLE_RULES = {
         "preferred_tfs": ["1m", "5m"],
     },
     "단타": {
-        "min_conf": 60,
+        "min_conf": 70,
         "entry_pct_min": 5,
         "entry_pct_max": 22,
         "lev_min": 5,
@@ -648,7 +648,7 @@ STYLE_RULES = {
         "preferred_tfs": ["15m", "30m"],
     },
     "스윙": {
-        "min_conf": 74,
+        "min_conf": 70,
         "entry_pct_min": 6,
         "entry_pct_max": 24,
         "lev_min": 1,
@@ -778,7 +778,7 @@ def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) ->
 def default_settings() -> Dict[str, Any]:
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 22,
+        "settings_schema_version": 23,
         "openai_api_key": "",
         "openai_model_trade": "gpt-4o-mini",
         "openai_model_style": "gpt-4o-mini",
@@ -1019,8 +1019,15 @@ def default_settings() -> Dict[str, Any]:
         "intraday_force_close_hours": 23.0,
         "intraday_aggressive_exit_score_relax": 2,
         # ✅ 인트라데이 활성화 파라미터
-        "intra_day_scalp_day_min_conf": 60,
+        "intra_day_scalp_day_min_conf": 58,
+        "intra_day_scalp_min_conf": 58,
+        "intra_day_day_min_conf": 70,
+        "intra_day_swing_min_conf": 70,
         "intra_day_mega_trend_adx": 30.0,
+        # ✅ 스캘핑 공격 진입(지표 수렴 강할 때 conf 완화)
+        "scalp_force_entry_min_indicators": 5,
+        "scalp_force_entry_conf_relax": 8,
+        "aggressive_no_position_scalp_bias": True,
         # 메인 루프 주기(초): 짧을수록 빠르게 반응
         "scan_loop_sleep_sec": 0.5,
 
@@ -2122,6 +2129,35 @@ def load_settings() -> Dict[str, Any]:
             try:
                 if int(cfg.get("max_open_positions_low_conf", 0) or 0) == 2:
                     cfg["max_open_positions_low_conf"] = 3
+                    changed = True
+            except Exception:
+                pass
+        # v23: 공격 스캘핑(진입장벽 완화) + 단타/스윙 보수 게이트(70) + 수렴 강제진입 키 추가
+        if saved_ver < 23:
+            for k, v in {
+                "intra_day_scalp_day_min_conf": 58,
+                "intra_day_scalp_min_conf": 58,
+                "intra_day_day_min_conf": 70,
+                "intra_day_swing_min_conf": 70,
+                "scalp_force_entry_min_indicators": 5,
+                "scalp_force_entry_conf_relax": 8,
+                "aggressive_no_position_scalp_bias": True,
+            }.items():
+                try:
+                    if k not in saved:
+                        cfg[k] = v
+                        changed = True
+                except Exception:
+                    pass
+            try:
+                if int(cfg.get("intra_day_scalp_day_min_conf", 60) or 60) >= 60:
+                    cfg["intra_day_scalp_day_min_conf"] = 58
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if float(cfg.get("scan_loop_sleep_sec", 1.0) or 1.0) > 0.5:
+                    cfg["scan_loop_sleep_sec"] = 0.5
                     changed = True
             except Exception:
                 pass
@@ -10179,6 +10215,92 @@ def _trend_dir_from_text(txt: str) -> int:
     return 0
 
 
+def super_indicator_alignment(status: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    스캘핑 강제진입용 "슈퍼지표 수렴" 요약.
+    - buy/sell 어느 쪽 지표가 더 많이 정렬됐는지 계산
+    """
+    out = {
+        "buy_count": 0,
+        "sell_count": 0,
+        "max_count": 0,
+        "direction": "hold",
+        "buy_indicators": [],
+        "sell_indicators": [],
+    }
+    try:
+        st = status or {}
+
+        def _mark(name: str, side: str) -> None:
+            if side == "buy":
+                out["buy_count"] = int(out["buy_count"]) + 1
+                out["buy_indicators"].append(str(name))
+            elif side == "sell":
+                out["sell_count"] = int(out["sell_count"]) + 1
+                out["sell_indicators"].append(str(name))
+
+        ichi_pos = str(st.get("ICHI_PRICE_CLOUD", "") or "").strip().lower()
+        if ichi_pos == "above_cloud":
+            _mark("ICHI", "buy")
+        elif ichi_pos == "below_cloud":
+            _mark("ICHI", "sell")
+
+        psar_txt = str(st.get("PSAR", "") or "")
+        if ("상승" in psar_txt) or ("🟢" in psar_txt):
+            _mark("PSAR", "buy")
+        elif ("하락" in psar_txt) or ("🔴" in psar_txt):
+            _mark("PSAR", "sell")
+
+        vwap_txt = str(st.get("VWAP", "") or "")
+        if "위" in vwap_txt:
+            _mark("VWAP", "buy")
+        elif "아래" in vwap_txt:
+            _mark("VWAP", "sell")
+
+        cmf_txt = str(st.get("CMF", "") or "")
+        if "유입" in cmf_txt:
+            _mark("CMF", "buy")
+        elif "유출" in cmf_txt:
+            _mark("CMF", "sell")
+
+        obv_txt = str(st.get("OBV", "") or "")
+        if "매수" in obv_txt:
+            _mark("OBV", "buy")
+        elif "매도" in obv_txt:
+            _mark("OBV", "sell")
+
+        vwma_txt = str(st.get("VWMA", "") or "")
+        if "위" in vwma_txt:
+            _mark("VWMA", "buy")
+        elif "아래" in vwma_txt:
+            _mark("VWMA", "sell")
+
+        macd_txt = str(st.get("MACD", "") or "")
+        if "골든" in macd_txt:
+            _mark("MACD", "buy")
+        elif "데드" in macd_txt:
+            _mark("MACD", "sell")
+
+        trend_txt = str(st.get("추세", "") or "")
+        if "상승" in trend_txt:
+            _mark("추세", "buy")
+        elif "하락" in trend_txt:
+            _mark("추세", "sell")
+
+        buy_cnt = int(out["buy_count"])
+        sell_cnt = int(out["sell_count"])
+        out["max_count"] = int(max(buy_cnt, sell_cnt))
+        if buy_cnt >= (sell_cnt + 2):
+            out["direction"] = "buy"
+        elif sell_cnt >= (buy_cnt + 2):
+            out["direction"] = "sell"
+        else:
+            out["direction"] = "hold"
+        return out
+    except Exception:
+        return out
+
+
 def build_full_spectrum_context(
     ex,
     symbol: str,
@@ -11916,11 +12038,14 @@ def ai_decide_trade(
 						   - 스캘핑: 1m/5m, SQZ·VWAP·OBV·캔들패턴 가중치↑, 장기지표 영향↓
 						   - 단타: 15m/30m, 추세+모멘텀 균형, 다이버전스 확인
 						   - 스윙: 1h, Ichimoku·ADX·하모닉·MTF 패턴 가중치↑
-					9) 모드 규칙 반드시 준수:
-					   - 최소 확신도: {rule["min_conf"]}
-					   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
-					   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
-				{soft_entry_hint}
+						9) 모드 규칙 반드시 준수:
+						   - 최소 확신도: {rule["min_conf"]}
+						   - 진입 비중(%): {rule["entry_pct_min"]}~{rule["entry_pct_max"]}
+						   - 레버리지: {rule["lev_min"]}~{rule["lev_max"]}
+                        10) 스타일별 진입 확신도 기준:
+                           - 스캘핑: 55~60%도 허용(지표 수렴 강하면 적극 진입)
+                           - 단타/스윙: 70% 이상에서만 진입
+					{soft_entry_hint}
 
 		[중요]
 		- 반드시 decision_tf를 선택해서 출력해라.
@@ -12082,6 +12207,11 @@ JSON 형식:
             tf_need = str(out.get("decision_tf", "") or "").strip()
             if tf_need and (f"on {tf_need}" not in reason_txt):
                 reason_txt = f"{reason_txt} on {tf_need}".strip()
+            if str(out.get("decision", "hold")) in ["buy", "sell"]:
+                tf_to_kr = {"1m": "1분봉", "5m": "5분봉", "15m": "15분봉", "30m": "30분봉", "1h": "1시간봉"}
+                tf_kr = tf_to_kr.get(str(tf_need or out.get("decision_tf", "")).strip(), str(tf_need or out.get("decision_tf", "")))
+                if "기준 지표 수렴 확인으로 진입했습니다" not in reason_txt:
+                    reason_txt = f"{reason_txt} | {tf_kr} 기준 지표 수렴 확인으로 진입했습니다."
         except Exception:
             pass
         out["reason_easy"] = reason_txt[:500]
@@ -20072,6 +20202,23 @@ def telegram_thread(ex):
                             ob_raw = safe_fetch_order_book(ex, sym, limit=20)
                             orderbook_context = orderbook_pressure_summary(ob_raw, depth=20)
                             dynamic_style_info = choose_dynamic_style(mtf_context, orderbook_context)
+                            try:
+                                # 무포지션 상태에서는 관망을 줄이고 스캘핑/단타 기회를 더 적극 탐색
+                                if (not active_syms) and bool(cfg.get("aggressive_no_position_scalp_bias", True)):
+                                    tfm_tmp = (mtf_context.get("timeframes", {}) if isinstance(mtf_context, dict) else {}) or {}
+                                    adx_anchor = float(
+                                        max(
+                                            _as_float(((tfm_tmp.get("15m", {}) or {}).get("adx", 0.0), 0.0)),
+                                            _as_float(((tfm_tmp.get("1h", {}) or {}).get("adx", 0.0), 0.0)),
+                                        )
+                                    )
+                                    mega_adx = float(cfg.get("intra_day_mega_trend_adx", 30.0) or 30.0)
+                                    if str(dynamic_style_info.get("style", "스캘핑")) == "스윙" and adx_anchor < mega_adx:
+                                        dynamic_style_info["style"] = "스캘핑"
+                                        dynamic_style_info["market_regime"] = "intraday"
+                                        dynamic_style_info["reason"] = f"무포지션 공격 스캔: ADX {adx_anchor:.1f}<{mega_adx:.1f} → 스캘핑 우선"
+                            except Exception:
+                                pass
 
                             cs["mtf_context"] = mtf_context
                             cs["orderbook_pressure"] = orderbook_context
@@ -20086,6 +20233,12 @@ def telegram_thread(ex):
                             stt["_dynamic_style"] = str(dynamic_style_info.get("style", "스캘핑"))
                             stt["_dynamic_style_reason"] = str(dynamic_style_info.get("reason", ""))
                             stt["_market_regime"] = str(dynamic_style_info.get("market_regime", ""))
+                            align_info = super_indicator_alignment(stt)
+                            stt["_super_align"] = dict(align_info)
+                            cs["super_align_dir"] = str(align_info.get("direction", "hold"))
+                            cs["super_align_buy"] = int(align_info.get("buy_count", 0) or 0)
+                            cs["super_align_sell"] = int(align_info.get("sell_count", 0) or 0)
+                            cs["super_align_max"] = int(align_info.get("max_count", 0) or 0)
                             mon_add_scan(
                                 mon,
                                 stage="full_spectrum",
@@ -20110,6 +20263,10 @@ def telegram_thread(ex):
                         event_override = False
                         event_force_ai = False
                         forced_ai = False
+                        align_info = stt.get("_super_align", {}) if isinstance(stt.get("_super_align", {}), dict) else {}
+                        align_max = int(_as_int((align_info or {}).get("max_count", 0), 0))
+                        align_dir = str((align_info or {}).get("direction", "hold") or "hold")
+                        no_pos_aggressive = bool((not active_syms) and bool(cfg.get("aggressive_no_position_scalp_bias", True)))
                         try:
                             sig_pullback = bool(stt.get("_pullback_candidate", False))
                             sig_rsi_resolve = bool(stt.get("_rsi_resolve_long", False)) or bool(stt.get("_rsi_resolve_short", False))
@@ -20221,6 +20378,9 @@ def telegram_thread(ex):
                                     call_ai = True
                                 # 추세 신호 단독으로도 AI 호출 허용(하이리스크 기회 포착)
                                 elif (("상승" in trend_txt) or ("하락" in trend_txt)) and adxv >= max(float(trend_min_adx), adx_th - 8.0):
+                                    call_ai = True
+                                # 무포지션일 때는 슈퍼지표 수렴(4+)이면 적극 호출
+                                elif no_pos_aggressive and int(align_max) >= 4:
                                     call_ai = True
                         except Exception:
                             call_ai = False
@@ -20419,7 +20579,7 @@ def telegram_thread(ex):
                                 pass
                         # ✅ 비용 절감 strict: 약한 조건에서는 AI 호출 자체를 스킵
                         try:
-                            if call_ai and (not forced_ai) and (not event_override) and bool(cfg.get("ai_cost_saver_strict", True)):
+                            if call_ai and (not forced_ai) and (not event_override) and bool(cfg.get("ai_cost_saver_strict", True)) and (not (no_pos_aggressive and int(align_max) >= 4)):
                                 ml_votes_now = int(ml.get("votes_max", 0) or 0)
                                 need_votes_now = max(2, int(cfg.get("entry_convergence_min_votes", 2) or 2))
                                 strong_sig_now = bool(stt.get("_pullback_candidate", False)) or bool(stt.get("_rsi_resolve_long", False)) or bool(stt.get("_rsi_resolve_short", False))
@@ -21017,22 +21177,46 @@ def telegram_thread(ex):
                         except Exception:
                             pre_style_hint = "스캘핑"
                         try:
-                            if pre_style_hint in ["스캘핑", "단타"]:
-                                min_scalp_day = int(cfg.get("intra_day_scalp_day_min_conf", 60) or 60)
-                                min_conf_gate = int(min(int(min_conf_effective), int(max(0, min_scalp_day))))
+                            if pre_style_hint == "스캘핑":
+                                min_scalp = int(cfg.get("intra_day_scalp_min_conf", cfg.get("intra_day_scalp_day_min_conf", 58)) or 58)
+                                min_conf_gate = int(min(int(min_conf_effective), int(max(0, min_scalp))))
+                            elif pre_style_hint == "단타":
+                                min_day = int(cfg.get("intra_day_day_min_conf", 70) or 70)
+                                min_conf_gate = int(max(int(min_conf_effective), int(max(0, min_day))))
+                            elif pre_style_hint == "스윙":
+                                min_swing = int(cfg.get("intra_day_swing_min_conf", 70) or 70)
+                                min_conf_gate = int(max(int(min_conf_effective), int(max(0, min_swing))))
                             else:
                                 min_conf_gate = int(min_conf_effective)
                         except Exception:
                             min_conf_gate = int(min_conf_effective)
+                        scalp_force_entry_pre = False
+                        scalp_force_gate_pre = int(min_conf_gate)
+                        try:
+                            force_need = int(cfg.get("scalp_force_entry_min_indicators", 5) or 5)
+                            force_relax = int(cfg.get("scalp_force_entry_conf_relax", 8) or 8)
+                            if (
+                                decision in ["buy", "sell"]
+                                and pre_style_hint == "스캘핑"
+                                and str(align_dir) == str(decision)
+                                and int(align_max) >= int(max(1, force_need))
+                            ):
+                                scalp_force_gate_pre = int(max(0, int(min_conf_gate) - int(max(0, force_relax))))
+                                if int(conf) >= int(scalp_force_gate_pre):
+                                    scalp_force_entry_pre = True
+                        except Exception:
+                            scalp_force_entry_pre = False
                         try:
                             cs["min_conf_gate"] = int(min_conf_gate)
                             cs["min_conf_gate_style_hint"] = str(pre_style_hint)
+                            cs["scalp_force_entry_pre"] = bool(scalp_force_entry_pre)
+                            cs["scalp_force_gate_pre"] = int(scalp_force_gate_pre)
                         except Exception:
                             pass
 
                         # ✅ buy/sell인데 확신도가 낮아 진입을 못 하면, 스킵 사유를 남겨 원인 파악을 쉽게 한다.
                         try:
-                            if decision in ["buy", "sell"] and int(conf) < int(min_conf_gate):
+                            if decision in ["buy", "sell"] and int(conf) < int(min_conf_gate) and (not bool(scalp_force_entry_pre)):
                                 if int(min_conf_gate) != int(min_conf_soft):
                                     cs["skip_reason"] = f"확신도 부족({int(conf)}% < {int(min_conf_gate)}%, 완화적용)"
                                 else:
@@ -21056,7 +21240,7 @@ def telegram_thread(ex):
                         except Exception:
                             pass
 
-                        if decision in ["buy", "sell"] and conf >= int(min_conf_gate):
+                        if decision in ["buy", "sell"] and (int(conf) >= int(min_conf_gate) or bool(scalp_force_entry_pre)):
                             is_soft_entry = bool(int(conf) < int(min_conf_strict))
                             # ✅ 강제스캔(scan_only) 또는 auto_trade OFF/정지/주말이면 신규진입 금지
                             if (not entry_allowed_global) or (forced_ai and force_scan_only):
@@ -21185,13 +21369,41 @@ def telegram_thread(ex):
                             except Exception:
                                 pass
 
-                            # ✅ 인트라데이(스캘핑/단타) 확신도 하한: 60%
+                            # ✅ 스타일별 확신도 게이트
+                            # - 스캘핑: 55~60 허용(공격적)
+                            # - 단타/스윙: 70 이상(보수적)
                             try:
                                 style_conf_gate = int(min_conf_gate)
-                                if str(style) in ["스캘핑", "단타"]:
-                                    style_floor = int(cfg.get("intra_day_scalp_day_min_conf", 60) or 60)
+                                style0 = str(style)
+                                if style0 == "스캘핑":
+                                    style_floor = int(cfg.get("intra_day_scalp_min_conf", cfg.get("intra_day_scalp_day_min_conf", 58)) or 58)
                                     style_conf_gate = int(min(int(min_conf_gate), max(0, int(style_floor))))
-                                if int(conf) < int(style_conf_gate):
+                                elif style0 == "단타":
+                                    style_floor = int(cfg.get("intra_day_day_min_conf", 70) or 70)
+                                    style_conf_gate = int(max(int(min_conf_gate), max(0, int(style_floor))))
+                                elif style0 == "스윙":
+                                    style_floor = int(cfg.get("intra_day_swing_min_conf", 70) or 70)
+                                    style_conf_gate = int(max(int(min_conf_gate), max(0, int(style_floor))))
+
+                                scalp_force_entry_final = False
+                                scalp_force_gate_final = int(style_conf_gate)
+                                if style0 == "스캘핑":
+                                    force_need = int(cfg.get("scalp_force_entry_min_indicators", 5) or 5)
+                                    force_relax = int(cfg.get("scalp_force_entry_conf_relax", 8) or 8)
+                                    if (
+                                        str(decision) in ["buy", "sell"]
+                                        and str(align_dir) == str(decision)
+                                        and int(align_max) >= int(max(1, force_need))
+                                    ):
+                                        scalp_force_gate_final = int(max(0, int(style_conf_gate) - int(max(0, force_relax))))
+                                        if int(conf) >= int(scalp_force_gate_final):
+                                            scalp_force_entry_final = True
+                                            cs["force_entry_reason"] = f"슈퍼지표 수렴 {int(align_max)}개({str(decision).upper()})"
+
+                                cs["style_conf_gate"] = int(style_conf_gate)
+                                cs["scalp_force_entry_final"] = bool(scalp_force_entry_final)
+                                cs["scalp_force_gate_final"] = int(scalp_force_gate_final)
+                                if int(conf) < int(style_conf_gate) and (not bool(scalp_force_entry_final)):
                                     cs["skip_reason"] = f"확신도 부족({int(conf)}% < {int(style_conf_gate)}%, 스타일={style})"
                                     mon_add_scan(
                                         mon,
@@ -21523,22 +21735,17 @@ def telegram_thread(ex):
                                 entry_risk_mul = entry_risk_mul
                             entry_usdt = free_usdt * (entry_pct / 100.0) * entry_risk_mul
 
-                            # ✅ (요구) 하이리스크/하이리턴 모드에서만: 총자산 20% 진입 + 레버 20x 고정
-                            # - 스캘핑/스윙 스타일 캡보다 우선(사용자 요구)
+                            # ✅ (요구) 하이리스크/하이리턴 모드: 모든 스타일 총자산 20% + 레버 20x 고정
                             try:
-                                if str(mode) == "하이리스크/하이리턴" and bool(cfg.get("highrisk_fixed_size_enable", True)):
-                                    lev_fix = int(cfg.get("highrisk_fixed_leverage", 20) or 20)
-                                    if highrisk_swing_fixed:
-                                        lev_fix = 20
+                                if str(mode) == "하이리스크/하이리턴":
+                                    lev_fix = 20
                                     lev_fix = int(clamp(lev_fix, 1, 125))
                                     lev = int(lev_fix)
                                     ai2["leverage"] = int(lev)
-                                    ai2["leverage_source"] = "HIGHRISK_FIXED"
-                                    lev_src = "HIGHRISK_FIXED"
+                                    ai2["leverage_source"] = "HIGHRISK_FORCED"
+                                    lev_src = "HIGHRISK_FORCED"
 
-                                    pct_total = float(cfg.get("highrisk_fixed_entry_pct_total", 20.0) or 20.0)
-                                    if highrisk_swing_fixed:
-                                        pct_total = 20.0
+                                    pct_total = 20.0
                                     pct_total = float(clamp(pct_total, 0.5, 95.0))
                                     try:
                                         # ✅ 일반 스윙에서만 FNG 진입비중 보정
