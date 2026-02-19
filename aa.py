@@ -952,7 +952,10 @@ def default_settings() -> Dict[str, Any]:
         "pattern_gate_strength": 0.65,
         "pattern_override_ai": True,
         "pattern_divergence_enable": True,
-        "pattern_harmonic_enable": True,
+        "pattern_harmonic_enable": True,        # Gartley / Bat / ✅ Butterfly 포함
+        "pattern_fibonacci_enable": True,        # ✅ Fibonacci 되돌림 레벨 탐지 (신규)
+        "pattern_fibonacci_lookback": 60,        # 피보나치 기준 최근 N봉 고점/저점
+        "pattern_fibonacci_tol_pct": 0.015,      # 레벨 근접 허용 범위 (range의 1.5%)
         "pattern_candle_enable": True,
         # ✅ 멀티 타임프레임 캔들패턴(요구)
         # - 1m/3m/5m/15m/30m/1h/2h/4h를 함께 보고 패턴 bias를 합산
@@ -1017,7 +1020,7 @@ def default_settings() -> Dict[str, Any]:
         # - 23시간 경과: 손익과 무관하게 시장가 정리.
         "intraday_force_close_enable": True,
         "intraday_aggressive_exit_hours": 20.0,
-        "intraday_force_close_hours": 23.0,
+        "intraday_force_close_hours": 23.5,     # ✅ 23시간 → 23.5시간(23:30) 강제청산: 복리/오버나잇 방지
         "intraday_aggressive_exit_score_relax": 2,
         # ✅ 인트라데이 활성화 파라미터
         "intra_day_scalp_day_min_conf": 58,
@@ -1341,19 +1344,27 @@ def default_settings() -> Dict[str, Any]:
         "swing_entry_pct_mult": 1.0,
         "swing_lev_cap": 25,
 
-        # ✅ 스윙: 부분익절/순환매도(옵션)
+        # ✅ 스윙 순환매(Cycle Trading): 1차 50% 익절 ROI+15%, 2차 트레일링/저항
         "swing_partial_tp_enable": True,
-        # TP(목표익절)의 비율로 단계 실행(예: TP의 35% 도달 시 1차 부분익절)
-        "swing_partial_tp1_at_tp_frac": 0.35, "swing_partial_tp1_close_pct": 33,
-        "swing_partial_tp2_at_tp_frac": 0.60, "swing_partial_tp2_close_pct": 33,
-        "swing_partial_tp3_at_tp_frac": 0.85, "swing_partial_tp3_close_pct": 34,
-        # ✅ (추가) 부분익절 "청산수량"을 USDT(마진)로 지정(사용자 요구)
-        # - 0이면 기존 % 청산을 사용
-        # - 값이 있으면 해당 USDT(마진)만큼의 포지션을 청산(레버 반영: qty = (usdt*lev)/price)
+        # ─ 1차: ROI +15% 도달 시 포지션 50% 청산 (확정 수익 확보)
+        "swing_partial_tp1_at_tp_frac": 0.0,   # tp_frac 기반 대신 절대 ROI 기준 사용
+        "swing_partial_tp1_roi_abs": 15.0,      # ✅ ROI +15% 도달 시 1차 익절
+        "swing_partial_tp1_close_pct": 50,      # ✅ 50% 청산 (절반 확정)
+        # ─ 2차: 나머지 50%는 트레일링 스탑 또는 주저항 도달까지 보유
+        "swing_partial_tp2_at_tp_frac": 0.85, "swing_partial_tp2_close_pct": 50,
+        "swing_partial_tp3_at_tp_frac": 1.00, "swing_partial_tp3_close_pct": 100,
+        # USDT 기반 청산 (0이면 % 청산 사용)
         "swing_partial_tp1_close_usdt": 0.0,
         "swing_partial_tp2_close_usdt": 0.0,
         "swing_partial_tp3_close_usdt": 0.0,
-
+        # ✅ 스윙 Hard SL: -7% 즉시 전량 청산 (마틴게일/추가진입 금지)
+        "swing_hard_sl_roi": -7.0,              # ✅ -7% ROI 도달 시 100% 즉시 청산
+        "swing_hard_sl_enable": True,           # ✅ Hard SL 활성화
+        # ✅ Scale-In: 수익 중 추세 강화 시 최초 진입금의 50% 추가진입 (1회 한정)
+        "swing_scalein_enable": True,           # ✅ Scale-in 활성화
+        "swing_scalein_min_roi": 3.0,           # 최소 ROI +3% 이상일 때만 Scale-in 허용
+        "swing_scalein_size_pct": 50.0,         # 최초 진입금의 50% 추가
+        "swing_scalein_max_count": 1,           # 최대 1회 (마틴게일 방지)
         # ✅ 사용자 요구: 스윙 순환매 기본 ON
         "swing_recycle_enable": True,
         "swing_recycle_cooldown_min": 10,
@@ -9017,13 +9028,43 @@ def detect_advanced_patterns(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str,
                     r_bc = abs(bc / ab)
                     r_cd = abs(cd / bc)
                     r_ad = abs((dv - xv) / xa)
-                    is_gartley = (0.55 <= r_ab <= 0.70) and (0.35 <= r_bc <= 0.92) and (1.10 <= r_cd <= 1.75) and (0.74 <= r_ad <= 0.84)
-                    is_bat = (0.35 <= r_ab <= 0.55) and (0.35 <= r_bc <= 0.92) and (1.55 <= r_cd <= 2.70) and (0.84 <= r_ad <= 0.93)
+                    is_gartley   = (0.55 <= r_ab <= 0.70) and (0.35 <= r_bc <= 0.92) and (1.10 <= r_cd <= 1.75) and (0.74 <= r_ad <= 0.84)
+                    is_bat       = (0.35 <= r_ab <= 0.55) and (0.35 <= r_bc <= 0.92) and (1.55 <= r_cd <= 2.70) and (0.84 <= r_ad <= 0.93)
+                    # ✅ Butterfly 패턴 추가 (XA 되돌림이 0.786, CD가 XA의 1.27~1.618)
+                    is_butterfly = (0.70 <= r_ab <= 0.90) and (0.35 <= r_bc <= 0.92) and (1.60 <= r_cd <= 2.24) and (1.27 <= r_ad <= 1.618)
                     side = 1 if d0[1] == "L" else -1
                     if is_gartley:
                         _add("가틀리 패턴(Gartley)", side, 1.15, "harm")
                     if is_bat:
                         _add("배트 패턴(Bat)", side, 1.05, "harm")
+                    if is_butterfly:
+                        _add("버터플라이 패턴(Butterfly)", side, 1.20, "harm")
+
+        # ✅ Fibonacci 되돌림 레벨 탐지 (최근 N봉 스윙 고점/저점 기준)
+        if bool(cfg.get("pattern_fibonacci_enable", True)) and n >= 30:
+            try:
+                fib_look = min(n, int(cfg.get("pattern_fibonacci_lookback", 60) or 60))
+                h_max = float(np.max(high[-fib_look:]))
+                l_min = float(np.min(low[-fib_look:]))
+                px_now = float(close[-1])
+                fib_range = h_max - l_min
+                if fib_range > 1e-9:
+                    fib_levels = {
+                        "23.6%": l_min + fib_range * 0.236,
+                        "38.2%": l_min + fib_range * 0.382,
+                        "50.0%": l_min + fib_range * 0.500,
+                        "61.8%": l_min + fib_range * 0.618,
+                        "78.6%": l_min + fib_range * 0.786,
+                    }
+                    fib_tol = fib_range * float(cfg.get("pattern_fibonacci_tol_pct", 0.015) or 0.015)
+                    for fib_label, fib_price in fib_levels.items():
+                        if abs(px_now - fib_price) <= fib_tol:
+                            # 가격이 레벨에 근접: 상승 되돌림이면 롱, 하락 되돌림이면 숏
+                            fib_side = 1 if px_now < (l_min + fib_range * 0.5) else -1
+                            _add(f"피보나치 되돌림 {fib_label}({fib_price:.4f})", fib_side, 0.80, "fib")
+                            break
+            except Exception:
+                pass
 
         # 3) 캔들 패턴(최근 1~3봉)
         if bool(cfg.get("pattern_candle_enable", True)) and n >= 3:
@@ -12116,6 +12157,8 @@ def ai_decide_trade(
   "{{패턴/셋업}} + {{지표 시그널}} on {{타임프레임}}" 형식
   예) "1m W패턴 + 오더북 매수우위 on 1m/5m"
 - 하이리스크/하이리턴 모드: 추세가 있으면 적극적으로 진입해라. 과도한 hold는 기회 손실이다.
+- 하이리스크/하이리턴 스윙 규칙: 진입금 총자산 20% + 레버 20x 고정. ROI +15%에서 50% 분할익절, 나머지는 트레일링/저항까지 보유. Hard SL은 ROI -7% 즉시 전량 청산. Scale-in은 ROI +3% 이상 추세 강화 시 초기 진입금의 50% 1회 추가 허용.
+- 스윙 순환매: 1차 익절 후 재진입 시 직전 청산 방향과 동일하거나 더 강한 추세 확인 필수.
 - 안전모드: 확신이 애매하면 'hold'를 선택해라. (무리한 진입 금지)
 """
 
@@ -16613,19 +16656,29 @@ def _try_scalp_to_swing_dca(ex, sym: str, side: str, cur_px: float, tgt: Dict[st
 def _swing_partial_tp_levels(tp_roi: float, cfg: Dict[str, Any]) -> List[Tuple[float, float, str]]:
     """
     returns: [(trigger_roi, close_frac, label), ...]
+    ✅ 1차 익절: ROI 절대값(swing_partial_tp1_roi_abs=15%) 기준 50% 청산
+    ✅ 2차 이후: TP 비율(tp_frac) 기준
     """
     try:
-        steps = [
-            (float(cfg.get("swing_partial_tp1_at_tp_frac", 0.35)), float(cfg.get("swing_partial_tp1_close_pct", 33)) / 100.0, "TP1"),
-            (float(cfg.get("swing_partial_tp2_at_tp_frac", 0.60)), float(cfg.get("swing_partial_tp2_close_pct", 33)) / 100.0, "TP2"),
-            (float(cfg.get("swing_partial_tp3_at_tp_frac", 0.85)), float(cfg.get("swing_partial_tp3_close_pct", 34)) / 100.0, "TP3"),
-        ]
         out = []
-        for frac, close_frac, label in steps:
+        # ── 1차: 절대 ROI 기준 (기본 +15% → 50% 청산) ─────────────
+        tp1_abs  = float(cfg.get("swing_partial_tp1_roi_abs", 15.0) or 15.0)
+        tp1_pct  = float(cfg.get("swing_partial_tp1_close_pct", 50) or 50) / 100.0
+        if tp1_abs > 0 and tp1_pct > 0:
+            out.append((float(tp1_abs), float(clamp(tp1_pct, 0.01, 0.95)), "TP1(ROI+15%,50%청산)"))
+
+        # ── 2차/3차: TP 비율 기준 (나머지 50% 관리) ───────────────
+        steps_frac = [
+            (float(cfg.get("swing_partial_tp2_at_tp_frac", 0.85)), float(cfg.get("swing_partial_tp2_close_pct", 50)) / 100.0, "TP2"),
+            (float(cfg.get("swing_partial_tp3_at_tp_frac", 1.00)), float(cfg.get("swing_partial_tp3_close_pct", 100)) / 100.0, "TP3"),
+        ]
+        for frac, close_frac, label in steps_frac:
             if frac <= 0 or close_frac <= 0:
                 continue
-            out.append((max(0.1, tp_roi * frac), float(clamp(close_frac, 0.01, 0.95)), label))
-        # 트리거 기준 오름차순 정렬
+            trig = max(0.1, tp_roi * frac)
+            if trig > tp1_abs:   # 1차보다 높은 레벨만 등록 (중복 방지)
+                out.append((trig, float(clamp(close_frac, 0.01, 1.0)), label))
+
         out.sort(key=lambda x: x[0])
         return out
     except Exception:
@@ -18471,6 +18524,54 @@ def telegram_thread(ex):
                                         except Exception:
                                             pass
 
+                        # ✅ 스윙 Scale-in: 수익 중 추세 강화 시 초기 진입금의 50% 추가 (1회 한정, 손실 중 금지)
+                        try:
+                            scalein_enabled = bool(cfg.get("swing_scalein_enable", True))
+                            scalein_min_roi = float(cfg.get("swing_scalein_min_roi", 3.0) or 3.0)
+                            scalein_size_pct = float(cfg.get("swing_scalein_size_pct", 50.0) or 50.0)
+                            scalein_max = int(cfg.get("swing_scalein_max_count", 1) or 1)
+                            trade_state_si = rt.setdefault("trades", {}).setdefault(sym, {})
+                            scalein_count = int(trade_state_si.get("scalein_count", 0) or 0)
+                            if (
+                                scalein_enabled
+                                and str(style_now) == "스윙"
+                                and float(roi) >= scalein_min_roi        # 수익 중일 때만
+                                and scalein_count < scalein_max          # 최대 1회
+                                and not bool(swing_hard_sl_hit)          # Hard SL 상황에서 금지
+                            ):
+                                # 추세 강화 확인: 단기/장기 추세 동일 방향
+                                stt_si = cs.get("status", {}) if isinstance(cs.get("status"), dict) else {}
+                                trend_si = str(stt_si.get("추세", "") or "")
+                                trend_ok = ("상승" in trend_si and side == "long") or ("하락" in trend_si and side == "short")
+                                if trend_ok:
+                                    free_si, _ = safe_fetch_balance(ex)
+                                    base_entry_si = float(tgt.get("entry_usdt", 0.0) or 0.0)
+                                    add_usdt_si = base_entry_si * (scalein_size_pct / 100.0)
+                                    if add_usdt_si > free_si:
+                                        add_usdt_si = free_si * 0.3
+                                    if add_usdt_si > 5 and cur_px:
+                                        lev_si = int(float(tgt.get("lev", rule["lev_min"])) or rule["lev_min"])
+                                        set_leverage_safe(ex, sym, lev_si)
+                                        qty_si = to_precision_qty(ex, sym, (add_usdt_si * lev_si) / cur_px)
+                                        ok_si = market_order_safe(ex, sym, "buy" if side == "long" else "sell", qty_si)
+                                        if ok_si:
+                                            trade_state_si["scalein_count"] = scalein_count + 1
+                                            save_runtime(rt)
+                                            tg_send(
+                                                f"📈 스윙 Scale-in (추가매수)\n"
+                                                f"- 코인: {sym}\n"
+                                                f"- 포지션: {_tg_dir_easy(side)}\n"
+                                                f"- 추가금액(마진): {add_usdt_si:.2f} USDT\n"
+                                                f"- 현재 ROI: {roi:+.2f}%\n"
+                                                f"- 추세 강화 확인 → 초기진입금의 {scalein_size_pct:.0f}% 추가\n"
+                                                f"- ID: {trade_id or '-'}",
+                                                target=cfg.get("tg_route_events_to", "channel"),
+                                                cfg=cfg,
+                                                silent=bool(cfg.get("tg_notify_entry_exit_only", True)),
+                                            )
+                        except Exception:
+                            pass
+
                         # 스캘핑 전환 청산 모드: 목표를 더 보수적으로(빨리 끝내기)
                         scalp_exit_mode = bool(tgt.get("scalp_exit_mode", False))
                         if scalp_exit_mode:
@@ -18786,17 +18887,31 @@ def telegram_thread(ex):
                                         hard_take = True
                             except Exception:
                                 hard_take = False
+                        # ✅ 스윙 Hard SL: ROI -7% 즉시 전량 청산 (확인 과정 없음, 마틴게일 금지)
+                        swing_hard_sl_hit = False
+                        try:
+                            if (
+                                str(style or "") == "스윙"
+                                and bool(cfg.get("swing_hard_sl_enable", True))
+                                and float(roi) <= float(cfg.get("swing_hard_sl_roi", -7.0))
+                            ):
+                                swing_hard_sl_hit = True
+                                tgt["force_take_reason"] = f"스윙 Hard SL({float(cfg.get('swing_hard_sl_roi',-7.0)):+.1f}%)"
+                                tgt["force_take_detail"] = f"ROI {roi:+.2f}% → Hard SL 즉시 전량 청산"
+                        except Exception:
+                            swing_hard_sl_hit = False
+
                         time_force_close_hit = False
                         if bool(intra_force_close):
                             time_force_close_hit = True
-                            force_take_reason = "시간초과 강제청산(23h)"
-                            force_take_detail = f"보유 {open_hours:.1f}시간 경과"
+                            force_take_reason = "시간초과 강제청산(23:30)"
+                            force_take_detail = f"보유 {open_hours:.1f}시간 경과 → 복리/오버나잇 방지"
                             tgt["force_take_reason"] = force_take_reason
                             tgt["force_take_detail"] = force_take_detail
 
                         # 인트라데이 정책:
                         # - 20시간 경과: 반대 시그널 청산 감도를 높임
-                        # - 23시간 경과: 손익과 무관하게 강제 청산(오버나잇 금지)
+                        # - 23.5시간(23:30) 경과: 손익과 무관하게 강제 청산(오버나잇 금지)
 
                         # ✅ ROI 손절은 "확인 n회"로 한 번 더 생각(휩쏘 방지)
                         roi_stop_hit = bool(ai_targets_ready and (float(roi) <= -abs(float(sl))))
@@ -18874,12 +18989,12 @@ def telegram_thread(ex):
                             snap_now_flex = None
 
                         if ai_exit_only:
-                            do_stop = bool(roi_stop_hit)
+                            do_stop = bool(roi_stop_hit) or bool(swing_hard_sl_hit)
                             do_take = bool(ai_targets_ready and (float(roi) >= float(tp))) or bool(signal_take_hit) or bool(time_force_close_hit)
                             sl_from_ai = True
                             tp_from_ai = True
                         else:
-                            do_stop = bool(hit_sl_by_price) or bool(roi_stop_confirmed)
+                            do_stop = bool(hit_sl_by_price) or bool(roi_stop_confirmed) or bool(swing_hard_sl_hit)
                             do_take = hit_tp_by_price or hard_take or (roi >= tp) or bool(signal_take_hit) or bool(time_force_close_hit)
 
                         # 손절
