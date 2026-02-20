@@ -111,6 +111,9 @@ class BitgetUniverseBuilder:
         max_spread_bps: float,
         ttl_sec: int,
         min_quote_volume: float = 0.0,
+        always_include: Optional[List[str]] = None,
+        use_orderbook_spread: bool = True,
+        orderbook_probe_factor: int = 2,
         force_refresh: bool = False,
     ) -> UniverseResult:
         now = time.time()
@@ -118,7 +121,14 @@ class BitgetUniverseBuilder:
         spread_cap = float(max(0.1, float(max_spread_bps or 20.0)))
         ttl = int(max(15, min(3600, int(ttl_sec or 180))))
         min_qv = float(max(0.0, float(min_quote_volume or 0.0)))
-        cache_key = f"n={n}|spread={spread_cap:.6f}|ttl={ttl}|qv={min_qv:.2f}"
+        probe_factor = int(max(1, min(6, int(orderbook_probe_factor or 2))))
+        always = [str(x or "").strip() for x in (always_include or []) if str(x or "").strip()]
+        always.sort()
+        always_key = ",".join(always[:80])
+        cache_key = (
+            f"n={n}|spread={spread_cap:.6f}|ttl={ttl}|qv={min_qv:.2f}|always={always_key}"
+            f"|ob={1 if bool(use_orderbook_spread) else 0}|pf={probe_factor}"
+        )
 
         with self._lock:
             cached = self._cache.get("result")
@@ -144,6 +154,9 @@ class BitgetUniverseBuilder:
             max_spread_bps=spread_cap,
             ttl_sec=ttl,
             min_quote_volume=min_qv,
+            always_include=always,
+            use_orderbook_spread=bool(use_orderbook_spread),
+            orderbook_probe_factor=probe_factor,
         )
         with self._lock:
             self._cache["key"] = cache_key
@@ -159,6 +172,9 @@ class BitgetUniverseBuilder:
         max_spread_bps: float,
         ttl_sec: int,
         min_quote_volume: float,
+        always_include: Optional[List[str]] = None,
+        use_orderbook_spread: bool = True,
+        orderbook_probe_factor: int = 2,
     ) -> UniverseResult:
         now = time.time()
         reason_code = "OK"
@@ -172,6 +188,7 @@ class BitgetUniverseBuilder:
             "skipped_spread_missing": 0,
             "skipped_spread_wide": 0,
             "ticker_errors": 0,
+            "orderbook_errors": 0,
         }
         top_rows: List[Dict[str, Any]] = []
         symbols: List[str] = []
@@ -241,6 +258,7 @@ class BitgetUniverseBuilder:
         except Exception as e:
             ticker_reason = f"FETCH_TICKERS_FAIL:{type(e).__name__}"
 
+        pre_rows: List[Dict[str, Any]] = []
         for sym, market in candidates:
             ticker = tickers.get(sym) if isinstance(tickers, dict) else None
             if not isinstance(ticker, dict):
@@ -259,23 +277,57 @@ class BitgetUniverseBuilder:
                 continue
 
             bid, ask = _extract_bid_ask(ticker)
-            spread_bps = _spread_bps_from_bid_ask(bid, ask)
-            if spread_bps is None or (not math.isfinite(float(spread_bps))):
-                stats["skipped_spread_missing"] = int(stats["skipped_spread_missing"]) + 1
-                continue
-            if float(spread_bps) > float(max_spread_bps):
-                stats["skipped_spread_wide"] = int(stats["skipped_spread_wide"]) + 1
-                continue
-
-            top_rows.append(
+            pre_rows.append(
                 {
                     "symbol": str(sym),
                     "quote_volume": float(qv),
-                    "spread_bps": float(spread_bps),
+                    "spread_bps": None,
                     "bid": float(bid),
                     "ask": float(ask),
                 }
             )
+
+        if pre_rows:
+            pre_rows.sort(key=lambda x: float(x.get("quote_volume", 0.0)), reverse=True)
+            probe_n = int(max(top_n, top_n * int(max(1, orderbook_probe_factor))))
+            probe_n = int(max(10, min(100, probe_n)))
+            probe_rows = pre_rows[:probe_n]
+            final_rows: List[Dict[str, Any]] = []
+
+            for row in probe_rows:
+                sym = str(row.get("symbol", "") or "")
+                bid = _as_float(row.get("bid"))
+                ask = _as_float(row.get("ask"))
+                spread_bps = _spread_bps_from_bid_ask(bid, ask)
+
+                if bool(use_orderbook_spread):
+                    try:
+                        ob = ex.fetch_order_book(sym, 5)
+                        bids = ob.get("bids", []) if isinstance(ob, dict) else []
+                        asks = ob.get("asks", []) if isinstance(ob, dict) else []
+                        ob_bid = _as_float(bids[0][0]) if bids and isinstance(bids[0], (list, tuple)) and len(bids[0]) >= 1 else 0.0
+                        ob_ask = _as_float(asks[0][0]) if asks and isinstance(asks[0], (list, tuple)) and len(asks[0]) >= 1 else 0.0
+                        if ob_bid > 0 and ob_ask > 0:
+                            bid = ob_bid
+                            ask = ob_ask
+                            spread_bps = _spread_bps_from_bid_ask(ob_bid, ob_ask)
+                    except Exception:
+                        stats["orderbook_errors"] = int(stats["orderbook_errors"]) + 1
+
+                if spread_bps is None or (not math.isfinite(float(spread_bps))):
+                    stats["skipped_spread_missing"] = int(stats["skipped_spread_missing"]) + 1
+                    continue
+                if float(spread_bps) > float(max_spread_bps):
+                    stats["skipped_spread_wide"] = int(stats["skipped_spread_wide"]) + 1
+                    continue
+
+                row2 = dict(row)
+                row2["bid"] = float(bid)
+                row2["ask"] = float(ask)
+                row2["spread_bps"] = float(spread_bps)
+                final_rows.append(row2)
+
+            top_rows = final_rows
 
         if ticker_reason and not top_rows:
             reason_code = ticker_reason
@@ -287,6 +339,23 @@ class BitgetUniverseBuilder:
             stats["accepted_total"] = int(len(symbols))
             if not symbols:
                 reason_code = "NO_TOP_SYMBOLS"
+
+        # 항상 포함 심볼은 필터에서 탈락해도 스캔 유니버스에 우선 추가
+        try:
+            always = [str(x or "").strip() for x in (always_include or []) if str(x or "").strip()]
+            if always:
+                merged: List[str] = []
+                seen = set()
+                for sym in symbols + always:
+                    s = str(sym or "").strip()
+                    if (not s) or (s in seen):
+                        continue
+                    merged.append(s)
+                    seen.add(s)
+                symbols = merged[: max(int(top_n), len(always))]
+                stats["accepted_total"] = int(len(symbols))
+        except Exception:
+            pass
 
         return UniverseResult(
             symbols=symbols,
