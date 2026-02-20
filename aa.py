@@ -19352,12 +19352,12 @@ def _maybe_switch_style_for_open_position(
                             slb2, tpb2 = _sr_price_bounds_from_price_pct(float(entry_px0), str(dec2), float(sl_price_pct0), float(tp_price_pct0))
                             if tgt.get("sl_price") is None:
                                 tgt["sl_price"] = float(slb2)
-                                    if not str(tgt.get("sl_price_source", "") or ""):
-                                        tgt["sl_price_source"] = "ROI_FALLBACK"
+                                if not str(tgt.get("sl_price_source", "") or ""):
+                                    tgt["sl_price_source"] = "ROI_FALLBACK"
                             if tgt.get("tp_price") is None:
                                 tgt["tp_price"] = float(tpb2)
-                                    if not str(tgt.get("tp_price_source", "") or ""):
-                                        tgt["tp_price_source"] = "ROI_FALLBACK"
+                                if not str(tgt.get("tp_price_source", "") or ""):
+                                    tgt["tp_price_source"] = "ROI_FALLBACK"
                         except Exception:
                             pass
             except Exception:
