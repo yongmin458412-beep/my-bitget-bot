@@ -29286,30 +29286,32 @@ with st.sidebar.expander("관망 완화(anti-drought, 10분 단계)"):
         "anti-drought 사용",
         value=bool(config.get("anti_drought_enable", True)),
         help="무포지션이 길어지면 진입 게이트만 단계적으로 완화합니다. (레버/사이즈/리스크는 유지)",
+        key="anti_drought_enable_key",
     )
     ad1, ad2 = st.columns(2)
-    config["anti_drought_start_min"] = ad1.number_input("시작(분)", 5, 720, int(_as_int(config.get("anti_drought_start_min", 20), 20)), step=5)
-    config["anti_drought_step_min"] = ad2.number_input("단계간격(분)", 5, 240, int(_as_int(config.get("anti_drought_step_min", 10), 10)), step=5)
+    config["anti_drought_start_min"] = ad1.number_input("시작(분)", 5, 720, int(_as_int(config.get("anti_drought_start_min", 20), 20)), step=5, key="anti_drought_start_min_key")
+    config["anti_drought_step_min"] = ad2.number_input("단계간격(분)", 5, 240, int(_as_int(config.get("anti_drought_step_min", 10), 10)), step=5, key="anti_drought_step_min_key")
     ad3, ad4 = st.columns(2)
-    config["anti_drought_max_steps"] = ad3.number_input("최대 단계", 1, 20, int(_as_int(config.get("anti_drought_max_steps", 6), 6)), step=1)
-    config["anti_drought_notify_every_steps"] = ad4.number_input("TG 알림 간격(단계)", 1, 10, int(_as_int(config.get("anti_drought_notify_every_steps", 1), 1)), step=1)
+    config["anti_drought_max_steps"] = ad3.number_input("최대 단계", 1, 20, int(_as_int(config.get("anti_drought_max_steps", 6), 6)), step=1, key="anti_drought_max_steps_key")
+    config["anti_drought_notify_every_steps"] = ad4.number_input("TG 알림 간격(단계)", 1, 10, int(_as_int(config.get("anti_drought_notify_every_steps", 1), 1)), step=1, key="anti_drought_notify_every_steps_key")
     config["anti_drought_notify_tg"] = st.checkbox(
         "단계 변화시 관리자 TG 알림",
         value=bool(config.get("anti_drought_notify_tg", True)),
+        key="anti_drought_notify_tg_key",
     )
     ad5, ad6 = st.columns(2)
-    config["anti_drought_conf_drop_per_step"] = ad5.number_input("단계당 conf 완화", 0.0, 5.0, float(_as_float(config.get("anti_drought_conf_drop_per_step", 2.0), 2.0)), step=0.1)
-    config["anti_drought_conf_drop_max"] = ad6.number_input("최대 conf 완화", 0.0, 20.0, float(_as_float(config.get("anti_drought_conf_drop_max", 10.0), 10.0)), step=0.5)
+    config["anti_drought_conf_drop_per_step"] = ad5.number_input("단계당 conf 완화", 0.0, 5.0, float(_as_float(config.get("anti_drought_conf_drop_per_step", 2.0), 2.0)), step=0.1, key="anti_drought_conf_drop_per_step_key")
+    config["anti_drought_conf_drop_max"] = ad6.number_input("최대 conf 완화", 0.0, 20.0, float(_as_float(config.get("anti_drought_conf_drop_max", 10.0), 10.0)), step=0.5, key="anti_drought_conf_drop_max_key")
     ad7, ad8 = st.columns(2)
-    config["anti_drought_votes_reduce_after_step"] = ad7.number_input("표수완화 시작 단계", 1, 20, int(_as_int(config.get("anti_drought_votes_reduce_after_step", 3), 3)), step=1)
-    config["anti_drought_disable_pattern_gate_step"] = ad8.number_input("패턴게이트 OFF 단계", 1, 20, int(_as_int(config.get("anti_drought_disable_pattern_gate_step", 4), 4)), step=1)
+    config["anti_drought_votes_reduce_after_step"] = ad7.number_input("표수완화 시작 단계", 1, 20, int(_as_int(config.get("anti_drought_votes_reduce_after_step", 3), 3)), step=1, key="anti_drought_votes_reduce_after_step_key")
+    config["anti_drought_disable_pattern_gate_step"] = ad8.number_input("패턴게이트 OFF 단계", 1, 20, int(_as_int(config.get("anti_drought_disable_pattern_gate_step", 4), 4)), step=1, key="anti_drought_disable_pattern_gate_step_key")
     ad9, ad10 = st.columns(2)
-    config["anti_drought_loosen_microfilters_step"] = ad9.number_input("마이크로필터 완화 단계", 1, 20, int(_as_int(config.get("anti_drought_loosen_microfilters_step", 5), 5)), step=1)
-    config["anti_drought_skip_window"] = ad10.number_input("스킵 집계 윈도우", 50, 500, int(_as_int(config.get("anti_drought_skip_window", 200), 200)), step=10)
+    config["anti_drought_loosen_microfilters_step"] = ad9.number_input("마이크로필터 완화 단계", 1, 20, int(_as_int(config.get("anti_drought_loosen_microfilters_step", 5), 5)), step=1, key="anti_drought_loosen_microfilters_step_key")
+    config["anti_drought_skip_window"] = ad10.number_input("스킵 집계 윈도우", 50, 500, int(_as_int(config.get("anti_drought_skip_window", 200), 200)), step=10, key="anti_drought_skip_window_key")
     ad11, ad12, ad13 = st.columns(3)
-    config["anti_drought_min_conf_floor_scalp"] = ad11.number_input("스캘핑 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_scalp", 50), 50)), step=1)
-    config["anti_drought_min_conf_floor_day"] = ad12.number_input("단타 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_day", 60), 60)), step=1)
-    config["anti_drought_min_conf_floor_swing"] = ad13.number_input("스윙 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_swing", 60), 60)), step=1)
+    config["anti_drought_min_conf_floor_scalp"] = ad11.number_input("스캘핑 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_scalp", 50), 50)), step=1, key="anti_drought_min_conf_floor_scalp_key")
+    config["anti_drought_min_conf_floor_day"] = ad12.number_input("단타 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_day", 60), 60)), step=1, key="anti_drought_min_conf_floor_day_key")
+    config["anti_drought_min_conf_floor_swing"] = ad13.number_input("스윙 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_swing", 60), 60)), step=1, key="anti_drought_min_conf_floor_swing_key")
 
 st.sidebar.subheader("⏱️ 주기 리포트")
 config["tg_enable_heartbeat_report"] = st.sidebar.checkbox(
