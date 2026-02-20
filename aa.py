@@ -1704,6 +1704,23 @@ def default_settings() -> Dict[str, Any]:
         "entry_relax_reduce_votes_enable": True,
         "entry_relax_votes_reduce_after_min": 30,
         "entry_relax_votes_reduce": 1,
+        # ✅ 관망 장기화(anti-drought): 무포지션이 길어질수록 단계적으로 진입 게이트 완화
+        # - 테스트 단계: 진입 기준만 완화, 레버리지/포지션 사이징/손절거리 규칙은 건드리지 않음
+        "anti_drought_enable": True,
+        "anti_drought_start_min": 20,
+        "anti_drought_step_min": 10,
+        "anti_drought_max_steps": 6,
+        "anti_drought_notify_tg": True,
+        "anti_drought_notify_every_steps": 1,
+        "anti_drought_conf_drop_per_step": 2.0,
+        "anti_drought_conf_drop_max": 10.0,
+        "anti_drought_votes_reduce_after_step": 3,
+        "anti_drought_disable_pattern_gate_step": 4,
+        "anti_drought_loosen_microfilters_step": 5,
+        "anti_drought_min_conf_floor_scalp": 50,
+        "anti_drought_min_conf_floor_day": 60,
+        "anti_drought_min_conf_floor_swing": 60,
+        "anti_drought_skip_window": 200,
 
         # ✅ 무포지션(관망) 상태 분석 리포트
         "tg_enable_watch_report": True,
@@ -3234,6 +3251,13 @@ def default_runtime() -> Dict[str, Any]:
         # ✅ 무포지션(관망) 시간 계산용
         "last_entry_epoch": 0.0,
         "last_entry_kst": "",
+        # ✅ anti-drought 상태(무포지션 장기화 완화 단계)
+        "last_position_change_epoch": 0.0,
+        "drought_active_since_epoch": 0.0,
+        "drought_step": 0,
+        "drought_next_step_epoch": 0.0,
+        "drought_last_notify_epoch": 0.0,
+        "drought_prev_has_open": False,
         # ✅ Telegram /scan 강제 스캔 요청
         "force_scan": {},
         # ✅ 워커 리스(중복 스레드/워치독 복구 시 안전장치)
@@ -3275,6 +3299,31 @@ def load_runtime() -> Dict[str, Any]:
             rt["last_entry_kst"] = str(prev_rt.get("last_entry_kst", "") or "")
         except Exception:
             rt["last_entry_kst"] = ""
+        # anti-drought 상태는 날짜가 바뀌어도 이어서 추적(무포지션 장기화 진단용)
+        try:
+            rt["last_position_change_epoch"] = float(prev_rt.get("last_position_change_epoch", 0.0) or 0.0)
+        except Exception:
+            rt["last_position_change_epoch"] = 0.0
+        try:
+            rt["drought_active_since_epoch"] = float(prev_rt.get("drought_active_since_epoch", 0.0) or 0.0)
+        except Exception:
+            rt["drought_active_since_epoch"] = 0.0
+        try:
+            rt["drought_step"] = int(prev_rt.get("drought_step", 0) or 0)
+        except Exception:
+            rt["drought_step"] = 0
+        try:
+            rt["drought_next_step_epoch"] = float(prev_rt.get("drought_next_step_epoch", 0.0) or 0.0)
+        except Exception:
+            rt["drought_next_step_epoch"] = 0.0
+        try:
+            rt["drought_last_notify_epoch"] = float(prev_rt.get("drought_last_notify_epoch", 0.0) or 0.0)
+        except Exception:
+            rt["drought_last_notify_epoch"] = 0.0
+        try:
+            rt["drought_prev_has_open"] = bool(prev_rt.get("drought_prev_has_open", False))
+        except Exception:
+            rt["drought_prev_has_open"] = False
     base = default_runtime()
     for k, v in base.items():
         if k not in rt:
@@ -15205,7 +15254,23 @@ JSON 형식:
 # ✅ 15) 모니터 상태(하트비트) + 이벤트 링버퍼
 # =========================================================
 def monitor_init():
-    mon = read_json_safe(MONITOR_FILE, {"coins": {}, "events": [], "scan_process": []}) or {"coins": {}, "events": [], "scan_process": []}
+    mon = read_json_safe(
+        MONITOR_FILE,
+        {"coins": {}, "events": [], "scan_process": [], "skip_events": [], "anti_drought": {}},
+    ) or {"coins": {}, "events": [], "scan_process": [], "skip_events": [], "anti_drought": {}}
+    try:
+        if not isinstance(mon.get("coins", {}), dict):
+            mon["coins"] = {}
+        if not isinstance(mon.get("events", []), list):
+            mon["events"] = []
+        if not isinstance(mon.get("scan_process", []), list):
+            mon["scan_process"] = []
+        if not isinstance(mon.get("skip_events", []), list):
+            mon["skip_events"] = []
+        if not isinstance(mon.get("anti_drought", {}), dict):
+            mon["anti_drought"] = {}
+    except Exception:
+        pass
     mon["_boot_time_kst"] = now_kst_str()
     mon["_last_write"] = 0
     write_json_atomic(MONITOR_FILE, mon)
@@ -15283,6 +15348,24 @@ def mon_add_scan(mon: Dict[str, Any], stage: str, symbol: str, tf: str = "", sig
         mon.setdefault("scan_process", [])
         mon["scan_process"].append(rec)
         mon["scan_process"] = mon["scan_process"][-400:]
+        try:
+            if str(stage or "").lower() == "trade_skipped":
+                extra0 = (extra or {}) if isinstance(extra, dict) else {}
+                skip_rec = {
+                    "time_kst": rec.get("time_kst", ""),
+                    "time_epoch": ts,
+                    "symbol": str(symbol or ""),
+                    "tf": str(tf or ""),
+                    "signal": str(signal or ""),
+                    "score": score,
+                    "reason": str(message or "").strip()[:180],
+                    "reason_code": str(extra0.get("reason_code", "") or "").strip()[:64],
+                }
+                mon.setdefault("skip_events", [])
+                mon["skip_events"].append(skip_rec)
+                mon["skip_events"] = mon["skip_events"][-300:]
+        except Exception:
+            pass
         mon["last_scan_epoch"] = ts
         mon["last_scan_kst"] = rec.get("time_kst", "")
         # 코인별 진행상황(요구사항: "어떤 단계로 분석중인지" 직관적으로)
@@ -15494,6 +15577,9 @@ def _watch_reason_top(mon: Dict[str, Any], symbols: List[str], top_n: int = 3) -
     무포지션 관망 리포트용: 코인별 skip_reason/ai_reason를 집계해 상위 사유를 반환.
     """
     try:
+        top_from_events = get_top_skip_reasons(mon, n=max(1, int(top_n)), window=200)
+        if top_from_events:
+            return top_from_events
         coins = (mon or {}).get("coins", {}) or {}
         counts: Dict[str, int] = {}
         for s in symbols:
@@ -15505,6 +15591,34 @@ def _watch_reason_top(mon: Dict[str, Any], symbols: List[str], top_n: int = 3) -
             counts[key] = int(counts.get(key, 0) or 0) + 1
         ranked = sorted(counts.items(), key=lambda x: (-int(x[1]), str(x[0])))
         return ranked[: max(1, int(top_n))]
+    except Exception:
+        return []
+
+
+def get_top_skip_reasons(mon: Dict[str, Any], n: int = 10, window: int = 200) -> List[Tuple[str, int]]:
+    """
+    최근 trade_skipped 링버퍼에서 스킵 사유 상위 집계.
+    """
+    try:
+        n_safe = max(1, int(n))
+        w_safe = max(1, int(window))
+        skip_events = (mon or {}).get("skip_events", []) or []
+        if not isinstance(skip_events, list):
+            return []
+        recent = skip_events[-w_safe:]
+        counts: Dict[str, int] = {}
+        for ev in recent:
+            if not isinstance(ev, dict):
+                continue
+            reason = str(ev.get("reason", "") or "").strip()
+            if not reason:
+                reason = str(ev.get("reason_code", "") or "").strip()
+            if not reason:
+                continue
+            key = reason[:120]
+            counts[key] = int(counts.get(key, 0) or 0) + 1
+        ranked = sorted(counts.items(), key=lambda x: (-int(x[1]), str(x[0])))
+        return ranked[:n_safe]
     except Exception:
         return []
 
@@ -15534,6 +15648,18 @@ def _skip_reason_gate(reason: str) -> str:
 
 def _watch_gate_top(mon: Dict[str, Any], symbols: List[str], top_n: int = 3) -> List[Tuple[str, int]]:
     try:
+        recent = (mon or {}).get("skip_events", []) or []
+        if isinstance(recent, list) and recent:
+            counts_evt: Dict[str, int] = {}
+            for ev in recent[-200:]:
+                if not isinstance(ev, dict):
+                    continue
+                reason = str(ev.get("reason", "") or ev.get("reason_code", "") or "").strip()
+                gate = _skip_reason_gate(reason)
+                counts_evt[gate] = int(counts_evt.get(gate, 0) or 0) + 1
+            ranked_evt = sorted(counts_evt.items(), key=lambda x: (-int(x[1]), str(x[0])))
+            if ranked_evt:
+                return ranked_evt[: max(1, int(top_n))]
         coins = (mon or {}).get("coins", {}) or {}
         counts: Dict[str, int] = {}
         for s in symbols:
@@ -15592,6 +15718,166 @@ def _entry_relax_state(cfg: Dict[str, Any], rt: Dict[str, Any], has_open_positio
         return out
     except Exception:
         return out
+
+
+def _ensure_runtime_drought_fields(rt: Dict[str, Any]) -> None:
+    try:
+        if "last_position_change_epoch" not in rt:
+            rt["last_position_change_epoch"] = 0.0
+        if "drought_active_since_epoch" not in rt:
+            rt["drought_active_since_epoch"] = 0.0
+        if "drought_step" not in rt:
+            rt["drought_step"] = 0
+        if "drought_next_step_epoch" not in rt:
+            rt["drought_next_step_epoch"] = 0.0
+        if "drought_last_notify_epoch" not in rt:
+            rt["drought_last_notify_epoch"] = 0.0
+        if "drought_prev_has_open" not in rt:
+            rt["drought_prev_has_open"] = False
+    except Exception:
+        pass
+
+
+def _mark_runtime_position_state(rt: Dict[str, Any], has_open_position: bool, now_epoch: Optional[float] = None) -> None:
+    try:
+        _ensure_runtime_drought_fields(rt)
+        now_ep = float(now_epoch if now_epoch is not None else time.time())
+        prev_has = bool(rt.get("drought_prev_has_open", False))
+        if has_open_position != prev_has:
+            rt["last_position_change_epoch"] = float(now_ep)
+        rt["drought_prev_has_open"] = bool(has_open_position)
+        if has_open_position:
+            rt["drought_active_since_epoch"] = 0.0
+            rt["drought_step"] = 0
+            rt["drought_next_step_epoch"] = 0.0
+        else:
+            if float(rt.get("last_position_change_epoch", 0.0) or 0.0) <= 0.0:
+                rt["last_position_change_epoch"] = float(now_ep)
+            if float(rt.get("drought_active_since_epoch", 0.0) or 0.0) <= 0.0:
+                rt["drought_active_since_epoch"] = float(now_ep)
+    except Exception:
+        pass
+
+
+def compute_anti_drought_state(cfg: Dict[str, Any], rt: Dict[str, Any], has_open_position: bool) -> Dict[str, Any]:
+    """
+    무포지션 장기화(anti-drought) 상태 계산 + runtime 상태 업데이트.
+    - 완화는 런타임 오버라이드만 적용(설정 파일 덮어쓰기 없음)
+    - 레버리지/진입비중/리스크는 건드리지 않고 진입 게이트만 완화
+    """
+    out = {
+        "enabled": bool(cfg.get("anti_drought_enable", True)),
+        "active": False,
+        "no_position_minutes": 0.0,
+        "step": 0,
+        "max_steps": int(max(1, _as_int(cfg.get("anti_drought_max_steps", 6), 6))),
+        "next_step_in_minutes": 0.0,
+        "conf_drop": 0.0,
+        "votes_reduce": 0,
+        "pattern_gate_disabled": False,
+        "micro_loosened": False,
+        "effective_min_conf_scalp": int(_as_int(cfg.get("intra_day_scalp_min_conf", 55), 55)),
+        "effective_min_conf_day": int(_as_int(cfg.get("intra_day_day_min_conf", 65), 65)),
+        "effective_min_conf_swing": int(_as_int(cfg.get("intra_day_swing_min_conf", 68), 68)),
+        "step_changed": False,
+        "notify_now": False,
+        "notify_step": 0,
+    }
+    try:
+        _ensure_runtime_drought_fields(rt)
+        now_ep = float(time.time())
+        _mark_runtime_position_state(rt, has_open_position=bool(has_open_position), now_epoch=now_ep)
+
+        if (not bool(cfg.get("anti_drought_enable", True))) or bool(has_open_position):
+            return out
+
+        start_min = float(max(1.0, _as_float(cfg.get("anti_drought_start_min", 20), 20.0)))
+        step_min = float(max(1.0, _as_float(cfg.get("anti_drought_step_min", 10), 10.0)))
+        max_steps = int(max(1, _as_int(cfg.get("anti_drought_max_steps", 6), 6)))
+        no_pos_min = max(0.0, (now_ep - float(rt.get("last_position_change_epoch", now_ep) or now_ep)) / 60.0)
+        out["no_position_minutes"] = float(no_pos_min)
+
+        if no_pos_min < start_min:
+            rt["drought_active_since_epoch"] = 0.0
+            rt["drought_step"] = 0
+            rt["drought_next_step_epoch"] = 0.0
+            return out
+
+        prev_step = int(_as_int(rt.get("drought_step", 0), 0))
+        step_now = int(min(max_steps, int((no_pos_min - start_min) // step_min) + 1))
+        step_now = max(1, step_now)
+        out["active"] = True
+        out["step"] = int(step_now)
+
+        if float(rt.get("drought_active_since_epoch", 0.0) or 0.0) <= 0.0:
+            rt["drought_active_since_epoch"] = float(now_ep)
+        if step_now != prev_step:
+            out["step_changed"] = True
+            rt["drought_step"] = int(step_now)
+
+        next_step_epoch = float(rt.get("last_position_change_epoch", now_ep) or now_ep) + ((start_min + float(step_now) * step_min) * 60.0)
+        rt["drought_next_step_epoch"] = float(next_step_epoch)
+        out["next_step_in_minutes"] = max(0.0, (next_step_epoch - now_ep) / 60.0)
+
+        drop_per_step = float(max(0.0, _as_float(cfg.get("anti_drought_conf_drop_per_step", 2.0), 2.0)))
+        drop_max = float(max(0.0, _as_float(cfg.get("anti_drought_conf_drop_max", 10.0), 10.0)))
+        conf_drop = min(drop_max, float(step_now) * drop_per_step)
+        out["conf_drop"] = float(conf_drop)
+
+        floor_scalp = int(max(0, _as_int(cfg.get("anti_drought_min_conf_floor_scalp", 50), 50)))
+        floor_day = int(max(0, _as_int(cfg.get("anti_drought_min_conf_floor_day", 60), 60)))
+        floor_swing = int(max(0, _as_int(cfg.get("anti_drought_min_conf_floor_swing", 60), 60)))
+        out["effective_min_conf_scalp"] = int(max(floor_scalp, int(round(_as_int(cfg.get("intra_day_scalp_min_conf", 55), 55) - conf_drop))))
+        out["effective_min_conf_day"] = int(max(floor_day, int(round(_as_int(cfg.get("intra_day_day_min_conf", 65), 65) - conf_drop))))
+        out["effective_min_conf_swing"] = int(max(floor_swing, int(round(_as_int(cfg.get("intra_day_swing_min_conf", 68), 68) - conf_drop))))
+
+        votes_reduce_after_step = int(max(1, _as_int(cfg.get("anti_drought_votes_reduce_after_step", 3), 3)))
+        votes_reduce = 1 if step_now >= votes_reduce_after_step else 0
+        out["votes_reduce"] = int(votes_reduce)
+
+        disable_pattern_step = int(max(1, _as_int(cfg.get("anti_drought_disable_pattern_gate_step", 4), 4)))
+        loosen_micro_step = int(max(1, _as_int(cfg.get("anti_drought_loosen_microfilters_step", 5), 5)))
+        out["pattern_gate_disabled"] = bool(step_now >= disable_pattern_step)
+        out["micro_loosened"] = bool(step_now >= loosen_micro_step)
+
+        if bool(cfg.get("anti_drought_notify_tg", True)) and bool(out.get("step_changed", False)):
+            every_steps = int(max(1, _as_int(cfg.get("anti_drought_notify_every_steps", 1), 1)))
+            if (step_now % every_steps) == 0:
+                last_notify = float(rt.get("drought_last_notify_epoch", 0.0) or 0.0)
+                if (now_ep - last_notify) >= 600.0:
+                    out["notify_now"] = True
+                    out["notify_step"] = int(step_now)
+                    rt["drought_last_notify_epoch"] = float(now_ep)
+        return out
+    except Exception:
+        return out
+
+
+def build_effective_cfg_with_anti_drought(cfg: Dict[str, Any], drought_state: Dict[str, Any]) -> Dict[str, Any]:
+    eff = dict(cfg or {})
+    try:
+        if not bool((drought_state or {}).get("active", False)):
+            return eff
+
+        eff["intra_day_scalp_min_conf"] = int(_as_int(drought_state.get("effective_min_conf_scalp", eff.get("intra_day_scalp_min_conf", 55)), 55))
+        eff["intra_day_day_min_conf"] = int(_as_int(drought_state.get("effective_min_conf_day", eff.get("intra_day_day_min_conf", 65)), 65))
+        eff["intra_day_swing_min_conf"] = int(_as_int(drought_state.get("effective_min_conf_swing", eff.get("intra_day_swing_min_conf", 68)), 68))
+
+        if bool(drought_state.get("pattern_gate_disabled", False)):
+            eff["pattern_gate_entry"] = False
+
+        if bool(drought_state.get("micro_loosened", False)) and bool(eff.get("micro_entry_filter_enable", False)):
+            eff["micro_max_spread_bps_scalp"] = float(min(25.0, _as_float(eff.get("micro_max_spread_bps_scalp", 12.0), 12.0) + 6.0))
+            eff["micro_max_spread_bps_day"] = float(min(25.0, _as_float(eff.get("micro_max_spread_bps_day", 18.0), 18.0) + 6.0))
+            eff["micro_max_spread_bps_swing"] = float(min(35.0, _as_float(eff.get("micro_max_spread_bps_swing", 25.0), 25.0) + 6.0))
+            eff["micro_min_depth_usdt_scalp"] = float(max(5000.0, _as_float(eff.get("micro_min_depth_usdt_scalp", 50000.0), 50000.0) * 0.5))
+            eff["micro_min_depth_usdt_day"] = float(max(5000.0, _as_float(eff.get("micro_min_depth_usdt_day", 120000.0), 120000.0) * 0.5))
+            eff["micro_min_depth_usdt_swing"] = float(max(5000.0, _as_float(eff.get("micro_min_depth_usdt_swing", 250000.0), 250000.0) * 0.5))
+            # 스텝5+: 파생 필터는 스캘핑에 한해 느슨하게(과관망 방지)
+            eff["_anti_drought_loosen_deriv_for_scalp"] = True
+    except Exception:
+        return eff
+    return eff
 
 
 def mon_recent_events(mon: Dict[str, Any], within_min: int = 15) -> List[Dict[str, Any]]:
@@ -20104,6 +20390,7 @@ def _try_reverse_switch_after_stop(
         rt.setdefault("open_targets", {})[sym] = active_targets[sym]
         rt["last_entry_epoch"] = float(time.time())
         rt["last_entry_kst"] = now_kst_str()
+        _mark_runtime_position_state(rt, has_open_position=True)
         rt.setdefault("cooldowns", {})[sym] = float(time.time() + 30.0)
         rt.setdefault("switch_cooldowns", {})[sym] = float(time.time() + cd_sec)
         save_runtime(rt)
@@ -22751,6 +23038,7 @@ def telegram_thread(ex):
                                 active_targets.pop(sym, None)
                                 rt.setdefault("trades", {}).pop(sym, None)
                                 rt.setdefault("open_targets", {}).pop(sym, None)
+                                _mark_runtime_position_state(rt, has_open_position=bool(rt.get("open_targets", {})))
                                 save_runtime(rt)
 
                                 switched = False
@@ -23194,6 +23482,7 @@ def telegram_thread(ex):
                                 active_targets.pop(sym, None)
                                 rt.setdefault("trades", {}).pop(sym, None)
                                 rt.setdefault("open_targets", {}).pop(sym, None)
+                                _mark_runtime_position_state(rt, has_open_position=bool(rt.get("open_targets", {})))
                                 save_runtime(rt)
 
                                 switched = False
@@ -23337,6 +23626,19 @@ def telegram_thread(ex):
                     relax_state = {"enabled": False, "idle_min": 0.0, "conf_bonus": 0.0, "votes_reduce": 0}
                     relax_conf_bonus = 0.0
                     relax_votes_reduce = 0
+                    anti_drought_state = {
+                        "enabled": bool(cfg.get("anti_drought_enable", True)),
+                        "active": False,
+                        "step": 0,
+                        "max_steps": int(max(1, _as_int(cfg.get("anti_drought_max_steps", 6), 6))),
+                        "no_position_minutes": 0.0,
+                        "next_step_in_minutes": 0.0,
+                        "conf_drop": 0.0,
+                        "votes_reduce": 0,
+                        "pattern_gate_disabled": False,
+                        "micro_loosened": False,
+                    }
+                    cfg_effective = dict(cfg)
                     active_syms = set(pos_by_sym.keys())
                     try:
                         now_ep_watch = time.time()
@@ -23362,6 +23664,40 @@ def telegram_thread(ex):
                     relax_state = _entry_relax_state(cfg, rt, has_open_position=bool(active_syms))
                     relax_conf_bonus = float(relax_state.get("conf_bonus", 0.0) or 0.0)
                     relax_votes_reduce = int(relax_state.get("votes_reduce", 0) or 0)
+                    drought_rt_before = (
+                        float(_as_float(rt.get("last_position_change_epoch", 0.0), 0.0)),
+                        float(_as_float(rt.get("drought_active_since_epoch", 0.0), 0.0)),
+                        int(_as_int(rt.get("drought_step", 0), 0)),
+                        float(_as_float(rt.get("drought_next_step_epoch", 0.0), 0.0)),
+                        float(_as_float(rt.get("drought_last_notify_epoch", 0.0), 0.0)),
+                        bool(rt.get("drought_prev_has_open", False)),
+                    )
+                    try:
+                        anti_drought_state = compute_anti_drought_state(cfg, rt, has_open_position=bool(active_syms))
+                    except Exception:
+                        anti_drought_state = {
+                            "enabled": bool(cfg.get("anti_drought_enable", True)),
+                            "active": False,
+                            "step": 0,
+                            "max_steps": int(max(1, _as_int(cfg.get("anti_drought_max_steps", 6), 6))),
+                            "no_position_minutes": 0.0,
+                            "next_step_in_minutes": 0.0,
+                            "conf_drop": 0.0,
+                            "votes_reduce": 0,
+                            "pattern_gate_disabled": False,
+                            "micro_loosened": False,
+                            "notify_now": False,
+                            "notify_step": 0,
+                        }
+                    try:
+                        cfg_effective = build_effective_cfg_with_anti_drought(cfg, anti_drought_state)
+                    except Exception:
+                        cfg_effective = dict(cfg)
+                    try:
+                        # 관망 완화와 기존 entry_relax를 합산(게이트 완화 전용)
+                        relax_votes_reduce = int(max(0, int(relax_votes_reduce) + int(_as_int(anti_drought_state.get("votes_reduce", 0), 0))))
+                    except Exception:
+                        relax_votes_reduce = int(max(0, int(relax_votes_reduce)))
                     try:
                         mon["entry_relax_state"] = {
                             "enabled": bool(relax_state.get("enabled", False)),
@@ -23369,6 +23705,74 @@ def telegram_thread(ex):
                             "conf_bonus": round(float(relax_conf_bonus), 2),
                             "votes_reduce": int(relax_votes_reduce),
                         }
+                        mon["anti_drought"] = {
+                            "enabled": bool(anti_drought_state.get("enabled", False)),
+                            "active": bool(anti_drought_state.get("active", False)),
+                            "no_position_minutes": round(float(anti_drought_state.get("no_position_minutes", 0.0) or 0.0), 1),
+                            "step": int(_as_int(anti_drought_state.get("step", 0), 0)),
+                            "max_steps": int(_as_int(anti_drought_state.get("max_steps", 0), 0)),
+                            "next_step_in_minutes": round(float(anti_drought_state.get("next_step_in_minutes", 0.0) or 0.0), 1),
+                            "conf_drop": round(float(anti_drought_state.get("conf_drop", 0.0) or 0.0), 2),
+                            "votes_reduce": int(_as_int(anti_drought_state.get("votes_reduce", 0), 0)),
+                            "pattern_gate_disabled": bool(anti_drought_state.get("pattern_gate_disabled", False)),
+                            "micro_loosened": bool(anti_drought_state.get("micro_loosened", False)),
+                            "effective_min_conf_scalp": int(_as_int(anti_drought_state.get("effective_min_conf_scalp", cfg_effective.get("intra_day_scalp_min_conf", 55)), 55)),
+                            "effective_min_conf_day": int(_as_int(anti_drought_state.get("effective_min_conf_day", cfg_effective.get("intra_day_day_min_conf", 65)), 65)),
+                            "effective_min_conf_swing": int(_as_int(anti_drought_state.get("effective_min_conf_swing", cfg_effective.get("intra_day_swing_min_conf", 68)), 68)),
+                            "skip_top": [{"reason": str(k), "count": int(v)} for k, v in get_top_skip_reasons(mon, n=10, window=int(max(50, _as_int(cfg.get("anti_drought_skip_window", 200), 200))))],
+                        }
+                    except Exception:
+                        pass
+                    try:
+                        if bool(anti_drought_state.get("step_changed", False)):
+                            mon_add_event(
+                                mon,
+                                "ANTI_DROUGHT_STEP",
+                                "*",
+                                f"step {int(_as_int(anti_drought_state.get('step', 0), 0))}/{int(_as_int(anti_drought_state.get('max_steps', 0), 0))}",
+                                {
+                                    "no_position_minutes": float(_as_float(anti_drought_state.get("no_position_minutes", 0.0), 0.0)),
+                                    "conf_drop": float(_as_float(anti_drought_state.get("conf_drop", 0.0), 0.0)),
+                                    "pattern_gate_disabled": bool(anti_drought_state.get("pattern_gate_disabled", False)),
+                                    "micro_loosened": bool(anti_drought_state.get("micro_loosened", False)),
+                                },
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        if bool(anti_drought_state.get("notify_now", False)) and bool(cfg.get("anti_drought_notify_tg", True)):
+                            top3 = get_top_skip_reasons(mon, n=3, window=int(max(50, _as_int(cfg.get("anti_drought_skip_window", 200), 200))))
+                            lines = [
+                                "🟠 관망 완화(anti-drought)",
+                                f"- 무포지션: {int(round(float(_as_float(anti_drought_state.get('no_position_minutes', 0.0), 0.0))))}분",
+                                f"- 단계: {int(_as_int(anti_drought_state.get('step', 0), 0))}/{int(_as_int(anti_drought_state.get('max_steps', 0), 0))}",
+                                f"- 다음 완화: {max(0, int(round(float(_as_float(anti_drought_state.get('next_step_in_minutes', 0.0), 0.0)))))}분 후",
+                                (
+                                    f"- 유효 min_conf: 스캘핑 {int(_as_int(anti_drought_state.get('effective_min_conf_scalp', cfg_effective.get('intra_day_scalp_min_conf', 55)), 55))}"
+                                    f" / 단타 {int(_as_int(anti_drought_state.get('effective_min_conf_day', cfg_effective.get('intra_day_day_min_conf', 65)), 65))}"
+                                    f" / 스윙 {int(_as_int(anti_drought_state.get('effective_min_conf_swing', cfg_effective.get('intra_day_swing_min_conf', 68)), 68))}"
+                                ),
+                                f"- 패턴게이트: {'OFF(완화)' if bool(anti_drought_state.get('pattern_gate_disabled', False)) else 'ON'}",
+                                f"- 마이크로필터: {'완화' if bool(anti_drought_state.get('micro_loosened', False)) else '기본'}",
+                            ]
+                            if top3:
+                                lines.append("- 스킵사유 TOP3")
+                                for reason, cnt in top3:
+                                    lines.append(f"  · {str(reason)[:55]} x{int(cnt)}")
+                            tg_send("\n".join(lines), target="admin", cfg=cfg, silent=True)
+                    except Exception:
+                        pass
+                    try:
+                        drought_rt_after = (
+                            float(_as_float(rt.get("last_position_change_epoch", 0.0), 0.0)),
+                            float(_as_float(rt.get("drought_active_since_epoch", 0.0), 0.0)),
+                            int(_as_int(rt.get("drought_step", 0), 0)),
+                            float(_as_float(rt.get("drought_next_step_epoch", 0.0), 0.0)),
+                            float(_as_float(rt.get("drought_last_notify_epoch", 0.0), 0.0)),
+                            bool(rt.get("drought_prev_has_open", False)),
+                        )
+                        if drought_rt_after != drought_rt_before:
+                            save_runtime(rt)
                     except Exception:
                         pass
 
@@ -24850,15 +25254,15 @@ def telegram_thread(ex):
                             if raw_decision2 in ["buy", "sell"] and bool(cfg.get("use_chart_patterns", True)):
                                 p_bias = int(stt.get("_pattern_bias", 0) or 0)
                                 p_strength = float(stt.get("_pattern_strength", 0.0) or 0.0)
-                                p_gate = float(cfg.get("pattern_gate_strength", 0.65) or 0.65)
+                                p_gate = float(cfg_effective.get("pattern_gate_strength", 0.65) or 0.65)
                                 p_gate = float(clamp(p_gate, 0.05, 1.0))
                                 aligned = (p_bias == 1 and raw_decision2 == "buy") or (p_bias == -1 and raw_decision2 == "sell")
                                 opposed = (p_bias == 1 and raw_decision2 == "sell") or (p_bias == -1 and raw_decision2 == "buy")
                                 if aligned:
                                     conf = int(min(100, int(conf) + int(round(8.0 * max(0.0, min(1.0, p_strength))))))
-                                elif opposed and bool(cfg.get("pattern_gate_entry", True)) and p_strength >= p_gate:
+                                elif opposed and bool(cfg_effective.get("pattern_gate_entry", True)) and p_strength >= p_gate:
                                     conf = int(round(float(conf) * max(0.0, 1.0 - min(0.85, 0.35 + (p_strength * 0.45)))))
-                                    if bool(cfg.get("pattern_override_ai", True)):
+                                    if bool(cfg_effective.get("pattern_override_ai", True)):
                                         decision = "hold"
                                     pattern_skip_reason = f"패턴 반대({p_strength:.2f})"
                                 if pattern_skip_reason:
@@ -25000,13 +25404,13 @@ def telegram_thread(ex):
                             pre_style_hint = "스캘핑"
                         try:
                             if pre_style_hint == "스캘핑":
-                                min_scalp = int(cfg.get("intra_day_scalp_min_conf", cfg.get("intra_day_scalp_day_min_conf", 58)) or 58)
+                                min_scalp = int(cfg_effective.get("intra_day_scalp_min_conf", cfg_effective.get("intra_day_scalp_day_min_conf", 58)) or 58)
                                 min_conf_gate = int(min(int(min_conf_effective), int(max(0, min_scalp))))
                             elif pre_style_hint == "단타":
-                                min_day = int(cfg.get("intra_day_day_min_conf", 70) or 70)
+                                min_day = int(cfg_effective.get("intra_day_day_min_conf", 70) or 70)
                                 min_conf_gate = int(max(int(min_conf_effective), int(max(0, min_day))))
                             elif pre_style_hint == "스윙":
-                                min_swing = int(cfg.get("intra_day_swing_min_conf", 70) or 70)
+                                min_swing = int(cfg_effective.get("intra_day_swing_min_conf", 70) or 70)
                                 min_conf_gate = int(max(int(min_conf_effective), int(max(0, min_swing))))
                             else:
                                 min_conf_gate = int(min_conf_effective)
@@ -25198,13 +25602,13 @@ def telegram_thread(ex):
                                 style_conf_gate = int(min_conf_gate)
                                 style0 = str(style)
                                 if style0 == "스캘핑":
-                                    style_floor = int(cfg.get("intra_day_scalp_min_conf", cfg.get("intra_day_scalp_day_min_conf", 58)) or 58)
+                                    style_floor = int(cfg_effective.get("intra_day_scalp_min_conf", cfg_effective.get("intra_day_scalp_day_min_conf", 58)) or 58)
                                     style_conf_gate = int(min(int(min_conf_gate), max(0, int(style_floor))))
                                 elif style0 == "단타":
-                                    style_floor = int(cfg.get("intra_day_day_min_conf", 70) or 70)
+                                    style_floor = int(cfg_effective.get("intra_day_day_min_conf", 70) or 70)
                                     style_conf_gate = int(max(int(min_conf_gate), max(0, int(style_floor))))
                                 elif style0 == "스윙":
-                                    style_floor = int(cfg.get("intra_day_swing_min_conf", 70) or 70)
+                                    style_floor = int(cfg_effective.get("intra_day_swing_min_conf", 70) or 70)
                                     style_conf_gate = int(max(int(min_conf_gate), max(0, int(style_floor))))
 
                                 scalp_force_entry_final = False
@@ -25450,13 +25854,21 @@ def telegram_thread(ex):
                                 continue
 
                             # ✅ 마이크로구조 + 파생지표 진입 필터(주문 직전)
+                            micro_gate_cfg = dict(cfg_effective)
+                            try:
+                                if bool(anti_drought_state.get("micro_loosened", False)) and str(style) == "스캘핑":
+                                    if bool(micro_gate_cfg.get("_anti_drought_loosen_deriv_for_scalp", False)):
+                                        micro_gate_cfg["micro_funding_filter_enable"] = False
+                                        micro_gate_cfg["micro_open_interest_filter_enable"] = False
+                            except Exception:
+                                pass
                             micro_gate = evaluate_microstructure_derivatives_gate(
                                 symbol=sym,
                                 decision=str(decision),
                                 style=str(style),
                                 orderbook_ctx=(orderbook_context if isinstance(orderbook_context, dict) else None),
                                 derivatives_ctx=(derivatives_context if isinstance(derivatives_context, dict) else None),
-                                cfg=cfg,
+                                cfg=micro_gate_cfg,
                             )
                             try:
                                 cs["micro_gate_ok"] = bool(micro_gate.get("ok", True))
@@ -26645,6 +27057,7 @@ def telegram_thread(ex):
                                 rt.setdefault("open_targets", {})[sym] = active_targets[sym]
                                 rt["last_entry_epoch"] = float(time.time())
                                 rt["last_entry_kst"] = now_kst_str()
+                                _mark_runtime_position_state(rt, has_open_position=True)
                                 save_runtime(rt)
                                 try:
                                     active_syms.add(sym)
@@ -27075,6 +27488,17 @@ def telegram_thread(ex):
                                     lines.append(
                                         f"- 진입완화: conf 기준 -{float(relax_conf_bonus):.1f}%p"
                                         + (f", 수렴표 -{int(relax_votes_reduce)}" if int(relax_votes_reduce) > 0 else "")
+                                    )
+                                if bool((anti_drought_state or {}).get("active", False)):
+                                    lines.append(
+                                        f"- anti-drought: step {int(_as_int((anti_drought_state or {}).get('step', 0), 0))}/{int(_as_int((anti_drought_state or {}).get('max_steps', 0), 0))}"
+                                        f", 유효conf(스/단/스윙) {int(_as_int((anti_drought_state or {}).get('effective_min_conf_scalp', cfg_effective.get('intra_day_scalp_min_conf', 55)), 55))}"
+                                        f"/{int(_as_int((anti_drought_state or {}).get('effective_min_conf_day', cfg_effective.get('intra_day_day_min_conf', 65)), 65))}"
+                                        f"/{int(_as_int((anti_drought_state or {}).get('effective_min_conf_swing', cfg_effective.get('intra_day_swing_min_conf', 68)), 68))}"
+                                    )
+                                    lines.append(
+                                        f"- anti-drought 게이트: 패턴 {'OFF' if bool((anti_drought_state or {}).get('pattern_gate_disabled', False)) else 'ON'}"
+                                        f", 마이크로 {'완화' if bool((anti_drought_state or {}).get('micro_loosened', False)) else '기본'}"
                                     )
 
                                 top_reasons = _watch_reason_top(mon, list(scan_symbols_loop), top_n=3)
@@ -28857,6 +29281,36 @@ with st.sidebar.expander("관망 장기화 시 진입 완화(소폭)"):
     config["entry_relax_votes_reduce_after_min"] = r5.number_input("N완화 시작(분)", 30, 1200, int(config.get("entry_relax_votes_reduce_after_min", 180) or 180), step=10)
     config["entry_relax_votes_reduce"] = r6.number_input("N완화 단계", 0, 2, int(config.get("entry_relax_votes_reduce", 1) or 1), step=1)
 
+with st.sidebar.expander("관망 완화(anti-drought, 10분 단계)"):
+    config["anti_drought_enable"] = st.checkbox(
+        "anti-drought 사용",
+        value=bool(config.get("anti_drought_enable", True)),
+        help="무포지션이 길어지면 진입 게이트만 단계적으로 완화합니다. (레버/사이즈/리스크는 유지)",
+    )
+    ad1, ad2 = st.columns(2)
+    config["anti_drought_start_min"] = ad1.number_input("시작(분)", 5, 720, int(_as_int(config.get("anti_drought_start_min", 20), 20)), step=5)
+    config["anti_drought_step_min"] = ad2.number_input("단계간격(분)", 5, 240, int(_as_int(config.get("anti_drought_step_min", 10), 10)), step=5)
+    ad3, ad4 = st.columns(2)
+    config["anti_drought_max_steps"] = ad3.number_input("최대 단계", 1, 20, int(_as_int(config.get("anti_drought_max_steps", 6), 6)), step=1)
+    config["anti_drought_notify_every_steps"] = ad4.number_input("TG 알림 간격(단계)", 1, 10, int(_as_int(config.get("anti_drought_notify_every_steps", 1), 1)), step=1)
+    config["anti_drought_notify_tg"] = st.checkbox(
+        "단계 변화시 관리자 TG 알림",
+        value=bool(config.get("anti_drought_notify_tg", True)),
+    )
+    ad5, ad6 = st.columns(2)
+    config["anti_drought_conf_drop_per_step"] = ad5.number_input("단계당 conf 완화", 0.0, 5.0, float(_as_float(config.get("anti_drought_conf_drop_per_step", 2.0), 2.0)), step=0.1)
+    config["anti_drought_conf_drop_max"] = ad6.number_input("최대 conf 완화", 0.0, 20.0, float(_as_float(config.get("anti_drought_conf_drop_max", 10.0), 10.0)), step=0.5)
+    ad7, ad8 = st.columns(2)
+    config["anti_drought_votes_reduce_after_step"] = ad7.number_input("표수완화 시작 단계", 1, 20, int(_as_int(config.get("anti_drought_votes_reduce_after_step", 3), 3)), step=1)
+    config["anti_drought_disable_pattern_gate_step"] = ad8.number_input("패턴게이트 OFF 단계", 1, 20, int(_as_int(config.get("anti_drought_disable_pattern_gate_step", 4), 4)), step=1)
+    ad9, ad10 = st.columns(2)
+    config["anti_drought_loosen_microfilters_step"] = ad9.number_input("마이크로필터 완화 단계", 1, 20, int(_as_int(config.get("anti_drought_loosen_microfilters_step", 5), 5)), step=1)
+    config["anti_drought_skip_window"] = ad10.number_input("스킵 집계 윈도우", 50, 500, int(_as_int(config.get("anti_drought_skip_window", 200), 200)), step=10)
+    ad11, ad12, ad13 = st.columns(3)
+    config["anti_drought_min_conf_floor_scalp"] = ad11.number_input("스캘핑 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_scalp", 50), 50)), step=1)
+    config["anti_drought_min_conf_floor_day"] = ad12.number_input("단타 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_day", 60), 60)), step=1)
+    config["anti_drought_min_conf_floor_swing"] = ad13.number_input("스윙 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_swing", 60), 60)), step=1)
+
 st.sidebar.subheader("⏱️ 주기 리포트")
 config["tg_enable_heartbeat_report"] = st.sidebar.checkbox(
     "💓 하트비트(요약) 전송",
@@ -29744,6 +30198,14 @@ with t1:
 
         if age >= stale_thresh:
             st.error(f"⚠️ 봇 스레드가 멈췄거나(크래시) 갱신이 안될 수 있어요. ({stale_thresh:.0f}초 이상)")
+        try:
+            pause_until_ep = float(_as_float(mon.get("pause_until", 0), 0.0))
+            if not bool(mon.get("auto_trade", False)):
+                st.warning("⚠️ 자동매매가 OFF 상태입니다. (무포지션의 가장 흔한 원인)")
+            elif pause_until_ep > time.time():
+                st.warning(f"⏸️ 손실보호 일시정지 중입니다. 해제시각: {_epoch_to_kst_str(pause_until_ep)}")
+        except Exception:
+            pass
 
         st.caption(
             f"봇 상태: {mon.get('global_state','-')} | stage: {mon.get('loop_stage','-')}@{mon.get('loop_stage_kst','-')} | code: {mon.get('code_version','-')}"
@@ -29789,6 +30251,36 @@ with t1:
         except Exception:
             pass
         try:
+            st.subheader("🧩 관망 상태(anti-drought)")
+            ad = mon.get("anti_drought", {}) if isinstance(mon.get("anti_drought", {}), dict) else {}
+            no_pos_min = float(_as_float(ad.get("no_position_minutes", 0.0), 0.0))
+            step_now = int(_as_int(ad.get("step", 0), 0))
+            step_max = int(max(1, _as_int(ad.get("max_steps", config.get("anti_drought_max_steps", 6)), _as_int(config.get("anti_drought_max_steps", 6), 6))))
+            next_step_min = float(_as_float(ad.get("next_step_in_minutes", 0.0), 0.0))
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("무포지션(분)", f"{int(round(no_pos_min))}")
+            m2.metric("완화 단계", f"{step_now}/{step_max}")
+            m3.metric("다음 단계(분)", f"{max(0, int(round(next_step_min)))}")
+            m4.metric("활성", "ON" if bool(ad.get("active", False)) else "OFF")
+            st.caption(
+                f"유효 min_conf: 스캘핑 {int(_as_int(ad.get('effective_min_conf_scalp', config.get('intra_day_scalp_min_conf', 55)), 55))}"
+                f" / 단타 {int(_as_int(ad.get('effective_min_conf_day', config.get('intra_day_day_min_conf', 65)), 65))}"
+                f" / 스윙 {int(_as_int(ad.get('effective_min_conf_swing', config.get('intra_day_swing_min_conf', 68)), 68))}"
+            )
+            st.caption(
+                f"게이트 상태: 패턴 {'OFF(완화)' if bool(ad.get('pattern_gate_disabled', False)) else 'ON'}"
+                f" | 마이크로 {'완화' if bool(ad.get('micro_loosened', False)) else '기본'}"
+            )
+            skip_rows = ad.get("skip_top", [])
+            if not (isinstance(skip_rows, list) and skip_rows):
+                topx = get_top_skip_reasons(mon, n=10, window=int(max(50, _as_int(config.get("anti_drought_skip_window", 200), 200))))
+                skip_rows = [{"reason": str(k), "count": int(v)} for k, v in topx]
+            if isinstance(skip_rows, list) and skip_rows:
+                st.caption("최근 스킵 사유 TOP 10")
+                st_dataframe_safe(df_for_display(pd.DataFrame(skip_rows[:10])), hide_index=True)
+        except Exception:
+            pass
+        try:
             st.subheader("🧪 Effective Settings (debug)")
             rt_eff = load_runtime()
             uni_view = mon.get("universe", {}) or {}
@@ -29811,6 +30303,13 @@ with t1:
                 "intra_day_scalp_min_conf": int(_as_int(config.get("intra_day_scalp_min_conf", 55), 55)),
                 "intra_day_day_min_conf": int(_as_int(config.get("intra_day_day_min_conf", 65), 65)),
                 "intra_day_swing_min_conf": int(_as_int(config.get("intra_day_swing_min_conf", 68), 68)),
+                "anti_drought_active": bool(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("active", False)),
+                "anti_drought_step": int(_as_int(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("step", 0), 0)),
+                "effective_min_conf_scalp": int(_as_int(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("effective_min_conf_scalp", config.get("intra_day_scalp_min_conf", 55)), 55)),
+                "effective_min_conf_day": int(_as_int(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("effective_min_conf_day", config.get("intra_day_day_min_conf", 65)), 65)),
+                "effective_min_conf_swing": int(_as_int(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("effective_min_conf_swing", config.get("intra_day_swing_min_conf", 68)), 68)),
+                "effective_pattern_gate_entry": (not bool(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("pattern_gate_disabled", False))) and bool(config.get("pattern_gate_entry", True)),
+                "effective_micro_filter_loosened": bool(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("micro_loosened", False)),
             }
             st.json(eff)
 
