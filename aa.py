@@ -146,6 +146,8 @@ except Exception:
 
 try:
     from bot import BitgetUniverseBuilder
+    from bot.ai import AICache as BotAICache
+    from bot.ai import select_top_k_candidates as bot_select_top_k_candidates
     from bot.config import (
         KST as BOT_KST,
         dt_to_epoch as bot_dt_to_epoch,
@@ -161,13 +163,17 @@ try:
     from bot.risk import as_float as bot_as_float
     from bot.risk import as_int as bot_as_int
     from bot.risk import clamp as bot_clamp
+    from bot.risk import pick_tp_sl_from_sr as bot_pick_tp_sl_from_sr
     from bot.risk import timeframe_seconds as bot_timeframe_seconds
+    from bot.sr import compute_sr_context as bot_compute_sr_context
     from bot.state import READ_JSON_LAST_ERROR as BOT_READ_JSON_LAST_ERROR
     from bot.state import read_json_safe as bot_read_json_safe
     from bot.state import safe_json_dumps as bot_safe_json_dumps
     from bot.state import write_json_atomic as bot_write_json_atomic
 except Exception:
     BitgetUniverseBuilder = None
+    BotAICache = None
+    bot_select_top_k_candidates = None
     BOT_KST = None
     bot_now_kst = None
     bot_now_kst_str = None
@@ -182,6 +188,8 @@ except Exception:
     BOT_READ_JSON_LAST_ERROR = None
     bot_clamp = None
     bot_timeframe_seconds = None
+    bot_pick_tp_sl_from_sr = None
+    bot_compute_sr_context = None
     bot_as_float = None
     bot_as_int = None
     bot_emit_event = None
@@ -271,6 +279,7 @@ TARGET_COINS = [
 FULL_SPECTRUM_TFS = ["1m", "5m", "15m", "1h", "4h", "1d"]
 
 UNIVERSE_BUILDER = BitgetUniverseBuilder() if BitgetUniverseBuilder is not None else None
+BOT_AI_CACHE = BotAICache(cache_dir="cache/ai", namespace="trade") if BotAICache is not None else None
 
 # OpenAI 호출 타임아웃(초) - 스레드 멈춤 방지
 OPENAI_TIMEOUT_SEC = 20
@@ -683,9 +692,9 @@ MODE_RULES = {
     "공격모드": {"min_conf": 75, "entry_pct_min": 7, "entry_pct_max": 22, "lev_min": 4, "lev_max": 12},
     "하이리스크/하이리턴": {"min_conf": 72, "entry_pct_min": 18, "entry_pct_max": 40, "lev_min": 12, "lev_max": 25},
     # Streamlit Cloud 단일 스크립트 운용에서도 선택 가능하도록 스타일 모드를 MODE_RULES에 추가(기존 구조 유지)
-    "스캘핑": {"min_conf": 58, "entry_pct_min": 3, "entry_pct_max": 18, "lev_min": 10, "lev_max": 30, "tp_roi_cap": 3.0},
-    "단타": {"min_conf": 70, "entry_pct_min": 5, "entry_pct_max": 22, "lev_min": 5, "lev_max": 10, "tp_roi_cap": 15.0},
-    "스윙": {"min_conf": 70, "entry_pct_min": 6, "entry_pct_max": 24, "lev_min": 1, "lev_max": 5, "tp_roi_min": 10.0, "tp_roi_cap": 50.0},
+    "스캘핑": {"min_conf": 55, "entry_pct_min": 3, "entry_pct_max": 18, "lev_min": 10, "lev_max": 30, "tp_roi_cap": 3.0},
+    "단타": {"min_conf": 65, "entry_pct_min": 5, "entry_pct_max": 22, "lev_min": 5, "lev_max": 10, "tp_roi_cap": 15.0},
+    "스윙": {"min_conf": 68, "entry_pct_min": 6, "entry_pct_max": 24, "lev_min": 1, "lev_max": 5, "tp_roi_min": 8.0, "tp_roi_cap": 45.0},
 }
 
 # =========================================================
@@ -695,7 +704,7 @@ MODE_RULES = {
 # =========================================================
 STYLE_RULES = {
     "스캘핑": {
-        "min_conf": 58,
+        "min_conf": 55,
         "entry_pct_min": 3,
         "entry_pct_max": 18,
         "lev_min": 10,
@@ -713,7 +722,7 @@ STYLE_RULES = {
         "preferred_tfs": ["1m", "5m"],
     },
     "단타": {
-        "min_conf": 70,
+        "min_conf": 65,
         "entry_pct_min": 5,
         "entry_pct_max": 22,
         "lev_min": 5,
@@ -729,19 +738,19 @@ STYLE_RULES = {
         "preferred_tfs": ["15m", "30m"],
     },
     "스윙": {
-        "min_conf": 70,
+        "min_conf": 68,
         "entry_pct_min": 6,
         "entry_pct_max": 24,
         "lev_min": 1,
         "lev_max": 5,
-        "tp_roi_min": 10.0,
-        "tp_roi_max": 50.0,
-        "sl_roi_min": 2.0,
-        "sl_roi_max": 12.0,
-        "tp_price_min": 10.0,
-        "tp_price_max": 50.0,
+        "tp_roi_min": 8.0,
+        "tp_roi_max": 45.0,
+        "sl_roi_min": 6.0,
+        "sl_roi_max": 30.0,
+        "tp_price_min": 8.0,
+        "tp_price_max": 45.0,
         "sl_price_min": 3.0,
-        "sl_price_max": 15.0,
+        "sl_price_max": 12.0,
         "preferred_tfs": ["1h"],
     },
 }
@@ -804,8 +813,8 @@ def hard_roi_limits_by_style(style: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
                 "tp_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_tp_roi", default_tp_cap), default_tp_cap))),
                 "sl_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_sl_roi", default_sl_cap), default_sl_cap))),
             }
-        default_tp_cap = float(max(1.0, _as_float(sr.get("tp_roi_max", 50.0), 50.0)))
-        default_sl_cap = float(max(0.5, _as_float(sr.get("sl_roi_max", 7.0), 7.0)))
+        default_tp_cap = float(max(1.0, _as_float(sr.get("tp_roi_max", 45.0), 45.0)))
+        default_sl_cap = float(max(0.5, _as_float(sr.get("sl_roi_max", 30.0), 30.0)))
         return {
             "tp_min": float(max(0.0, _as_float(cfg.get("hard_cap_swing_tp_min_roi", 0.0), 0.0))),
             "tp_cap": float(max(1.0, _as_float(cfg.get("hard_cap_swing_tp_roi", default_tp_cap), default_tp_cap))),
@@ -827,7 +836,7 @@ def _rr_floor_by_style(style: Any, cfg: Dict[str, Any]) -> float:
         if st == "단타":
             return float(max(1.0, _as_float(cfg.get("day_rr_floor", 2.0), 2.0)))
         if st == "스윙":
-            return float(max(1.0, _as_float(cfg.get("swing_rr_floor", 3.0), 3.0)))
+            return float(max(1.0, _as_float(cfg.get("swing_rr_floor", 1.6), 1.6)))
     except Exception:
         pass
     return 1.5
@@ -1030,11 +1039,11 @@ def default_settings() -> Dict[str, Any]:
     scalp_sl_cap_default = float((STYLE_RULES.get("스캘핑", {}) or {}).get("sl_roi_max", 5.0))
     day_tp_cap_default = float((STYLE_RULES.get("단타", {}) or {}).get("tp_roi_max", 15.0))
     day_sl_cap_default = float((STYLE_RULES.get("단타", {}) or {}).get("sl_roi_max", 5.0))
-    swing_tp_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("tp_roi_max", 50.0))
-    swing_sl_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("sl_roi_max", 7.0))
+    swing_tp_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("tp_roi_max", 45.0))
+    swing_sl_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("sl_roi_max", 30.0))
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 28,
+        "settings_schema_version": 29,
         "openai_api_key": "",
         "openai_model_trade": "gpt-4o-mini",
         "openai_model_style": "gpt-4o-mini",
@@ -1046,11 +1055,14 @@ def default_settings() -> Dict[str, Any]:
         "order_usdt": 100.0,
         # 동적 유니버스(Bitget USDT 선물): 거래대상 자동 확장
         "universe_enable": True,
-        "universe_top_n": 30,
-        "universe_ttl_sec": 120,
-        "universe_max_spread_bps": 15.0,
-        "universe_min_quote_volume": 1000000.0,
+        "universe_top_n": 150,
+        "universe_ttl_sec": 600,
+        "universe_max_spread_bps": 8.0,
+        "universe_min_quote_volume": 20000000.0,
         "universe_log_max_symbols": 12,
+        "universe_scan_max_per_cycle": 50,
+        "universe_scan_rotation_enable": True,
+        "universe_always_include": ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
 
         # Telegram (기본 유지)
         "tg_enable_reports": True,  # 이벤트 알림(진입/청산 등)
@@ -1084,10 +1096,12 @@ def default_settings() -> Dict[str, Any]:
         "vision_report_interval_min": 60,
         # ✅ 하트비트 정체 감지(초) - false positive 완화
         "ui_heartbeat_stale_min_sec": 90,
-        "watchdog_hb_warn_sec": 120,
+        "watchdog_hb_warn_sec": 180,
         "watchdog_hb_clear_sec": 45,
-        "watchdog_hb_restart_sec": 180,
+        "watchdog_hb_restart_sec": 420,
         "watchdog_restart_cooldown_sec": 120,
+        "watchdog_enable_recovery": True,
+        "watchdog_send_stack_snapshot": True,
         # ✅ 진입/청산 이벤트 차트 이미지 전송
         "tg_send_trade_images": True,
         "tg_send_entry_image": True,
@@ -1293,10 +1307,10 @@ def default_settings() -> Dict[str, Any]:
         "intraday_force_close_hours": 23.5,     # ✅ 23시간 → 23.5시간(23:30) 강제청산: 복리/오버나잇 방지
         "intraday_aggressive_exit_score_relax": 2,
         # ✅ 인트라데이 활성화 파라미터
-        "intra_day_scalp_day_min_conf": 58,
-        "intra_day_scalp_min_conf": 58,
-        "intra_day_day_min_conf": 70,
-        "intra_day_swing_min_conf": 70,
+        "intra_day_scalp_day_min_conf": 55,
+        "intra_day_scalp_min_conf": 55,
+        "intra_day_day_min_conf": 65,
+        "intra_day_swing_min_conf": 68,
         "intra_day_mega_trend_adx": 30.0,
         # ✅ 스캘핑 공격 진입(지표 수렴 강할 때 conf 완화)
         "scalp_force_entry_min_indicators": 5,
@@ -1485,21 +1499,27 @@ def default_settings() -> Dict[str, Any]:
         # ✅ AI 비용 절약(강화): 자동 스캔에서 불필요한 호출 최소화
         # - strict ON: 스타일 AI 비활성 + 외부시황 AI 입력 제외 + 약한 신호는 AI 호출 스킵
         "ai_cost_saver_strict": True,
+        "ai_mode": "veto",  # off|veto|confirm|advisory
+        "ai_top_k_per_cycle": 5,
+        "ai_batch_call": True,
+        "ai_batch_max_items": 8,
         "ai_budget_enable": True,
         # 0 이하면 시간당 제한 없음(요청)
         "ai_budget_hourly_limit": 0,
-        "ai_budget_daily_limit": 180,
-        "ai_budget_min_interval_sec": 45,
+        "ai_budget_daily_limit": 0,
+        "ai_budget_min_interval_sec": 30,
         # AI 예산 제한에 걸렸을 때 fallback 동작
         # - skip: 기존처럼 스킵
         # - cache: 최근 AI 결과 재사용
         # - rules: 초강신호(보수)일 때 룰 기반 대체
         # - cache_or_rules: cache 우선, 없으면 rules
         "ai_budget_fallback_policy": "cache_or_rules",
-        "ai_cache_ttl_sec": 600,
+        "ai_cache_ttl_sec": 900,
         "ai_fallback_min_conf": 82,
         "ai_fallback_min_ml_votes": 4,
         "ai_fallback_min_align": 4,
+        "allow_rule_entry_when_ai_blocked": True,
+        "rule_entry_min_local_conf": 0.75,
         # 횡보/저변동/저거래량 구간에서는 AI 호출 간격을 자동으로 늘려 비용 절감
         "ai_budget_adaptive_interval_enable": True,
         "ai_budget_adaptive_max_interval_sec": 180,
@@ -1511,18 +1531,18 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 진입 필터 강화(요구): 거래량(스파이크) + 이격도(Disparity) 조건
         # - 횡보 박스(거래량 없음)에서 RSI 해소만 보고 진입하는 실수를 줄이기 위해 AI 호출 자체를 제한한다.
         # - /scan 강제스캔은 이 필터를 우회(사용자 의도)한다.
-        "ai_call_require_volume_spike": True,   # ✅ 비용 절감: 거래량 스파이크 없으면 AI 호출 안 함
-        "ai_call_volume_spike_mul": 1.3,
+        "ai_call_require_volume_spike": False,
+        "ai_call_volume_spike_mul": 1.25,
         "ai_call_volume_spike_period": 20,
-        "ai_call_require_disparity": True,      # ✅ 비용 절감: 이격도 과다 시 AI 호출 안 함
+        "ai_call_require_disparity": False,
         "ai_call_disparity_ma_period": 20,
-        "ai_call_disparity_max_abs_pct": 6.0,
+        "ai_call_disparity_max_abs_pct": 8.0,
         # ✅ 진입이 너무 안 되는 경우를 대비한 완화 옵션
         # - 0이면 모드별 기본값(안전 20 / 공격 17 / 하이리스크 15)을 사용
         "ai_call_adx_threshold": 0,
         # ✅ 비용 절감: volume/disparity 조건 미달 시 AI 호출 자체를 막음(비용↓)
         # - 수렴 조건 통과 + 거래량/이격도 조건 통과 시에만 AI 호출 → 대폭 비용 절감
-        "ai_call_filters_block_ai": True,       # ✅ 비용 절감: 필터 미달 시 AI 호출 완전 차단
+        "ai_call_filters_block_ai": False,
         # ✅ AI가 buy/sell을 유지할 수 있는 최소 확신 바닥값(그 이하면 강제 hold)
         "ai_decision_min_conf_floor": 50,
 
@@ -1651,6 +1671,12 @@ def default_settings() -> Dict[str, Any]:
         "pullback_distance_pct_day": 0.80,
         "pullback_wait_candles_min": 3,
         "pullback_wait_candles_max": 5,
+        "entry_prefer_limit": True,
+        "entry_post_only": True,
+        "entry_fallback_to_market": True,
+        "entry_limit_timeout_sec_scalp": 4,
+        "entry_limit_timeout_sec_day": 6,
+        "entry_limit_timeout_sec_swing": 15,
         # ✅ 지정가 대기 상한(초): 긴 블로킹으로 하트비트 정체되는 문제 방지
         "pullback_wait_timeout_sec_min": 6,
         "pullback_wait_timeout_sec_max": 25,
@@ -1659,7 +1685,7 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 스타일별 RR 하한(목표손절이 목표익절보다 커지는 케이스 방지)
         "scalp_rr_floor": 1.5,
         "day_rr_floor": 2.0,
-        "swing_rr_floor": 3.0,
+        "swing_rr_floor": 1.6,
         "day_entry_pct_mult": 0.85,
         "day_lev_cap": 10,
         # ✅ 스캘핑: "가격 변동폭(%)" 기준 가드레일(레버가 높아도 TP/SL이 과도해지지 않게)
@@ -1698,16 +1724,22 @@ def default_settings() -> Dict[str, Any]:
         "sr_trigger_sl_buffer_pct": 0.12,
         "sr_trigger_tp_buffer_pct": 0.08,
 
-        "swing_tp_roi_min": 10.0,
-        "swing_tp_roi_max": 50.0,
+        "swing_tp_roi_min": 8.0,
+        "swing_tp_roi_max": 45.0,
         # ✅ 스윙 손절(ROI%)은 너무 짧으면 휩쏘로 잘리는 문제가 커서 기본을 더 넓게(요구사항)
-        "swing_sl_roi_min": 12.0,
-        "swing_sl_roi_max": 35.0,
+        "swing_sl_roi_min": 6.0,
+        "swing_sl_roi_max": 30.0,
         # 스윙 TP/SL 가격변동폭 가이드(고정값이 아니라 SR 탐색 범위)
         "swing_tp_price_pct_min": 10.0,
-        "swing_tp_price_pct_max": 50.0,
+        "swing_tp_price_pct_max": 45.0,
         "swing_sl_price_pct_min": 3.0,
         "swing_sl_price_pct_max": 15.0,
+        "use_sr_tp_sl": True,
+        "remove_fixed_swing_clamps": True,
+        "auto_widen_stop_instead_of_skip": True,
+        "min_stop_price_pct_major": 0.25,
+        "min_stop_price_pct_alt": 0.35,
+        "stop_spread_mult": 2.0,
         "swing_entry_pct_mult": 1.0,
         "swing_lev_cap": 25,
 
@@ -1839,8 +1871,8 @@ def load_settings() -> Dict[str, Any]:
                 pass
             # 스윙은 스캘핑처럼 -2~-3%에 잘리는 문제를 줄이기 위해 기본 손절 하한을 넓게 유지
             try:
-                if float(cfg.get("swing_sl_roi_min", 0.0) or 0.0) < 12.0:
-                    cfg["swing_sl_roi_min"] = 12.0
+                if float(cfg.get("swing_sl_roi_min", 0.0) or 0.0) < 6.0:
+                    cfg["swing_sl_roi_min"] = 6.0
                     changed = True
             except Exception:
                 pass
@@ -1895,13 +1927,13 @@ def load_settings() -> Dict[str, Any]:
             # 스윙 목표 확장(기존 기본값을 쓰던 경우에만)
             try:
                 if float(cfg.get("swing_tp_roi_min", 0.0) or 0.0) == 3.0:
-                    cfg["swing_tp_roi_min"] = 10.0
+                    cfg["swing_tp_roi_min"] = 8.0
                     changed = True
             except Exception:
                 pass
             try:
                 if float(cfg.get("swing_tp_roi_max", 0.0) or 0.0) == 35.0:
-                    cfg["swing_tp_roi_max"] = 50.0
+                    cfg["swing_tp_roi_max"] = 45.0
                     changed = True
             except Exception:
                 pass
@@ -2188,19 +2220,19 @@ def load_settings() -> Dict[str, Any]:
                 pass
             try:
                 if "ai_budget_hourly_limit" not in saved:
-                    cfg["ai_budget_hourly_limit"] = 24
+                    cfg["ai_budget_hourly_limit"] = 0
                     changed = True
             except Exception:
                 pass
             try:
                 if "ai_budget_daily_limit" not in saved:
-                    cfg["ai_budget_daily_limit"] = 180
+                    cfg["ai_budget_daily_limit"] = 0
                     changed = True
             except Exception:
                 pass
             try:
                 if "ai_budget_min_interval_sec" not in saved:
-                    cfg["ai_budget_min_interval_sec"] = 45
+                    cfg["ai_budget_min_interval_sec"] = 30
                     changed = True
             except Exception:
                 pass
@@ -2437,8 +2469,8 @@ def load_settings() -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                if int(cfg.get("ai_budget_min_interval_sec", 45) or 45) < 45:
-                    cfg["ai_budget_min_interval_sec"] = 45
+                if int(cfg.get("ai_budget_min_interval_sec", 30) or 30) < 30:
+                    cfg["ai_budget_min_interval_sec"] = 30
                     changed = True
             except Exception:
                 pass
@@ -2489,13 +2521,13 @@ def load_settings() -> Dict[str, Any]:
                 pass
             try:
                 if float(cfg.get("swing_tp_roi_max", 0.0) or 0.0) == 35.0:
-                    cfg["swing_tp_roi_max"] = 50.0
+                    cfg["swing_tp_roi_max"] = 45.0
                     changed = True
             except Exception:
                 pass
             try:
                 if float(cfg.get("swing_tp_price_pct_max", 0.0) or 0.0) == 35.0:
-                    cfg["swing_tp_price_pct_max"] = 50.0
+                    cfg["swing_tp_price_pct_max"] = 45.0
                     changed = True
             except Exception:
                 pass
@@ -2546,8 +2578,8 @@ def load_settings() -> Dict[str, Any]:
             scalp_sl_cap_default = float((STYLE_RULES.get("스캘핑", {}) or {}).get("sl_roi_max", 5.0))
             day_tp_cap_default = float((STYLE_RULES.get("단타", {}) or {}).get("tp_roi_max", 15.0))
             day_sl_cap_default = float((STYLE_RULES.get("단타", {}) or {}).get("sl_roi_max", 5.0))
-            swing_tp_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("tp_roi_max", 50.0))
-            swing_sl_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("sl_roi_max", 7.0))
+            swing_tp_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("tp_roi_max", 45.0))
+            swing_sl_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("sl_roi_max", 30.0))
             for k, v in {
                 "hard_cap_scalp_tp_min_roi": 0.0,
                 "hard_cap_scalp_tp_roi": scalp_tp_cap_default,
@@ -2651,6 +2683,96 @@ def load_settings() -> Dict[str, Any]:
                         changed = True
                 except Exception:
                     pass
+        # v29: 유니버스 확장 + AI budget 기본값 완화 + 스윙 고정 클램프 완화
+        if saved_ver < 29:
+            for k, v in {
+                "universe_enable": True,
+                "universe_top_n": 150,
+                "universe_ttl_sec": 600,
+                "universe_max_spread_bps": 8.0,
+                "universe_min_quote_volume": 20000000.0,
+                "universe_scan_max_per_cycle": 50,
+                "universe_scan_rotation_enable": True,
+                "universe_always_include": ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
+                "ai_mode": "veto",
+                "ai_top_k_per_cycle": 5,
+                "ai_batch_call": True,
+                "ai_batch_max_items": 8,
+                "ai_cache_ttl_sec": 900,
+                "allow_rule_entry_when_ai_blocked": True,
+                "rule_entry_min_local_conf": 0.75,
+                "entry_prefer_limit": True,
+                "entry_post_only": True,
+                "entry_fallback_to_market": True,
+                "entry_limit_timeout_sec_scalp": 4,
+                "entry_limit_timeout_sec_day": 6,
+                "entry_limit_timeout_sec_swing": 15,
+                "use_sr_tp_sl": True,
+                "remove_fixed_swing_clamps": True,
+                "auto_widen_stop_instead_of_skip": True,
+                "swing_rr_floor": 1.6,
+                "swing_sl_roi_min": 6.0,
+                "swing_sl_roi_max": 30.0,
+                "swing_tp_roi_min": 8.0,
+                "swing_tp_roi_max": 45.0,
+                "watchdog_hb_warn_sec": 180,
+                "watchdog_hb_restart_sec": 420,
+                "watchdog_enable_recovery": True,
+                "watchdog_send_stack_snapshot": True,
+                "intra_day_scalp_min_conf": 55,
+                "intra_day_day_min_conf": 65,
+                "intra_day_swing_min_conf": 68,
+                "ai_decision_min_conf_floor": 50,
+            }.items():
+                try:
+                    if k not in saved:
+                        cfg[k] = v
+                        changed = True
+                except Exception:
+                    pass
+            # 기존 기본값이 남아있는 경우만 안전하게 업데이트
+            try:
+                if int(_as_int(cfg.get("ai_budget_daily_limit", 0), 0)) == 180:
+                    cfg["ai_budget_daily_limit"] = 0
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if int(_as_int(cfg.get("ai_budget_min_interval_sec", 0), 0)) == 45:
+                    cfg["ai_budget_min_interval_sec"] = 30
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if bool(cfg.get("ai_call_require_volume_spike", True)):
+                    cfg["ai_call_require_volume_spike"] = False
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if bool(cfg.get("ai_call_require_disparity", True)):
+                    cfg["ai_call_require_disparity"] = False
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if bool(cfg.get("ai_call_filters_block_ai", True)):
+                    cfg["ai_call_filters_block_ai"] = False
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if float(_as_float(cfg.get("ai_call_volume_spike_mul", 0.0), 0.0)) == 1.3:
+                    cfg["ai_call_volume_spike_mul"] = 1.25
+                    changed = True
+            except Exception:
+                pass
+            try:
+                if float(_as_float(cfg.get("ai_call_disparity_max_abs_pct", 0.0), 0.0)) == 6.0:
+                    cfg["ai_call_disparity_max_abs_pct"] = 8.0
+                    changed = True
+            except Exception:
+                pass
         cfg["settings_schema_version"] = base_ver
         if changed:
             try:
@@ -3168,7 +3290,7 @@ def ai_budget_status_snapshot(
         min_itv = float(clamp(min_itv, 1.0, 3600.0))
         last_ep = float(st.get("last_call_epoch", 0.0) or 0.0)
         h_lim = int(_as_int(cfg.get("ai_budget_hourly_limit", 0), 0))
-        d_lim = int(_as_int(cfg.get("ai_budget_daily_limit", 180), 180))
+        d_lim = int(_as_int(cfg.get("ai_budget_daily_limit", 0), 0))
         h_calls = int(st.get("hour_calls", 0) or 0)
         d_calls = int(st.get("day_calls", 0) or 0)
 
@@ -3268,8 +3390,15 @@ def _ai_budget_policy_parts(cfg: Dict[str, Any]) -> set:
     return set()
 
 
-def _build_cached_ai_from_cs(cs: Dict[str, Any], max_age_sec: float) -> Tuple[Optional[Dict[str, Any]], str]:
+def _build_cached_ai_from_cs(cs: Dict[str, Any], max_age_sec: float, symbol: str = "") -> Tuple[Optional[Dict[str, Any]], str]:
     try:
+        if BOT_AI_CACHE is not None and str(symbol or "").strip():
+            try:
+                cached_bot = BOT_AI_CACHE.get(str(symbol).strip())
+                if isinstance(cached_bot, dict):
+                    return dict(cached_bot), "bot_ai_cache_hit"
+            except Exception:
+                pass
         if not isinstance(cs, dict):
             return None, "cache_missing"
         last_ep = float(_as_float(cs.get("ai_last_called_epoch", 0.0), 0.0))
@@ -14491,9 +14620,12 @@ def apply_style_envelope(ai: Dict[str, Any], style: str, cfg: Dict[str, Any], ru
         elif st == "스윙":
             entry_pct = float(clamp(entry_pct * float(cfg.get("swing_entry_pct_mult", 1.0)), rule["entry_pct_min"], rule["entry_pct_max"]))
             lev = int(min(lev, int(cfg.get("swing_lev_cap", rule["lev_max"]))))
-            sl = float(clamp(sl, float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 35.0))))
-            swing_tp_max = float(max(float(cfg.get("swing_tp_roi_max", sr.get("tp_roi_max", 50.0)) or sr.get("tp_roi_max", 50.0)), float(sr.get("tp_roi_max", 50.0))))
-            tp = float(clamp(tp, float(cfg.get("swing_tp_roi_min", 10.0)), swing_tp_max))
+            sl_min_cfg = float(cfg.get("swing_sl_roi_min", sr.get("sl_roi_min", 6.0)) or sr.get("sl_roi_min", 6.0))
+            sl_max_cfg = float(cfg.get("swing_sl_roi_max", sr.get("sl_roi_max", 30.0)) or sr.get("sl_roi_max", 30.0))
+            tp_min_cfg = float(cfg.get("swing_tp_roi_min", sr.get("tp_roi_min", 8.0)) or sr.get("tp_roi_min", 8.0))
+            tp_max_cfg = float(cfg.get("swing_tp_roi_max", sr.get("tp_roi_max", 45.0)) or sr.get("tp_roi_max", 45.0))
+            sl = float(clamp(sl, min(sl_min_cfg, sl_max_cfg), max(sl_min_cfg, sl_max_cfg)))
+            tp = float(clamp(tp, min(tp_min_cfg, tp_max_cfg), max(tp_min_cfg, tp_max_cfg)))
 
         # 스타일 범위(요청 스펙) 재보정
         entry_pct = float(clamp(entry_pct, entry_lo, entry_hi))
@@ -14505,8 +14637,8 @@ def apply_style_envelope(ai: Dict[str, Any], style: str, cfg: Dict[str, Any], ru
             sl = float(clamp(sl, float(sr.get("sl_roi_min", 1.0)), float(sr.get("sl_roi_max", 4.0))))
             tp = float(clamp(tp, float(sr.get("tp_roi_min", 2.0)), float(sr.get("tp_roi_max", 15.0))))
         else:
-            sl = float(clamp(sl, float(sr.get("sl_roi_min", 2.0)), float(sr.get("sl_roi_max", 12.0))))
-            tp = float(clamp(tp, float(sr.get("tp_roi_min", 10.0)), float(sr.get("tp_roi_max", 50.0))))
+            sl = float(clamp(sl, float(sr.get("sl_roi_min", 6.0)), float(sr.get("sl_roi_max", 30.0))))
+            tp = float(clamp(tp, float(sr.get("tp_roi_min", 8.0)), float(sr.get("tp_roi_max", 45.0))))
 
         # ✅ 스타일별 하드캡(우선순위): 스캘핑/단타 TP 상한, 스윙 TP 하한(10%+) 강제
         tmp_caps = apply_hard_roi_caps({"tp_pct": tp, "sl_pct": sl, "leverage": lev}, st, cfg)
@@ -14859,9 +14991,12 @@ def resolve_dynamic_universe(
             "enabled": bool(cfg.get("universe_enable", True)),
             "reason_code": "DISABLED_OR_UNAVAILABLE",
             "scan_count": len(base_symbols),
+            "pool_count": len(base_symbols),
+            "scan_batch_max": int(max(1, _as_int(cfg.get("universe_scan_max_per_cycle", 50), 50))),
+            "rotation_idx": 0,
             "managed_count": len(managed_seed),
             "symbols_preview": base_symbols[:8],
-            "ttl_sec": int(cfg.get("universe_ttl_sec", 120) or 120),
+            "ttl_sec": int(cfg.get("universe_ttl_sec", 600) or 600),
             "next_refresh_sec": None,
             "refreshed": False,
             "stats": {},
@@ -14873,11 +15008,18 @@ def resolve_dynamic_universe(
         return base_symbols, managed_seed, info
 
     try:
-        top_n = int(max(5, min(150, int(cfg.get("universe_top_n", 30) or 30))))
-        ttl_sec = int(max(15, min(3600, int(cfg.get("universe_ttl_sec", 120) or 120))))
-        max_spread_bps = float(max(0.1, float(cfg.get("universe_max_spread_bps", 15.0) or 15.0)))
+        top_n = int(max(5, min(150, int(cfg.get("universe_top_n", 150) or 150))))
+        ttl_sec = int(max(15, min(3600, int(cfg.get("universe_ttl_sec", 600) or 600))))
+        max_spread_bps = float(max(0.1, float(cfg.get("universe_max_spread_bps", 8.0) or 8.0)))
         min_quote_volume = float(max(0.0, float(cfg.get("universe_min_quote_volume", 0.0) or 0.0)))
         log_max_symbols = int(max(3, min(60, int(cfg.get("universe_log_max_symbols", 12) or 12))))
+        scan_batch_max = int(max(5, min(100, int(cfg.get("universe_scan_max_per_cycle", 50) or 50))))
+        rotation_enable = bool(cfg.get("universe_scan_rotation_enable", True))
+        always_include_cfg = cfg.get("universe_always_include", ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"])
+        if isinstance(always_include_cfg, list):
+            always_include = [str(x).strip() for x in always_include_cfg if str(x).strip()]
+        else:
+            always_include = [x.strip() for x in str(always_include_cfg or "").split(",") if x.strip()]
 
         uni_res = UNIVERSE_BUILDER.get_universe(
             ex,
@@ -14885,10 +15027,26 @@ def resolve_dynamic_universe(
             max_spread_bps=max_spread_bps,
             ttl_sec=ttl_sec,
             min_quote_volume=min_quote_volume,
+            always_include=always_include,
             force_refresh=False,
         )
-        dyn_symbols = _dedupe_symbols_keep_order(list(uni_res.symbols or []))
-        scan_symbols = dyn_symbols if dyn_symbols else list(base_symbols)
+        dyn_pool = _dedupe_symbols_keep_order(list(uni_res.symbols or []))
+        pool_symbols = dyn_pool if dyn_pool else list(base_symbols)
+        rot_idx = int(max(0, _as_int(mon.get("_uni_rot_idx", 0), 0)))
+        if (not rotation_enable) or len(pool_symbols) <= scan_batch_max:
+            scan_symbols = list(pool_symbols[:scan_batch_max])
+            next_rot_idx = 0 if len(pool_symbols) <= scan_batch_max else int((rot_idx + len(scan_symbols)) % max(1, len(pool_symbols)))
+        else:
+            n_pool = len(pool_symbols)
+            start = int(rot_idx % n_pool)
+            end = start + scan_batch_max
+            if end <= n_pool:
+                scan_symbols = list(pool_symbols[start:end])
+            else:
+                scan_symbols = list(pool_symbols[start:]) + list(pool_symbols[: end - n_pool])
+            next_rot_idx = int((start + len(scan_symbols)) % n_pool)
+        mon["_uni_rot_idx"] = int(next_rot_idx)
+        scan_symbols = _dedupe_symbols_keep_order(scan_symbols)
         managed_symbols = _dedupe_symbols_keep_order(managed_seed + scan_symbols)
 
         now_ep = time.time()
@@ -14897,6 +15055,9 @@ def resolve_dynamic_universe(
             "enabled": True,
             "reason_code": str(uni_res.reason_code or "OK"),
             "scan_count": len(scan_symbols),
+            "pool_count": len(pool_symbols),
+            "scan_batch_max": int(scan_batch_max),
+            "rotation_idx": int(next_rot_idx),
             "managed_count": len(managed_symbols),
             "symbols_preview": scan_symbols[:log_max_symbols],
             "ttl_sec": int(uni_res.ttl_sec or ttl_sec),
@@ -14917,10 +15078,12 @@ def resolve_dynamic_universe(
                     mon,
                     "UNIVERSE_REFRESH",
                     "*",
-                    f"scan={len(scan_symbols)} managed={len(managed_symbols)} next={next_refresh_sec}s",
+                    f"pool={len(pool_symbols)} scan={len(scan_symbols)} managed={len(managed_symbols)} next={next_refresh_sec}s",
                     {
                         "reason_code": str(uni_res.reason_code or "OK"),
                         "top_n": int(top_n),
+                        "scan_batch_max": int(scan_batch_max),
+                        "rotation_idx": int(next_rot_idx),
                         "max_spread_bps": float(max_spread_bps),
                         "min_quote_volume": float(min_quote_volume),
                         "ttl_sec": int(uni_res.ttl_sec or ttl_sec),
@@ -14940,7 +15103,7 @@ def resolve_dynamic_universe(
             "scan_count": len(base_symbols),
             "managed_count": len(managed_seed),
             "symbols_preview": base_symbols[:8],
-            "ttl_sec": int(max(15, min(3600, int(cfg.get("universe_ttl_sec", 120) or 120)))),
+            "ttl_sec": int(max(15, min(3600, int(cfg.get("universe_ttl_sec", 600) or 600)))),
             "next_refresh_sec": None,
             "refreshed": False,
             "stats": {},
@@ -19001,8 +19164,8 @@ def _maybe_switch_style_for_open_position(
                 tgt["sl"] = float(clamp(float(tgt.get("sl", 1.8)), float(cfg.get("day_sl_roi_min", 1.0)), float(cfg.get("day_sl_roi_max", 4.0))))
                 tgt["scalp_exit_mode"] = False
             else:
-                tgt["tp"] = float(clamp(float(tgt.get("tp", 6.0)), float(cfg.get("swing_tp_roi_min", 10.0)), float(cfg.get("swing_tp_roi_max", 50.0))))
-                tgt["sl"] = float(clamp(float(tgt.get("sl", 3.0)), float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 35.0))))
+                tgt["tp"] = float(clamp(float(tgt.get("tp", 6.0)), float(cfg.get("swing_tp_roi_min", 8.0)), float(cfg.get("swing_tp_roi_max", 45.0))))
+                tgt["sl"] = float(clamp(float(tgt.get("sl", 3.0)), float(cfg.get("swing_sl_roi_min", 6.0)), float(cfg.get("swing_sl_roi_max", 30.0))))
                 tgt["scalp_exit_mode"] = False
                 # ✅ 스윙은 스캘핑보다 RR/목표폭이 "확연히" 커야 하므로,
                 #    전환 시점에도 RR 하한을 강제해 TP를 충분히 늘린다.
@@ -19013,8 +19176,8 @@ def _maybe_switch_style_for_open_position(
                     tp_now = float(tgt.get("tp", 0) or 0.0)
                     tp_need = abs(sl_now) * float(rr_min_now)
                     if tp_now < tp_need:
-                        tp_cap = float(cfg.get("swing_tp_roi_max", 50.0))
-                        tgt["tp"] = float(clamp(tp_need, float(cfg.get("swing_tp_roi_min", 10.0)), tp_cap))
+                        tp_cap = float(cfg.get("swing_tp_roi_max", 45.0))
+                        tgt["tp"] = float(clamp(tp_need, float(cfg.get("swing_tp_roi_min", 8.0)), tp_cap))
                 except Exception:
                     pass
 
@@ -20479,7 +20642,7 @@ def telegram_thread(ex):
                         try:
                             if (not forced_exit) and (not ai_exit_only) and style_now == "스윙":
                                 changed_targets = False
-                                sl_min = float(cfg.get("swing_sl_roi_min", 12.0))
+                                sl_min = float(cfg.get("swing_sl_roi_min", 6.0))
                                 if sl < sl_min:
                                     sl = float(sl_min)
                                     tgt["sl"] = float(sl_min)
@@ -20488,8 +20651,8 @@ def telegram_thread(ex):
                                 rr_min_now = max(float(_rr_min_by_mode(str(mode))), float(_rr_min_by_style("스윙")))
                                 tp_need = abs(float(sl)) * float(rr_min_now)
                                 if tp < float(tp_need):
-                                    tp_cap = float(cfg.get("swing_tp_roi_max", 50.0))
-                                    tp_new = float(clamp(tp_need, float(cfg.get("swing_tp_roi_min", 10.0)), tp_cap))
+                                    tp_cap = float(cfg.get("swing_tp_roi_max", 45.0))
+                                    tp_new = float(clamp(tp_need, float(cfg.get("swing_tp_roi_min", 8.0)), tp_cap))
                                     tp = float(tp_new)
                                     tgt["tp"] = float(tp_new)
                                     changed_targets = True
@@ -20994,8 +21157,8 @@ def telegram_thread(ex):
                                 except Exception:
                                     pass
                                 # 스윙 목표로 확장
-                                tgt["tp"] = float(clamp(max(tp, float(cfg.get("swing_tp_roi_min", 10.0))), float(cfg.get("swing_tp_roi_min", 10.0)), float(cfg.get("swing_tp_roi_max", 50.0))))
-                                tgt["sl"] = float(clamp(max(sl, float(cfg.get("swing_sl_roi_min", 12.0))), float(cfg.get("swing_sl_roi_min", 12.0)), float(cfg.get("swing_sl_roi_max", 35.0))))
+                                tgt["tp"] = float(clamp(max(tp, float(cfg.get("swing_tp_roi_min", 8.0))), float(cfg.get("swing_tp_roi_min", 8.0)), float(cfg.get("swing_tp_roi_max", 45.0))))
+                                tgt["sl"] = float(clamp(max(sl, float(cfg.get("swing_sl_roi_min", 6.0))), float(cfg.get("swing_sl_roi_min", 6.0)), float(cfg.get("swing_sl_roi_max", 30.0))))
                                 # ✅ 스윙 전환이면 "손절폭을 넓힌 만큼 익절도 같이" 늘려서 손익비가 나빠지지 않게 한다.
                                 # - (중요) 손절만 넓히고 익절은 그대로면, 이미 수익 중인 포지션에서 되레 수익 반납 리스크만 커질 수 있음
                                 try:
@@ -21005,8 +21168,8 @@ def telegram_thread(ex):
                                     tp_now = float(tgt.get("tp", 0) or 0.0)
                                     tp_need = abs(sl_now) * float(rr_min_now)
                                     if tp_now < tp_need:
-                                        tp_cap = float(cfg.get("swing_tp_roi_max", 50.0))
-                                        tgt["tp"] = float(clamp(tp_need, float(cfg.get("swing_tp_roi_min", 10.0)), tp_cap))
+                                        tp_cap = float(cfg.get("swing_tp_roi_max", 45.0))
+                                        tgt["tp"] = float(clamp(tp_need, float(cfg.get("swing_tp_roi_min", 8.0)), tp_cap))
                                 except Exception:
                                     pass
                                 # ✅ 전환 시 SR 가격 라인도 스윙 기준으로 재계산(너무 타이트한 SL 방지)
@@ -22827,6 +22990,11 @@ def telegram_thread(ex):
                     scan_iteration_symbols = list(scan_symbols_loop)
                     if force_scan_pending and force_scan_syms_set:
                         scan_iteration_symbols = _dedupe_symbols_keep_order(scan_iteration_symbols + list(force_scan_syms_set))
+                    ai_mode_cycle = str(cfg.get("ai_mode", "veto") or "veto").strip().lower()
+                    if ai_mode_cycle not in ["off", "veto", "confirm", "advisory"]:
+                        ai_mode_cycle = "veto"
+                    ai_top_k_cycle = int(max(1, _as_int(cfg.get("ai_top_k_per_cycle", 5), 5)))
+                    ai_called_cycle = 0
 
                     for sym in (scan_iteration_symbols if (not skip_scan_loop) else []):
                         try:
@@ -23766,6 +23934,7 @@ def telegram_thread(ex):
 
                         ai = None
                         ai_fallback_tag = ""
+                        ai_mode_now = str(ai_mode_cycle or "veto")
                         if use_cached_ai:
                             mon_add_scan(mon, stage="ai_cached", symbol=sym, tf=str(cfg.get("timeframe", "5m")), message=f"{cache_reason or '캐시 재사용'}")
                             try:
@@ -23785,23 +23954,45 @@ def telegram_thread(ex):
                             except Exception:
                                 ai = {"decision": "hold", "confidence": 0, "reason_easy": "ai_cache_parse_fail", "used_indicators": stt.get("_used_indicators", [])}
                         else:
+                            if (ai_mode_now == "off") and (not bool(forced_ai)):
+                                allow_ai_budget = False
+                                budget_note = "ai_mode=off"
+                            else:
                             # ✅ AI 호출 예산(비용 보호): 자동 스캔 호출을 시간/일 단위로 제한
-                            allow_ai_budget, budget_note = ai_budget_can_call(
-                                rt,
-                                cfg,
-                                force=bool(forced_ai),
-                                last=last,
-                                status=stt,
-                                symbol=str(sym),
-                                urgent=bool(event_triggered),
-                            )
+                                allow_ai_budget, budget_note = ai_budget_can_call(
+                                    rt,
+                                    cfg,
+                                    force=bool(forced_ai),
+                                    last=last,
+                                    status=stt,
+                                    symbol=str(sym),
+                                    urgent=bool(event_triggered),
+                                )
+                            # 사이클 Top-K 제한: 예산과 별도로 초과분은 fallback으로 처리
+                            if bool(allow_ai_budget) and (not bool(forced_ai)) and ai_mode_now in ["veto", "confirm", "advisory"]:
+                                try:
+                                    ml_votes_q = int(_as_int((ml or {}).get("votes_max", 0), 0))
+                                    align_q = int(_as_int((align_info or {}).get("max_count", 0), 0))
+                                    event_q = int(_as_int((event_sig or {}).get("score", 0), 0))
+                                    local_rank_score = float((ml_votes_q * 12) + (align_q * 10) + max(0, event_q))
+                                except Exception:
+                                    local_rank_score = 0.0
+                                hard_pass = bool(local_rank_score >= 110.0) or bool(event_override)
+                                if (ai_called_cycle >= ai_top_k_cycle) and (not hard_pass):
+                                    allow_ai_budget = False
+                                    budget_note = f"ai_top_k_limit({ai_called_cycle}/{ai_top_k_cycle})"
                             if not bool(allow_ai_budget):
                                 fallback_parts = _ai_budget_policy_parts(cfg)
+                                if ai_mode_now in ["off", "advisory"]:
+                                    fallback_parts.add("rules")
+                                if bool(cfg.get("allow_rule_entry_when_ai_blocked", True)):
+                                    fallback_parts.add("rules")
                                 style_hint_for_budget = normalize_style_name(dynamic_style_info.get("style", "스캘핑"))
                                 if "cache" in fallback_parts:
                                     ai_cache_budget, cache_budget_note = _build_cached_ai_from_cs(
                                         cs,
                                         max_age_sec=float(_as_float(cfg.get("ai_cache_ttl_sec", 600), 600.0)),
+                                        symbol=str(sym),
                                     )
                                     if isinstance(ai_cache_budget, dict):
                                         ai = ai_cache_budget
@@ -23823,37 +24014,61 @@ def telegram_thread(ex):
                                             {"budget_note": budget_note, "cache_note": cache_budget_note},
                                         )
                                 if (ai is None) and ("rules" in fallback_parts):
-                                    ai_rules_budget, rules_note = _build_budget_rules_ai(
-                                        symbol=str(sym),
-                                        mode=str(mode),
-                                        rule=dict(rule),
-                                        cfg=cfg,
-                                        style_hint=str(style_hint_for_budget),
-                                        decision_tf=str(cfg.get("timeframe", "5m")),
-                                        status=stt,
-                                        ml=ml if isinstance(ml, dict) else {},
-                                        align_info=align_info if isinstance(align_info, dict) else {},
-                                        event_sig=event_sig if isinstance(event_sig, dict) else {},
-                                    )
-                                    if isinstance(ai_rules_budget, dict):
-                                        ai = ai_rules_budget
-                                        ai_fallback_tag = "rules_budget"
-                                        cs["ai_fallback"] = "rules_budget"
-                                        cs["skip_reason"] = ""
+                                    local_conf_quick = 0.0
+                                    try:
+                                        ml_votes_q = int(_as_int((ml or {}).get("votes_max", 0), 0))
+                                        align_q = int(_as_int((align_info or {}).get("max_count", 0), 0))
+                                        event_q = float(_as_float((event_sig or {}).get("score", 0.0), 0.0)) / 100.0
+                                        local_conf_quick = max(
+                                            min(1.0, ml_votes_q / 6.0),
+                                            min(1.0, align_q / 6.0),
+                                            min(1.0, event_q),
+                                        )
+                                    except Exception:
+                                        local_conf_quick = 0.0
+                                    min_local_conf = float(clamp(float(_as_float(cfg.get("rule_entry_min_local_conf", 0.75), 0.75)), 0.0, 1.0))
+                                    if local_conf_quick < min_local_conf:
                                         mon_add_scan(
                                             mon,
-                                            stage="ai_fallback_rules",
+                                            stage="trade_skipped",
                                             symbol=sym,
                                             tf=str(cfg.get("timeframe", "5m")),
-                                            message=f"budget_guard:{budget_note} | {rules_note}",
+                                            message=f"rules_fallback_low_local_conf({local_conf_quick:.2f}<{min_local_conf:.2f})",
+                                            extra={"local_conf": float(local_conf_quick), "min_local_conf": float(min_local_conf)},
                                         )
-                                        mon_add_event(
-                                            mon,
-                                            "ai_fallback_rules",
-                                            sym,
-                                            f"AI 예산 제한 룰 기반 대체 | {rules_note}",
-                                            {"budget_note": budget_note, "rules_note": rules_note},
+                                    else:
+                                        ai_rules_budget, rules_note = _build_budget_rules_ai(
+                                            symbol=str(sym),
+                                            mode=str(mode),
+                                            rule=dict(rule),
+                                            cfg=cfg,
+                                            style_hint=str(style_hint_for_budget),
+                                            decision_tf=str(cfg.get("timeframe", "5m")),
+                                            status=stt,
+                                            ml=ml if isinstance(ml, dict) else {},
+                                            align_info=align_info if isinstance(align_info, dict) else {},
+                                            event_sig=event_sig if isinstance(event_sig, dict) else {},
                                         )
+                                        if isinstance(ai_rules_budget, dict):
+                                            ai = ai_rules_budget
+                                            ai_fallback_tag = "rules_budget"
+                                            cs["ai_fallback"] = "rules_budget"
+                                            cs["skip_reason"] = ""
+                                            mon_add_scan(
+                                                mon,
+                                                stage="ai_fallback_rules",
+                                                symbol=sym,
+                                                tf=str(cfg.get("timeframe", "5m")),
+                                                message=f"budget_guard:{budget_note} | {rules_note}",
+                                                extra={"local_conf": float(local_conf_quick)},
+                                            )
+                                            mon_add_event(
+                                                mon,
+                                                "ai_fallback_rules",
+                                                sym,
+                                                f"AI 예산 제한 룰 기반 대체 | {rules_note}",
+                                                {"budget_note": budget_note, "rules_note": rules_note, "local_conf": float(local_conf_quick)},
+                                            )
                                 if ai is None:
                                     try:
                                         cs["ai_called"] = False
@@ -23932,6 +24147,7 @@ def telegram_thread(ex):
                                 if bool(ai.get("_openai_model", "")):
                                     ai_budget_mark_call(rt, symbol=str(sym))
                                     save_runtime(rt)
+                                    ai_called_cycle += 1
                             except Exception:
                                 pass
                             try:
@@ -24233,6 +24449,7 @@ def telegram_thread(ex):
                                 "ai_called": True,
                                 "ai_decision": decision,
                                 "ai_confidence_raw": int(conf_raw),
+                                "ai_confidence_final": int(conf),
                                 "ai_confidence": conf,
                                 "ai_entry_pct": float(ai.get("entry_pct", rule["entry_pct_min"])),
                                 "ai_leverage": int(ai.get("leverage", rule["lev_min"])),
@@ -24254,6 +24471,28 @@ def telegram_thread(ex):
                                 "skip_reason": skip_reason_merged,
                             }
                         )
+                        try:
+                            if BOT_AI_CACHE is not None:
+                                BOT_AI_CACHE.set(
+                                    str(sym),
+                                    {
+                                        "decision": str(decision),
+                                        "confidence": int(conf),
+                                        "entry_pct": float(ai.get("entry_pct", rule["entry_pct_min"])),
+                                        "leverage": int(ai.get("leverage", rule["lev_min"])),
+                                        "sl_pct": float(ai.get("sl_pct", 1.2)),
+                                        "tp_pct": float(ai.get("tp_pct", 3.0)),
+                                        "rr": float(ai.get("rr", 1.5)),
+                                        "decision_tf": str(ai.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
+                                        "used_indicators": list(ai.get("used_indicators", [])) if isinstance(ai.get("used_indicators", []), list) else [],
+                                        "reason_easy": str(ai.get("reason_easy", "") or ""),
+                                        "sl_price": ai.get("sl_price", None),
+                                        "tp_price": ai.get("tp_price", None),
+                                    },
+                                    ttl_sec=int(max(60, _as_int(cfg.get("ai_cache_ttl_sec", 900), 900))),
+                                )
+                        except Exception:
+                            pass
                         monitor_write_throttled(mon, 1.0)
 
                         # 진입(STRICT + SOFT)
@@ -25463,14 +25702,31 @@ def telegram_thread(ex):
                                     sym,
                                     decision,
                                     qty,
+                                    params={"postOnly": bool(cfg.get("entry_post_only", True))},
                                     prefer_limit=True,
                                     limit_timeout_sec=float(max(2.0, pullback_timeout_sec)),
                                     limit_price_override=float(pullback_limit_price),
-                                    fallback_to_market=False,
+                                    fallback_to_market=bool(cfg.get("entry_fallback_to_market", True)),
                                 )
                                 entry_order_mode = "지정가(눌림목)"
                             else:
-                                ok, err_order = market_order_safe_ex(ex, sym, decision, qty)
+                                style_now_for_order = normalize_style_name(style)
+                                if style_now_for_order == "스윙":
+                                    timeout_sec = float(max(2.0, _as_float(cfg.get("entry_limit_timeout_sec_swing", 15), 15)))
+                                elif style_now_for_order == "단타":
+                                    timeout_sec = float(max(2.0, _as_float(cfg.get("entry_limit_timeout_sec_day", 6), 6)))
+                                else:
+                                    timeout_sec = float(max(2.0, _as_float(cfg.get("entry_limit_timeout_sec_scalp", 4), 4)))
+                                ok, err_order = smart_order_safe_ex(
+                                    ex,
+                                    sym,
+                                    decision,
+                                    qty,
+                                    params={"postOnly": bool(cfg.get("entry_post_only", True))},
+                                    prefer_limit=bool(cfg.get("entry_prefer_limit", True)),
+                                    limit_timeout_sec=timeout_sec,
+                                    fallback_to_market=bool(cfg.get("entry_fallback_to_market", True)),
+                                )
                             if not ok:
                                 try:
                                     if use_pullback and str(err_order or "").lower().strip() == "limit_not_filled":
@@ -25633,6 +25889,61 @@ def telegram_thread(ex):
                                                 sr_used["atr"] = float(atr_local)
                                     except Exception:
                                         pass
+                                # bot/risk + bot/sr 기반 동적 TP/SL(지지/저항 우선)
+                                try:
+                                    if bool(cfg.get("use_sr_tp_sl", True)) and (bot_pick_tp_sl_from_sr is not None):
+                                        if not isinstance(sr_used, dict):
+                                            sr_used = {}
+                                        sr_ctx_bot = dict(sr_used)
+                                        if (not sr_ctx_bot.get("supports")) or (not sr_ctx_bot.get("resistances")):
+                                            try:
+                                                if bot_compute_sr_context is not None and isinstance(df, pd.DataFrame) and (not df.empty):
+                                                    sr_ctx_bot = bot_compute_sr_context(
+                                                        df,
+                                                        timeframe=str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
+                                                        lookback_bars=int(max(80, _as_int(cfg.get("sr_lookback", 220), 220))),
+                                                        pivot_order=int(max(3, _as_int(cfg.get("sr_pivot_order", 6), 6))),
+                                                        cluster_bps=float(max(2.0, _as_float(cfg.get("sr_front_run_bps", 5.0), 5.0) * 2.0)),
+                                                    )
+                                            except Exception:
+                                                pass
+                                        tp_cap_style = float(_style_hard_tp_cap_roi(style, cfg) or max(1.0, _as_float(cfg.get("hard_cap_swing_tp_roi", 45.0), 45.0)))
+                                        sl_cap_style = float(max(0.5, _as_float(hard_roi_limits_by_style(style, cfg).get("sl_cap", _as_float(slp, 5.0)), _as_float(slp, 5.0))))
+                                        rr_floor_style = float(_rr_floor_by_style(style, cfg))
+                                        atr_pct_now = float(_as_float((sr_ctx_bot or {}).get("atr_price_pct", ai2.get("atr_price_pct", 0.0)), 0.0))
+                                        plan_bot = bot_pick_tp_sl_from_sr(
+                                            entry_price=float(px),
+                                            side=str(decision),
+                                            leverage=float(max(1, int(lev))),
+                                            sr_context=sr_ctx_bot,
+                                            atr_price_pct=float(atr_pct_now),
+                                            rr_floor=float(rr_floor_style),
+                                            tp_roi_cap=float(tp_cap_style),
+                                            sl_roi_cap=float(sl_cap_style),
+                                            sr_front_run_bps=float(_as_float(cfg.get("sr_front_run_bps", 5.0), 5.0)),
+                                            sr_breathing_bps=float(_as_float(cfg.get("sr_sl_breathing_bps", 10.0), 10.0)),
+                                            sr_breathing_atr_mult=float(_as_float(cfg.get("sr_buffer_atr_mult", 0.25), 0.25)),
+                                            fallback_tp_roi=float(max(0.5, _as_float(tpp, 4.0))),
+                                            fallback_sl_roi=float(max(0.5, _as_float(slp, 2.0))),
+                                        )
+                                        if isinstance(plan_bot, dict) and bool(plan_bot.get("ok", False)):
+                                            sl_price = float(plan_bot.get("sl_price", sl_price if sl_price is not None else 0.0))
+                                            tp_price = float(plan_bot.get("tp_price", tp_price if tp_price is not None else 0.0))
+                                            sl_price_source = str(plan_bot.get("sl_price_source", "") or sl_price_source or "SR")
+                                            tp_price_source = str(plan_bot.get("tp_price_source", "") or tp_price_source or "SR")
+                                            sl_price_pct = float(_as_float(plan_bot.get("sl_price_pct", sl_price_pct), sl_price_pct))
+                                            tp_price_pct = float(_as_float(plan_bot.get("tp_price_pct", tp_price_pct), tp_price_pct))
+                                            slp = float(_as_float(plan_bot.get("sl_roi", slp), slp))
+                                            tpp = float(_as_float(plan_bot.get("tp_roi", tpp), tpp))
+                                            ai2["sl_price_source"] = str(sl_price_source)
+                                            ai2["tp_price_source"] = str(tp_price_source)
+                                            ai2["sl_price_pct"] = float(sl_price_pct)
+                                            ai2["tp_price_pct"] = float(tp_price_pct)
+                                            ai2["sl_pct"] = float(slp)
+                                            ai2["tp_pct"] = float(tpp)
+                                            ai2["rr"] = float(_as_float(plan_bot.get("rr", ai2.get("rr", 0.0)), ai2.get("rr", 0.0)))
+                                except Exception:
+                                    pass
                                 # SR 계산 실패/값 비정상 시에도 최소한 "가격 기준 SL/TP"는 ROI 바운드로 확보
                                 if sl_price is None or tp_price is None:
                                     try:
@@ -27813,6 +28124,34 @@ config["timeframe"] = st.sidebar.selectbox(
     ["1m", "3m", "5m", "15m", "1h"],
     index=["1m", "3m", "5m", "15m", "1h"].index(config.get("timeframe", "5m")),
 )
+with st.sidebar.expander("🌐 동적 유니버스"):
+    config["universe_enable"] = st.checkbox("동적 유니버스 사용", value=bool(config.get("universe_enable", True)))
+    u1, u2 = st.columns(2)
+    config["universe_top_n"] = u1.number_input("풀 최대 심볼", 5, 150, int(config.get("universe_top_n", 150) or 150), step=5)
+    config["universe_scan_max_per_cycle"] = u2.number_input("사이클 스캔 수", 5, 100, int(config.get("universe_scan_max_per_cycle", 50) or 50), step=1)
+    u3, u4 = st.columns(2)
+    config["universe_ttl_sec"] = u3.number_input("새로고침(초)", 30, 3600, int(config.get("universe_ttl_sec", 600) or 600), step=30)
+    config["universe_max_spread_bps"] = u4.number_input("최대 스프레드(bps)", 0.5, 50.0, float(config.get("universe_max_spread_bps", 8.0) or 8.0), step=0.5)
+    config["universe_min_quote_volume"] = st.number_input(
+        "최소 24h 거래대금(USDT)",
+        0.0,
+        10_000_000_000.0,
+        float(config.get("universe_min_quote_volume", 20_000_000.0) or 20_000_000.0),
+        step=1_000_000.0,
+    )
+    config["universe_scan_rotation_enable"] = st.checkbox(
+        "사이클 회전 스캔",
+        value=bool(config.get("universe_scan_rotation_enable", True)),
+        help="풀(최대 150)에서 매 사이클 50개만 회전 스캔합니다.",
+    )
+    ua_raw = config.get("universe_always_include", ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"])
+    if isinstance(ua_raw, list):
+        ua_text_default = ",".join([str(x) for x in ua_raw if str(x).strip()])
+    else:
+        ua_text_default = str(ua_raw or "")
+    ua_text = st.text_input("항상 포함(쉼표)", value=ua_text_default)
+    config["universe_always_include"] = [x.strip() for x in str(ua_text or "").split(",") if x.strip()]
+
 config["tg_enable_reports"] = st.sidebar.checkbox("📨 텔레그램 이벤트 알림(진입/청산 등)", value=bool(config.get("tg_enable_reports", True)))
 config["tg_send_entry_reason"] = st.sidebar.checkbox("📌 텔레그램에 진입근거(긴글)도 보내기", value=bool(config.get("tg_send_entry_reason", False)))
 config["tg_simple_messages"] = st.sidebar.checkbox(
@@ -27858,6 +28197,15 @@ config["ai_cost_saver_strict"] = st.sidebar.checkbox(
     value=bool(config.get("ai_cost_saver_strict", True)),
     help="ON이면 스타일 AI를 끄고, 약한 신호에서는 AI 호출 자체를 건너뜁니다.",
 )
+ai_mode_opts = ["off", "veto", "confirm", "advisory"]
+ai_mode_now = str(config.get("ai_mode", "veto") or "veto").strip().lower()
+if ai_mode_now not in ai_mode_opts:
+    ai_mode_now = "veto"
+config["ai_mode"] = st.sidebar.selectbox("AI 모드", ai_mode_opts, index=ai_mode_opts.index(ai_mode_now))
+bk1, bk2, bk3 = st.sidebar.columns(3)
+config["ai_top_k_per_cycle"] = bk1.number_input("사이클 Top-K", 1, 50, int(config.get("ai_top_k_per_cycle", 5) or 5), step=1)
+config["ai_batch_call"] = bk2.checkbox("배치호출", value=bool(config.get("ai_batch_call", True)))
+config["ai_batch_max_items"] = bk3.number_input("배치 최대", 1, 30, int(config.get("ai_batch_max_items", 8) or 8), step=1)
 bz1, bz2, bz3 = st.sidebar.columns(3)
 config["ai_budget_enable"] = bz1.checkbox("예산제한", value=bool(config.get("ai_budget_enable", True)))
 config["ai_budget_hourly_limit"] = bz2.number_input(
@@ -27867,12 +28215,18 @@ config["ai_budget_hourly_limit"] = bz2.number_input(
     int(config.get("ai_budget_hourly_limit", 0) or 0),
     step=1,
 )
-config["ai_budget_daily_limit"] = bz3.number_input("일일(0=무제한)", 0, 200000, int(config.get("ai_budget_daily_limit", 180) or 180), step=10)
+config["ai_budget_daily_limit"] = bz3.number_input(
+    "일일(0=무제한)",
+    0,
+    200000,
+    int(_as_int(config.get("ai_budget_daily_limit", 0), 0)),
+    step=10,
+)
 config["ai_budget_min_interval_sec"] = st.sidebar.number_input(
     "AI 최소 간격(초)",
     1,
     3600,
-    int(config.get("ai_budget_min_interval_sec", 45) or 45),
+    int(config.get("ai_budget_min_interval_sec", 30) or 30),
     step=1,
     help="자동 스캔에서 AI 호출 사이 최소 간격입니다.",
 )
@@ -27904,13 +28258,25 @@ config["ai_cache_ttl_sec"] = fp2.number_input(
     "AI 캐시 TTL(초)",
     30,
     3600,
-    int(config.get("ai_cache_ttl_sec", 600) or 600),
+    int(config.get("ai_cache_ttl_sec", 900) or 900),
     step=10,
 )
 ff1, ff2 = st.sidebar.columns(2)
 config["ai_fallback_min_conf"] = ff1.number_input("대체 최소 확신", 50, 100, int(config.get("ai_fallback_min_conf", 82) or 82), step=1)
 config["ai_fallback_min_ml_votes"] = ff2.number_input("대체 ML 최소표", 1, 8, int(config.get("ai_fallback_min_ml_votes", 4) or 4), step=1)
 config["ai_fallback_min_align"] = st.sidebar.number_input("대체 정렬 최소개수", 1, 8, int(config.get("ai_fallback_min_align", 4) or 4), step=1)
+rw1, rw2 = st.sidebar.columns(2)
+config["allow_rule_entry_when_ai_blocked"] = rw1.checkbox(
+    "AI 막힘 시 룰진입 허용",
+    value=bool(config.get("allow_rule_entry_when_ai_blocked", True)),
+)
+config["rule_entry_min_local_conf"] = rw2.number_input(
+    "룰진입 최소 점수",
+    0.50,
+    1.0,
+    float(config.get("rule_entry_min_local_conf", 0.75) or 0.75),
+    step=0.01,
+)
 
 try:
     _rt_budget_ui = load_runtime()
@@ -27962,21 +28328,26 @@ config["sqz_fire_window_bars"] = st.sidebar.number_input(
 with st.sidebar.expander("진입 전 AI 호출 필터(거래량/이격도)"):
     config["ai_call_require_volume_spike"] = st.checkbox(
         "거래량 스파이크 없으면 AI 호출 안함",
-        value=bool(config.get("ai_call_require_volume_spike", True)),
+        value=bool(config.get("ai_call_require_volume_spike", False)),
         help="현재 봉 거래량이 최근 평균보다 충분히 커야만 AI를 호출합니다(박스권/힘 없는 해소 진입 방지).",
     )
     v1, v2 = st.columns(2)
-    config["ai_call_volume_spike_mul"] = v1.number_input("스파이크 배수", 1.0, 10.0, float(config.get("ai_call_volume_spike_mul", 1.5) or 1.5), step=0.1)
+    config["ai_call_volume_spike_mul"] = v1.number_input("스파이크 배수", 1.0, 10.0, float(config.get("ai_call_volume_spike_mul", 1.25) or 1.25), step=0.1)
     config["ai_call_volume_spike_period"] = v2.number_input("평균 기간", 5, 120, int(config.get("ai_call_volume_spike_period", 20) or 20), step=1)
     st.divider()
     config["ai_call_require_disparity"] = st.checkbox(
         "이격도 과하면 AI 호출 안함",
-        value=bool(config.get("ai_call_require_disparity", True)),
+        value=bool(config.get("ai_call_require_disparity", False)),
         help="가격이 MA(기본 20)에서 너무 멀면(과열/급락) 눌림목이 아니라 추세 꺾임일 수 있어 AI 호출을 막습니다.",
     )
     d1, d2 = st.columns(2)
-    config["ai_call_disparity_max_abs_pct"] = d1.number_input("최대 |이격도|%", 0.5, 30.0, float(config.get("ai_call_disparity_max_abs_pct", 4.0) or 4.0), step=0.5)
+    config["ai_call_disparity_max_abs_pct"] = d1.number_input("최대 |이격도|%", 0.5, 30.0, float(config.get("ai_call_disparity_max_abs_pct", 8.0) or 8.0), step=0.5)
     config["ai_call_disparity_ma_period"] = d2.number_input("이격도 MA 기간", 5, 120, int(config.get("ai_call_disparity_ma_period", 20) or 20), step=1)
+    config["ai_call_filters_block_ai"] = st.checkbox(
+        "필터 미달 시 AI 강제 차단",
+        value=bool(config.get("ai_call_filters_block_ai", False)),
+        help="OFF 권장: 필터 미달이어도 AI/룰 fallback이 기회를 잡을 수 있습니다.",
+    )
 with st.sidebar.expander("관망 장기화 시 진입 완화(소폭)"):
     config["entry_relax_enable"] = st.checkbox(
         "무포지션 오래 지속 시 완화",
@@ -28905,6 +29276,15 @@ with t1:
             )
         except Exception:
             pass
+        try:
+            uni_view = mon.get("universe", {}) or {}
+            st.caption(
+                f"Universe: pool {int(_as_int(uni_view.get('pool_count', 0), 0))} | "
+                f"scan {int(_as_int(uni_view.get('scan_count', 0), 0))}/{int(_as_int(uni_view.get('scan_batch_max', 0), 0))} | "
+                f"rot_idx {int(_as_int(uni_view.get('rotation_idx', 0), 0))} | next_refresh {int(_as_int(uni_view.get('next_refresh_sec', 0), 0))}s"
+            )
+        except Exception:
+            pass
 
         # ✅ 포지션/진입 정보(직관적 표시)
         st.subheader("📊 현재 포지션(스타일/목표 포함)")
@@ -28934,6 +29314,23 @@ with t1:
                 st_dataframe_safe(df_for_display(df_scan), hide_index=True)
             except Exception:
                 st_dataframe_safe(df_for_display(pd.DataFrame(scan_logs[-int(max_show):][::-1])), hide_index=True)
+            try:
+                df_skip = pd.DataFrame(scan_logs[-200:])
+                if not df_skip.empty:
+                    mask = df_skip["stage"].astype(str).str.lower().eq("trade_skipped")
+                    df_skip = df_skip[mask].copy()
+                    if not df_skip.empty:
+                        reason_series = df_skip["message"].astype(str).str.slice(0, 120)
+                        top_skip = (
+                            reason_series.value_counts(dropna=False)
+                            .rename_axis("skip_reason")
+                            .reset_index(name="count")
+                            .head(12)
+                        )
+                        st.caption("🚫 최근 200스캔 기준 상위 스킵 사유")
+                        st_dataframe_safe(df_for_display(top_skip), hide_index=True)
+            except Exception:
+                pass
         else:
             st.caption("SCAN 로그 없음")
 
@@ -28967,6 +29364,7 @@ with t1:
                     "눌림목후보": "✅" if cs.get("pullback_candidate") else "—",
                     "AI호출": "✅" if cs.get("ai_called") else "—",
                     "AI결론": str(cs.get("ai_decision", "-")).upper(),
+                    "확신(raw)": cs.get("ai_confidence_raw", "-"),
                     "확신도": cs.get("ai_confidence", "-"),
                     "AI대체": cs.get("ai_fallback", ""),
                     "필요확신도": cs.get("min_conf_required", "-"),
