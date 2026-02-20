@@ -24027,7 +24027,14 @@ def telegram_thread(ex):
                             if not str(cs.get("skip_reason", "") or "").strip():
                                 cs["skip_reason"] = "횡보/해소 신호 없음(휩쏘 위험)"
                             monitor_write_throttled(mon, 1.0)
-                            mon_add_scan(mon, stage="trade_skipped", symbol=sym, tf=str(cfg.get("timeframe", "5m")), message="call_ai=False")
+                            mon_add_scan(
+                                mon,
+                                stage="trade_skipped",
+                                symbol=sym,
+                                tf=str(cfg.get("timeframe", "5m")),
+                                message=str(cs.get("skip_reason", "") or "call_ai=False")[:180],
+                                extra={"reason_code": "CALL_AI_FALSE"},
+                            )
                             continue
 
                         # ✅ 비용 절감: 신규진입이 꺼져 있으면 AI를 자동 호출하지 않음(강제스캔만 예외)
@@ -29377,6 +29384,11 @@ with t1:
                 f"AI Budget: day {int(_as_int(budget_view.get('day_calls',0),0))}/{d_lim_txt}, "
                 f"hour {int(_as_int(budget_view.get('hour_calls',0),0))}/{h_lim_txt}, "
                 f"next {next_left}s"
+            )
+            st.caption(
+                f"AI Mode: {str(config.get('ai_mode','veto')).upper()} | "
+                f"Top-K/cycle: {int(_as_int(config.get('ai_top_k_per_cycle',5),5))} | "
+                f"Local fallback ≥ {float(_as_float(config.get('ai_min_local_confidence_no_ai',0.75),0.75)):.2f}"
             )
         except Exception:
             pass
