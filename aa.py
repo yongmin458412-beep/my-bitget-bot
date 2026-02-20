@@ -19352,12 +19352,12 @@ def _maybe_switch_style_for_open_position(
                             slb2, tpb2 = _sr_price_bounds_from_price_pct(float(entry_px0), str(dec2), float(sl_price_pct0), float(tp_price_pct0))
                             if tgt.get("sl_price") is None:
                                 tgt["sl_price"] = float(slb2)
-                                if not str(tgt.get("sl_price_source", "") or ""):
-                                    tgt["sl_price_source"] = "ROI"
+                                    if not str(tgt.get("sl_price_source", "") or ""):
+                                        tgt["sl_price_source"] = "ROI_FALLBACK"
                             if tgt.get("tp_price") is None:
                                 tgt["tp_price"] = float(tpb2)
-                                if not str(tgt.get("tp_price_source", "") or ""):
-                                    tgt["tp_price_source"] = "ROI"
+                                    if not str(tgt.get("tp_price_source", "") or ""):
+                                        tgt["tp_price_source"] = "ROI_FALLBACK"
                         except Exception:
                             pass
             except Exception:
@@ -20903,10 +20903,10 @@ def telegram_thread(ex):
                                                 slb2, tpb2 = _sr_price_bounds_from_price_pct(float(entry_px0), str(dec2), float(sl_price_pct), float(tp_price_pct))
                                                 if tgt.get("sl_price") is None:
                                                     tgt["sl_price"] = float(slb2)
-                                                    tgt["sl_price_source"] = str(tgt.get("sl_price_source", "") or "") or "ROI"
+                                                    tgt["sl_price_source"] = str(tgt.get("sl_price_source", "") or "") or "ROI_FALLBACK"
                                                 if tgt.get("tp_price") is None:
                                                     tgt["tp_price"] = float(tpb2)
-                                                    tgt["tp_price_source"] = str(tgt.get("tp_price_source", "") or "") or "ROI"
+                                                    tgt["tp_price_source"] = str(tgt.get("tp_price_source", "") or "") or "ROI_FALLBACK"
                                 except Exception:
                                     pass
                         except Exception:
@@ -21345,11 +21345,11 @@ def telegram_thread(ex):
                                                 if tgt.get("sl_price") is None:
                                                     tgt["sl_price"] = float(slb2)
                                                     if not str(tgt.get("sl_price_source", "") or ""):
-                                                        tgt["sl_price_source"] = "ROI"
+                                                        tgt["sl_price_source"] = "ROI_FALLBACK"
                                                 if tgt.get("tp_price") is None:
                                                     tgt["tp_price"] = float(tpb2)
                                                     if not str(tgt.get("tp_price_source", "") or ""):
-                                                        tgt["tp_price_source"] = "ROI"
+                                                        tgt["tp_price_source"] = "ROI_FALLBACK"
                                             except Exception:
                                                 pass
                                 except Exception:
@@ -25997,9 +25997,9 @@ def telegram_thread(ex):
                                         sl_price = float(slb)
                                         tp_price = float(tpb)
                                         if not sl_price_source:
-                                            sl_price_source = "ROI"
+                                            sl_price_source = "ROI_FALLBACK"
                                         if not tp_price_source:
-                                            tp_price_source = "ROI"
+                                            tp_price_source = "ROI_FALLBACK"
                                         if not sl_price_reason:
                                             sl_price_reason = "구조 레벨 미검출 → ROI 하드캡 기준 손절"
                                         if not tp_price_reason:
@@ -26108,10 +26108,10 @@ def telegram_thread(ex):
                                         )
                                         if sl_price is None:
                                             sl_price = float(slb_cap)
-                                            sl_price_source = (str(sl_price_source or "").strip() + "+CAP").strip("+") or "ROI+CAP"
+                                            sl_price_source = (str(sl_price_source or "").strip() + "+CAP").strip("+") or "ROI_FALLBACK+CAP"
                                         if tp_price is None:
                                             tp_price = float(tpb_cap)
-                                            tp_price_source = (str(tp_price_source or "").strip() + "+CAP").strip("+") or "ROI+CAP"
+                                            tp_price_source = (str(tp_price_source or "").strip() + "+CAP").strip("+") or "ROI_FALLBACK+CAP"
                                 except Exception:
                                     pass
 
