@@ -29631,6 +29631,7 @@ with t1:
 
         rows = []
         coins = mon.get("coins", {}) or {}
+        st.caption("ℹ️ `AI호출`은 실제 OpenAI 호출 여부입니다. (캐시/룰 기반 대체는 OFF)")
         for sym, cs in coins.items():
             last_scan = float(cs.get("last_scan_epoch", 0) or 0)
             scan_age = (time.time() - last_scan) if last_scan else 9999
