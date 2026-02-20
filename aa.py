@@ -40,6 +40,7 @@ import sqlite3
 import threading
 import traceback
 import socket
+import subprocess
 from collections import deque
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timedelta, timezone
@@ -243,6 +244,26 @@ def _code_version_token() -> str:
 
 
 CODE_VERSION = _code_version_token()
+
+
+def _git_branch_token() -> str:
+    try:
+        cwd = os.path.dirname(str(__file__) or ".") or "."
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd,
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+            text=True,
+        ).strip()
+        if out:
+            return str(out)
+    except Exception:
+        pass
+    return "unknown"
+
+
+GIT_BRANCH = _git_branch_token()
 
 
 # =========================================================
@@ -1034,6 +1055,62 @@ def validate_trade_plan(
 # =========================================================
 # ✅ 4) 설정 관리 (load/save)
 # =========================================================
+SETTINGS_SCHEMA_VERSION = 31
+CRITICAL_TUNING_OPTOUT_KEY = "test_tuning_opt_out"
+CRITICAL_TUNING_ENFORCE_KEY = "critical_tuning_force_apply"
+
+
+def critical_tuning_recommended_values() -> Dict[str, Any]:
+    return {
+        "pattern_gate_entry": False,
+        "ai_call_require_volume_spike": False,
+        "ai_call_require_disparity": False,
+        "ai_call_filters_block_ai": False,
+        "intra_day_scalp_min_conf": 55,
+        "intra_day_day_min_conf": 65,
+        "intra_day_swing_min_conf": 68,
+        "ai_mode": "veto",
+        "ai_enable_scalp": False,
+        "ai_enable_day": True,
+        "ai_enable_swing": True,
+        "universe_scan_max_per_cycle": 50,
+        "universe_scan_rotation_enable": True,
+        "universe_top_n": 150,
+    }
+
+
+def _setting_value_eq(cur: Any, expected: Any) -> bool:
+    try:
+        if isinstance(expected, bool):
+            return bool(cur) is bool(expected)
+        if isinstance(expected, (int, float)) and (not isinstance(expected, bool)):
+            return abs(float(_as_float(cur, float(expected))) - float(expected)) < 1e-9
+        return str(cur) == str(expected)
+    except Exception:
+        return str(cur) == str(expected)
+
+
+def critical_tuning_status(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    rec = critical_tuning_recommended_values()
+    mismatches: List[Dict[str, Any]] = []
+    for key, expected in rec.items():
+        current = cfg.get(key)
+        if not _setting_value_eq(current, expected):
+            mismatches.append(
+                {
+                    "key": key,
+                    "current": current,
+                    "recommended": expected,
+                }
+            )
+    return {
+        "opt_out": bool(cfg.get(CRITICAL_TUNING_OPTOUT_KEY, False)),
+        "force_apply": bool(cfg.get(CRITICAL_TUNING_ENFORCE_KEY, True)),
+        "mismatches": mismatches,
+        "recommended": rec,
+    }
+
+
 def default_settings() -> Dict[str, Any]:
     scalp_tp_cap_default = float((STYLE_RULES.get("스캘핑", {}) or {}).get("tp_roi_max", 3.0))
     scalp_sl_cap_default = float((STYLE_RULES.get("스캘핑", {}) or {}).get("sl_roi_max", 5.0))
@@ -1043,7 +1120,7 @@ def default_settings() -> Dict[str, Any]:
     swing_sl_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("sl_roi_max", 30.0))
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 30,
+        "settings_schema_version": SETTINGS_SCHEMA_VERSION,
         "openai_api_key": "",
         "openai_model_trade": "gpt-4o-mini",
         "openai_model_style": "gpt-4o-mini",
@@ -1094,8 +1171,10 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 사용자 요구: AI 시야 리포트(자동 전송)는 기본 OFF (필요할 때만 /vision 으로 조회)
         "tg_enable_hourly_vision_report": False,
         "vision_report_interval_min": 60,
+        CRITICAL_TUNING_OPTOUT_KEY: False,
+        CRITICAL_TUNING_ENFORCE_KEY: True,
         # ✅ 하트비트 정체 감지(초) - false positive 완화
-        "ui_heartbeat_stale_min_sec": 90,
+        "ui_heartbeat_stale_min_sec": 180,
         "watchdog_hb_warn_sec": 180,
         "watchdog_hb_clear_sec": 45,
         "watchdog_hb_restart_sec": 420,
@@ -1828,6 +1907,8 @@ def load_settings() -> Dict[str, Any]:
     base = default_settings()
     saved = {}
     saved_ver = 0
+    saved_opt_out = False
+    saved_force_apply = True
     if os.path.exists(SETTINGS_FILE):
         saved = read_json_safe(SETTINGS_FILE, {}) or {}
         if isinstance(saved, dict):
@@ -1835,6 +1916,14 @@ def load_settings() -> Dict[str, Any]:
                 saved_ver = int(saved.get("settings_schema_version", 0) or 0)
             except Exception:
                 saved_ver = 0
+            try:
+                saved_opt_out = bool(saved.get(CRITICAL_TUNING_OPTOUT_KEY, False))
+            except Exception:
+                saved_opt_out = False
+            try:
+                saved_force_apply = bool(saved.get(CRITICAL_TUNING_ENFORCE_KEY, True))
+            except Exception:
+                saved_force_apply = True
     cfg = dict(base)
     if isinstance(saved, dict):
         cfg.update(saved)
@@ -2778,7 +2867,7 @@ def load_settings() -> Dict[str, Any]:
             except Exception:
                 pass
         # v30: 스캘핑 무AI + 테스트 진입 완화 프리셋
-        if saved_ver < 30:
+        if (saved_ver < 30) and (not saved_opt_out):
             for k, v in {
                 "ai_enable_scalp": False,
                 "ai_enable_day": True,
@@ -2812,6 +2901,35 @@ def load_settings() -> Dict[str, Any]:
                 try:
                     cfg[k] = v
                     changed = True
+                except Exception:
+                    pass
+        # v31: 구버전 설정 안전가드(관망 장기화 방지 핵심키 강제)
+        # - 사용자가 명시적으로 opt-out 하지 않은 경우에만 적용
+        if saved_ver < 31:
+            do_force_apply = bool((not saved_opt_out) and saved_force_apply)
+            if do_force_apply:
+                for k, v in critical_tuning_recommended_values().items():
+                    try:
+                        if not _setting_value_eq(cfg.get(k), v):
+                            cfg[k] = v
+                            changed = True
+                    except Exception:
+                        pass
+                try:
+                    stale_now = float(_as_float(cfg.get("ui_heartbeat_stale_min_sec", 0), 0.0))
+                    if stale_now < 180.0:
+                        cfg["ui_heartbeat_stale_min_sec"] = 180
+                        changed = True
+                except Exception:
+                    pass
+                try:
+                    cfg["critical_tuning_applied_kst"] = now_kst_str()
+                    changed = True
+                except Exception:
+                    pass
+            else:
+                try:
+                    cfg["critical_tuning_applied_kst"] = str(cfg.get("critical_tuning_applied_kst", "") or "")
                 except Exception:
                     pass
         cfg["settings_schema_version"] = base_ver
@@ -15115,6 +15233,20 @@ def mon_mark_exchange_refresh(mon: Dict[str, Any], reason: str = "") -> None:
         pass
 
 
+def mon_touch_heartbeat(mon: Dict[str, Any], stage: str, detail: str = "", flush_sec: float = 0.2) -> None:
+    try:
+        t_kst = now_kst_str()
+        mon["loop_stage"] = str(stage or "RUNNING")[:80]
+        mon["loop_stage_kst"] = t_kst
+        mon["last_heartbeat_epoch"] = time.time()
+        mon["last_heartbeat_kst"] = t_kst
+        if str(detail or "").strip():
+            mon["loop_stage_detail"] = str(detail)[:180]
+        monitor_write_throttled(mon, float(max(0.1, flush_sec)))
+    except Exception:
+        pass
+
+
 def mon_add_event(mon: Dict[str, Any], ev_type: str, symbol: str = "", message: str = "", extra: Optional[Dict[str, Any]] = None):
     try:
         ev = {"time_kst": now_kst_str(), "type": ev_type, "symbol": symbol, "message": message, "extra": extra or {}}
@@ -15371,6 +15503,44 @@ def _watch_reason_top(mon: Dict[str, Any], symbols: List[str], top_n: int = 3) -
                 continue
             key = reason[:120]
             counts[key] = int(counts.get(key, 0) or 0) + 1
+        ranked = sorted(counts.items(), key=lambda x: (-int(x[1]), str(x[0])))
+        return ranked[: max(1, int(top_n))]
+    except Exception:
+        return []
+
+
+def _skip_reason_gate(reason: str) -> str:
+    txt = str(reason or "").strip().lower()
+    if not txt:
+        return "unknown"
+    if ("신규진입 off" in txt) or ("entry_disabled" in txt) or ("auto_trade" in txt):
+        return "auto_trade_off"
+    if ("일시정지" in txt) or ("pause" in txt) or ("쿨다운" in txt) or ("cooldown" in txt):
+        return "paused_or_cooldown"
+    if ("ai 예산" in txt) or ("ai_skipped_budget" in txt) or ("budget" in txt) or ("ai_mode=off" in txt):
+        return "ai_blocked"
+    if "패턴" in txt:
+        return "pattern_gate"
+    if ("확신도 부족" in txt) or ("confidence" in txt):
+        return "confidence_gate"
+    if ("역추세" in txt) or ("추세" in txt) or ("이치모쿠" in txt) or ("trend" in txt):
+        return "trend_gate"
+    if ("포지션 제한" in txt) or ("한도" in txt):
+        return "position_limit"
+    if ("거래량" in txt) or ("obv" in txt) or ("spread" in txt) or ("funding" in txt):
+        return "micro_filter"
+    return "other"
+
+
+def _watch_gate_top(mon: Dict[str, Any], symbols: List[str], top_n: int = 3) -> List[Tuple[str, int]]:
+    try:
+        coins = (mon or {}).get("coins", {}) or {}
+        counts: Dict[str, int] = {}
+        for s in symbols:
+            cs = coins.get(s, {}) if isinstance(coins, dict) else {}
+            reason = str((cs or {}).get("skip_reason") or (cs or {}).get("ai_reason_easy") or "").strip()
+            gate = _skip_reason_gate(reason)
+            counts[gate] = int(counts.get(gate, 0) or 0) + 1
         ranked = sorted(counts.items(), key=lambda x: (-int(x[1]), str(x[0])))
         return ranked[: max(1, int(top_n))]
     except Exception:
@@ -23275,8 +23445,10 @@ def telegram_thread(ex):
                         # 데이터 로드(단기: cfg timeframe)
                         try:
                             mon_add_scan(mon, stage="fetch_short", symbol=sym, tf=str(cfg.get("timeframe", "5m")), message="OHLCV 로드")
+                            mon_touch_heartbeat(mon, stage=f"FETCH_OHLCV:{sym}", detail=str(cfg.get("timeframe", "5m")))
                             _to_before = float(getattr(ex, "_wonyoti_ccxt_timeout_epoch", 0) or 0)
                             ohlcv = safe_fetch_ohlcv(ex, sym, str(cfg.get("timeframe", "5m")), limit=220)
+                            mon_touch_heartbeat(mon, stage=f"FETCH_OHLCV_DONE:{sym}", detail=f"bars={len(ohlcv or [])}")
                             if not ohlcv:
                                 _to_after = float(getattr(ex, "_wonyoti_ccxt_timeout_epoch", 0) or 0)
                                 if _to_after and _to_after > _to_before:
@@ -23545,6 +23717,7 @@ def telegram_thread(ex):
                         regime_info: Dict[str, Any] = {"regime": "mean_reversion", "reason": "기본"}
                         strategy_info: Dict[str, Any] = {"strategy": "mean_reversion", "reason": "기본"}
                         try:
+                            mon_touch_heartbeat(mon, stage=f"FETCH_MTF:{sym}", detail="1m~1d+orderbook")
                             mtf_context = build_full_spectrum_context(
                                 ex,
                                 sym,
@@ -23554,9 +23727,12 @@ def telegram_thread(ex):
                                 base_status=stt,
                                 base_last=last,
                             )
+                            mon_touch_heartbeat(mon, stage=f"FETCH_ORDERBOOK:{sym}", detail="depth=20")
                             ob_raw = safe_fetch_order_book(ex, sym, limit=20)
+                            mon_touch_heartbeat(mon, stage=f"FETCH_ORDERBOOK_DONE:{sym}", detail="ok")
                             orderbook_context = orderbook_pressure_summary(ob_raw, depth=20)
                             derivatives_context = fetch_derivatives_context_cached(ex, sym, cfg)
+                            mon_touch_heartbeat(mon, stage=f"FETCH_MTF_DONE:{sym}", detail="context_ready")
                             dynamic_style_info = choose_dynamic_style(mtf_context, orderbook_context, cfg=cfg)
                             regime_info = classify_regime_adx_volatility(mtf_context, cfg, orderbook_ctx=orderbook_context)
                             strategy_info = select_strategy_for_cycle(
@@ -24164,7 +24340,14 @@ def telegram_thread(ex):
                             if not str(cs.get("skip_reason", "") or "").strip():
                                 cs["skip_reason"] = "횡보/해소 신호 없음(휩쏘 위험)"
                             monitor_write_throttled(mon, 1.0)
-                            mon_add_scan(mon, stage="trade_skipped", symbol=sym, tf=str(cfg.get("timeframe", "5m")), message="call_ai=False")
+                            mon_add_scan(
+                                mon,
+                                stage="trade_skipped",
+                                symbol=sym,
+                                tf=str(cfg.get("timeframe", "5m")),
+                                message=str(cs.get("skip_reason", "call_ai=False"))[:160],
+                                extra={"reason_code": "CALL_AI_FALSE"},
+                            )
                             continue
 
                         # ✅ 비용 절감: 신규진입이 꺼져 있으면 AI를 자동 호출하지 않음(강제스캔만 예외)
@@ -24409,6 +24592,7 @@ def telegram_thread(ex):
                         else:
                             ext_for_ai = ext if chart_style_hint in ["단타", "스윙"] else {"enabled": False}
                         if ai is None:
+                            mon_touch_heartbeat(mon, stage=f"AI_CALL:{sym}", detail=f"style={chart_style_hint}")
                             ai = ai_decide_trade(
                                 df,
                                 stt,
@@ -24423,6 +24607,7 @@ def telegram_thread(ex):
                                 orderbook_context=orderbook_context,
                                 calculated_style=chart_style_hint,
                             )
+                            mon_touch_heartbeat(mon, stage=f"AI_CALL_DONE:{sym}", detail=str(ai.get('decision', 'hold')))
                             try:
                                 if bool(ai.get("_openai_model", "")):
                                     ai_budget_mark_call(rt, symbol=str(sym))
@@ -26873,9 +27058,9 @@ def telegram_thread(ex):
                                 scan_lag_sec = max(0.0, time.time() - float(mon.get("last_scan_epoch", 0) or 0))
                                 scan_cycle_sec = float(mon.get("scan_cycle_sec", 0.0) or 0.0)
                                 try:
-                                    stale_min_cfg = float(clamp(float(_as_float(cfg.get("ui_heartbeat_stale_min_sec", 90), 90.0)), 45.0, 900.0))
+                                    stale_min_cfg = float(clamp(float(_as_float(cfg.get("ui_heartbeat_stale_min_sec", 180), 180.0)), 45.0, 900.0))
                                 except Exception:
-                                    stale_min_cfg = 90.0
+                                    stale_min_cfg = 180.0
                                 stale_thresh = max(float(stale_min_cfg), float(scan_cycle_sec) * 4.0) if scan_cycle_sec > 0 else float(stale_min_cfg)
                                 analyzing = bool(scan_lag_sec <= stale_thresh)
 
@@ -26897,6 +27082,11 @@ def telegram_thread(ex):
                                     lines.append("- 관망 사유 TOP")
                                     for reason, cnt in top_reasons:
                                         lines.append(f"  · {reason[:55]} x{int(cnt)}")
+                                top_gates = _watch_gate_top(mon, list(scan_symbols_loop), top_n=2)
+                                if top_gates:
+                                    lines.append("- 주요 게이트 TOP")
+                                    for gate, cnt in top_gates:
+                                        lines.append(f"  · {gate} x{int(cnt)}")
 
                                 coins_now = mon.get("coins", {}) if isinstance(mon.get("coins", {}), dict) else {}
                                 for sym0 in list(scan_symbols_loop)[:3]:
@@ -28490,6 +28680,16 @@ sa1, sa2, sa3 = st.sidebar.columns(3)
 config["ai_enable_scalp"] = sa1.checkbox("스캘핑", value=bool(config.get("ai_enable_scalp", False)))
 config["ai_enable_day"] = sa2.checkbox("단타", value=bool(config.get("ai_enable_day", True)))
 config["ai_enable_swing"] = sa3.checkbox("스윙", value=bool(config.get("ai_enable_swing", True)))
+config[CRITICAL_TUNING_OPTOUT_KEY] = st.sidebar.checkbox(
+    "테스트 튜닝 강제 적용 해제(고급)",
+    value=bool(config.get(CRITICAL_TUNING_OPTOUT_KEY, False)),
+    help="ON이면 마이그레이션 시 핵심 튜닝 키를 강제 보정하지 않습니다.",
+)
+config[CRITICAL_TUNING_ENFORCE_KEY] = st.sidebar.checkbox(
+    "마이그레이션 시 핵심 튜닝 강제 적용",
+    value=bool(config.get(CRITICAL_TUNING_ENFORCE_KEY, True)),
+    help="구버전 bot_settings.json 로드 시 관망 장기화 방지 핵심키를 권장값으로 교정합니다.",
+)
 bk1, bk2, bk3 = st.sidebar.columns(3)
 config["ai_top_k_per_cycle"] = bk1.number_input("사이클 Top-K", 1, 50, int(config.get("ai_top_k_per_cycle", 5) or 5), step=1)
 config["ai_batch_call"] = bk2.checkbox("배치호출", value=bool(config.get("ai_batch_call", True)))
@@ -28674,6 +28874,14 @@ config["tg_heartbeat_silent"] = st.sidebar.checkbox(
     "하트비트는 무음(알림X)",
     value=bool(config.get("tg_heartbeat_silent", True)),
     help="무음 전송(disable_notification)로 보내서 알림을 줄입니다.",
+)
+config["ui_heartbeat_stale_min_sec"] = st.sidebar.number_input(
+    "UI 멈춤 경고 기준(초)",
+    45,
+    1800,
+    int(_as_int(config.get("ui_heartbeat_stale_min_sec", 180), 180)),
+    step=15,
+    help="스캔이 느린 구간에서 워치독 오탐을 줄이려면 값을 높이세요.",
 )
 st.sidebar.divider()
 config["tg_enable_periodic_report"] = st.sidebar.checkbox(
@@ -29523,9 +29731,9 @@ with t1:
             scan_cycle_sec = 0.0
         # 요구사항: heartbeat lag가 scan_interval*4 이상이면 '멈춤 의심'
         try:
-            stale_min_cfg = float(clamp(float(_as_float(config.get("ui_heartbeat_stale_min_sec", 90), 90.0)), 45.0, 900.0))
+            stale_min_cfg = float(clamp(float(_as_float(config.get("ui_heartbeat_stale_min_sec", 180), 180.0)), 45.0, 900.0))
         except Exception:
-            stale_min_cfg = 90.0
+            stale_min_cfg = 180.0
         stale_thresh = max(float(stale_min_cfg), float(scan_cycle_sec) * 4.0) if scan_cycle_sec > 0 else float(stale_min_cfg)
 
         c1, c2, c3, c4 = st.columns(4)
@@ -29580,6 +29788,44 @@ with t1:
             )
         except Exception:
             pass
+        try:
+            st.subheader("🧪 Effective Settings (debug)")
+            rt_eff = load_runtime()
+            uni_view = mon.get("universe", {}) or {}
+            eff = {
+                "branch": GIT_BRANCH,
+                "code_version": str(mon.get("code_version", CODE_VERSION) or CODE_VERSION),
+                "auto_trade": bool(config.get("auto_trade", False)),
+                "pause_until_epoch": float(_as_float(rt_eff.get("pause_until", 0), 0.0)),
+                "regime_mode": str(config.get("regime_mode", "auto")),
+                "scan_count": int(_as_int(uni_view.get("scan_count", 0), 0)),
+                "pool_count": int(_as_int(uni_view.get("pool_count", 0), 0)),
+                "scan_batch_max": int(_as_int(config.get("universe_scan_max_per_cycle", 50), 50)),
+                "pattern_gate_entry": bool(config.get("pattern_gate_entry", True)),
+                "ai_enable_scalp": bool(config.get("ai_enable_scalp", False)),
+                "ai_enable_day": bool(config.get("ai_enable_day", True)),
+                "ai_enable_swing": bool(config.get("ai_enable_swing", True)),
+                "ai_call_require_volume_spike": bool(config.get("ai_call_require_volume_spike", False)),
+                "ai_call_require_disparity": bool(config.get("ai_call_require_disparity", False)),
+                "ai_call_filters_block_ai": bool(config.get("ai_call_filters_block_ai", False)),
+                "intra_day_scalp_min_conf": int(_as_int(config.get("intra_day_scalp_min_conf", 55), 55)),
+                "intra_day_day_min_conf": int(_as_int(config.get("intra_day_day_min_conf", 65), 65)),
+                "intra_day_swing_min_conf": int(_as_int(config.get("intra_day_swing_min_conf", 68), 68)),
+            }
+            st.json(eff)
+
+            ct = critical_tuning_status(config)
+            mm = list(ct.get("mismatches", []) or [])
+            if mm:
+                if bool(ct.get("opt_out", False)):
+                    st.warning("⚠️ 핵심 튜닝이 권장값과 다릅니다. (사용자 Opt-out 상태)")
+                else:
+                    st.error("⚠️ bot_settings.json이 핵심 튜닝 권장값과 다릅니다. 관망이 길어질 수 있습니다.")
+                st_dataframe_safe(df_for_display(pd.DataFrame(mm)), hide_index=True)
+            else:
+                st.success("핵심 튜닝 권장값 적용 상태 정상")
+        except Exception:
+            pass
 
         # ✅ 포지션/진입 정보(직관적 표시)
         st.subheader("📊 현재 포지션(스타일/목표 포함)")
@@ -29624,6 +29870,21 @@ with t1:
                         )
                         st.caption("🚫 최근 200스캔 기준 상위 스킵 사유")
                         st_dataframe_safe(df_for_display(top_skip), hide_index=True)
+                        gate_rows: List[Dict[str, Any]] = []
+                        try:
+                            gate_counts: Dict[str, int] = {}
+                            for rs in reason_series.tolist():
+                                gk = _skip_reason_gate(str(rs))
+                                gate_counts[gk] = int(gate_counts.get(gk, 0) or 0) + 1
+                            gate_rows = [
+                                {"gate": k, "count": int(v)}
+                                for k, v in sorted(gate_counts.items(), key=lambda x: (-int(x[1]), str(x[0])))
+                            ]
+                        except Exception:
+                            gate_rows = []
+                        if gate_rows:
+                            st.caption("🧱 최근 200스캔 기준 주요 게이트")
+                            st_dataframe_safe(df_for_display(pd.DataFrame(gate_rows[:10])), hide_index=True)
             except Exception:
                 pass
         else:
