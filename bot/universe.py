@@ -111,6 +111,7 @@ class BitgetUniverseBuilder:
         max_spread_bps: float,
         ttl_sec: int,
         min_quote_volume: float = 0.0,
+        always_include: Optional[List[str]] = None,
         force_refresh: bool = False,
     ) -> UniverseResult:
         now = time.time()
@@ -118,7 +119,8 @@ class BitgetUniverseBuilder:
         spread_cap = float(max(0.1, float(max_spread_bps or 20.0)))
         ttl = int(max(15, min(3600, int(ttl_sec or 180))))
         min_qv = float(max(0.0, float(min_quote_volume or 0.0)))
-        cache_key = f"n={n}|spread={spread_cap:.6f}|ttl={ttl}|qv={min_qv:.2f}"
+        always = sorted([str(x).strip() for x in (always_include or []) if str(x).strip()])
+        cache_key = f"n={n}|spread={spread_cap:.6f}|ttl={ttl}|qv={min_qv:.2f}|always={','.join(always)}"
 
         with self._lock:
             cached = self._cache.get("result")
@@ -144,6 +146,7 @@ class BitgetUniverseBuilder:
             max_spread_bps=spread_cap,
             ttl_sec=ttl,
             min_quote_volume=min_qv,
+            always_include=always,
         )
         with self._lock:
             self._cache["key"] = cache_key
@@ -159,6 +162,7 @@ class BitgetUniverseBuilder:
         max_spread_bps: float,
         ttl_sec: int,
         min_quote_volume: float,
+        always_include: Optional[List[str]],
     ) -> UniverseResult:
         now = time.time()
         reason_code = "OK"
@@ -172,6 +176,7 @@ class BitgetUniverseBuilder:
             "skipped_spread_missing": 0,
             "skipped_spread_wide": 0,
             "ticker_errors": 0,
+            "always_include_added": 0,
         }
         top_rows: List[Dict[str, Any]] = []
         symbols: List[str] = []
@@ -241,6 +246,9 @@ class BitgetUniverseBuilder:
         except Exception as e:
             ticker_reason = f"FETCH_TICKERS_FAIL:{type(e).__name__}"
 
+        # fetch_tickers 미지원/누락 대응용 심볼별 fallback 캐시
+        ticker_fallback_cache: Dict[str, Dict[str, Any]] = {}
+
         for sym, market in candidates:
             ticker = tickers.get(sym) if isinstance(tickers, dict) else None
             if not isinstance(ticker, dict):
@@ -249,6 +257,17 @@ class BitgetUniverseBuilder:
                     t_alt = tickers.get(mid)
                     if isinstance(t_alt, dict):
                         ticker = t_alt
+            if not isinstance(ticker, dict):
+                try:
+                    if sym in ticker_fallback_cache:
+                        ticker = ticker_fallback_cache[sym]
+                    else:
+                        one = ex.fetch_ticker(sym)
+                        if isinstance(one, dict):
+                            ticker = one
+                            ticker_fallback_cache[sym] = one
+                except Exception:
+                    ticker = None
             if not isinstance(ticker, dict):
                 stats["ticker_errors"] = int(stats["ticker_errors"]) + 1
                 continue
@@ -287,6 +306,15 @@ class BitgetUniverseBuilder:
             stats["accepted_total"] = int(len(symbols))
             if not symbols:
                 reason_code = "NO_TOP_SYMBOLS"
+
+        if always_include:
+            seen = set(symbols)
+            for s in always_include:
+                if s not in seen:
+                    symbols.insert(0, s)
+                    seen.add(s)
+                    stats["always_include_added"] = int(stats.get("always_include_added", 0) or 0) + 1
+            symbols = symbols[: int(max(1, top_n))]
 
         return UniverseResult(
             symbols=symbols,
