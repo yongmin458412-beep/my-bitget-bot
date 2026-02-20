@@ -145,6 +145,49 @@ except Exception:
     DiscordEmbed = None
 
 try:
+    from bot import BitgetUniverseBuilder
+    from bot.config import (
+        KST as BOT_KST,
+        dt_to_epoch as bot_dt_to_epoch,
+        epoch_to_kst_str as bot_epoch_to_kst_str,
+        next_midnight_kst_epoch as bot_next_midnight_kst_epoch,
+        now_kst as bot_now_kst,
+        now_kst_str as bot_now_kst_str,
+        parse_time_kst as bot_parse_time_kst,
+        today_kst_str as bot_today_kst_str,
+    )
+    from bot.logging import emit_event as bot_emit_event
+    from bot.logging import register_sink as bot_register_event_sink
+    from bot.risk import as_float as bot_as_float
+    from bot.risk import as_int as bot_as_int
+    from bot.risk import clamp as bot_clamp
+    from bot.risk import timeframe_seconds as bot_timeframe_seconds
+    from bot.state import READ_JSON_LAST_ERROR as BOT_READ_JSON_LAST_ERROR
+    from bot.state import read_json_safe as bot_read_json_safe
+    from bot.state import safe_json_dumps as bot_safe_json_dumps
+    from bot.state import write_json_atomic as bot_write_json_atomic
+except Exception:
+    BitgetUniverseBuilder = None
+    BOT_KST = None
+    bot_now_kst = None
+    bot_now_kst_str = None
+    bot_today_kst_str = None
+    bot_next_midnight_kst_epoch = None
+    bot_parse_time_kst = None
+    bot_dt_to_epoch = None
+    bot_epoch_to_kst_str = None
+    bot_write_json_atomic = None
+    bot_read_json_safe = None
+    bot_safe_json_dumps = None
+    BOT_READ_JSON_LAST_ERROR = None
+    bot_clamp = None
+    bot_timeframe_seconds = None
+    bot_as_float = None
+    bot_as_int = None
+    bot_emit_event = None
+    bot_register_event_sink = None
+
+try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -226,6 +269,8 @@ TARGET_COINS = [
 
 # 풀스펙트럼 분석 타임프레임(요구사항)
 FULL_SPECTRUM_TFS = ["1m", "5m", "15m", "1h", "4h", "1d"]
+
+UNIVERSE_BUILDER = BitgetUniverseBuilder() if BitgetUniverseBuilder is not None else None
 
 # OpenAI 호출 타임아웃(초) - 스레드 멈춤 방지
 OPENAI_TIMEOUT_SEC = 20
@@ -352,23 +397,45 @@ def ccxt_health_snapshot() -> Dict[str, Any]:
 # =========================================================
 # ✅ 1) 시간 유틸 (KST)
 # =========================================================
-KST = timezone(timedelta(hours=9))
+KST = BOT_KST if BOT_KST is not None else timezone(timedelta(hours=9))
 
 
 def now_kst() -> datetime:
+    try:
+        if bot_now_kst is not None:
+            return bot_now_kst()
+    except Exception:
+        pass
     return datetime.now(KST)
 
 
 def now_kst_str() -> str:
+    try:
+        if bot_now_kst_str is not None:
+            return str(bot_now_kst_str())
+    except Exception:
+        pass
     return now_kst().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def today_kst_str() -> str:
+    try:
+        if bot_today_kst_str is not None:
+            return str(bot_today_kst_str())
+    except Exception:
+        pass
     return now_kst().strftime("%Y-%m-%d")
 
 
 def next_midnight_kst_epoch() -> float:
     """KST 기준 다음날 00:00:00 epoch."""
+    try:
+        if bot_next_midnight_kst_epoch is not None:
+            v = float(bot_next_midnight_kst_epoch())
+            if v > 0:
+                return v
+    except Exception:
+        pass
     try:
         dt = now_kst()
         dt2 = (dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -379,7 +446,11 @@ def next_midnight_kst_epoch() -> float:
 
 def _parse_time_kst(s: str) -> Optional[datetime]:
     try:
-        # "YYYY-MM-DD HH:MM:SS"
+        if bot_parse_time_kst is not None:
+            return bot_parse_time_kst(s)
+    except Exception:
+        pass
+    try:
         return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
     except Exception:
         return None
@@ -387,12 +458,24 @@ def _parse_time_kst(s: str) -> Optional[datetime]:
 
 def _dt_to_epoch(dt: datetime) -> float:
     try:
+        if bot_dt_to_epoch is not None:
+            v = float(bot_dt_to_epoch(dt))
+            if v > 0:
+                return v
+    except Exception:
+        pass
+    try:
         return dt.timestamp()
     except Exception:
         return time.time()
 
 
 def _epoch_to_kst_str(epoch: float) -> str:
+    try:
+        if bot_epoch_to_kst_str is not None:
+            return str(bot_epoch_to_kst_str(epoch))
+    except Exception:
+        pass
     try:
         return datetime.fromtimestamp(epoch, tz=KST).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
@@ -402,64 +485,35 @@ def _epoch_to_kst_str(epoch: float) -> str:
 # =========================================================
 # ✅ 2) JSON 안전 저장/로드 (원자적)
 # =========================================================
-def _json_default(obj: Any):
-    # JSON 직렬화 실패로 monitor_state.json 갱신이 멈추는 문제 방지(실시간 UI 갱신 핵심)
-    try:
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-    except Exception:
-        pass
-    try:
-        if isinstance(obj, (set, tuple)):
-            return list(obj)
-    except Exception:
-        pass
-    try:
-        # numpy scalar(예: np.float64) 방어
-        if isinstance(obj, np.generic):
-            return obj.item()
-    except Exception:
-        pass
-    try:
-        return str(obj)
-    except Exception:
-        return None
-
-
 def write_json_atomic(path: str, data: Dict[str, Any]) -> None:
+    try:
+        if bot_write_json_atomic is not None:
+            bot_write_json_atomic(path, data)
+            return
+    except Exception:
+        pass
     tmp = path + ".tmp"
     try:
         if orjson:
             with open(tmp, "wb") as f:
-                opt = 0
-                try:
-                    opt |= orjson.OPT_SERIALIZE_NUMPY  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                try:
-                    opt |= orjson.OPT_NON_STR_KEYS  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                f.write(orjson.dumps(data, default=_json_default, option=opt))
+                f.write(orjson.dumps(data))
         else:
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
+                json.dump(data, f, ensure_ascii=False, indent=2, default=str)
         os.replace(tmp, path)
     except Exception:
-        # 파일 I/O 에러가 봇을 죽이면 안 됨
-        try:
-            # 마지막 보루: 값들을 문자열로 덤프(구조는 유지)
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2, default=str)
-            os.replace(tmp, path)
-        except Exception:
-            pass
+        pass
 
 
-_READ_JSON_LAST_ERROR: Dict[str, str] = {}
+_READ_JSON_LAST_ERROR: Dict[str, str] = BOT_READ_JSON_LAST_ERROR if isinstance(BOT_READ_JSON_LAST_ERROR, dict) else {}
 
 
 def read_json_safe(path: str, default=None):
+    try:
+        if bot_read_json_safe is not None:
+            return bot_read_json_safe(path, default)
+    except Exception:
+        pass
     try:
         if orjson:
             with open(path, "rb") as f:
@@ -480,6 +534,11 @@ def read_json_safe(path: str, default=None):
 
 def safe_json_dumps(x: Any, limit: int = 2000) -> str:
     try:
+        if bot_safe_json_dumps is not None:
+            return str(bot_safe_json_dumps(x, limit=limit))
+    except Exception:
+        pass
+    try:
         s = json.dumps(x, ensure_ascii=False)
     except Exception:
         try:
@@ -489,6 +548,28 @@ def safe_json_dumps(x: Any, limit: int = 2000) -> str:
     if len(s) > limit:
         return s[:limit] + "..."
     return s
+
+
+def emit_event(event_type: str, payload: Optional[Dict[str, Any]] = None, **meta: Any) -> Dict[str, Any]:
+    try:
+        if bot_emit_event is not None:
+            return bot_emit_event(event_type=event_type, payload=payload, **meta)
+    except Exception as e:
+        return {
+            "event_type": str(event_type or "").strip().upper(),
+            "sink_count": 0,
+            "deliveries": [{"sink": "local", "ok": False, "reason_code": type(e).__name__, "detail": str(e)[:200]}],
+        }
+    return {"event_type": str(event_type or "").strip().upper(), "sink_count": 0, "deliveries": []}
+
+
+def register_event_sink(name: str, sink, overwrite: bool = True) -> bool:
+    try:
+        if bot_register_event_sink is None:
+            return False
+        return bool(bot_register_event_sink(name=name, sink=sink, overwrite=overwrite))
+    except Exception:
+        return False
 
 
 # =========================================================
@@ -708,28 +789,34 @@ def hard_roi_limits_by_style(style: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
     sr = style_rule(st)
     try:
         if st == "스캘핑":
+            default_tp_cap = float(max(0.2, _as_float(sr.get("tp_roi_max", 3.0), 3.0)))
+            default_sl_cap = float(max(0.2, _as_float(sr.get("sl_roi_max", 5.0), 5.0)))
             return {
                 "tp_min": float(max(0.0, _as_float(cfg.get("hard_cap_scalp_tp_min_roi", 0.0), 0.0))),
-                "tp_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_tp_roi", 2.5), 2.5))),
-                "sl_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_sl_roi", 5.0), 5.0))),
+                "tp_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_tp_roi", default_tp_cap), default_tp_cap))),
+                "sl_cap": float(max(0.2, _as_float(cfg.get("hard_cap_scalp_sl_roi", default_sl_cap), default_sl_cap))),
             }
         if st == "단타":
+            default_tp_cap = float(max(0.5, _as_float(sr.get("tp_roi_max", 15.0), 15.0)))
+            default_sl_cap = float(max(0.5, _as_float(sr.get("sl_roi_max", 5.0), 5.0)))
             return {
                 "tp_min": float(max(0.0, _as_float(cfg.get("hard_cap_day_tp_min_roi", 0.0), 0.0))),
-                "tp_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_tp_roi", 15.0), 15.0))),
-                "sl_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_sl_roi", 5.0), 5.0))),
+                "tp_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_tp_roi", default_tp_cap), default_tp_cap))),
+                "sl_cap": float(max(0.5, _as_float(cfg.get("hard_cap_day_sl_roi", default_sl_cap), default_sl_cap))),
             }
+        default_tp_cap = float(max(1.0, _as_float(sr.get("tp_roi_max", 50.0), 50.0)))
+        default_sl_cap = float(max(0.5, _as_float(sr.get("sl_roi_max", 7.0), 7.0)))
         return {
             "tp_min": float(max(0.0, _as_float(cfg.get("hard_cap_swing_tp_min_roi", 0.0), 0.0))),
-            "tp_cap": float(max(10.0, _as_float(cfg.get("hard_cap_swing_tp_roi", 50.0), 50.0))),
-            "sl_cap": float(max(1.0, _as_float(cfg.get("hard_cap_swing_sl_roi", 7.0), 7.0))),
+            "tp_cap": float(max(1.0, _as_float(cfg.get("hard_cap_swing_tp_roi", default_tp_cap), default_tp_cap))),
+            "sl_cap": float(max(0.5, _as_float(cfg.get("hard_cap_swing_sl_roi", default_sl_cap), default_sl_cap))),
         }
     except Exception:
-        if st == "스윙":
-            return {"tp_min": 0.0, "tp_cap": 50.0, "sl_cap": 7.0}
-        if st == "단타":
-            return {"tp_min": 0.0, "tp_cap": 15.0, "sl_cap": 5.0}
-        return {"tp_min": 0.0, "tp_cap": 2.5, "sl_cap": 5.0}
+        sr = style_rule(st)
+        tp_max_fallback = float(max(0.2, _as_float(sr.get("tp_roi_max", 3.0), 3.0)))
+        sl_max_fallback = float(max(0.2, _as_float(sr.get("sl_roi_max", 5.0), 5.0)))
+        tp_min_fallback = float(max(0.0, _as_float(sr.get("tp_roi_min", 0.0), 0.0)))
+        return {"tp_min": tp_min_fallback, "tp_cap": tp_max_fallback, "sl_cap": sl_max_fallback}
 
 
 def _rr_floor_by_style(style: Any, cfg: Dict[str, Any]) -> float:
@@ -749,12 +836,11 @@ def _rr_floor_by_style(style: Any, cfg: Dict[str, Any]) -> float:
 def _style_hard_tp_cap_roi(style: Any, cfg: Dict[str, Any]) -> Optional[float]:
     st = normalize_style_name(style)
     try:
-        if st == "스캘핑":
-            return 2.5
-        if st == "단타":
-            return float(max(0.5, _as_float(cfg.get("hard_cap_day_tp_roi", 15.0), 15.0)))
-        if st == "스윙":
-            return float(max(10.0, _as_float(cfg.get("hard_cap_swing_tp_roi", 50.0), 50.0)))
+        lim = hard_roi_limits_by_style(st, cfg)
+        tp_cap = lim.get("tp_cap", None)
+        if tp_cap is None:
+            return None
+        return float(max(0.2, _as_float(tp_cap, 0.0)))
     except Exception:
         return None
     return None
@@ -800,9 +886,12 @@ def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) ->
         if sl_cap is not None and sl_cap > 0:
             sl = min(sl, sl_cap)
 
-        # ✅ RR 강제: 목표손절이 목표익절보다 커지지 않도록 보정
+        # ✅ RR 보정:
+        # - TP가 스타일 상한(tp_cap)에 걸리지 않은 경우: TP 상향으로 RR 하한 충족 시도
+        # - TP가 상한에 걸린 경우: SL을 강제로 축소하지 않음(요청사항)
         if sl <= 0:
             sl = max(0.2, tp / max(rr_floor, 1.0))
+            res["_rr_guard_note"] = f"SL 미지정 → RR 하한({rr_floor:.2f}) 기반 기본 SL 산출"
         if rr_floor > 1.0:
             tp_need = float(sl * rr_floor)
             if tp < tp_need:
@@ -811,16 +900,12 @@ def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) ->
                     res["_rr_guard_note"] = f"RR 하한({rr_floor:.2f}) 충족 위해 TP 상향"
                 else:
                     tp = float(min(tp, float(tp_cap)))
-                    sl = float(min(sl, max(0.2, tp / rr_floor)))
-                    res["_rr_guard_note"] = f"TP 상한 내에서 RR 하한({rr_floor:.2f}) 충족하도록 SL 축소"
+                    res["_rr_guard_note"] = f"TP 상한({float(tp_cap):.2f}%)으로 RR 하한({rr_floor:.2f}) 미충족( SL 축소 금지 )"
 
         if tp_cap is not None and tp_cap > 0:
             tp = float(min(tp, tp_cap))
         if sl_cap is not None and sl_cap > 0:
             sl = float(min(sl, sl_cap))
-
-        if rr_floor > 1.0 and tp < (sl * rr_floor):
-            sl = float(min(sl, max(0.2, tp / rr_floor)))
 
         res["tp_pct"] = float(tp)
         res["sl_pct"] = float(sl)
@@ -846,13 +931,110 @@ def apply_hard_roi_caps(out: Dict[str, Any], style: Any, cfg: Dict[str, Any]) ->
     return res
 
 
+def validate_trade_plan(
+    *,
+    symbol: str,
+    style: Any,
+    decision: str,
+    entry_price: float,
+    leverage: float,
+    sl_pct_roi: float,
+    tp_pct_roi: float,
+    sl_price_pct: Optional[float],
+    tp_price_pct: Optional[float],
+    orderbook_ctx: Optional[Dict[str, Any]],
+    atr_price_pct: float,
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "ok": True,
+        "reason_code": "OK",
+        "symbol": str(symbol or ""),
+        "style": normalize_style_name(style),
+        "decision": str(decision or ""),
+        "entry_price": float(_as_float(entry_price, 0.0)),
+        "leverage": float(max(1.0, abs(_as_float(leverage, 1.0)))),
+        "sl_roi_pct": float(abs(_as_float(sl_pct_roi, 0.0))),
+        "tp_roi_pct": float(abs(_as_float(tp_pct_roi, 0.0))),
+        "sl_price_pct": 0.0,
+        "tp_price_pct": 0.0,
+        "rr_price": 0.0,
+        "min_stop_price_pct": 0.0,
+        "spread_pct": 0.0,
+        "spread_floor_pct": 0.0,
+        "atr_price_pct": float(max(0.0, _as_float(atr_price_pct, 0.0))),
+        "atr_floor_pct": 0.0,
+        "required_stop_price_pct": 0.0,
+    }
+    try:
+        lev = float(out["leverage"])
+        sl_price_pct_eff = float(max(0.0, abs(_as_float(sl_price_pct, 0.0))))
+        tp_price_pct_eff = float(max(0.0, abs(_as_float(tp_price_pct, 0.0))))
+        if sl_price_pct_eff <= 0 and lev > 0:
+            sl_price_pct_eff = float(out["sl_roi_pct"] / lev)
+        if tp_price_pct_eff <= 0 and lev > 0:
+            tp_price_pct_eff = float(out["tp_roi_pct"] / lev)
+        out["sl_price_pct"] = float(sl_price_pct_eff)
+        out["tp_price_pct"] = float(tp_price_pct_eff)
+        if sl_price_pct_eff > 0:
+            out["rr_price"] = float(tp_price_pct_eff / sl_price_pct_eff)
+
+        min_stop_price_pct = float(max(0.01, _as_float(cfg.get("min_stop_price_pct", 0.20), 0.20)))
+        spread_floor_min_pct = float(max(0.0, _as_float(cfg.get("min_stop_spread_floor_pct", 0.03), 0.03)))
+        spread_floor_mult = float(max(0.0, _as_float(cfg.get("min_stop_spread_mult", 1.5), 1.5)))
+        atr_floor_min_pct = float(max(0.0, _as_float(cfg.get("min_stop_atr_floor_pct", 0.05), 0.05)))
+        atr_floor_mult = float(max(0.0, _as_float(cfg.get("min_stop_atr_mult", 0.20), 0.20)))
+
+        spread_pct_now = 0.0
+        if isinstance(orderbook_ctx, dict):
+            spread_pct_now = float(max(0.0, _as_float(orderbook_ctx.get("spread_pct", 0.0), 0.0)))
+        spread_floor_pct = float(max(spread_floor_min_pct, spread_pct_now * spread_floor_mult))
+        atr_floor_pct = float(max(atr_floor_min_pct, float(out["atr_price_pct"]) * atr_floor_mult))
+        required_stop_pct = float(min_stop_price_pct + spread_floor_pct + atr_floor_pct)
+
+        out["min_stop_price_pct"] = float(min_stop_price_pct)
+        out["spread_pct"] = float(spread_pct_now)
+        out["spread_floor_pct"] = float(spread_floor_pct)
+        out["atr_floor_pct"] = float(atr_floor_pct)
+        out["required_stop_price_pct"] = float(required_stop_pct)
+
+        if sl_price_pct_eff <= 0:
+            out["ok"] = False
+            out["reason_code"] = "STOP_PRICE_MISSING"
+            return out
+        if sl_price_pct_eff < required_stop_pct:
+            out["ok"] = False
+            out["reason_code"] = "STOP_TOO_TIGHT"
+            return out
+        if tp_price_pct_eff <= 0:
+            out["ok"] = False
+            out["reason_code"] = "TP_PRICE_MISSING"
+            return out
+        if tp_price_pct_eff <= sl_price_pct_eff:
+            out["ok"] = False
+            out["reason_code"] = "RR_INVALID"
+            return out
+        return out
+    except Exception as e:
+        out["ok"] = False
+        out["reason_code"] = "VALIDATE_ERROR"
+        out["error"] = f"{type(e).__name__}: {e}"[:220]
+        return out
+
+
 # =========================================================
 # ✅ 4) 설정 관리 (load/save)
 # =========================================================
 def default_settings() -> Dict[str, Any]:
+    scalp_tp_cap_default = float((STYLE_RULES.get("스캘핑", {}) or {}).get("tp_roi_max", 3.0))
+    scalp_sl_cap_default = float((STYLE_RULES.get("스캘핑", {}) or {}).get("sl_roi_max", 5.0))
+    day_tp_cap_default = float((STYLE_RULES.get("단타", {}) or {}).get("tp_roi_max", 15.0))
+    day_sl_cap_default = float((STYLE_RULES.get("단타", {}) or {}).get("sl_roi_max", 5.0))
+    swing_tp_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("tp_roi_max", 50.0))
+    swing_sl_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("sl_roi_max", 7.0))
     return {
         # ✅ 설정 마이그레이션(기본값 변경/추가 기능 반영)
-        "settings_schema_version": 23,
+        "settings_schema_version": 28,
         "openai_api_key": "",
         "openai_model_trade": "gpt-4o-mini",
         "openai_model_style": "gpt-4o-mini",
@@ -862,6 +1044,13 @@ def default_settings() -> Dict[str, Any]:
         "trade_mode": "하이리스크/하이리턴",
         "timeframe": "5m",
         "order_usdt": 100.0,
+        # 동적 유니버스(Bitget USDT 선물): 거래대상 자동 확장
+        "universe_enable": True,
+        "universe_top_n": 30,
+        "universe_ttl_sec": 120,
+        "universe_max_spread_bps": 15.0,
+        "universe_min_quote_volume": 1000000.0,
+        "universe_log_max_symbols": 12,
 
         # Telegram (기본 유지)
         "tg_enable_reports": True,  # 이벤트 알림(진입/청산 등)
@@ -1165,6 +1354,24 @@ def default_settings() -> Dict[str, Any]:
         "kelly_sizing_enable": False,
         "kelly_fraction_mult": 0.5,   # half-kelly 권장
         "kelly_max_entry_pct": 20.0,  # Kelly cap 상한(% of free)
+        # ✅ 하드 ROI 캡(스타일별, 설정값 우선)
+        "hard_cap_scalp_tp_min_roi": 0.0,
+        "hard_cap_scalp_tp_roi": scalp_tp_cap_default,
+        "hard_cap_scalp_sl_roi": scalp_sl_cap_default,
+        "hard_cap_day_tp_min_roi": 0.0,
+        "hard_cap_day_tp_roi": day_tp_cap_default,
+        "hard_cap_day_sl_roi": day_sl_cap_default,
+        "hard_cap_swing_tp_min_roi": 0.0,
+        "hard_cap_swing_tp_roi": swing_tp_cap_default,
+        "hard_cap_swing_sl_roi": swing_sl_cap_default,
+        # ✅ 진입 플랜 검증(너무 타이트한 손절 차단)
+        # required_stop = min_stop_price_pct + spread_floor + atr_floor
+        "validate_trade_plan_enable": True,
+        "min_stop_price_pct": 0.20,
+        "min_stop_spread_mult": 1.5,
+        "min_stop_spread_floor_pct": 0.03,
+        "min_stop_atr_mult": 0.20,
+        "min_stop_atr_floor_pct": 0.05,
 
         # ✅ 손절(ROI) 확인(휩쏘 방지):
         # - SR(지지/저항) 가격 이탈 손절은 즉시 실행
@@ -1191,6 +1398,39 @@ def default_settings() -> Dict[str, Any]:
         "cooldown_after_exit_tp_bars": 1,
         "cooldown_after_exit_sl_bars": 3,
         "cooldown_after_exit_protect_bars": 2,
+        "symbol_stop_loss_cooldown_min": 20,
+        # ✅ 레짐별 전략 프로파일
+        "trend_strategy_rr_min": 2.4,
+        "trend_strategy_atr_stop_mult": 1.5,
+        "trend_strategy_breakout_bonus_rr": 0.25,
+        "mean_reversion_strategy_rr_target": 1.35,
+        "mean_reversion_strategy_atr_stop_mult": 1.0,
+        "mean_reversion_time_stop_bars_scalp": 6,
+        "mean_reversion_time_stop_bars_day": 8,
+        "mean_reversion_time_stop_bars_swing": 10,
+        # ✅ 마이크로구조 + 파생지표 진입 필터
+        "micro_entry_filter_enable": True,
+        "micro_max_spread_bps_scalp": 12.0,
+        "micro_max_spread_bps_day": 18.0,
+        "micro_max_spread_bps_swing": 25.0,
+        "micro_min_depth_usdt_scalp": 50000.0,
+        "micro_min_depth_usdt_day": 120000.0,
+        "micro_min_depth_usdt_swing": 250000.0,
+        "micro_block_on_opp_pressure": True,
+        "micro_opp_pressure_imbalance": 0.20,
+        "micro_funding_filter_enable": True,
+        "micro_funding_block_enable": True,
+        "micro_funding_long_crowded_rate": 0.0005,
+        "micro_funding_short_crowded_rate": -0.0005,
+        "micro_open_interest_filter_enable": True,
+        "micro_open_interest_require_confirm": False,
+        "micro_open_interest_confirm_min_change_pct": 1.0,
+        "derivatives_cache_sec": 60,
+        # ✅ 시작 시 거래소 상태와 봇 상태 동기화(포지션/오픈주문)
+        "startup_reconcile_enable": True,
+        "startup_cancel_unknown_orders": False,
+        "startup_cancel_unknown_orders_max": 20,
+        "startup_reconcile_import_style": "auto",  # auto|스캘핑|단타|스윙
         "use_dca": True,
         "dca_trigger": -32.0,
         "dca_max_count": 2,
@@ -1250,6 +1490,16 @@ def default_settings() -> Dict[str, Any]:
         "ai_budget_hourly_limit": 0,
         "ai_budget_daily_limit": 180,
         "ai_budget_min_interval_sec": 45,
+        # AI 예산 제한에 걸렸을 때 fallback 동작
+        # - skip: 기존처럼 스킵
+        # - cache: 최근 AI 결과 재사용
+        # - rules: 초강신호(보수)일 때 룰 기반 대체
+        # - cache_or_rules: cache 우선, 없으면 rules
+        "ai_budget_fallback_policy": "cache_or_rules",
+        "ai_cache_ttl_sec": 600,
+        "ai_fallback_min_conf": 82,
+        "ai_fallback_min_ml_votes": 4,
+        "ai_fallback_min_align": 4,
         # 횡보/저변동/저거래량 구간에서는 AI 호출 간격을 자동으로 늘려 비용 절감
         "ai_budget_adaptive_interval_enable": True,
         "ai_budget_adaptive_max_interval_sec": 180,
@@ -1310,6 +1560,12 @@ def default_settings() -> Dict[str, Any]:
         "regime_hysteresis_step": 0.2,
         "regime_hysteresis_enter_swing": 0.75,
         "regime_hysteresis_enter_scalp": 0.25,
+        # ✅ 레짐 분류(ADX + 변동성 확장/스퀴즈 릴리즈)
+        "regime_adx_trend_min": 24.0,
+        "regime_adx_range_max": 18.0,
+        "regime_vol_expansion_ratio": 1.18,
+        "regime_vol_expansion_abs_pct": 0.75,
+        "regime_sqz_release_threshold_pct": 0.05,
         # ✅ (옵션) 하이리스크/하이리턴 모드 신규진입 제한:
         # - ON이면 auto 레짐에서 "스윙(단기+장기 정렬)"일 때만 신규 진입
         # - OFF(기본)이면 스캘핑 진입도 허용하되, 모드의 레버/진입비중 범위는 유지
@@ -2284,6 +2540,117 @@ def load_settings() -> Dict[str, Any]:
                     changed = True
             except Exception:
                 pass
+        # v24: 하드캡/진입플랜 검증 키 보강
+        if saved_ver < 24:
+            scalp_tp_cap_default = float((STYLE_RULES.get("스캘핑", {}) or {}).get("tp_roi_max", 3.0))
+            scalp_sl_cap_default = float((STYLE_RULES.get("스캘핑", {}) or {}).get("sl_roi_max", 5.0))
+            day_tp_cap_default = float((STYLE_RULES.get("단타", {}) or {}).get("tp_roi_max", 15.0))
+            day_sl_cap_default = float((STYLE_RULES.get("단타", {}) or {}).get("sl_roi_max", 5.0))
+            swing_tp_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("tp_roi_max", 50.0))
+            swing_sl_cap_default = float((STYLE_RULES.get("스윙", {}) or {}).get("sl_roi_max", 7.0))
+            for k, v in {
+                "hard_cap_scalp_tp_min_roi": 0.0,
+                "hard_cap_scalp_tp_roi": scalp_tp_cap_default,
+                "hard_cap_scalp_sl_roi": scalp_sl_cap_default,
+                "hard_cap_day_tp_min_roi": 0.0,
+                "hard_cap_day_tp_roi": day_tp_cap_default,
+                "hard_cap_day_sl_roi": day_sl_cap_default,
+                "hard_cap_swing_tp_min_roi": 0.0,
+                "hard_cap_swing_tp_roi": swing_tp_cap_default,
+                "hard_cap_swing_sl_roi": swing_sl_cap_default,
+                "validate_trade_plan_enable": True,
+                "min_stop_price_pct": 0.20,
+                "min_stop_spread_mult": 1.5,
+                "min_stop_spread_floor_pct": 0.03,
+                "min_stop_atr_mult": 0.20,
+                "min_stop_atr_floor_pct": 0.05,
+            }.items():
+                try:
+                    if k not in saved:
+                        cfg[k] = v
+                        changed = True
+                except Exception:
+                    pass
+        # v25: ADX+변동성 레짐 분류 + trend/mean-reversion 전략 + 손절 심볼쿨다운
+        if saved_ver < 25:
+            for k, v in {
+                "regime_adx_trend_min": 24.0,
+                "regime_adx_range_max": 18.0,
+                "regime_vol_expansion_ratio": 1.18,
+                "regime_vol_expansion_abs_pct": 0.75,
+                "regime_sqz_release_threshold_pct": 0.05,
+                "trend_strategy_rr_min": 2.4,
+                "trend_strategy_atr_stop_mult": 1.5,
+                "trend_strategy_breakout_bonus_rr": 0.25,
+                "mean_reversion_strategy_rr_target": 1.35,
+                "mean_reversion_strategy_atr_stop_mult": 1.0,
+                "mean_reversion_time_stop_bars_scalp": 6,
+                "mean_reversion_time_stop_bars_day": 8,
+                "mean_reversion_time_stop_bars_swing": 10,
+                "symbol_stop_loss_cooldown_min": 20,
+            }.items():
+                try:
+                    if k not in saved:
+                        cfg[k] = v
+                        changed = True
+                except Exception:
+                    pass
+        # v26: 마이크로구조 + 파생지표(펀딩/OI) 진입 필터
+        if saved_ver < 26:
+            for k, v in {
+                "micro_entry_filter_enable": True,
+                "micro_max_spread_bps_scalp": 12.0,
+                "micro_max_spread_bps_day": 18.0,
+                "micro_max_spread_bps_swing": 25.0,
+                "micro_min_depth_usdt_scalp": 50000.0,
+                "micro_min_depth_usdt_day": 120000.0,
+                "micro_min_depth_usdt_swing": 250000.0,
+                "micro_block_on_opp_pressure": True,
+                "micro_opp_pressure_imbalance": 0.20,
+                "micro_funding_filter_enable": True,
+                "micro_funding_block_enable": True,
+                "micro_funding_long_crowded_rate": 0.0005,
+                "micro_funding_short_crowded_rate": -0.0005,
+                "micro_open_interest_filter_enable": True,
+                "micro_open_interest_require_confirm": False,
+                "micro_open_interest_confirm_min_change_pct": 1.0,
+                "derivatives_cache_sec": 60,
+            }.items():
+                try:
+                    if k not in saved:
+                        cfg[k] = v
+                        changed = True
+                except Exception:
+                    pass
+        # v27: 시작 시 거래소와 상태 동기화(포지션/오픈주문)
+        if saved_ver < 27:
+            for k, v in {
+                "startup_reconcile_enable": True,
+                "startup_cancel_unknown_orders": False,
+                "startup_cancel_unknown_orders_max": 20,
+                "startup_reconcile_import_style": "auto",
+            }.items():
+                try:
+                    if k not in saved:
+                        cfg[k] = v
+                        changed = True
+                except Exception:
+                    pass
+        # v28: AI 예산 fallback 정책(캐시/룰 기반) + 캐시 TTL
+        if saved_ver < 28:
+            for k, v in {
+                "ai_budget_fallback_policy": "cache_or_rules",
+                "ai_cache_ttl_sec": 600,
+                "ai_fallback_min_conf": 82,
+                "ai_fallback_min_ml_votes": 4,
+                "ai_fallback_min_align": 4,
+            }.items():
+                try:
+                    if k not in saved:
+                        cfg[k] = v
+                        changed = True
+                except Exception:
+                    pass
         cfg["settings_schema_version"] = base_ver
         if changed:
             try:
@@ -2756,6 +3123,102 @@ def _ai_dynamic_min_interval_sec(
     return dyn, note
 
 
+def _next_hour_kst_epoch(now_dt: Optional[datetime] = None) -> float:
+    try:
+        dt = now_dt if isinstance(now_dt, datetime) else now_kst()
+        dt2 = (dt + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        return float(dt2.timestamp())
+    except Exception:
+        return float(time.time() + 3600)
+
+
+def ai_budget_status_snapshot(
+    rt: Dict[str, Any],
+    cfg: Dict[str, Any],
+    last: Optional[pd.Series] = None,
+    status: Optional[Dict[str, Any]] = None,
+    urgent: bool = False,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "ok": True,
+        "reason_code": "OK",
+        "reason_note": "ok",
+        "next_allowed_sec": 0,
+        "next_allowed_epoch": 0.0,
+        "next_allowed_kst": "",
+        "day_calls": 0,
+        "day_limit": 0,
+        "hour_calls": 0,
+        "hour_limit": 0,
+        "last_call_epoch": 0.0,
+        "min_interval_sec": 0.0,
+        "min_interval_note": "",
+    }
+    try:
+        if not bool(cfg.get("ai_budget_enable", True)):
+            out["reason_code"] = "DISABLED"
+            out["reason_note"] = "예산제한 OFF"
+            return out
+
+        st = _ai_budget_state(rt)
+        now_ep = float(time.time())
+        now_dt = now_kst()
+
+        min_itv, min_itv_note = _ai_dynamic_min_interval_sec(cfg, last=last, status=status, urgent=bool(urgent))
+        min_itv = float(clamp(min_itv, 1.0, 3600.0))
+        last_ep = float(st.get("last_call_epoch", 0.0) or 0.0)
+        h_lim = int(_as_int(cfg.get("ai_budget_hourly_limit", 0), 0))
+        d_lim = int(_as_int(cfg.get("ai_budget_daily_limit", 180), 180))
+        h_calls = int(st.get("hour_calls", 0) or 0)
+        d_calls = int(st.get("day_calls", 0) or 0)
+
+        out["day_calls"] = int(d_calls)
+        out["day_limit"] = int(max(0, d_lim))
+        out["hour_calls"] = int(h_calls)
+        out["hour_limit"] = int(max(0, h_lim))
+        out["last_call_epoch"] = float(last_ep)
+        out["min_interval_sec"] = float(min_itv)
+        out["min_interval_note"] = str(min_itv_note or "")
+
+        blockers: List[Tuple[str, float, str]] = []
+
+        if last_ep > 0 and (now_ep - last_ep) < min_itv:
+            next_ep = float(last_ep + min_itv)
+            left = int(max(1.0, next_ep - now_ep))
+            blockers.append(("INTERVAL", next_ep, f"호출 간격 제한({left}s/{int(min_itv)}s)"))
+
+        if h_lim > 0 and h_calls >= h_lim:
+            next_ep = float(_next_hour_kst_epoch(now_dt))
+            left = int(max(1.0, next_ep - now_ep))
+            blockers.append(("HOURLY_LIMIT", next_ep, f"시간 예산 초과({h_calls}/{h_lim}, {left}s 후 재개)"))
+
+        if d_lim > 0 and d_calls >= d_lim:
+            next_ep = float(next_midnight_kst_epoch())
+            left = int(max(1.0, next_ep - now_ep))
+            blockers.append(("DAILY_LIMIT", next_ep, f"일일 예산 초과({d_calls}/{d_lim}, {left}s 후 재개)"))
+
+        if blockers:
+            blockers.sort(key=lambda x: float(x[1]))
+            b_code, b_ep, b_note = blockers[0]
+            out["ok"] = False
+            out["reason_code"] = str(b_code)
+            out["next_allowed_epoch"] = float(max([float(x[1]) for x in blockers] or [b_ep]))
+            out["next_allowed_sec"] = int(max(1.0, float(out["next_allowed_epoch"]) - now_ep))
+            out["next_allowed_kst"] = _epoch_to_kst_str(float(out["next_allowed_epoch"]))
+            out["reason_note"] = f"{b_note} | 재개시각 {out['next_allowed_kst']}"
+            return out
+
+        h_txt = str(h_lim) if h_lim > 0 else "∞"
+        d_txt = str(d_lim) if d_lim > 0 else "∞"
+        out["reason_note"] = f"ok(itv:{int(min_itv)}s,{min_itv_note}, h:{h_calls}/{h_txt}, d:{d_calls}/{d_txt})"
+        return out
+    except Exception as e:
+        out["ok"] = True
+        out["reason_code"] = "UNKNOWN"
+        out["reason_note"] = f"unknown:{type(e).__name__}"
+        return out
+
+
 def ai_budget_can_call(
     rt: Dict[str, Any],
     cfg: Dict[str, Any],
@@ -2768,29 +3231,9 @@ def ai_budget_can_call(
     try:
         if force:
             return True, "force"
-        if not bool(cfg.get("ai_budget_enable", True)):
-            return True, "disabled"
-        st = _ai_budget_state(rt)
-        now_ep = time.time()
-        min_itv, min_itv_note = _ai_dynamic_min_interval_sec(cfg, last=last, status=status, urgent=bool(urgent))
-        min_itv = float(clamp(min_itv, 1.0, 3600.0))
-        last_ep = float(st.get("last_call_epoch", 0.0) or 0.0)
-        if last_ep > 0 and (now_ep - last_ep) < min_itv:
-            left = int(max(1.0, min_itv - (now_ep - last_ep)))
-            return False, f"호출 간격 제한({left}s/{int(min_itv)}s)"
-        h_lim = int(cfg.get("ai_budget_hourly_limit", 0) or 0)
-        d_lim = int(cfg.get("ai_budget_daily_limit", 180) or 180)
-        d_lim = max(1, d_lim)
-        h_calls = int(st.get("hour_calls", 0) or 0)
-        d_calls = int(st.get("day_calls", 0) or 0)
-        if h_lim > 0 and h_calls >= h_lim:
-            return False, f"시간 예산 초과({h_calls}/{h_lim})"
-        if d_calls >= d_lim:
-            return False, f"일일 예산 초과({d_calls}/{d_lim})"
-        h_txt = str(h_lim) if h_lim > 0 else "∞"
-        _ = status
+        snap = ai_budget_status_snapshot(rt, cfg, last=last, status=status, urgent=bool(urgent))
         _ = symbol
-        return True, f"ok(itv:{int(min_itv)}s,{min_itv_note}, h:{h_calls}/{h_txt}, d:{d_calls}/{d_lim})"
+        return bool(snap.get("ok", True)), str(snap.get("reason_note", ""))
     except Exception:
         return True, "unknown"
 
@@ -2810,6 +3253,148 @@ def ai_budget_mark_call(rt: Dict[str, Any], symbol: str = "") -> None:
             bs[key] = int(bs.get(key, 0) or 0) + 1
     except Exception:
         pass
+
+
+def _ai_budget_policy_parts(cfg: Dict[str, Any]) -> set:
+    raw = str(cfg.get("ai_budget_fallback_policy", "cache_or_rules") or "cache_or_rules").strip().lower()
+    if raw not in ["skip", "cache", "rules", "cache_or_rules"]:
+        raw = "cache_or_rules"
+    if raw == "cache_or_rules":
+        return {"cache", "rules"}
+    if raw == "cache":
+        return {"cache"}
+    if raw == "rules":
+        return {"rules"}
+    return set()
+
+
+def _build_cached_ai_from_cs(cs: Dict[str, Any], max_age_sec: float) -> Tuple[Optional[Dict[str, Any]], str]:
+    try:
+        if not isinstance(cs, dict):
+            return None, "cache_missing"
+        last_ep = float(_as_float(cs.get("ai_last_called_epoch", 0.0), 0.0))
+        if last_ep <= 0:
+            return None, "cache_no_epoch"
+        ttl = float(max(1.0, _as_float(max_age_sec, 600.0)))
+        age = float(max(0.0, time.time() - last_ep))
+        if age > ttl:
+            return None, f"cache_expired({int(age)}s>{int(ttl)}s)"
+        decision = str(cs.get("ai_decision", "hold") or "hold").lower().strip()
+        if decision not in ["buy", "sell", "hold"]:
+            return None, "cache_invalid_decision"
+        ai = {
+            "decision": decision,
+            "confidence": int(_as_int(cs.get("ai_confidence", 0), 0)),
+            "entry_pct": float(_as_float(cs.get("ai_entry_pct", 0.0), 0.0)),
+            "leverage": int(_as_int(cs.get("ai_leverage", 0), 0)),
+            "sl_pct": float(_as_float(cs.get("ai_sl_pct", 0.0), 0.0)),
+            "tp_pct": float(_as_float(cs.get("ai_tp_pct", 0.0), 0.0)),
+            "rr": float(_as_float(cs.get("ai_rr", 0.0), 0.0)),
+            "decision_tf": str(cs.get("ai_decision_tf", "") or ""),
+            "used_indicators": [x.strip() for x in str(cs.get("ai_used", "") or "").split(",") if x.strip()],
+            "reason_easy": str(cs.get("ai_reason_easy", "") or ""),
+            "sl_price": cs.get("ai_sl_price", None),
+            "tp_price": cs.get("ai_tp_price", None),
+            "_fallback": "cache_budget",
+            "_cache_age_sec": int(age),
+        }
+        if ai["entry_pct"] <= 0:
+            ai["entry_pct"] = 0.0
+        if ai["leverage"] <= 0:
+            ai["leverage"] = 0
+        if ai["sl_pct"] <= 0:
+            ai["sl_pct"] = 0.0
+        if ai["tp_pct"] <= 0:
+            ai["tp_pct"] = 0.0
+        return ai, f"cache_hit(age={int(age)}s)"
+    except Exception as e:
+        return None, f"cache_error:{type(e).__name__}"
+
+
+def _build_budget_rules_ai(
+    *,
+    symbol: str,
+    mode: str,
+    rule: Dict[str, Any],
+    cfg: Dict[str, Any],
+    style_hint: str,
+    decision_tf: str,
+    status: Optional[Dict[str, Any]],
+    ml: Optional[Dict[str, Any]],
+    align_info: Optional[Dict[str, Any]],
+    event_sig: Optional[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    try:
+        ml = ml if isinstance(ml, dict) else {}
+        align_info = align_info if isinstance(align_info, dict) else {}
+        event_sig = event_sig if isinstance(event_sig, dict) else {}
+        status = status if isinstance(status, dict) else {}
+
+        ml_dir = str(ml.get("dir", "hold") or "hold").lower().strip()
+        align_dir = str(align_info.get("direction", "hold") or "hold").lower().strip()
+        ml_votes = int(_as_int(ml.get("votes_max", 0), 0))
+        align_max = int(_as_int(align_info.get("max_count", 0), 0))
+        min_conf = int(_as_int(cfg.get("ai_fallback_min_conf", 82), 82))
+        min_ml_votes = int(_as_int(cfg.get("ai_fallback_min_ml_votes", 4), 4))
+        min_align = int(_as_int(cfg.get("ai_fallback_min_align", 4), 4))
+
+        decision = "hold"
+        if ml_dir in ["buy", "sell"] and ml_dir == align_dir:
+            decision = ml_dir
+        elif ml_dir in ["buy", "sell"] and align_dir == "hold":
+            decision = ml_dir
+        elif align_dir in ["buy", "sell"] and ml_dir == "hold":
+            decision = align_dir
+        if decision not in ["buy", "sell"]:
+            return None, "rules_no_direction"
+
+        event_dir = str(event_sig.get("decision", "hold") or "hold").lower().strip()
+        event_score = int(_as_int(event_sig.get("score", 0), 0))
+        base_conf = int(max(0, min(100, 50 + (min(6, ml_votes) * 8))))
+        align_conf = int(max(0, min(100, 50 + (min(6, align_max) * 8))))
+        event_conf = int(event_score if event_dir == decision else 0)
+        conf = int(max(base_conf, align_conf, event_conf))
+
+        if conf < int(min_conf):
+            return None, f"rules_low_conf({conf}<{int(min_conf)})"
+        if ml_votes < int(min_ml_votes):
+            return None, f"rules_low_ml_votes({ml_votes}<{int(min_ml_votes)})"
+        if align_max < int(min_align):
+            return None, f"rules_low_align({align_max}<{int(min_align)})"
+
+        st = normalize_style_name(style_hint or "스캘핑")
+        sr = style_rule(st)
+        tf_final = normalize_decision_tf(decision_tf, st, default_tf=str(cfg.get("timeframe", "5m") or "5m"))
+
+        entry_pct = float(max(float(rule.get("entry_pct_min", 1.0) or 1.0), 1.0))
+        leverage = int(max(1, int(rule.get("lev_min", 1) or 1)))
+        sl_roi = float(max(0.2, _as_float(sr.get("sl_roi_min", 1.0), 1.0)))
+        rr_floor = float(max(1.2, _rr_floor_by_style(st, cfg)))
+        tp_roi = float(max(_as_float(sr.get("tp_roi_min", 1.0), 1.0), sl_roi * rr_floor))
+
+        used = status.get("_used_indicators", []) if isinstance(status.get("_used_indicators", []), list) else []
+        ai = {
+            "decision": str(decision),
+            "confidence": int(conf),
+            "entry_pct": float(entry_pct),
+            "leverage": int(leverage),
+            "sl_pct": float(sl_roi),
+            "tp_pct": float(tp_roi),
+            "rr": float(tp_roi / max(abs(sl_roi), 0.01)),
+            "decision_tf": str(tf_final),
+            "used_indicators": [str(x) for x in used[:12]],
+            "reason_easy": (
+                f"AI 예산 제한 → 룰 기반(초강신호) 진입: "
+                f"ML={ml_votes}, 정렬={align_max}, 방향={str(decision).upper()} on {tf_final}"
+            ),
+            "_fallback": "rules_budget",
+            "_fallback_ml_votes": int(ml_votes),
+            "_fallback_align_max": int(align_max),
+        }
+        ai = apply_hard_roi_caps(ai, st, cfg)
+        return ai, "rules_ok"
+    except Exception as e:
+        return None, f"rules_error:{type(e).__name__}"
 
 
 # =========================================================
@@ -7157,6 +7742,183 @@ def safe_fetch_positions(ex, symbols: List[str]) -> List[Dict[str, Any]]:
         return []
 
 
+def safe_fetch_positions_all(ex, symbols_fallback: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """
+    startup reconciliation 용:
+    - 가능한 경우 전체 포지션(fetch_positions without symbols) 조회
+    - 거래소/ccxt 제약 시 symbols_fallback 기반 조회로 폴백
+    """
+    try:
+        rows = _ccxt_call_with_timeout(
+            lambda: ex.fetch_positions(),
+            CCXT_TIMEOUT_SEC_PRIVATE,
+            where="fetch_positions_all",
+        )
+        if isinstance(rows, list):
+            return rows
+    except FuturesTimeoutError:
+        try:
+            setattr(ex, "_wonyoti_ccxt_timeout_epoch", time.time())
+            setattr(ex, "_wonyoti_ccxt_timeout_where", "fetch_positions_all")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        syms = [str(x or "").strip() for x in (symbols_fallback or []) if str(x or "").strip()]
+    except Exception:
+        syms = []
+    if not syms:
+        syms = list(TARGET_COINS)
+    return safe_fetch_positions(ex, syms)
+
+
+def _dedupe_orders(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        oid = str(row.get("id", "") or "")
+        sym = str(row.get("symbol", "") or "")
+        key = f"{oid}|{sym}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def safe_fetch_open_orders(ex, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """
+    오픈 주문 조회(타임아웃/거래소별 파라미터 차이 흡수).
+    - 전체 조회가 되면 전체 우선
+    - 실패 시 심볼별 조회로 폴백
+    """
+    rows_all: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    try:
+        rows = _ccxt_call_with_timeout(
+            lambda: ex.fetch_open_orders(),
+            CCXT_TIMEOUT_SEC_PRIVATE,
+            where="fetch_open_orders_all",
+        )
+        if isinstance(rows, list):
+            rows_all.extend(rows)
+    except FuturesTimeoutError:
+        try:
+            setattr(ex, "_wonyoti_ccxt_timeout_epoch", time.time())
+            setattr(ex, "_wonyoti_ccxt_timeout_where", "fetch_open_orders_all")
+        except Exception:
+            pass
+        errors.append("TIMEOUT_ALL")
+    except Exception as e:
+        errors.append(f"ALL:{type(e).__name__}")
+
+    if rows_all:
+        return _dedupe_orders(rows_all)
+
+    try:
+        syms = [str(x or "").strip() for x in (symbols or []) if str(x or "").strip()]
+    except Exception:
+        syms = []
+    if not syms:
+        syms = list(TARGET_COINS)
+
+    for sym in syms:
+        try:
+            rows = _ccxt_call_with_timeout(
+                lambda s=sym: ex.fetch_open_orders(s),
+                CCXT_TIMEOUT_SEC_PRIVATE,
+                where="fetch_open_orders_symbol",
+                context={"symbol": sym},
+            )
+            if isinstance(rows, list):
+                rows_all.extend(rows)
+                continue
+        except FuturesTimeoutError:
+            try:
+                setattr(ex, "_wonyoti_ccxt_timeout_epoch", time.time())
+                setattr(ex, "_wonyoti_ccxt_timeout_where", "fetch_open_orders_symbol")
+            except Exception:
+                pass
+            errors.append(f"TIMEOUT:{sym}")
+            continue
+        except Exception:
+            pass
+        try:
+            rows2 = _ccxt_call_with_timeout(
+                lambda s=sym: ex.fetch_open_orders(symbol=s),
+                CCXT_TIMEOUT_SEC_PRIVATE,
+                where="fetch_open_orders_symbol_kw",
+                context={"symbol": sym},
+            )
+            if isinstance(rows2, list):
+                rows_all.extend(rows2)
+        except Exception as e2:
+            errors.append(f"{sym}:{type(e2).__name__}")
+
+    if (not rows_all) and errors:
+        try:
+            if logger is not None:
+                logger.warning(f"safe_fetch_open_orders empty | errors={errors[:5]}")
+        except Exception:
+            pass
+    return _dedupe_orders(rows_all)
+
+
+def safe_cancel_open_order(ex, order_id: str, symbol: str = "") -> Dict[str, Any]:
+    out = {
+        "ok": False,
+        "reason_code": "UNKNOWN",
+        "order_id": str(order_id or ""),
+        "symbol": str(symbol or ""),
+        "error": "",
+    }
+    oid = str(order_id or "").strip()
+    sym = str(symbol or "").strip()
+    if not oid:
+        out["reason_code"] = "ORDER_ID_EMPTY"
+        return out
+    try:
+        if sym:
+            _run_trade_call_with_retry(
+                lambda: _ccxt_call_with_timeout(
+                    lambda: ex.cancel_order(oid, sym),
+                    CCXT_TIMEOUT_SEC_PRIVATE,
+                    where="cancel_order_reconcile",
+                    context={"order_id": oid, "symbol": sym},
+                ),
+                attempts=2,
+            )
+        else:
+            _run_trade_call_with_retry(
+                lambda: _ccxt_call_with_timeout(
+                    lambda: ex.cancel_order(oid),
+                    CCXT_TIMEOUT_SEC_PRIVATE,
+                    where="cancel_order_reconcile_no_symbol",
+                    context={"order_id": oid},
+                ),
+                attempts=2,
+            )
+        out["ok"] = True
+        out["reason_code"] = "OK"
+        return out
+    except FuturesTimeoutError as e:
+        out["reason_code"] = "TIMEOUT"
+        out["error"] = f"{type(e).__name__}: {e}"[:220]
+        try:
+            setattr(ex, "_wonyoti_ccxt_timeout_epoch", time.time())
+            setattr(ex, "_wonyoti_ccxt_timeout_where", "cancel_order_reconcile")
+        except Exception:
+            pass
+        return out
+    except Exception as e:
+        out["reason_code"] = "CANCEL_FAIL"
+        out["error"] = f"{type(e).__name__}: {e}"[:220]
+        return out
+
+
 def get_last_price(ex, sym: str) -> Optional[float]:
     try:
         t = _ccxt_call_with_timeout(lambda: ex.fetch_ticker(sym), CCXT_TIMEOUT_SEC_PUBLIC, where="fetch_ticker")
@@ -7209,6 +7971,11 @@ def safe_fetch_order_book(ex, sym: str, limit: int = 20) -> Optional[Dict[str, A
 
 def clamp(v, lo, hi):
     try:
+        if bot_clamp is not None:
+            return bot_clamp(v, lo, hi)
+    except Exception:
+        pass
+    try:
         return max(lo, min(hi, v))
     except Exception:
         return lo
@@ -7219,6 +7986,11 @@ def _timeframe_seconds(tf: str, default_sec: int = 300) -> int:
     "1m"|"3m"|"5m"|"15m"|"1h"|"4h"|"1d" 등을 초로 변환.
     실패 시 default_sec 반환.
     """
+    try:
+        if bot_timeframe_seconds is not None:
+            return int(bot_timeframe_seconds(tf, default_sec=default_sec))
+    except Exception:
+        pass
     try:
         s = str(tf or "").strip().lower()
         m = re.match(r"^(\d+)\s*([mhdw])$", s)
@@ -7242,6 +8014,11 @@ def _timeframe_seconds(tf: str, default_sec: int = 300) -> int:
 
 
 def _as_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if bot_as_float is not None:
+            return float(bot_as_float(v, default=default))
+    except Exception:
+        pass
     try:
         if v is None:
             return float(default)
@@ -7268,6 +8045,11 @@ def _as_float(v: Any, default: float = 0.0) -> float:
 
 
 def _as_int(v: Any, default: int = 0) -> int:
+    try:
+        if bot_as_int is not None:
+            return int(bot_as_int(v, default=default))
+    except Exception:
+        pass
     try:
         if v is None:
             return int(default)
@@ -8376,15 +9158,8 @@ def _dynamic_sr_targets_in_zone(
                         out["tp_reason"] = (str(out.get("tp_reason", "") or "").strip() + f" | RR 하한 {rr_floor:.2f} 맞춤").strip(" |")
                         tp_pct_now = float(tp_new_pct)
                     if tp_pct_now < (sl_pct_now * rr_floor):
-                        sl_new_pct = float(max(0.2, tp_pct_now / rr_floor))
-                        if sl_cap > 0:
-                            sl_new_pct = float(min(sl_new_pct, sl_cap))
-                        if s == "buy":
-                            out["sl_price"] = float(px * (1.0 - sl_new_pct / 100.0))
-                        else:
-                            out["sl_price"] = float(px * (1.0 + sl_new_pct / 100.0))
-                        out["sl_source"] = (str(out.get("sl_source", "") or "").strip() + "+RR").strip("+")
-                        out["sl_reason"] = (str(out.get("sl_reason", "") or "").strip() + f" | RR 하한 {rr_floor:.2f} 맞춤").strip(" |")
+                        out["rr_guard_blocked"] = True
+                        out["rr_guard_note"] = f"TP 상한으로 RR 하한({rr_floor:.2f}) 미충족, SL 축소 금지"
         except Exception:
             pass
         out["ok"] = bool(out.get("sl_price") is not None and out.get("tp_price") is not None)
@@ -10684,6 +11459,9 @@ def orderbook_pressure_summary(order_book: Optional[Dict[str, Any]], depth: int 
         "spread_pct": 0.0,
         "bid_volume": 0.0,
         "ask_volume": 0.0,
+        "bid_notional_usdt": 0.0,
+        "ask_notional_usdt": 0.0,
+        "depth_notional_usdt": 0.0,
         "imbalance": 0.0,
         "pressure_side": "neutral",
         "pressure_score": 0.0,
@@ -10709,6 +11487,8 @@ def orderbook_pressure_summary(order_book: Optional[Dict[str, Any]], depth: int 
         best_ask = float((a[0] or [0, 0])[0] or 0.0)
         bid_vol = float(sum(float((x or [0, 0])[1] or 0.0) for x in b))
         ask_vol = float(sum(float((x or [0, 0])[1] or 0.0) for x in a))
+        bid_notional = float(sum(float((x or [0, 0])[0] or 0.0) * float((x or [0, 0])[1] or 0.0) for x in b))
+        ask_notional = float(sum(float((x or [0, 0])[0] or 0.0) * float((x or [0, 0])[1] or 0.0) for x in a))
         denom = bid_vol + ask_vol
         imbalance = float((bid_vol - ask_vol) / denom) if denom > 0 else 0.0
         mid = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else 0.0
@@ -10756,6 +11536,9 @@ def orderbook_pressure_summary(order_book: Optional[Dict[str, Any]], depth: int 
                 "spread_pct": spread_pct,
                 "bid_volume": bid_vol,
                 "ask_volume": ask_vol,
+                "bid_notional_usdt": bid_notional,
+                "ask_notional_usdt": ask_notional,
+                "depth_notional_usdt": float(max(0.0, bid_notional + ask_notional)),
                 "imbalance": imbalance,
                 "pressure_side": side,
                 "pressure_score": score,
@@ -10771,6 +11554,328 @@ def orderbook_pressure_summary(order_book: Optional[Dict[str, Any]], depth: int 
         return out
     except Exception:
         return out
+
+
+_DERIV_CACHE_LOCK = threading.RLock()
+_DERIV_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def safe_fetch_funding_rate_best_effort(ex, sym: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "supported": False,
+        "available": False,
+        "symbol": str(sym or ""),
+        "rate": None,
+        "next_rate": None,
+        "timestamp": None,
+        "source": "",
+        "warning": "",
+        "reason_code": "UNSUPPORTED",
+    }
+    methods = ["fetch_funding_rate", "fetchFundingRate"]
+    for m in methods:
+        fn = getattr(ex, m, None)
+        if not callable(fn):
+            continue
+        out["supported"] = True
+        try:
+            raw = _ccxt_call_with_timeout(lambda: fn(sym), CCXT_TIMEOUT_SEC_PUBLIC, where=f"funding:{m}")
+        except FuturesTimeoutError:
+            out["warning"] = "timeout"
+            out["reason_code"] = "TIMEOUT"
+            return out
+        except Exception as e:
+            out["warning"] = f"{type(e).__name__}: {e}"[:180]
+            out["reason_code"] = "FETCH_ERROR"
+            continue
+        try:
+            if not isinstance(raw, dict):
+                out["warning"] = "empty_or_invalid_response"
+                out["reason_code"] = "EMPTY"
+                continue
+            fr = raw.get("fundingRate", raw.get("funding_rate", None))
+            if fr is None:
+                fr = (raw.get("info", {}) or {}).get("fundingRate", None)
+            nfr = raw.get("nextFundingRate", raw.get("next_funding_rate", None))
+            ts = raw.get("timestamp", None)
+            if ts is None:
+                ts = (raw.get("info", {}) or {}).get("fundingTime", None)
+            out["rate"] = (float(fr) if fr is not None else None)
+            out["next_rate"] = (float(nfr) if nfr is not None else None)
+            out["timestamp"] = (int(float(ts)) if ts is not None else None)
+            out["available"] = out["rate"] is not None
+            out["source"] = str(m)
+            out["reason_code"] = "OK" if out["available"] else "RATE_MISSING"
+            return out
+        except Exception as e:
+            out["warning"] = f"parse_error:{type(e).__name__}"[:180]
+            out["reason_code"] = "PARSE_ERROR"
+    return out
+
+
+def safe_fetch_open_interest_best_effort(ex, sym: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "supported": False,
+        "available": False,
+        "symbol": str(sym or ""),
+        "value": None,
+        "value_kind": "",
+        "timestamp": None,
+        "source": "",
+        "warning": "",
+        "reason_code": "UNSUPPORTED",
+    }
+    methods = ["fetch_open_interest", "fetchOpenInterest"]
+    for m in methods:
+        fn = getattr(ex, m, None)
+        if not callable(fn):
+            continue
+        out["supported"] = True
+        try:
+            raw = _ccxt_call_with_timeout(lambda: fn(sym), CCXT_TIMEOUT_SEC_PUBLIC, where=f"open_interest:{m}")
+        except FuturesTimeoutError:
+            out["warning"] = "timeout"
+            out["reason_code"] = "TIMEOUT"
+            return out
+        except Exception as e:
+            out["warning"] = f"{type(e).__name__}: {e}"[:180]
+            out["reason_code"] = "FETCH_ERROR"
+            continue
+        try:
+            if not isinstance(raw, dict):
+                out["warning"] = "empty_or_invalid_response"
+                out["reason_code"] = "EMPTY"
+                continue
+            info = (raw.get("info", {}) or {}) if isinstance(raw.get("info", {}), dict) else {}
+            cand_fields = [
+                ("quote", raw.get("openInterestValue", None)),
+                ("base", raw.get("openInterestAmount", None)),
+                ("raw", raw.get("openInterest", None)),
+                ("quote", info.get("openInterestValue", None)),
+                ("base", info.get("openInterestAmount", None)),
+                ("raw", info.get("openInterest", None)),
+                ("raw", info.get("amount", None)),
+                ("quote", info.get("value", None)),
+            ]
+            val = None
+            kind = ""
+            for k, v in cand_fields:
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                    if math.isfinite(fv) and fv > 0:
+                        val = fv
+                        kind = str(k)
+                        break
+                except Exception:
+                    continue
+            ts = raw.get("timestamp", None)
+            if ts is None:
+                ts = info.get("timestamp", None)
+            out["value"] = val
+            out["value_kind"] = kind
+            out["timestamp"] = (int(float(ts)) if ts is not None else None)
+            out["available"] = val is not None
+            out["source"] = str(m)
+            out["reason_code"] = "OK" if out["available"] else "VALUE_MISSING"
+            return out
+        except Exception as e:
+            out["warning"] = f"parse_error:{type(e).__name__}"[:180]
+            out["reason_code"] = "PARSE_ERROR"
+    return out
+
+
+def fetch_derivatives_context_cached(ex, sym: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    ttl_sec = int(max(10, min(600, _as_int(cfg.get("derivatives_cache_sec", 60), 60))))
+    key = str(sym or "").strip()
+    now_ep = float(time.time())
+    try:
+        with _DERIV_CACHE_LOCK:
+            c0 = _DERIV_CACHE.get(key, {})
+            ts0 = float(c0.get("ts", 0.0) or 0.0)
+            if ts0 > 0 and (now_ep - ts0) < float(ttl_sec):
+                return dict(c0.get("data", {})) if isinstance(c0.get("data", {}), dict) else {}
+    except Exception:
+        pass
+
+    funding = safe_fetch_funding_rate_best_effort(ex, key)
+    oi = safe_fetch_open_interest_best_effort(ex, key)
+    oi_change_pct = None
+    try:
+        with _DERIV_CACHE_LOCK:
+            prev = _DERIV_CACHE.get(key, {})
+            prev_data = prev.get("data", {}) if isinstance(prev.get("data", {}), dict) else {}
+            prev_oi = (prev_data.get("open_interest", {}) or {}) if isinstance(prev_data.get("open_interest", {}), dict) else {}
+            prev_val = _as_float(prev_oi.get("value", None), 0.0)
+            cur_val = _as_float(oi.get("value", None), 0.0)
+            if prev_val > 0 and cur_val > 0:
+                oi_change_pct = float((cur_val - prev_val) / prev_val * 100.0)
+    except Exception:
+        oi_change_pct = None
+
+    out = {
+        "symbol": key,
+        "asof_kst": now_kst_str(),
+        "funding": funding,
+        "open_interest": oi,
+        "oi_change_pct": oi_change_pct,
+        "supported_any": bool(funding.get("supported", False) or oi.get("supported", False)),
+    }
+    try:
+        with _DERIV_CACHE_LOCK:
+            _DERIV_CACHE[key] = {"ts": now_ep, "data": out}
+    except Exception:
+        pass
+    return out
+
+
+def evaluate_microstructure_derivatives_gate(
+    *,
+    symbol: str,
+    decision: str,
+    style: Any,
+    orderbook_ctx: Optional[Dict[str, Any]],
+    derivatives_ctx: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    st = normalize_style_name(style)
+    dec = str(decision or "")
+    out: Dict[str, Any] = {
+        "ok": True,
+        "reason_code": "OK",
+        "symbol": str(symbol or ""),
+        "style": str(st),
+        "decision": str(dec),
+        "warnings": [],
+        "values": {},
+    }
+    if dec not in ["buy", "sell"]:
+        out["reason_code"] = "NO_DECISION"
+        return out
+    if not bool(cfg.get("micro_entry_filter_enable", True)):
+        out["reason_code"] = "FILTER_DISABLED"
+        return out
+
+    ob = orderbook_ctx if isinstance(orderbook_ctx, dict) else {}
+    deriv = derivatives_ctx if isinstance(derivatives_ctx, dict) else {}
+    values: Dict[str, Any] = {}
+    warnings: List[str] = []
+
+    try:
+        if st == "스캘핑":
+            max_spread_bps = float(max(0.1, _as_float(cfg.get("micro_max_spread_bps_scalp", 12.0), 12.0)))
+            min_depth_usdt = float(max(0.0, _as_float(cfg.get("micro_min_depth_usdt_scalp", 50000.0), 50000.0)))
+        elif st == "단타":
+            max_spread_bps = float(max(0.1, _as_float(cfg.get("micro_max_spread_bps_day", 18.0), 18.0)))
+            min_depth_usdt = float(max(0.0, _as_float(cfg.get("micro_min_depth_usdt_day", 120000.0), 120000.0)))
+        else:
+            max_spread_bps = float(max(0.1, _as_float(cfg.get("micro_max_spread_bps_swing", 25.0), 25.0)))
+            min_depth_usdt = float(max(0.0, _as_float(cfg.get("micro_min_depth_usdt_swing", 250000.0), 250000.0)))
+
+        values["max_spread_bps"] = float(max_spread_bps)
+        values["min_depth_usdt"] = float(min_depth_usdt)
+
+        ob_available = bool(ob.get("available", False))
+        values["orderbook_available"] = bool(ob_available)
+        spread_bps = float(max(0.0, _as_float(ob.get("spread_pct", 0.0), 0.0) * 100.0))
+        depth_notional = float(max(0.0, _as_float(ob.get("depth_notional_usdt", 0.0), 0.0)))
+        imbalance = float(_as_float(ob.get("imbalance", 0.0), 0.0))
+        pressure_side = str(ob.get("pressure_side", "neutral") or "neutral")
+        values.update(
+            {
+                "spread_bps": float(spread_bps),
+                "depth_notional_usdt": float(depth_notional),
+                "imbalance": float(imbalance),
+                "pressure_side": str(pressure_side),
+                "pressure_score": float(_as_float(ob.get("pressure_score", 0.0), 0.0)),
+            }
+        )
+        if ob_available:
+            if spread_bps > max_spread_bps:
+                out["ok"] = False
+                out["reason_code"] = "SPREAD_TOO_WIDE"
+            elif depth_notional < min_depth_usdt:
+                out["ok"] = False
+                out["reason_code"] = "DEPTH_TOO_THIN"
+            else:
+                block_opp = bool(cfg.get("micro_block_on_opp_pressure", True))
+                opp_th = float(max(0.05, _as_float(cfg.get("micro_opp_pressure_imbalance", 0.20), 0.20)))
+                if block_opp and dec == "buy" and imbalance <= -opp_th:
+                    out["ok"] = False
+                    out["reason_code"] = "ORDERBOOK_SELL_PRESSURE"
+                elif block_opp and dec == "sell" and imbalance >= opp_th:
+                    out["ok"] = False
+                    out["reason_code"] = "ORDERBOOK_BUY_PRESSURE"
+        else:
+            warnings.append("ORDERBOOK_UNAVAILABLE")
+    except Exception as e:
+        warnings.append(f"ORDERBOOK_CHECK_ERROR:{type(e).__name__}")
+
+    try:
+        if bool(cfg.get("micro_funding_filter_enable", True)):
+            f = (deriv.get("funding", {}) or {}) if isinstance(deriv.get("funding", {}), dict) else {}
+            fr_supported = bool(f.get("supported", False))
+            fr_available = bool(f.get("available", False))
+            fr = f.get("rate", None)
+            values["funding_supported"] = bool(fr_supported)
+            values["funding_available"] = bool(fr_available)
+            values["funding_rate"] = (float(fr) if fr is not None else None)
+            long_crowded = float(_as_float(cfg.get("micro_funding_long_crowded_rate", 0.0005), 0.0005))
+            short_crowded = float(_as_float(cfg.get("micro_funding_short_crowded_rate", -0.0005), -0.0005))
+            values["funding_long_crowded_rate"] = float(long_crowded)
+            values["funding_short_crowded_rate"] = float(short_crowded)
+            if fr_supported and fr is not None:
+                block_crowded = bool(cfg.get("micro_funding_block_enable", True))
+                frv = float(fr)
+                if dec == "buy" and frv >= long_crowded:
+                    if block_crowded and out["ok"]:
+                        out["ok"] = False
+                        out["reason_code"] = "FUNDING_LONG_CROWDED"
+                    else:
+                        warnings.append("FUNDING_LONG_CROWDED")
+                elif dec == "sell" and frv <= short_crowded:
+                    if block_crowded and out["ok"]:
+                        out["ok"] = False
+                        out["reason_code"] = "FUNDING_SHORT_CROWDED"
+                    else:
+                        warnings.append("FUNDING_SHORT_CROWDED")
+            else:
+                warnings.append("FUNDING_UNAVAILABLE")
+    except Exception as e:
+        warnings.append(f"FUNDING_CHECK_ERROR:{type(e).__name__}")
+
+    try:
+        if bool(cfg.get("micro_open_interest_filter_enable", True)):
+            oi = (deriv.get("open_interest", {}) or {}) if isinstance(deriv.get("open_interest", {}), dict) else {}
+            oi_supported = bool(oi.get("supported", False))
+            oi_available = bool(oi.get("available", False))
+            oi_val = oi.get("value", None)
+            oi_change_pct = deriv.get("oi_change_pct", None)
+            values["oi_supported"] = bool(oi_supported)
+            values["oi_available"] = bool(oi_available)
+            values["oi_value"] = (float(oi_val) if oi_val is not None else None)
+            values["oi_change_pct"] = (float(oi_change_pct) if oi_change_pct is not None else None)
+            oi_confirm_min = float(max(0.0, _as_float(cfg.get("micro_open_interest_confirm_min_change_pct", 1.0), 1.0)))
+            values["oi_confirm_min_change_pct"] = float(oi_confirm_min)
+            require_confirm = bool(cfg.get("micro_open_interest_require_confirm", False))
+            if oi_supported and oi_change_pct is not None:
+                if abs(float(oi_change_pct)) < oi_confirm_min:
+                    if require_confirm and st in ["단타", "스윙"] and out["ok"]:
+                        out["ok"] = False
+                        out["reason_code"] = "OI_CONFIRMATION_WEAK"
+                    else:
+                        warnings.append("OI_CONFIRMATION_WEAK")
+            else:
+                warnings.append("OI_UNAVAILABLE")
+    except Exception as e:
+        warnings.append(f"OI_CHECK_ERROR:{type(e).__name__}")
+
+    out["warnings"] = warnings[:8]
+    out["values"] = values
+    if out["ok"] and warnings:
+        out["reason_code"] = "OK_WITH_WARNINGS"
+    return out
 
 
 def _trend_dir_from_text(txt: str) -> int:
@@ -10913,10 +12018,15 @@ def build_full_spectrum_context(
                 atr_pct = float(_atr_price_pct(df2, 14))
                 sqz_bias = int(st2.get("_sqz_bias", 0) or 0)
                 sqz_mom = float(st2.get("_sqz_mom_pct", 0.0) or 0.0)
+                sqz_on = bool(st2.get("_sqz_on", False))
+                sqz_fire_up_recent = bool(st2.get("_sqz_fire_up_recent", False))
+                sqz_fire_down_recent = bool(st2.get("_sqz_fire_down_recent", False))
                 vol_ratio = float(current_volume_ratio(df2, period=int(cfg.get("ai_call_volume_spike_period", 20) or 20)))
                 pat_bias = int(st2.get("_pattern_bias", 0) or 0)
                 pat_str = float(st2.get("_pattern_strength", 0.0) or 0.0)
                 trend_txt = str(st2.get("추세", "") or "")
+                bb_state = str(st2.get("BB", "") or "")
+                vwap_state = str(st2.get("VWAP", "") or "")
                 ema_dir = 0
                 macd_dir = 0
                 try:
@@ -10958,9 +12068,14 @@ def build_full_spectrum_context(
                     "atr_pct": atr_pct,
                     "sqz_bias": sqz_bias,
                     "sqz_mom_pct": sqz_mom,
+                    "sqz_on": bool(sqz_on),
+                    "sqz_release_up": bool(sqz_fire_up_recent),
+                    "sqz_release_down": bool(sqz_fire_down_recent),
                     "vol_ratio": vol_ratio,
                     "pattern_bias": pat_bias,
                     "pattern_strength": pat_str,
+                    "bb_state": bb_state,
+                    "vwap_state": vwap_state,
                     "ema_dir": int(ema_dir),
                     "macd_dir": int(macd_dir),
                     "breakout_up": bool(br_up),
@@ -11000,17 +12115,200 @@ def htf_bearish_bias_for_intraday(mtf_context: Optional[Dict[str, Any]]) -> Tupl
     return False, ""
 
 
+def classify_regime_adx_volatility(
+    spectrum: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+    orderbook_ctx: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    out = {
+        "regime": "mean_reversion",
+        "reason": "기본: 횡보/평균회귀",
+        "trend_score": 0.0,
+        "mean_reversion_score": 0.0,
+        "vol_expansion": False,
+        "squeeze_release": False,
+        "squeeze_release_bias": 0,
+        "adx_anchor": 0.0,
+        "atr_fast_pct": 0.0,
+        "atr_mid_pct": 0.0,
+        "atr_slow_pct": 0.0,
+    }
+    try:
+        tfm = (spectrum or {}).get("timeframes", {}) if isinstance(spectrum, dict) else {}
+        t5 = tfm.get("5m", {}) if isinstance(tfm, dict) else {}
+        t15 = tfm.get("15m", {}) if isinstance(tfm, dict) else {}
+        t1h = tfm.get("1h", {}) if isinstance(tfm, dict) else {}
+
+        def _g(d: Dict[str, Any], k: str, dv: float = 0.0) -> float:
+            try:
+                return float(d.get(k, dv) or dv)
+            except Exception:
+                return float(dv)
+
+        adx5 = _g(t5, "adx")
+        adx15 = _g(t15, "adx")
+        adx1h = _g(t1h, "adx")
+        atr5 = _g(t5, "atr_pct")
+        atr15 = _g(t15, "atr_pct")
+        atr1h = _g(t1h, "atr_pct")
+        vol15 = _g(t15, "vol_ratio", 1.0)
+        vol1h = _g(t1h, "vol_ratio", 1.0)
+        sqz5 = _g(t5, "sqz_mom_pct")
+        sqz15 = _g(t15, "sqz_mom_pct")
+        sqz_on5 = bool(t5.get("sqz_on", False))
+        sqz_on15 = bool(t15.get("sqz_on", False))
+        sqz_rel_up = bool(t5.get("sqz_release_up", False)) or bool(t15.get("sqz_release_up", False))
+        sqz_rel_dn = bool(t5.get("sqz_release_down", False)) or bool(t15.get("sqz_release_down", False))
+
+        adx_trend_min = float(max(5.0, _as_float(cfg.get("regime_adx_trend_min", 24.0), 24.0)))
+        adx_range_max = float(max(3.0, _as_float(cfg.get("regime_adx_range_max", 18.0), 18.0)))
+        vol_expand_ratio = float(max(1.01, _as_float(cfg.get("regime_vol_expansion_ratio", 1.18), 1.18)))
+        vol_expand_abs = float(max(0.05, _as_float(cfg.get("regime_vol_expansion_abs_pct", 0.75), 0.75)))
+        sqz_thr = float(max(0.005, abs(_as_float(cfg.get("regime_sqz_release_threshold_pct", cfg.get("sqz_mom_threshold_pct", 0.05)), 0.05))))
+
+        atr_fast_ref = max(atr15 * vol_expand_ratio, vol_expand_abs)
+        atr_mid_ref = max(atr1h * vol_expand_ratio, vol_expand_abs * 0.8)
+        vol_expansion = bool((atr5 >= atr_fast_ref) or (atr15 >= atr_mid_ref) or (max(vol15, vol1h) >= 1.35))
+
+        squeeze_release = bool(sqz_rel_up or sqz_rel_dn)
+        squeeze_release_bias = 0
+        if sqz_rel_up and (sqz5 >= sqz_thr or sqz15 >= sqz_thr):
+            squeeze_release_bias = 1
+        elif sqz_rel_dn and (sqz5 <= -sqz_thr or sqz15 <= -sqz_thr):
+            squeeze_release_bias = -1
+        elif abs(sqz5) >= sqz_thr:
+            squeeze_release_bias = 1 if sqz5 > 0 else -1
+        elif abs(sqz15) >= sqz_thr:
+            squeeze_release_bias = 1 if sqz15 > 0 else -1
+
+        ob_imb = 0.0
+        ob_score = 0.0
+        if isinstance(orderbook_ctx, dict):
+            ob_imb = float(_as_float(orderbook_ctx.get("imbalance", 0.0), 0.0))
+            ob_score = float(_as_float(orderbook_ctx.get("pressure_score", 0.0), 0.0))
+
+        trend_score = 0.0
+        mean_score = 0.0
+        adx_anchor = float(max(adx15, adx1h))
+        adx_fast = float(max(adx5, adx15))
+
+        if adx_anchor >= adx_trend_min:
+            trend_score += 0.45
+        else:
+            mean_score += 0.25
+        if vol_expansion:
+            trend_score += 0.30
+        else:
+            mean_score += 0.20
+        if squeeze_release and abs(float(sqz5)) >= sqz_thr:
+            trend_score += 0.15
+        if (sqz_on5 or sqz_on15) and (not vol_expansion):
+            mean_score += 0.25
+        if adx_fast <= adx_range_max:
+            mean_score += 0.25
+        if abs(ob_imb) >= 0.15 and ob_score >= 20:
+            if vol_expansion:
+                trend_score += 0.10
+            else:
+                mean_score += 0.05
+
+        trend_score = float(clamp(trend_score, 0.0, 1.0))
+        mean_score = float(clamp(mean_score, 0.0, 1.0))
+
+        regime = "trend" if trend_score >= (mean_score + 0.10) else "mean_reversion"
+        if regime == "trend":
+            reason = (
+                f"ADX {adx_anchor:.1f} + 변동성확장({atr5:.2f}/{max(atr_fast_ref,1e-9):.2f})"
+                + (" + SQZ release" if squeeze_release else "")
+            )
+        else:
+            reason = (
+                f"ADX {adx_fast:.1f} 약세 + 평균회귀 구간"
+                + (" + squeeze 유지" if (sqz_on5 or sqz_on15) else "")
+            )
+
+        out.update(
+            {
+                "regime": regime,
+                "reason": reason,
+                "trend_score": trend_score,
+                "mean_reversion_score": mean_score,
+                "vol_expansion": bool(vol_expansion),
+                "squeeze_release": bool(squeeze_release),
+                "squeeze_release_bias": int(squeeze_release_bias),
+                "adx_anchor": float(adx_anchor),
+                "atr_fast_pct": float(atr5),
+                "atr_mid_pct": float(atr15),
+                "atr_slow_pct": float(atr1h),
+            }
+        )
+    except Exception:
+        return out
+    return out
+
+
+def select_strategy_for_cycle(
+    style: Any,
+    regime_info: Optional[Dict[str, Any]],
+    status: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    st = normalize_style_name(style)
+    regime = str((regime_info or {}).get("regime", "mean_reversion") or "mean_reversion")
+    strategy = "trend" if regime == "trend" else "mean_reversion"
+
+    rr_floor_style = float(_rr_floor_by_style(st, cfg))
+    trend_rr_min = float(max(rr_floor_style, _as_float(cfg.get("trend_strategy_rr_min", 2.4), 2.4)))
+    trend_atr_stop_mult = float(max(0.8, _as_float(cfg.get("trend_strategy_atr_stop_mult", 1.5), 1.5)))
+    trend_breakout_bonus = float(max(0.0, _as_float(cfg.get("trend_strategy_breakout_bonus_rr", 0.25), 0.25)))
+
+    mean_rr_target = float(max(1.05, _as_float(cfg.get("mean_reversion_strategy_rr_target", 1.35), 1.35)))
+    mean_rr_target = float(min(mean_rr_target, max(1.1, rr_floor_style)))
+    mean_atr_stop_mult = float(max(0.5, _as_float(cfg.get("mean_reversion_strategy_atr_stop_mult", 1.0), 1.0)))
+
+    if st == "스윙":
+        time_stop_bars = int(max(0, _as_int(cfg.get("mean_reversion_time_stop_bars_swing", 10), 10)))
+    elif st == "단타":
+        time_stop_bars = int(max(0, _as_int(cfg.get("mean_reversion_time_stop_bars_day", 8), 8)))
+    else:
+        time_stop_bars = int(max(0, _as_int(cfg.get("mean_reversion_time_stop_bars_scalp", 6), 6)))
+
+    bb_txt = str((status or {}).get("BB", "") or "")
+    vwap_txt = str((status or {}).get("VWAP", "") or "")
+    if strategy == "mean_reversion" and (("상단 돌파" in bb_txt) or ("하단 이탈" in bb_txt) or ("위" in vwap_txt) or ("아래" in vwap_txt)):
+        reason = "VWAP/볼린저 평균회귀 전략"
+    elif strategy == "trend":
+        reason = "돌파/추세지속 전략(ATR 손절 + 높은 RR)"
+    else:
+        reason = "평균회귀 전략(시간손절 포함)"
+
+    return {
+        "strategy": strategy,
+        "regime": regime,
+        "reason": reason,
+        "trend_rr_min": float(trend_rr_min),
+        "trend_atr_stop_mult": float(trend_atr_stop_mult),
+        "trend_breakout_bonus_rr": float(trend_breakout_bonus),
+        "mean_rr_target": float(mean_rr_target),
+        "mean_atr_stop_mult": float(mean_atr_stop_mult),
+        "mean_time_stop_bars": int(time_stop_bars),
+    }
+
+
 def choose_dynamic_style(
     spectrum: Dict[str, Any],
     orderbook_ctx: Optional[Dict[str, Any]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     res = {
         "style": "스캘핑",
         "market_regime": "ranging",
         "reason": "기본 스캘핑",
         "scores": {"range": 0.0, "breakout": 0.0, "trend": 0.0},
+        "regime_detail": {},
     }
     try:
+        cfg = dict(cfg or {})
         tfm = (spectrum or {}).get("timeframes", {}) if isinstance(spectrum, dict) else {}
         t1 = tfm.get("1m", {}) if isinstance(tfm, dict) else {}
         t5 = tfm.get("5m", {}) if isinstance(tfm, dict) else {}
@@ -11077,13 +12375,20 @@ def choose_dynamic_style(
         mega_trend_adx = float(max(adx1h, adx4h, adx1d))
         mega_trend = bool(mega_trend_adx >= 30.0)
 
+        regime_detail = classify_regime_adx_volatility(spectrum, cfg, orderbook_ctx=orderbook_ctx)
+        regime_cls = str(regime_detail.get("regime", "mean_reversion") or "mean_reversion")
+
         style = "스캘핑"
         regime = "ranging"
         reason = "횡보/저변동성 구간 → 스캘핑(1m/5m 반전 + 오더북 압력)"
-        if trend_score >= 0.62 and mega_trend:
+        if regime_cls == "trend" and trend_score >= 0.62 and mega_trend:
             style = "스윙"
             regime = "trend"
-            reason = "메가추세(ADX≥30) + 상위 TF 정렬 → 스윙 추세추종"
+            reason = f"메가추세(ADX≥30) + {str(regime_detail.get('reason','')).strip()}"
+        elif regime_cls == "trend" and breakout_score >= 0.45:
+            style = "단타"
+            regime = "breakout"
+            reason = f"변동성 확장/브레이크아웃 → 단타 | {str(regime_detail.get('reason','')).strip()}"
         elif breakout_score >= 0.52:
             style = "단타"
             regime = "breakout"
@@ -11096,6 +12401,10 @@ def choose_dynamic_style(
             style = "단타"
             regime = "intraday"
             reason = "메가추세 아님(ADX<30) + 기회구간 → 단타 우선"
+        elif regime_cls == "mean_reversion":
+            style = "스캘핑"
+            regime = "ranging"
+            reason = f"평균회귀 유리 구간 | {str(regime_detail.get('reason','')).strip()}"
 
         res.update(
             {
@@ -11103,6 +12412,7 @@ def choose_dynamic_style(
                 "market_regime": regime,
                 "reason": reason,
                 "scores": {"range": range_score, "breakout": breakout_score, "trend": trend_score},
+                "regime_detail": dict(regime_detail or {}),
             }
         )
         return res
@@ -13260,6 +14570,79 @@ def apply_scalp_price_guardrails(out: Dict[str, Any], df: pd.DataFrame, cfg: Dic
     return res
 
 
+def apply_strategy_profile(
+    out: Dict[str, Any],
+    *,
+    strategy_info: Optional[Dict[str, Any]],
+    style: str,
+    decision: str,
+    df: pd.DataFrame,
+    status: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    res = dict(out or {})
+    try:
+        dec = str(decision or "")
+        if dec not in ["buy", "sell"]:
+            return res
+        st = normalize_style_name(style)
+        info = dict(strategy_info or {})
+        strategy = str(info.get("strategy", "trend") or "trend")
+        lev = float(max(1.0, abs(_as_float(res.get("leverage", 1), 1.0))))
+        atr_pct = float(_as_float(res.get("atr_price_pct", 0.0), 0.0))
+        if atr_pct <= 0:
+            atr_pct = float(_atr_price_pct(df, int(cfg.get("atr_leverage_window", 14) or 14)))
+
+        sl_price_pct = abs(float(_as_float(res.get("sl_price_pct", 0.0), 0.0)))
+        tp_price_pct = abs(float(_as_float(res.get("tp_price_pct", 0.0), 0.0)))
+        if sl_price_pct <= 0:
+            sl_price_pct = abs(float(_as_float(res.get("sl_pct", 0.0), 0.0))) / max(lev, 1.0)
+        if tp_price_pct <= 0:
+            tp_price_pct = abs(float(_as_float(res.get("tp_pct", 0.0), 0.0))) / max(lev, 1.0)
+
+        strategy_note = ""
+        time_stop_bars = 0
+        if strategy == "trend":
+            atr_mult = float(max(0.8, _as_float(info.get("trend_atr_stop_mult", cfg.get("trend_strategy_atr_stop_mult", 1.5)), 1.5)))
+            rr_min = float(max(_rr_floor_by_style(st, cfg), _as_float(info.get("trend_rr_min", cfg.get("trend_strategy_rr_min", 2.4)), 2.4)))
+            rr_bonus = float(max(0.0, _as_float(info.get("trend_breakout_bonus_rr", cfg.get("trend_strategy_breakout_bonus_rr", 0.25)), 0.25)))
+            sqz_release = bool((status or {}).get("_sqz_fire_up_recent", False) or (status or {}).get("_sqz_fire_down_recent", False))
+            bb_break = bool(("상단 돌파" in str((status or {}).get("BB", "") or "")) or ("하단 이탈" in str((status or {}).get("BB", "") or "")))
+            rr_use = float(rr_min + (rr_bonus if (sqz_release or bb_break) else 0.0))
+            sl_price_pct = float(max(sl_price_pct, atr_pct * atr_mult, 0.05))
+            tp_price_pct = float(max(tp_price_pct, sl_price_pct * rr_use))
+            strategy_note = f"trend(ATRx{atr_mult:.2f}, RR>={rr_use:.2f})"
+            time_stop_bars = 0
+        else:
+            atr_mult = float(max(0.5, _as_float(info.get("mean_atr_stop_mult", cfg.get("mean_reversion_strategy_atr_stop_mult", 1.0)), 1.0)))
+            rr_target = float(max(1.05, _as_float(info.get("mean_rr_target", cfg.get("mean_reversion_strategy_rr_target", 1.35)), 1.35)))
+            min_stop_base = float(max(0.01, _as_float(cfg.get("min_stop_price_pct", 0.20), 0.20)))
+            sl_price_pct = float(max(sl_price_pct, atr_pct * atr_mult, min_stop_base))
+            tp_price_pct = float(max(tp_price_pct, sl_price_pct * rr_target))
+            time_stop_bars = int(max(1, _as_int(info.get("mean_time_stop_bars", 0), 0)))
+            strategy_note = f"mean_reversion(VWAP/BB, ATRx{atr_mult:.2f}, RR≈{rr_target:.2f}, time_stop={time_stop_bars}bars)"
+
+        res["strategy"] = str(strategy)
+        res["strategy_note"] = str(strategy_note)[:220]
+        res["strategy_time_stop_bars"] = int(max(0, time_stop_bars))
+        res["sl_price_pct"] = float(sl_price_pct)
+        res["tp_price_pct"] = float(tp_price_pct)
+        res["sl_pct"] = float(sl_price_pct * lev)
+        res["tp_pct"] = float(tp_price_pct * lev)
+        res["rr"] = float(res["tp_pct"] / max(abs(float(res["sl_pct"])), 0.01))
+        res["_strategy_profile"] = {
+            "style": str(st),
+            "strategy": str(strategy),
+            "atr_price_pct": float(atr_pct),
+            "sl_price_pct": float(sl_price_pct),
+            "tp_price_pct": float(tp_price_pct),
+            "time_stop_bars": int(max(0, time_stop_bars)),
+        }
+    except Exception:
+        return res
+    return res
+
+
 # =========================================================
 # ✅ 14) AI 회고(후기) (기존 유지 + 안정성)
 # =========================================================
@@ -13404,6 +14787,151 @@ def mon_add_scan(mon: Dict[str, Any], stage: str, symbol: str, tf: str = "", sig
             pass
     except Exception:
         pass
+
+
+def _dedupe_symbols_keep_order(symbols: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for sym in symbols or []:
+        try:
+            s = str(sym or "").strip()
+        except Exception:
+            s = ""
+        if (not s) or (s in seen):
+            continue
+        out.append(s)
+        seen.add(s)
+    return out
+
+
+def _runtime_open_target_symbols(rt: Dict[str, Any]) -> List[str]:
+    try:
+        ot = rt.get("open_targets", {}) if isinstance(rt, dict) else {}
+        if not isinstance(ot, dict):
+            return []
+        return _dedupe_symbols_keep_order(list(ot.keys()))
+    except Exception:
+        return []
+
+
+def resolve_dynamic_universe(
+    ex,
+    cfg: Dict[str, Any],
+    rt: Dict[str, Any],
+    active_targets: Dict[str, Dict[str, Any]],
+    mon: Dict[str, Any],
+) -> Tuple[List[str], List[str], Dict[str, Any]]:
+    base_symbols = _dedupe_symbols_keep_order(list(TARGET_COINS))
+    open_target_symbols = _runtime_open_target_symbols(rt)
+    active_target_symbols = _dedupe_symbols_keep_order(list((active_targets or {}).keys()))
+    managed_seed = _dedupe_symbols_keep_order(base_symbols + open_target_symbols + active_target_symbols)
+
+    if (not bool(cfg.get("universe_enable", True))) or (UNIVERSE_BUILDER is None):
+        info = {
+            "enabled": bool(cfg.get("universe_enable", True)),
+            "reason_code": "DISABLED_OR_UNAVAILABLE",
+            "scan_count": len(base_symbols),
+            "managed_count": len(managed_seed),
+            "symbols_preview": base_symbols[:8],
+            "ttl_sec": int(cfg.get("universe_ttl_sec", 120) or 120),
+            "next_refresh_sec": None,
+            "refreshed": False,
+            "stats": {},
+        }
+        try:
+            mon["universe"] = info
+        except Exception:
+            pass
+        return base_symbols, managed_seed, info
+
+    try:
+        top_n = int(max(5, min(150, int(cfg.get("universe_top_n", 30) or 30))))
+        ttl_sec = int(max(15, min(3600, int(cfg.get("universe_ttl_sec", 120) or 120))))
+        max_spread_bps = float(max(0.1, float(cfg.get("universe_max_spread_bps", 15.0) or 15.0)))
+        min_quote_volume = float(max(0.0, float(cfg.get("universe_min_quote_volume", 0.0) or 0.0)))
+        log_max_symbols = int(max(3, min(60, int(cfg.get("universe_log_max_symbols", 12) or 12))))
+
+        uni_res = UNIVERSE_BUILDER.get_universe(
+            ex,
+            top_n=top_n,
+            max_spread_bps=max_spread_bps,
+            ttl_sec=ttl_sec,
+            min_quote_volume=min_quote_volume,
+            force_refresh=False,
+        )
+        dyn_symbols = _dedupe_symbols_keep_order(list(uni_res.symbols or []))
+        scan_symbols = dyn_symbols if dyn_symbols else list(base_symbols)
+        managed_symbols = _dedupe_symbols_keep_order(managed_seed + scan_symbols)
+
+        now_ep = time.time()
+        next_refresh_sec = max(0, int(float(uni_res.next_refresh_epoch or 0.0) - now_ep))
+        info = {
+            "enabled": True,
+            "reason_code": str(uni_res.reason_code or "OK"),
+            "scan_count": len(scan_symbols),
+            "managed_count": len(managed_symbols),
+            "symbols_preview": scan_symbols[:log_max_symbols],
+            "ttl_sec": int(uni_res.ttl_sec or ttl_sec),
+            "next_refresh_sec": int(next_refresh_sec),
+            "refresh_at_epoch": float(uni_res.refresh_at_epoch or now_ep),
+            "next_refresh_epoch": float(uni_res.next_refresh_epoch or (now_ep + ttl_sec)),
+            "refreshed": bool(uni_res.refreshed),
+            "stats": dict(uni_res.stats or {}),
+            "top_rows": [dict(x) for x in (uni_res.top_rows or [])[: min(8, log_max_symbols)]],
+        }
+        try:
+            mon["universe"] = info
+        except Exception:
+            pass
+        if bool(uni_res.refreshed):
+            try:
+                mon_add_event(
+                    mon,
+                    "UNIVERSE_REFRESH",
+                    "*",
+                    f"scan={len(scan_symbols)} managed={len(managed_symbols)} next={next_refresh_sec}s",
+                    {
+                        "reason_code": str(uni_res.reason_code or "OK"),
+                        "top_n": int(top_n),
+                        "max_spread_bps": float(max_spread_bps),
+                        "min_quote_volume": float(min_quote_volume),
+                        "ttl_sec": int(uni_res.ttl_sec or ttl_sec),
+                        "scan_symbols": scan_symbols[: min(20, log_max_symbols)],
+                        "stats": dict(uni_res.stats or {}),
+                    },
+                )
+            except Exception:
+                pass
+        return scan_symbols, managed_symbols, info
+    except Exception as e:
+        now_ep = time.time()
+        err_info = {
+            "enabled": True,
+            "reason_code": "UNIVERSE_ERROR",
+            "error": f"{type(e).__name__}: {e}"[:220],
+            "scan_count": len(base_symbols),
+            "managed_count": len(managed_seed),
+            "symbols_preview": base_symbols[:8],
+            "ttl_sec": int(max(15, min(3600, int(cfg.get("universe_ttl_sec", 120) or 120)))),
+            "next_refresh_sec": None,
+            "refreshed": False,
+            "stats": {},
+        }
+        try:
+            mon["universe"] = err_info
+        except Exception:
+            pass
+        try:
+            last_err_ep = float(mon.get("_universe_error_epoch", 0.0) or 0.0)
+        except Exception:
+            last_err_ep = 0.0
+        if (now_ep - last_err_ep) >= 60.0:
+            try:
+                mon_add_event(mon, "UNIVERSE_ERROR", "*", err_info["error"], {"reason_code": "UNIVERSE_ERROR"})
+                mon["_universe_error_epoch"] = float(now_ep)
+            except Exception:
+                pass
+        return base_symbols, managed_seed, err_info
 
 
 def _watch_reason_top(mon: Dict[str, Any], symbols: List[str], top_n: int = 3) -> List[Tuple[str, int]]:
@@ -14350,6 +15878,32 @@ def tg_send(text: str, target: str = "default", cfg: Optional[Dict[str, Any]] = 
         pass
 
 
+_EVENT_SINKS_REGISTERED = False
+
+
+def _register_default_event_sinks() -> None:
+    global _EVENT_SINKS_REGISTERED
+    if _EVENT_SINKS_REGISTERED:
+        return
+    if bot_register_event_sink is None:
+        return
+
+    def _telegram_sink(event: Dict[str, Any]) -> None:
+        payload = event.get("payload") if isinstance(event, dict) else {}
+        if not isinstance(payload, dict):
+            return
+        text = str(payload.get("telegram_text") or payload.get("text") or "").strip()
+        if not text:
+            return
+        target = str(payload.get("target") or "default")
+        parse_mode = str(payload.get("parse_mode") or "")
+        silent = bool(payload.get("silent", False))
+        tg_send(text=text, target=target, cfg=load_settings(), silent=silent, parse_mode=parse_mode)
+
+    if register_event_sink("telegram", _telegram_sink, overwrite=True):
+        _EVENT_SINKS_REGISTERED = True
+
+
 def tg_send_photo(photo_path: str, caption: str = "", target: str = "default", cfg: Optional[Dict[str, Any]] = None, *, silent: bool = False):
     path = str(photo_path or "").strip()
     if (not path) or (not os.path.exists(path)):
@@ -15067,6 +16621,321 @@ def _resolve_open_target_for_symbol(
     if ac_t:
         merged.update(ac_t)
     return merged
+
+
+def _startup_reconcile_style_from_position(cfg: Dict[str, Any], pos: Dict[str, Any]) -> str:
+    raw_pref = str(cfg.get("startup_reconcile_import_style", "auto") or "auto").strip()
+    if raw_pref and raw_pref.lower() != "auto":
+        return normalize_style_name(raw_pref)
+    lev = abs(float(_as_float(pos.get("leverage", 0.0), 0.0)))
+    if lev >= 12.0:
+        return "스캘핑"
+    if lev >= 5.0:
+        return "단타"
+    return "스윙"
+
+
+def _startup_reconcile_target_from_position(
+    pos: Dict[str, Any],
+    cfg: Dict[str, Any],
+    total_equity: float,
+    free_equity: float,
+) -> Dict[str, Any]:
+    sym = str(pos.get("symbol", "") or "")
+    side = position_side_normalize(pos)
+    decision = "buy" if side == "long" else "sell"
+    entry_price = float(max(0.0, _as_float(pos.get("entryPrice", 0.0), 0.0)))
+    lev = float(max(1.0, abs(_as_float(pos.get("leverage", 1.0), 1.0))))
+    style = _startup_reconcile_style_from_position(cfg, pos)
+    sr = style_rule(style)
+    tp_seed = float((_as_float(sr.get("tp_roi_min", 2.0), 2.0) + _as_float(sr.get("tp_roi_max", 6.0), 6.0)) / 2.0)
+    sl_seed = float((_as_float(sr.get("sl_roi_min", 1.0), 1.0) + _as_float(sr.get("sl_roi_max", 3.0), 3.0)) / 2.0)
+    capped = apply_hard_roi_caps({"tp_pct": tp_seed, "sl_pct": sl_seed, "leverage": lev}, style, cfg)
+    tp_roi = float(max(0.2, abs(_as_float(capped.get("tp_pct", tp_seed), tp_seed))))
+    sl_roi = float(max(0.2, abs(_as_float(capped.get("sl_pct", sl_seed), sl_seed))))
+    rr = float(tp_roi / max(sl_roi, 0.01))
+
+    margin_guess = 0.0
+    for k in ["initialMargin", "margin", "collateral", "initialMarginPercentage"]:
+        v = float(_as_float(pos.get(k, 0.0), 0.0))
+        if v > margin_guess:
+            margin_guess = v
+
+    entry_pct_plan = 0.0
+    if total_equity > 0 and margin_guess > 0:
+        entry_pct_plan = (margin_guess / max(total_equity, 1e-9)) * 100.0
+
+    sl_price = _price_from_roi_target(entry_price, decision, sl_roi, lev, "sl")
+    tp_price = _price_from_roi_target(entry_price, decision, tp_roi, lev, "tp")
+    decision_tf = normalize_decision_tf(cfg.get("timeframe", "5m"), style, default_tf=str(cfg.get("timeframe", "5m") or "5m"))
+
+    return {
+        "sl": float(sl_roi),
+        "tp": float(tp_roi),
+        "rr": float(rr),
+        "entry_usdt": float(margin_guess) if margin_guess > 0 else 0.0,
+        "entry_pct": float(entry_pct_plan),
+        "entry_confidence": 0,
+        "lev": float(lev),
+        "entry_order_mode": "startup-reconcile",
+        "entry_price": float(entry_price) if entry_price > 0 else 0.0,
+        "entry_snapshot": {"source": "startup_reconcile"},
+        "bal_entry_total": float(total_equity) if total_equity > 0 else "",
+        "bal_entry_free": float(free_equity) if free_equity > 0 else "",
+        "reason": "startup_reconcile_import",
+        "trade_id": f"recon-{uuid.uuid4().hex[:10]}",
+        "style": str(style),
+        "style_confidence": 0,
+        "style_reason": "startup_reconcile:auto_import",
+        "entry_epoch": float(time.time()),
+        "style_last_switch_epoch": float(time.time()),
+        "sl_price": float(sl_price) if sl_price is not None else None,
+        "tp_price": float(tp_price) if tp_price is not None else None,
+        "sl_price_pct": float(sl_roi / max(lev, 1.0)),
+        "tp_price_pct": float(tp_roi / max(lev, 1.0)),
+        "sl_price_source": "RECON_ROI",
+        "tp_price_source": "RECON_ROI",
+        "sl_price_reason": "startup_reconcile:style_seed",
+        "tp_price_reason": "startup_reconcile:style_seed",
+        "decision_tf": str(decision_tf),
+    }
+
+
+def startup_reconcile_exchange_state(
+    ex,
+    cfg: Dict[str, Any],
+    rt: Dict[str, Any],
+    active_targets: Dict[str, Dict[str, Any]],
+    mon: Optional[Dict[str, Any]] = None,
+    symbols_hint: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    시작 시 거래소 상태와 봇 상태를 동기화한다.
+    - exchange 포지션/오픈주문 조회
+    - 누락 포지션 open_targets 자동 복구
+    - 거래소에 없는 stale 상태 제거
+    - 옵션으로 unknown open order 취소
+    """
+    result: Dict[str, Any] = {
+        "ok": False,
+        "enabled": bool(cfg.get("startup_reconcile_enable", True)),
+        "reason_code": "INIT",
+        "imported_positions": 0,
+        "cleared_stale": 0,
+        "open_orders": 0,
+        "unknown_orders": 0,
+        "canceled_unknown_orders": 0,
+        "cancel_failed": 0,
+        "import_symbols": [],
+        "cleared_symbols": [],
+        "unknown_order_ids": [],
+        "errors": [],
+        "time_kst": now_kst_str(),
+    }
+    if not bool(result["enabled"]):
+        result["ok"] = True
+        result["reason_code"] = "DISABLED"
+        return result
+
+    rt_open_targets = rt.setdefault("open_targets", {})
+    if not isinstance(rt_open_targets, dict):
+        rt_open_targets = {}
+        rt["open_targets"] = rt_open_targets
+
+    try:
+        free_eq, total_eq = safe_fetch_balance(ex)
+    except Exception as e:
+        free_eq, total_eq = 0.0, 0.0
+        result["errors"].append(f"BALANCE:{type(e).__name__}")
+
+    symbols_q = _dedupe_symbols_keep_order(list((symbols_hint or []) + list(TARGET_COINS)))
+    positions_raw = safe_fetch_positions_all(ex, symbols_fallback=symbols_q)
+    open_orders_raw = safe_fetch_open_orders(ex, symbols=symbols_q)
+
+    live_positions: List[Dict[str, Any]] = []
+    live_norm_to_symbol: Dict[str, str] = {}
+    for p in positions_raw or []:
+        if not isinstance(p, dict):
+            continue
+        sym = str(p.get("symbol", "") or "").strip()
+        if not sym:
+            continue
+        contracts = float(_as_float(p.get("contracts", 0.0), 0.0))
+        if contracts <= 0:
+            continue
+        live_positions.append(p)
+        nk = _norm_symbol_key(sym)
+        if nk:
+            live_norm_to_symbol[nk] = sym
+
+    live_norm_set = set(live_norm_to_symbol.keys())
+
+    imported_symbols: List[str] = []
+    for pos in live_positions:
+        sym = str(pos.get("symbol", "") or "").strip()
+        if not sym:
+            continue
+        existing = _resolve_open_target_for_symbol(sym, active_targets, rt_open_targets)
+        if existing:
+            if sym not in active_targets:
+                active_targets[sym] = dict(existing)
+            if sym not in rt_open_targets:
+                rt_open_targets[sym] = dict(existing)
+            continue
+        tgt = _startup_reconcile_target_from_position(pos, cfg, float(total_eq), float(free_eq))
+        active_targets[sym] = dict(tgt)
+        rt_open_targets[sym] = dict(tgt)
+        imported_symbols.append(sym)
+        try:
+            save_trade_detail(
+                str(tgt.get("trade_id", "") or f"recon-{uuid.uuid4().hex[:10]}"),
+                {
+                    "time": now_kst_str(),
+                    "coin": sym,
+                    "result": "RECON_IMPORTED",
+                    "reason_code": "STARTUP_IMPORT_POSITION",
+                    "style": str(tgt.get("style", "")),
+                    "entry_price": float(_as_float(tgt.get("entry_price", 0.0), 0.0)),
+                    "tp_pct_roi": float(_as_float(tgt.get("tp", 0.0), 0.0)),
+                    "sl_pct_roi": float(_as_float(tgt.get("sl", 0.0), 0.0)),
+                    "tp_price_sr": tgt.get("tp_price"),
+                    "sl_price_sr": tgt.get("sl_price"),
+                    "source_position": {
+                        "contracts": float(_as_float(pos.get("contracts", 0.0), 0.0)),
+                        "leverage": float(_as_float(pos.get("leverage", 0.0), 0.0)),
+                        "side": position_side_normalize(pos),
+                    },
+                },
+            )
+        except Exception as e:
+            result["errors"].append(f"DETAIL_IMPORT:{sym}:{type(e).__name__}")
+
+    stale_symbols: List[str] = []
+    tracked_keys = _dedupe_symbols_keep_order(list(active_targets.keys()) + list(rt_open_targets.keys()))
+    for sym in tracked_keys:
+        nk = _norm_symbol_key(sym)
+        if nk and nk in live_norm_set:
+            continue
+        removed_any = False
+        if sym in active_targets:
+            active_targets.pop(sym, None)
+            removed_any = True
+        if sym in rt_open_targets:
+            rt_open_targets.pop(sym, None)
+            removed_any = True
+        try:
+            if isinstance(rt.get("trades"), dict):
+                rt["trades"].pop(sym, None)
+        except Exception:
+            pass
+        if removed_any:
+            stale_symbols.append(sym)
+            try:
+                save_trade_detail(
+                    f"recon-clear-{uuid.uuid4().hex[:10]}",
+                    {
+                        "time": now_kst_str(),
+                        "coin": str(sym),
+                        "result": "RECON_STALE_CLEARED",
+                        "reason_code": "NOT_ON_EXCHANGE_POSITION",
+                    },
+                )
+            except Exception as e:
+                result["errors"].append(f"DETAIL_CLEAR:{sym}:{type(e).__name__}")
+
+    unknown_orders: List[Dict[str, Any]] = []
+    for o in open_orders_raw or []:
+        if not isinstance(o, dict):
+            continue
+        oid = str(o.get("id", "") or "").strip()
+        sym = str(o.get("symbol", "") or "").strip()
+        if (not oid) or (not sym):
+            continue
+        nk = _norm_symbol_key(sym)
+        if nk and (nk in live_norm_set):
+            continue
+        unknown_orders.append(o)
+
+    cancel_unknown = bool(cfg.get("startup_cancel_unknown_orders", False))
+    cancel_max = int(max(0, _as_int(cfg.get("startup_cancel_unknown_orders_max", 20), 20)))
+    canceled_ok = 0
+    canceled_fail = 0
+    unknown_ids: List[str] = []
+    for idx, o in enumerate(unknown_orders):
+        oid = str(o.get("id", "") or "").strip()
+        sym = str(o.get("symbol", "") or "").strip()
+        if not oid:
+            continue
+        unknown_ids.append(oid)
+        if cancel_unknown and idx < cancel_max:
+            cres = safe_cancel_open_order(ex, oid, sym)
+            if bool(cres.get("ok", False)):
+                canceled_ok += 1
+            else:
+                canceled_fail += 1
+                result["errors"].append(f"CANCEL_FAIL:{sym}:{oid}:{cres.get('reason_code','')}")
+        try:
+            save_trade_detail(
+                f"recon-order-{uuid.uuid4().hex[:10]}",
+                {
+                    "time": now_kst_str(),
+                    "coin": sym,
+                    "result": "RECON_UNKNOWN_ORDER",
+                    "reason_code": "UNKNOWN_OPEN_ORDER",
+                    "order_id": oid,
+                    "order_side": str(o.get("side", "") or ""),
+                    "order_type": str(o.get("type", "") or ""),
+                    "order_price": float(_as_float(o.get("price", 0.0), 0.0)),
+                    "order_amount": float(_as_float(o.get("amount", 0.0), 0.0)),
+                    "action": "CANCEL" if cancel_unknown else "KEEP",
+                },
+            )
+        except Exception as e:
+            result["errors"].append(f"DETAIL_ORDER:{sym}:{type(e).__name__}")
+
+    result["imported_positions"] = int(len(imported_symbols))
+    result["cleared_stale"] = int(len(stale_symbols))
+    result["open_orders"] = int(len(open_orders_raw or []))
+    result["unknown_orders"] = int(len(unknown_orders))
+    result["canceled_unknown_orders"] = int(canceled_ok)
+    result["cancel_failed"] = int(canceled_fail)
+    result["import_symbols"] = imported_symbols[:30]
+    result["cleared_symbols"] = stale_symbols[:30]
+    result["unknown_order_ids"] = unknown_ids[:40]
+    result["ok"] = True
+    result["reason_code"] = "OK"
+
+    rt["startup_reconcile"] = {
+        "time_kst": now_kst_str(),
+        "imported_positions": int(result["imported_positions"]),
+        "cleared_stale": int(result["cleared_stale"]),
+        "open_orders": int(result["open_orders"]),
+        "unknown_orders": int(result["unknown_orders"]),
+        "canceled_unknown_orders": int(result["canceled_unknown_orders"]),
+        "cancel_failed": int(result["cancel_failed"]),
+        "reason_code": str(result["reason_code"]),
+        "errors": list(result["errors"])[:20],
+    }
+    save_runtime(rt)
+
+    if isinstance(mon, dict):
+        try:
+            mon["startup_reconcile"] = dict(result)
+            mon_add_event(
+                mon,
+                "STARTUP_RECON",
+                "*",
+                f"import={result['imported_positions']} stale={result['cleared_stale']} unknown_orders={result['unknown_orders']}",
+                {
+                    "reason_code": str(result["reason_code"]),
+                    "cancel_unknown": bool(cancel_unknown),
+                    "canceled_unknown_orders": int(canceled_ok),
+                    "cancel_failed": int(canceled_fail),
+                },
+            )
+        except Exception as e:
+            result["errors"].append(f"MON_EVENT:{type(e).__name__}")
+    return result
 
 
 def _fmt_pos_block(
@@ -17743,6 +19612,32 @@ def telegram_thread(ex):
 
     # 부팅 메시지(그룹: 메뉴, 채널: 시작 알림)
     cfg_boot = load_settings()
+    try:
+        recon_syms = _dedupe_symbols_keep_order(
+            list(TARGET_COINS)
+            + _runtime_open_target_symbols(rt_boot)
+            + list(active_targets.keys())
+        )
+        recon_res = startup_reconcile_exchange_state(
+            ex,
+            cfg_boot,
+            rt_boot,
+            active_targets,
+            mon=mon,
+            symbols_hint=recon_syms,
+        )
+        mon["startup_reconcile"] = dict(recon_res)
+    except Exception as e:
+        try:
+            mon_add_event(
+                mon,
+                "STARTUP_RECON_ERROR",
+                "*",
+                f"{type(e).__name__}: {e}"[:220],
+                {"reason_code": "STARTUP_RECON_ERROR"},
+            )
+        except Exception:
+            pass
     boot_msg = f"🚀 AI 봇 가동 시작! (모의투자)\n- code: {CODE_VERSION}\n명령: /menu /status /positions /scan /mode /log /gsheet"
     tg_send(boot_msg, target="channel", cfg=cfg_boot)
     # ✅ 요구: TG_TARGET_CHAT_ID는 채널(브로드캐스트), 관리는 관리자 DM으로(중복/스팸 방지)
@@ -17819,6 +19714,7 @@ def telegram_thread(ex):
             rule = MODE_RULES.get(mode, MODE_RULES["안전모드"])
             ccxt_timeout_epoch_loop_start = float(getattr(ex, "_wonyoti_ccxt_timeout_epoch", 0) or 0)
             ccxt_timeout_where_loop_start = str(getattr(ex, "_wonyoti_ccxt_timeout_where", "") or "")
+            scan_symbols_loop, managed_symbols_loop, _universe_info = resolve_dynamic_universe(ex, cfg, rt, active_targets, mon)
 
             # =========================================================
             # ✅ 루프 하트비트(즉시 기록)
@@ -18066,7 +19962,7 @@ def telegram_thread(ex):
 
                         # 포지션 요약
                         pos_blocks: List[str] = []
-                        ps = safe_fetch_positions(ex, TARGET_COINS)
+                        ps = safe_fetch_positions(ex, managed_symbols_loop)
                         act = [p for p in ps if float(p.get("contracts") or 0) > 0]
                         rt_open_targets = {}
                         try:
@@ -18151,7 +20047,7 @@ def telegram_thread(ex):
                             free, total = safe_fetch_balance(ex)
                             # 포지션 요약
                             pos_blocks: List[str] = []
-                            ps = safe_fetch_positions(ex, TARGET_COINS)
+                            ps = safe_fetch_positions(ex, managed_symbols_loop)
                             act = [p for p in ps if float(p.get("contracts") or 0) > 0]
                             if act:
                                 rt_open_targets = {}
@@ -18353,7 +20249,7 @@ def telegram_thread(ex):
                         except Exception:
                             pass
                         _to_before_pos = float(getattr(ex, "_wonyoti_ccxt_timeout_epoch", 0) or 0)
-                        ps_all = safe_fetch_positions(ex, TARGET_COINS)
+                        ps_all = safe_fetch_positions(ex, managed_symbols_loop)
                         _to_after_pos = float(getattr(ex, "_wonyoti_ccxt_timeout_epoch", 0) or 0)
                         if _to_after_pos and _to_after_pos > _to_before_pos:
                             need_exchange_refresh = True
@@ -18386,7 +20282,7 @@ def telegram_thread(ex):
                             pass
 
                     # ✅ 포지션 관리는 "항상" 수행해야 함(자동매매 OFF/일시정지/주말이어도 청산은 계속 필요)
-                    for sym in TARGET_COINS:
+                    for sym in managed_symbols_loop:
                         try:
                             mon["loop_stage"] = f"MANAGE_POS:{sym}"
                             mon["loop_stage_kst"] = now_kst_str()
@@ -18456,6 +20352,9 @@ def telegram_thread(ex):
                                 "sl_price_ai": None,
                                 "tp_price_ai": None,
                                 "style": "스캘핑",
+                                "strategy": "trend",
+                                "strategy_reason": "",
+                                "strategy_time_stop_bars": 0,
                                 "entry_epoch": time.time(),
                                 "style_last_switch_epoch": time.time(),
                             }
@@ -18479,6 +20378,13 @@ def telegram_thread(ex):
                         if (not forced_exit) and (not ai_exit_only):
                             tgt = _maybe_switch_style_for_open_position(ex, sym, side, tgt, cfg, mon)
                         style_now = str(tgt.get("style", "스캘핑"))
+                        strategy_now = str(tgt.get("strategy", "trend") or "trend")
+                        strategy_time_stop_bars = int(max(0, _as_int(tgt.get("strategy_time_stop_bars", 0), 0)))
+                        try:
+                            tgt["strategy"] = str(strategy_now)
+                            tgt["strategy_time_stop_bars"] = int(strategy_time_stop_bars)
+                        except Exception:
+                            pass
                         try:
                             tgt["exit_trailing_protect_enable"] = bool(forced_exit)
                         except Exception:
@@ -19666,7 +21572,7 @@ def telegram_thread(ex):
                         swing_hard_sl_hit = False
                         try:
                             if (
-                                str(style or "") == "스윙"
+                                str(style_now or "") == "스윙"
                                 and bool(cfg.get("swing_hard_sl_enable", True))
                                 and float(roi) <= float(cfg.get("swing_hard_sl_roi", -7.0))
                             ):
@@ -19675,6 +21581,38 @@ def telegram_thread(ex):
                                 tgt["force_take_detail"] = f"ROI {roi:+.2f}% → Hard SL 즉시 전량 청산"
                         except Exception:
                             swing_hard_sl_hit = False
+
+                        strategy_time_stop_hit = False
+                        try:
+                            if str(strategy_now or "trend") == "mean_reversion" and int(strategy_time_stop_bars) > 0:
+                                tf_for_bars = str(tgt.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m"))
+                                tf_sec_for_bars = int(_timeframe_seconds(tf_for_bars, 300))
+                                elapsed_sec = float(max(0.0, time.time() - float(entry_epoch)))
+                                elapsed_bars = int(elapsed_sec / max(1, tf_sec_for_bars))
+                                tgt["strategy_elapsed_bars"] = int(elapsed_bars)
+                                if elapsed_bars >= int(strategy_time_stop_bars):
+                                    strategy_time_stop_hit = True
+                                    tgt["force_take_reason"] = f"전략 시간정리({int(strategy_time_stop_bars)}봉)"
+                                    tgt["force_take_detail"] = f"mean_reversion 시간손절: {elapsed_bars}봉 경과"
+                                    try:
+                                        mon_add_scan(
+                                            mon,
+                                            stage="strategy_time_stop",
+                                            symbol=sym,
+                                            tf=str(tf_for_bars),
+                                            signal=str(strategy_now),
+                                            score=int(elapsed_bars),
+                                            message=f"time_stop {elapsed_bars}/{int(strategy_time_stop_bars)} bars",
+                                            extra={
+                                                "strategy": str(strategy_now),
+                                                "elapsed_bars": int(elapsed_bars),
+                                                "time_stop_bars": int(strategy_time_stop_bars),
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            strategy_time_stop_hit = False
 
                         time_force_close_hit = False
                         if bool(intra_force_close):
@@ -19765,12 +21703,24 @@ def telegram_thread(ex):
 
                         if ai_exit_only:
                             do_stop = bool(roi_stop_hit) or bool(swing_hard_sl_hit)
-                            do_take = bool(ai_targets_ready and (float(roi) >= float(tp))) or bool(signal_take_hit) or bool(time_force_close_hit)
+                            do_take = (
+                                bool(ai_targets_ready and (float(roi) >= float(tp)))
+                                or bool(signal_take_hit)
+                                or bool(strategy_time_stop_hit)
+                                or bool(time_force_close_hit)
+                            )
                             sl_from_ai = True
                             tp_from_ai = True
                         else:
                             do_stop = bool(hit_sl_by_price) or bool(roi_stop_confirmed) or bool(swing_hard_sl_hit)
-                            do_take = hit_tp_by_price or hard_take or (roi >= tp) or bool(signal_take_hit) or bool(time_force_close_hit)
+                            do_take = (
+                                hit_tp_by_price
+                                or hard_take
+                                or (roi >= tp)
+                                or bool(signal_take_hit)
+                                or bool(strategy_time_stop_hit)
+                                or bool(time_force_close_hit)
+                            )
 
                         # 손절
                         if do_stop:
@@ -20178,6 +22128,13 @@ def telegram_thread(ex):
                                     bars = max(0, bars)
                                     if tf_sec > 0 and bars > 0:
                                         rt.setdefault("cooldowns", {})[sym] = time.time() + float(tf_sec) * float(bars)
+                                except Exception:
+                                    pass
+                                try:
+                                    if (not bool(is_protect)):
+                                        sl_cd_min = float(max(0.0, _as_float(cfg.get("symbol_stop_loss_cooldown_min", 20), 20.0)))
+                                        if sl_cd_min > 0:
+                                            rt.setdefault("sl_cooldowns", {})[sym] = float(time.time() + (sl_cd_min * 60.0))
                                 except Exception:
                                     pass
                                 try:
@@ -20704,7 +22661,7 @@ def telegram_thread(ex):
                     # ✅ 자동매매가 OFF/정지/주말이어도 포지션 스냅샷은 UI에 표시
                     if (not open_pos_snapshot) and (not entry_allowed_global) and pos_by_sym:
                         try:
-                            for sym in TARGET_COINS:
+                            for sym in managed_symbols_loop:
                                 p = pos_by_sym.get(sym)
                                 if not p:
                                     continue
@@ -20828,7 +22785,7 @@ def telegram_thread(ex):
                     try:
                         if bool(cfg.get("exit_trailing_protect_enable", False)) and bool(cfg.get("exit_trailing_protect_pause_scan_while_in_position", True)):
                             # 포지션을 더 열 수 있으면(최대 갯수 미만) 스캔은 계속 돌려 신규 진입 기회를 유지
-                            # - 스캔 자체는 가볍고(대상 코인 5개), AI는 봉당 1회 캐시로 비용을 제어
+                            # - 동적 유니버스 사용 시에도, 포지션이 최대치면 스캔을 잠시 멈춰 청산 모니터링 우선
                             max_pos_total = int(cfg.get("max_open_positions_total", 5) or 5)
                             if active_syms and (len(active_syms) >= max(1, max_pos_total)) and (not bool(force_scan_pending)):
                                 skip_scan_loop = True
@@ -20836,7 +22793,11 @@ def telegram_thread(ex):
                     except Exception:
                         skip_scan_loop = False
 
-                    for sym in (TARGET_COINS if (not skip_scan_loop) else []):
+                    scan_iteration_symbols = list(scan_symbols_loop)
+                    if force_scan_pending and force_scan_syms_set:
+                        scan_iteration_symbols = _dedupe_symbols_keep_order(scan_iteration_symbols + list(force_scan_syms_set))
+
+                    for sym in (scan_iteration_symbols if (not skip_scan_loop) else []):
                         try:
                             mon["loop_stage"] = f"SCAN:{sym}"
                             mon["loop_stage_kst"] = now_kst_str()
@@ -20852,6 +22813,25 @@ def telegram_thread(ex):
 
                         # 현재(단기) 봉 timestamp(ms) - AI 재호출 최소화(같은 봉에서는 캐시 사용)
                         short_last_bar_ms = 0
+
+                        # 손절 후 심볼 전용 쿨다운
+                        try:
+                            sl_cd = float(rt.get("sl_cooldowns", {}).get(sym, 0) or 0)
+                        except Exception:
+                            sl_cd = 0.0
+                        if time.time() < sl_cd:
+                            remain_sec = float(max(0.0, sl_cd - time.time()))
+                            mon.setdefault("coins", {}).setdefault(sym, {})
+                            mon["coins"][sym]["skip_reason"] = f"손절쿨다운({remain_sec/60.0:.1f}분 남음)"
+                            mon_add_scan(
+                                mon,
+                                stage="trade_skipped",
+                                symbol=sym,
+                                tf=str(cfg.get("timeframe", "")),
+                                message=f"sl_cooldown {remain_sec/60.0:.1f}m",
+                                extra={"reason_code": "STOP_LOSS_COOLDOWN", "remain_sec": float(remain_sec)},
+                            )
+                            continue
 
                         # 쿨다운
                         cd = float(rt.get("cooldowns", {}).get(sym, 0))
@@ -21129,7 +23109,10 @@ def telegram_thread(ex):
                         # ✅ 풀스펙트럼 데이터 수집(1m/5m/15m/1h/4h/1d) + 오더북(L2)
                         mtf_context: Dict[str, Any] = {}
                         orderbook_context: Dict[str, Any] = {}
+                        derivatives_context: Dict[str, Any] = {}
                         dynamic_style_info: Dict[str, Any] = {"style": "스캘핑", "market_regime": "ranging", "reason": "", "scores": {}}
+                        regime_info: Dict[str, Any] = {"regime": "mean_reversion", "reason": "기본"}
+                        strategy_info: Dict[str, Any] = {"strategy": "mean_reversion", "reason": "기본"}
                         try:
                             mtf_context = build_full_spectrum_context(
                                 ex,
@@ -21142,7 +23125,15 @@ def telegram_thread(ex):
                             )
                             ob_raw = safe_fetch_order_book(ex, sym, limit=20)
                             orderbook_context = orderbook_pressure_summary(ob_raw, depth=20)
-                            dynamic_style_info = choose_dynamic_style(mtf_context, orderbook_context)
+                            derivatives_context = fetch_derivatives_context_cached(ex, sym, cfg)
+                            dynamic_style_info = choose_dynamic_style(mtf_context, orderbook_context, cfg=cfg)
+                            regime_info = classify_regime_adx_volatility(mtf_context, cfg, orderbook_ctx=orderbook_context)
+                            strategy_info = select_strategy_for_cycle(
+                                dynamic_style_info.get("style", "스캘핑"),
+                                regime_info,
+                                stt if isinstance(stt, dict) else {},
+                                cfg,
+                            )
                             try:
                                 # 무포지션 상태에서는 관망을 줄이고 스캘핑/단타 기회를 더 적극 탐색
                                 if (not active_syms) and bool(cfg.get("aggressive_no_position_scalp_bias", True)):
@@ -21166,14 +23157,36 @@ def telegram_thread(ex):
                             cs["dynamic_style"] = str(dynamic_style_info.get("style", "스캘핑"))
                             cs["market_regime"] = str(dynamic_style_info.get("market_regime", ""))
                             cs["dynamic_style_reason"] = str(dynamic_style_info.get("reason", ""))[:180]
+                            cs["regime_class"] = str(regime_info.get("regime", ""))
+                            cs["regime_reason"] = str(regime_info.get("reason", ""))[:220]
+                            cs["strategy_reco"] = str(strategy_info.get("strategy", ""))
+                            cs["strategy_reason"] = str(strategy_info.get("reason", ""))[:220]
+                            cs["strategy_rr_hint"] = float(_as_float(strategy_info.get("trend_rr_min" if str(strategy_info.get("strategy","")) == "trend" else "mean_rr_target", 0.0), 0.0))
                             cs["orderbook_side"] = str(orderbook_context.get("pressure_side", "neutral"))
                             cs["orderbook_imbalance"] = float(orderbook_context.get("imbalance", 0.0) or 0.0)
                             cs["orderbook_spread_pct"] = float(orderbook_context.get("spread_pct", 0.0) or 0.0)
+                            cs["orderbook_depth_notional_usdt"] = float(orderbook_context.get("depth_notional_usdt", 0.0) or 0.0)
+                            try:
+                                funding_now = ((derivatives_context.get("funding", {}) or {}).get("rate", None)) if isinstance(derivatives_context, dict) else None
+                                cs["funding_rate"] = (float(funding_now) if funding_now is not None else None)
+                            except Exception:
+                                cs["funding_rate"] = None
+                            try:
+                                cs["oi_change_pct"] = (
+                                    float(derivatives_context.get("oi_change_pct"))
+                                    if (isinstance(derivatives_context, dict) and derivatives_context.get("oi_change_pct") is not None)
+                                    else None
+                                )
+                            except Exception:
+                                cs["oi_change_pct"] = None
                             stt["_mtf_context"] = dict(mtf_context)
                             stt["_orderbook_context"] = dict(orderbook_context)
+                            stt["_derivatives_context"] = dict(derivatives_context) if isinstance(derivatives_context, dict) else {}
                             stt["_dynamic_style"] = str(dynamic_style_info.get("style", "스캘핑"))
                             stt["_dynamic_style_reason"] = str(dynamic_style_info.get("reason", ""))
                             stt["_market_regime"] = str(dynamic_style_info.get("market_regime", ""))
+                            stt["_regime_info"] = dict(regime_info)
+                            stt["_strategy_info"] = dict(strategy_info)
                             align_info = super_indicator_alignment(stt)
                             stt["_super_align"] = dict(align_info)
                             cs["super_align_dir"] = str(align_info.get("direction", "hold"))
@@ -21187,11 +23200,37 @@ def telegram_thread(ex):
                                 tf="1m~1d",
                                 signal=str(dynamic_style_info.get("style", "스캘핑")),
                                 score=float(orderbook_context.get("pressure_score", 0.0) or 0.0),
-                                message=f"regime={dynamic_style_info.get('market_regime','')} | ob={orderbook_context.get('pressure_side','neutral')} {float(orderbook_context.get('imbalance',0.0) or 0.0):+.2f}",
+                                message=f"regime={dynamic_style_info.get('market_regime','')} | class={regime_info.get('regime','')} | strat={strategy_info.get('strategy','')} | ob={orderbook_context.get('pressure_side','neutral')} {float(orderbook_context.get('imbalance',0.0) or 0.0):+.2f}",
+                                extra={
+                                    "regime_detail": dict(regime_info),
+                                    "strategy": dict(strategy_info),
+                                    "orderbook": {
+                                        "spread_bps": float(_as_float(orderbook_context.get("spread_pct", 0.0), 0.0) * 100.0),
+                                        "depth_notional_usdt": float(_as_float(orderbook_context.get("depth_notional_usdt", 0.0), 0.0)),
+                                    },
+                                    "derivatives": {
+                                        "funding": (derivatives_context.get("funding", {}) if isinstance(derivatives_context, dict) else {}),
+                                        "oi_change_pct": (derivatives_context.get("oi_change_pct", None) if isinstance(derivatives_context, dict) else None),
+                                    },
+                                },
+                            )
+                            mon_add_scan(
+                                mon,
+                                stage="derivatives_context",
+                                symbol=sym,
+                                tf="perp",
+                                signal="funding+oi",
+                                score=float(_as_float(((derivatives_context.get("funding", {}) or {}).get("rate", 0.0) if isinstance(derivatives_context, dict) else 0.0), 0.0)),
+                                message=(
+                                    f"funding={_as_float(((derivatives_context.get('funding', {}) or {}).get('rate', 0.0) if isinstance(derivatives_context, dict) else 0.0), 0.0):+.6f}, "
+                                    f"oi_chg={_as_float((derivatives_context.get('oi_change_pct', 0.0) if isinstance(derivatives_context, dict) else 0.0), 0.0):+.2f}%"
+                                ),
+                                extra=(dict(derivatives_context) if isinstance(derivatives_context, dict) else {"supported_any": False}),
                             )
                         except Exception as e:
                             mtf_context = {"symbol": sym, "timeframes": {}, "error": str(e)[:120]}
                             orderbook_context = {"available": False, "pressure_side": "neutral", "imbalance": 0.0, "error": str(e)[:120]}
+                            derivatives_context = {"supported_any": False, "error": str(e)[:120]}
 
                         # AI 호출 필터(완화 + 모드/추세 기반)
                         # - "해소 신호가 없으면 AI 자체를 안 부른다"가 너무 보수적이라 무포지션이 길어질 수 있음
@@ -21694,6 +23733,8 @@ def telegram_thread(ex):
                             use_cached_ai = False
                             cache_reason = ""
 
+                        ai = None
+                        ai_fallback_tag = ""
                         if use_cached_ai:
                             mon_add_scan(mon, stage="ai_cached", symbol=sym, tf=str(cfg.get("timeframe", "5m")), message=f"{cache_reason or '캐시 재사용'}")
                             try:
@@ -21724,26 +23765,96 @@ def telegram_thread(ex):
                                 urgent=bool(event_triggered),
                             )
                             if not bool(allow_ai_budget):
-                                try:
-                                    cs["ai_called"] = False
-                                    cs["skip_reason"] = f"AI 예산: {budget_note}"
-                                except Exception:
-                                    pass
+                                fallback_parts = _ai_budget_policy_parts(cfg)
+                                style_hint_for_budget = normalize_style_name(dynamic_style_info.get("style", "스캘핑"))
+                                if "cache" in fallback_parts:
+                                    ai_cache_budget, cache_budget_note = _build_cached_ai_from_cs(
+                                        cs,
+                                        max_age_sec=float(_as_float(cfg.get("ai_cache_ttl_sec", 600), 600.0)),
+                                    )
+                                    if isinstance(ai_cache_budget, dict):
+                                        ai = ai_cache_budget
+                                        ai_fallback_tag = "cache_budget"
+                                        cs["ai_fallback"] = "cache_budget"
+                                        cs["skip_reason"] = ""
+                                        mon_add_scan(
+                                            mon,
+                                            stage="ai_fallback_cache",
+                                            symbol=sym,
+                                            tf=str(cfg.get("timeframe", "5m")),
+                                            message=f"budget_guard:{budget_note} | {cache_budget_note}",
+                                        )
+                                        mon_add_event(
+                                            mon,
+                                            "ai_fallback_cache",
+                                            sym,
+                                            f"AI 예산 제한 캐시 재사용 | {cache_budget_note}",
+                                            {"budget_note": budget_note, "cache_note": cache_budget_note},
+                                        )
+                                if (ai is None) and ("rules" in fallback_parts):
+                                    ai_rules_budget, rules_note = _build_budget_rules_ai(
+                                        symbol=str(sym),
+                                        mode=str(mode),
+                                        rule=dict(rule),
+                                        cfg=cfg,
+                                        style_hint=str(style_hint_for_budget),
+                                        decision_tf=str(cfg.get("timeframe", "5m")),
+                                        status=stt,
+                                        ml=ml if isinstance(ml, dict) else {},
+                                        align_info=align_info if isinstance(align_info, dict) else {},
+                                        event_sig=event_sig if isinstance(event_sig, dict) else {},
+                                    )
+                                    if isinstance(ai_rules_budget, dict):
+                                        ai = ai_rules_budget
+                                        ai_fallback_tag = "rules_budget"
+                                        cs["ai_fallback"] = "rules_budget"
+                                        cs["skip_reason"] = ""
+                                        mon_add_scan(
+                                            mon,
+                                            stage="ai_fallback_rules",
+                                            symbol=sym,
+                                            tf=str(cfg.get("timeframe", "5m")),
+                                            message=f"budget_guard:{budget_note} | {rules_note}",
+                                        )
+                                        mon_add_event(
+                                            mon,
+                                            "ai_fallback_rules",
+                                            sym,
+                                            f"AI 예산 제한 룰 기반 대체 | {rules_note}",
+                                            {"budget_note": budget_note, "rules_note": rules_note},
+                                        )
+                                if ai is None:
+                                    try:
+                                        cs["ai_called"] = False
+                                        cs["ai_fallback"] = ""
+                                        cs["skip_reason"] = f"AI 예산: {budget_note}"
+                                    except Exception:
+                                        pass
+                                    mon_add_scan(
+                                        mon,
+                                        stage="ai_skipped_budget",
+                                        symbol=sym,
+                                        tf=str(cfg.get("timeframe", "5m")),
+                                        message=f"budget_guard: {budget_note}",
+                                    )
+                                    mon_add_event(
+                                        mon,
+                                        "ai_skipped_budget",
+                                        sym,
+                                        f"AI 예산 제한으로 스킵 | {budget_note}",
+                                        {"budget_note": budget_note},
+                                    )
+                                    continue
+                            else:
+                                cs["ai_fallback"] = ""
+                            if ai is None:
                                 mon_add_scan(
                                     mon,
-                                    stage="ai_skipped",
+                                    stage="ai_call",
                                     symbol=sym,
                                     tf=str(cfg.get("timeframe", "5m")),
-                                    message=f"budget_guard: {budget_note}",
+                                    message=("AI 판단 요청(이벤트)" if bool(event_override) else "AI 판단 요청"),
                                 )
-                                continue
-                            mon_add_scan(
-                                mon,
-                                stage="ai_call",
-                                symbol=sym,
-                                tf=str(cfg.get("timeframe", "5m")),
-                                message=("AI 판단 요청(이벤트)" if bool(event_override) else "AI 판단 요청"),
-                            )
                         # ✅ 동적 스타일 힌트(풀스펙트럼 + 오더북)
                         try:
                             chart_style_hint = normalize_style_name(dynamic_style_info.get("style", "스캘핑"))
@@ -21771,7 +23882,7 @@ def telegram_thread(ex):
                             ext_for_ai = {"enabled": False}
                         else:
                             ext_for_ai = ext if chart_style_hint in ["단타", "스윙"] else {"enabled": False}
-                        if not use_cached_ai:
+                        if ai is None:
                             ai = ai_decide_trade(
                                 df,
                                 stt,
@@ -21797,6 +23908,11 @@ def telegram_thread(ex):
                                 cs["ai_last_called_bar_ms"] = int(short_last_bar_ms or 0)
                                 cs["ai_sl_price"] = ai.get("sl_price", None)
                                 cs["ai_tp_price"] = ai.get("tp_price", None)
+                            except Exception:
+                                pass
+                        elif str(ai_fallback_tag or "").strip():
+                            try:
+                                cs["ai_last_called_epoch"] = float(time.time())
                             except Exception:
                                 pass
                         # ✅ Pre-Execution ROI Clamp (필수)
@@ -22081,6 +24197,7 @@ def telegram_thread(ex):
                             "ai_decision_tf": str(ai.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                             "ai_used": ", ".join(ai.get("used_indicators", [])),
                                 "ai_reason_easy": ai.get("reason_easy", ""),
+                                "ai_fallback": str(ai.get("_fallback", "") or cs.get("ai_fallback", "")),
                                 "pattern": stt.get("패턴", ""),
                                 "pattern_bias": int(stt.get("_pattern_bias", 0) or 0),
                                 "pattern_strength": float(stt.get("_pattern_strength", 0.0) or 0.0),
@@ -22509,6 +24626,32 @@ def telegram_thread(ex):
                             except Exception:
                                 pass
 
+                            # ✅ 심볼/사이클별 전략 선택: trend vs mean_reversion
+                            try:
+                                reg_info_now = stt.get("_regime_info", {}) if isinstance(stt.get("_regime_info", {}), dict) else {}
+                                strategy_info_now = select_strategy_for_cycle(
+                                    style,
+                                    reg_info_now if isinstance(reg_info_now, dict) else {},
+                                    stt if isinstance(stt, dict) else {},
+                                    cfg,
+                                )
+                                strategy_now = str(strategy_info_now.get("strategy", "trend") or "trend")
+                                cs["strategy_reco"] = str(strategy_now)
+                                cs["strategy_reason"] = str(strategy_info_now.get("reason", ""))[:220]
+                                stt["_strategy_info"] = dict(strategy_info_now)
+                                mon_add_scan(
+                                    mon,
+                                    stage="strategy_select",
+                                    symbol=sym,
+                                    tf=str(cfg.get("timeframe", "5m")),
+                                    signal=str(strategy_now),
+                                    score=float(_as_float(strategy_info_now.get("trend_rr_min" if strategy_now == "trend" else "mean_rr_target", 0.0), 0.0)),
+                                    message=str(strategy_info_now.get("reason", ""))[:120],
+                                    extra=dict(strategy_info_now),
+                                )
+                            except Exception:
+                                strategy_info_now = {"strategy": "trend", "reason": "fallback"}
+
                             # ✅ 하이리스크/하이리턴 모드 신규진입 제한(선택):
                             # - 사용자가 원하면(auto에서) "스윙(단기+장기 정렬)"일 때만 신규 진입하도록 제한 가능
                             # - 기본값은 OFF(진입 허용)이며, 이때도 MODE_RULES의 레버/진입비중 범위를 우선 존중한다.
@@ -22532,6 +24675,57 @@ def telegram_thread(ex):
                                     )
                                 except Exception:
                                     pass
+                                continue
+
+                            # ✅ 마이크로구조 + 파생지표 진입 필터(주문 직전)
+                            micro_gate = evaluate_microstructure_derivatives_gate(
+                                symbol=sym,
+                                decision=str(decision),
+                                style=str(style),
+                                orderbook_ctx=(orderbook_context if isinstance(orderbook_context, dict) else None),
+                                derivatives_ctx=(derivatives_context if isinstance(derivatives_context, dict) else None),
+                                cfg=cfg,
+                            )
+                            try:
+                                cs["micro_gate_ok"] = bool(micro_gate.get("ok", True))
+                                cs["micro_gate_reason_code"] = str(micro_gate.get("reason_code", ""))
+                                cs["micro_gate_values"] = dict(micro_gate.get("values", {})) if isinstance(micro_gate.get("values", {}), dict) else {}
+                            except Exception:
+                                pass
+                            mon_add_scan(
+                                mon,
+                                stage="micro_deriv_gate",
+                                symbol=sym,
+                                tf=str(cfg.get("timeframe", "5m")),
+                                signal=str(decision),
+                                score=int(conf),
+                                message=(
+                                    f"{str(micro_gate.get('reason_code','OK'))} | "
+                                    f"spread={float(_as_float((micro_gate.get('values', {}) or {}).get('spread_bps', 0.0), 0.0)):.2f}bps | "
+                                    f"depth={float(_as_float((micro_gate.get('values', {}) or {}).get('depth_notional_usdt', 0.0), 0.0)):.0f}"
+                                )[:180],
+                                extra=dict(micro_gate),
+                            )
+                            if not bool(micro_gate.get("ok", True)):
+                                reason_code = str(micro_gate.get("reason_code", "MICRO_FILTER_BLOCK") or "MICRO_FILTER_BLOCK")
+                                cs["skip_reason"] = f"진입 보류({reason_code})"
+                                skip_id = f"skip_{uuid.uuid4().hex[:10]}"
+                                save_trade_detail(
+                                    skip_id,
+                                    {
+                                        "trade_id": skip_id,
+                                        "time": now_kst_str(),
+                                        "coin": sym,
+                                        "decision": decision,
+                                        "style": style,
+                                        "result": "SKIP",
+                                        "skip_reason_code": str(reason_code),
+                                        "skip_reason": str(cs.get("skip_reason", "")),
+                                        "micro_gate": dict(micro_gate),
+                                        "orderbook_context": (dict(orderbook_context) if isinstance(orderbook_context, dict) else {}),
+                                        "derivatives_context": (dict(derivatives_context) if isinstance(derivatives_context, dict) else {}),
+                                    },
+                                )
                                 continue
 
                             # 스타일별 envelope + 리스크가드레일
@@ -22587,6 +24781,19 @@ def telegram_thread(ex):
                             # ✅ 스캘핑: 레버가 높을 때 TP/SL이 과도해지는 문제(익절 미발동 등) 방지
                             if str(style) == "스캘핑":
                                 ai2 = apply_scalp_price_guardrails(ai2, df, cfg, rule)
+                            # ✅ 전략 프로파일(trend / mean_reversion) 적용
+                            try:
+                                ai2 = apply_strategy_profile(
+                                    ai2,
+                                    strategy_info=(strategy_info_now if isinstance(strategy_info_now, dict) else {}),
+                                    style=str(style),
+                                    decision=str(decision),
+                                    df=df,
+                                    status=stt if isinstance(stt, dict) else {},
+                                    cfg=cfg,
+                                )
+                            except Exception:
+                                pass
                             pre_style_ai_tp = abs(float(_as_float(ai2.get("tp_pct", 0.0), 0.0)))
                             # ✅ 최종 하드캡(절대 상한/하한): 스타일별 TP/SL 한도를 넘지 않도록 마지막에 강제
                             ai2 = apply_hard_roi_caps(ai2, style, cfg)
@@ -22959,6 +25166,96 @@ def telegram_thread(ex):
                                 cs["skip_reason"] = "잔고 부족(진입금 너무 작음)"
                                 continue
 
+                            plan_validation: Dict[str, Any] = {}
+                            try:
+                                sl_price_pct_plan = float(_as_float(ai2.get("sl_price_pct", 0.0), 0.0))
+                                tp_price_pct_plan = float(_as_float(ai2.get("tp_price_pct", 0.0), 0.0))
+                                if sl_price_pct_plan <= 0:
+                                    sl_price_pct_plan = float(abs(float(slp)) / max(float(lev), 1.0))
+                                if tp_price_pct_plan <= 0:
+                                    tp_price_pct_plan = float(abs(float(tpp)) / max(float(lev), 1.0))
+                                atr_price_pct_plan = float(_as_float(ai2.get("atr_price_pct", 0.0), 0.0))
+                                if atr_price_pct_plan <= 0:
+                                    atr_price_pct_plan = float(_atr_price_pct(df, int(cfg.get("atr_leverage_window", 14) or 14)))
+
+                                plan_validation = validate_trade_plan(
+                                    symbol=sym,
+                                    style=style,
+                                    decision=decision,
+                                    entry_price=float(px),
+                                    leverage=float(lev),
+                                    sl_pct_roi=float(slp),
+                                    tp_pct_roi=float(tpp),
+                                    sl_price_pct=float(sl_price_pct_plan),
+                                    tp_price_pct=float(tp_price_pct_plan),
+                                    orderbook_ctx=(orderbook_context if isinstance(orderbook_context, dict) else None),
+                                    atr_price_pct=float(atr_price_pct_plan),
+                                    cfg=cfg,
+                                )
+                                ai2["trade_plan_validation"] = dict(plan_validation)
+                                cs["plan_stop_price_pct"] = float(plan_validation.get("sl_price_pct", 0.0) or 0.0)
+                                cs["plan_tp_price_pct"] = float(plan_validation.get("tp_price_pct", 0.0) or 0.0)
+                                cs["plan_required_stop_pct"] = float(plan_validation.get("required_stop_price_pct", 0.0) or 0.0)
+                                cs["plan_rr_price"] = float(plan_validation.get("rr_price", 0.0) or 0.0)
+
+                                mon_add_scan(
+                                    mon,
+                                    stage="risk_plan",
+                                    symbol=sym,
+                                    tf=str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
+                                    signal=str(decision),
+                                    score=float(plan_validation.get("rr_price", 0.0) or 0.0),
+                                    message=(
+                                        f"SL {float(plan_validation.get('sl_price_pct',0.0) or 0.0):.3f}% / "
+                                        f"TP {float(plan_validation.get('tp_price_pct',0.0) or 0.0):.3f}% / "
+                                        f"min {float(plan_validation.get('required_stop_price_pct',0.0) or 0.0):.3f}%"
+                                    ),
+                                    extra=dict(plan_validation),
+                                )
+
+                                if bool(cfg.get("validate_trade_plan_enable", True)) and (not bool(plan_validation.get("ok", False))):
+                                    reason_code = str(plan_validation.get("reason_code", "PLAN_REJECT") or "PLAN_REJECT")
+                                    reason_txt = (
+                                        f"진입 보류({reason_code}) "
+                                        f"SL {float(plan_validation.get('sl_price_pct',0.0) or 0.0):.3f}% < "
+                                        f"최소 {float(plan_validation.get('required_stop_price_pct',0.0) or 0.0):.3f}%"
+                                    )
+                                    cs["skip_reason"] = reason_txt
+                                    mon_add_scan(
+                                        mon,
+                                        stage="trade_skipped",
+                                        symbol=sym,
+                                        tf=str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
+                                        signal=str(decision),
+                                        score=conf,
+                                        message=reason_txt[:180],
+                                        extra={"reason_code": reason_code, "trade_plan": dict(plan_validation)},
+                                    )
+                                    skip_id = f"skip_{uuid.uuid4().hex[:10]}"
+                                    save_trade_detail(
+                                        skip_id,
+                                        {
+                                            "trade_id": skip_id,
+                                            "time": now_kst_str(),
+                                            "coin": sym,
+                                            "decision": decision,
+                                            "style": style,
+                                            "result": "SKIP",
+                                            "skip_reason_code": reason_code,
+                                            "skip_reason": reason_txt,
+                                            "entry_price": float(px),
+                                            "entry_usdt": float(entry_usdt),
+                                            "entry_pct": float(entry_pct),
+                                            "lev": int(lev),
+                                            "sl_pct_roi": float(slp),
+                                            "tp_pct_roi": float(tpp),
+                                            "trade_plan_validation": dict(plan_validation),
+                                        },
+                                    )
+                                    continue
+                            except Exception:
+                                plan_validation = {}
+
                             # margin mode(cross/isolated) + leverage
                             try:
                                 set_margin_mode_safe(ex, sym, str(cfg.get("margin_mode", "cross")))
@@ -23151,7 +25448,15 @@ def telegram_thread(ex):
                                     signal=str(decision),
                                     score=conf,
                                     message=f"주문 체결, trade_id={trade_id}",
-                                    extra={"qty": qty, "entry_usdt": entry_usdt, "lev": lev, "style": style},
+                                    extra={
+                                        "qty": qty,
+                                        "entry_usdt": entry_usdt,
+                                        "lev": lev,
+                                        "style": style,
+                                        "tp_pct": float(tpp),
+                                        "sl_pct": float(slp),
+                                        "trade_plan_validation": dict(plan_validation) if isinstance(plan_validation, dict) else {},
+                                    },
                                 )
                                 try:
                                     gsheet_log_trade(
@@ -23410,6 +25715,7 @@ def telegram_thread(ex):
                                     "sl": slp,
                                     "tp": tpp,
                                     "rr": float(float(tpp) / max(abs(float(slp)), 0.01)),
+                                    "plan_validation": dict(plan_validation) if isinstance(plan_validation, dict) else {},
                                     "entry_usdt": entry_usdt,
                                     "entry_pct": entry_pct,
                                     "entry_confidence": int(conf),
@@ -23452,6 +25758,13 @@ def telegram_thread(ex):
                                     "style": style,
                                     "style_confidence": int(cs.get("style_confidence", 0)),
                                     "style_reason": str(cs.get("style_reason", ""))[:240],
+                                    "strategy": str(ai2.get("strategy", cs.get("strategy_reco", "trend")) or "trend"),
+                                    "strategy_reason": str(ai2.get("strategy_note", cs.get("strategy_reason", "")) or "")[:240],
+                                    "strategy_time_stop_bars": int(_as_int(ai2.get("strategy_time_stop_bars", 0), 0)),
+                                    "strategy_profile": dict(ai2.get("_strategy_profile", {})) if isinstance(ai2.get("_strategy_profile", {}), dict) else {},
+                                    "micro_gate": dict(micro_gate) if isinstance(micro_gate, dict) else {},
+                                    "orderbook_context": dict(orderbook_context) if isinstance(orderbook_context, dict) else {},
+                                    "derivatives_context": dict(derivatives_context) if isinstance(derivatives_context, dict) else {},
                                     "decision_tf": str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                     "entry_epoch": time.time(),
                                     "style_last_switch_epoch": time.time(),
@@ -23495,6 +25808,7 @@ def telegram_thread(ex):
                                         "sl_pct_roi": slp,
                                         "tp_pct_roi": tpp,
                                         "rr": float(float(tpp) / max(abs(float(slp)), 0.01)),
+                                        "trade_plan_validation": dict(plan_validation) if isinstance(plan_validation, dict) else {},
                                         "sl_price_sr": sl_price,
                                         "tp_price_sr": tp_price,
                                         "sl_price_reason_ai": str(ai2.get("sl_price_reason", "") or ""),
@@ -23517,6 +25831,13 @@ def telegram_thread(ex):
                                         "style": style,
                                         "style_confidence": int(cs.get("style_confidence", 0)),
                                         "style_reason": str(cs.get("style_reason", ""))[:240],
+                                        "strategy": str(ai2.get("strategy", cs.get("strategy_reco", "trend")) or "trend"),
+                                        "strategy_reason": str(ai2.get("strategy_note", cs.get("strategy_reason", "")) or "")[:240],
+                                        "strategy_time_stop_bars": int(_as_int(ai2.get("strategy_time_stop_bars", 0), 0)),
+                                        "strategy_profile": dict(ai2.get("_strategy_profile", {})) if isinstance(ai2.get("_strategy_profile", {}), dict) else {},
+                                        "micro_gate": dict(micro_gate) if isinstance(micro_gate, dict) else {},
+                                        "orderbook_context": dict(orderbook_context) if isinstance(orderbook_context, dict) else {},
+                                        "derivatives_context": dict(derivatives_context) if isinstance(derivatives_context, dict) else {},
                                         "decision_tf": str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
                                         "events": [],
                                         "external_used": (
@@ -23892,14 +26213,14 @@ def telegram_thread(ex):
                                         + (f", 수렴표 -{int(relax_votes_reduce)}" if int(relax_votes_reduce) > 0 else "")
                                     )
 
-                                top_reasons = _watch_reason_top(mon, list(TARGET_COINS), top_n=3)
+                                top_reasons = _watch_reason_top(mon, list(scan_symbols_loop), top_n=3)
                                 if top_reasons:
                                     lines.append("- 관망 사유 TOP")
                                     for reason, cnt in top_reasons:
                                         lines.append(f"  · {reason[:55]} x{int(cnt)}")
 
                                 coins_now = mon.get("coins", {}) if isinstance(mon.get("coins", {}), dict) else {}
-                                for sym0 in TARGET_COINS[:3]:
+                                for sym0 in list(scan_symbols_loop)[:3]:
                                     cs0 = coins_now.get(sym0, {}) if isinstance(coins_now, dict) else {}
                                     lines.append(
                                         f"- {sym0}: {str(cs0.get('ai_decision','-')).upper()}({cs0.get('ai_confidence','-')}%)"
@@ -24096,7 +26417,7 @@ def telegram_thread(ex):
                                 _deny()
                             else:
                                 blocks: List[str] = []
-                                ps = safe_fetch_positions(ex, TARGET_COINS)
+                                ps = safe_fetch_positions(ex, managed_symbols_loop)
                                 act = [p for p in ps if float(p.get("contracts") or 0) > 0]
                                 if not act:
                                     _reply_admin_dm("📊 포지션\n\n- ⚪ 없음(관망)")
@@ -24138,12 +26459,12 @@ def telegram_thread(ex):
                                 parts = txt.split()
                                 sym_arg = parts[1].strip().upper() if len(parts) >= 2 else ""
                                 # 심볼 필터(간단): "BTC" 또는 "BTC/USDT:USDT" 형태 지원
-                                syms = list(TARGET_COINS)
+                                syms = list(scan_symbols_loop)
                                 if sym_arg:
                                     if "/" in sym_arg:
-                                        syms = [s for s in TARGET_COINS if s.upper().startswith(sym_arg)]
+                                        syms = [s for s in scan_symbols_loop if s.upper().startswith(sym_arg)]
                                     else:
-                                        syms = [s for s in TARGET_COINS if s.upper().startswith(f"{sym_arg}/")]
+                                        syms = [s for s in scan_symbols_loop if s.upper().startswith(f"{sym_arg}/")]
                                 if not syms:
                                     _reply_admin_dm("대상 심볼이 없습니다. 예) /scan BTC 또는 /scan BTC/USDT:USDT")
                                 else:
@@ -24467,7 +26788,7 @@ def telegram_thread(ex):
                                 _cb_reply("⛔️ 관리자만 사용할 수 있는 버튼입니다.")
                             else:
                                 blocks: List[str] = []
-                                ps = safe_fetch_positions(ex, TARGET_COINS)
+                                ps = safe_fetch_positions(ex, managed_symbols_loop)
                                 act = [p for p in ps if float(p.get("contracts") or 0) > 0]
                                 if not act:
                                     _cb_reply("📊 포지션\n\n- ⚪ 없음(관망)")
@@ -24574,14 +26895,14 @@ def telegram_thread(ex):
                                     "requested_at_epoch": time.time(),
                                     "requested_at_kst": now_kst_str(),
                                     "requested_by": int(uid or 0),
-                                    "symbols": list(TARGET_COINS),
+                                    "symbols": list(scan_symbols_loop),
                                     "scan_only": True,
                                     "done": False,
                                 }
                                 save_runtime(rt2)
                                 try:
-                                    mon_add_event(mon, "SCAN_REQUEST", "", f"force_scan id={rid}", {"symbols": list(TARGET_COINS), "by": uid})
-                                    gsheet_log_event("SCAN_REQUEST", message=f"id={rid}", payload={"symbols": list(TARGET_COINS), "by": uid})
+                                    mon_add_event(mon, "SCAN_REQUEST", "", f"force_scan id={rid}", {"symbols": list(scan_symbols_loop), "by": uid})
+                                    gsheet_log_event("SCAN_REQUEST", message=f"id={rid}", payload={"symbols": list(scan_symbols_loop), "by": uid})
                                 except Exception:
                                     pass
                                 _cb_reply(f"🔎 강제스캔 요청 완료: {rid}\n- 주의: 스캔만 수행(주문X)")
@@ -24616,7 +26937,7 @@ def telegram_thread(ex):
                                 _cb_reply("⛔️ 관리자만 사용할 수 있는 버튼입니다.")
                             else:
                                 _cb_reply("🛑 전량 청산 시도")
-                                for sym in TARGET_COINS:
+                                for sym in managed_symbols_loop:
                                     ps = safe_fetch_positions(ex, [sym])
                                     act = [p for p in ps if float(p.get("contracts") or 0) > 0]
                                     if not act:
@@ -24860,6 +27181,7 @@ def get_bot_instance() -> TradingBot:
 # ✅ 18) 스레드 시작(중복 방지) - TG_THREAD + WATCHDOG
 # =========================================================
 def ensure_threads_started():
+    _register_default_event_sinks()
     has_tg = False
     has_wd = False
     has_poll = False
@@ -24905,6 +27227,453 @@ def ensure_threads_started():
 # 전역 예외 훅 설치(가능한 경우): 스레드/런타임에서 잡히지 않은 오류를 관리자 DM으로
 install_global_error_hooks()
 bot = get_bot_instance()
+
+
+def _backtest_entry_signal(prev_row: pd.Series, row: pd.Series, style: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    out = {
+        "decision": "hold",
+        "votes_long": 0,
+        "votes_short": 0,
+        "votes_need": 2,
+        "signals": {},
+        "reason_code": "NO_SIGNAL",
+    }
+    try:
+        st = normalize_style_name(style)
+        rsi_buy = float(_as_float(cfg.get("rsi_buy", 30), 30))
+        rsi_sell = float(_as_float(cfg.get("rsi_sell", 70), 70))
+        sqz_thr = float(max(0.001, abs(_as_float(cfg.get("sqz_mom_threshold_pct", 0.05), 0.05))))
+
+        close_now = float(_as_float(row.get("close", 0.0), 0.0))
+        close_prev = float(_as_float(prev_row.get("close", 0.0), 0.0))
+        ma_fast_now = float(_as_float(row.get("MA_fast", close_now), close_now))
+        ma_slow_now = float(_as_float(row.get("MA_slow", close_now), close_now))
+
+        trend_up = bool((ma_fast_now > ma_slow_now) and (close_now > ma_slow_now))
+        trend_down = bool((ma_fast_now < ma_slow_now) and (close_now < ma_slow_now))
+        out["signals"]["TREND"] = 1 if trend_up else (-1 if trend_down else 0)
+
+        rsi_prev = float(_as_float(prev_row.get("RSI", 50.0), 50.0))
+        rsi_now = float(_as_float(row.get("RSI", 50.0), 50.0))
+        rsi_resolve_long = bool((rsi_prev < rsi_buy) and (rsi_now >= rsi_buy))
+        rsi_resolve_short = bool((rsi_prev > rsi_sell) and (rsi_now <= rsi_sell))
+        out["signals"]["RSI"] = 1 if rsi_resolve_long else (-1 if rsi_resolve_short else 0)
+
+        macd_prev = float(_as_float(prev_row.get("MACD", 0.0), 0.0))
+        macd_sig_prev = float(_as_float(prev_row.get("MACD_signal", 0.0), 0.0))
+        macd_now = float(_as_float(row.get("MACD", 0.0), 0.0))
+        macd_sig_now = float(_as_float(row.get("MACD_signal", 0.0), 0.0))
+        macd_cross_up = bool((macd_prev <= macd_sig_prev) and (macd_now > macd_sig_now))
+        macd_cross_down = bool((macd_prev >= macd_sig_prev) and (macd_now < macd_sig_now))
+        out["signals"]["MACD"] = 1 if macd_cross_up else (-1 if macd_cross_down else 0)
+
+        sqz_on_prev = int(_as_int(prev_row.get("SQZ_ON", 0), 0)) == 1
+        sqz_on_now = int(_as_int(row.get("SQZ_ON", 0), 0)) == 1
+        sqz_prev = float(_as_float(prev_row.get("SQZ_MOM_PCT", 0.0), 0.0))
+        sqz_now = float(_as_float(row.get("SQZ_MOM_PCT", 0.0), 0.0))
+        sqz_fire_up = bool(sqz_on_prev and (not sqz_on_now) and (sqz_now >= sqz_thr) and (sqz_now > sqz_prev))
+        sqz_fire_down = bool(sqz_on_prev and (not sqz_on_now) and (sqz_now <= -sqz_thr) and (sqz_now < sqz_prev))
+        if sqz_fire_up:
+            out["signals"]["SQZ"] = 1
+        elif sqz_fire_down:
+            out["signals"]["SQZ"] = -1
+        elif sqz_now >= sqz_thr:
+            out["signals"]["SQZ"] = 1
+        elif sqz_now <= -sqz_thr:
+            out["signals"]["SQZ"] = -1
+        else:
+            out["signals"]["SQZ"] = 0
+
+        vol_spike = int(_as_int(row.get("VOL_SPIKE", 0), 0)) == 1
+        if vol_spike and close_now > close_prev:
+            out["signals"]["VOL"] = 1
+        elif vol_spike and close_now < close_prev:
+            out["signals"]["VOL"] = -1
+        else:
+            out["signals"]["VOL"] = 0
+
+        ichi_state = str(row.get("ICHI_PRICE_CLOUD", "") or "").strip()
+        if ichi_state == "above_cloud":
+            out["signals"]["ICHI"] = 1
+        elif ichi_state == "below_cloud":
+            out["signals"]["ICHI"] = -1
+        else:
+            out["signals"]["ICHI"] = 0
+
+        votes_long = int(sum(1 for v in out["signals"].values() if int(v) == 1))
+        votes_short = int(sum(1 for v in out["signals"].values() if int(v) == -1))
+        votes_need = int(max(2, _as_int(cfg.get("entry_convergence_min_votes", 2), 2)))
+        if st == "스캘핑":
+            votes_need = max(2, votes_need - 1)
+
+        out["votes_long"] = int(votes_long)
+        out["votes_short"] = int(votes_short)
+        out["votes_need"] = int(votes_need)
+
+        if votes_long >= votes_need and votes_long > votes_short:
+            out["decision"] = "buy"
+            out["reason_code"] = "VOTE_LONG"
+        elif votes_short >= votes_need and votes_short > votes_long:
+            out["decision"] = "sell"
+            out["reason_code"] = "VOTE_SHORT"
+        else:
+            out["reason_code"] = "VOTE_INSUFFICIENT"
+        return out
+    except Exception as e:
+        out["decision"] = "hold"
+        out["reason_code"] = f"SIGNAL_ERROR:{type(e).__name__}"
+        return out
+
+
+def _backtest_build_plan(
+    *,
+    style: str,
+    decision: str,
+    entry_price: float,
+    df_ctx: pd.DataFrame,
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    st = normalize_style_name(style)
+    rule = dict(MODE_RULES.get(st, MODE_RULES.get("스캘핑", {"entry_pct_min": 3, "entry_pct_max": 18, "lev_min": 10, "lev_max": 30})))
+    sr = style_rule(st)
+    entry_pct = float((float(sr.get("entry_pct_min", 3.0)) + float(sr.get("entry_pct_max", 18.0))) / 2.0)
+    lev = float((float(sr.get("lev_min", 2.0)) + float(sr.get("lev_max", 8.0))) / 2.0)
+    sl_seed = float((float(sr.get("sl_roi_min", 1.0)) + float(sr.get("sl_roi_max", 3.0))) / 2.0)
+    tp_seed = float((float(sr.get("tp_roi_min", 2.0)) + float(sr.get("tp_roi_max", 6.0))) / 2.0)
+
+    plan = {
+        "decision": str(decision),
+        "style": str(st),
+        "entry_pct": float(clamp(entry_pct, float(rule.get("entry_pct_min", 1.0)), float(rule.get("entry_pct_max", 100.0)))),
+        "leverage": float(clamp(lev, float(rule.get("lev_min", 1.0)), float(rule.get("lev_max", 125.0)))),
+        "sl_pct": float(max(0.2, sl_seed)),
+        "tp_pct": float(max(0.2, tp_seed)),
+    }
+    plan = apply_style_envelope(plan, st, cfg, rule)
+    plan = apply_hard_roi_caps(plan, st, cfg)
+    if st == "스캘핑":
+        plan = apply_scalp_price_guardrails(plan, df_ctx, cfg, rule)
+
+    lev_final = float(max(1.0, _as_float(plan.get("leverage", 1.0), 1.0)))
+    sl_roi = float(abs(_as_float(plan.get("sl_pct", 0.0), 0.0)))
+    tp_roi = float(abs(_as_float(plan.get("tp_pct", 0.0), 0.0)))
+    sl_price = _price_from_roi_target(entry_price, decision, sl_roi, lev_final, "sl")
+    tp_price = _price_from_roi_target(entry_price, decision, tp_roi, lev_final, "tp")
+    sl_price_pct = float(sl_roi / max(lev_final, 1.0))
+    tp_price_pct = float(tp_roi / max(lev_final, 1.0))
+    atr_pct = float(_atr_price_pct(df_ctx, 14))
+
+    validation = validate_trade_plan(
+        symbol="BACKTEST",
+        style=st,
+        decision=decision,
+        entry_price=float(entry_price),
+        leverage=float(lev_final),
+        sl_pct_roi=float(sl_roi),
+        tp_pct_roi=float(tp_roi),
+        sl_price_pct=float(sl_price_pct),
+        tp_price_pct=float(tp_price_pct),
+        orderbook_ctx={"spread_pct": 0.0},
+        atr_price_pct=float(atr_pct),
+        cfg=cfg,
+    )
+    plan.update(
+        {
+            "sl_price": float(sl_price) if sl_price is not None else None,
+            "tp_price": float(tp_price) if tp_price is not None else None,
+            "sl_price_pct": float(sl_price_pct),
+            "tp_price_pct": float(tp_price_pct),
+            "validation": dict(validation),
+        }
+    )
+    return plan
+
+
+def simulate_strategy_backtest(
+    df_raw: pd.DataFrame,
+    cfg: Dict[str, Any],
+    *,
+    style: str = "스캘핑",
+    initial_equity_usdt: float = 1000.0,
+    fee_bps_per_side: float = 5.0,
+    slippage_bps_per_side: float = 2.0,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"ok": False, "reason_code": "INIT", "metrics": {}, "trades": [], "skip_reasons": {}}
+    if df_raw is None or df_raw.empty or len(df_raw) < 120:
+        out["reason_code"] = "DATA_TOO_SHORT"
+        return out
+    df2, _st0, _last0 = calc_indicators(df_raw.copy(), cfg)
+    if df2 is None or df2.empty or len(df2) < 80:
+        out["reason_code"] = "INDICATOR_FAIL"
+        return out
+
+    style_norm = normalize_style_name(style)
+    fee_rate = float(max(0.0, _as_float(fee_bps_per_side, 5.0))) / 10000.0
+    slip_rate = float(max(0.0, _as_float(slippage_bps_per_side, 2.0))) / 10000.0
+
+    equity = float(max(10.0, _as_float(initial_equity_usdt, 1000.0)))
+    peak_equity = float(equity)
+    max_drawdown_pct = 0.0
+    skip_reasons: Dict[str, int] = {}
+    trades: List[Dict[str, Any]] = []
+    position: Optional[Dict[str, Any]] = None
+
+    for i in range(2, len(df2)):
+        row = df2.iloc[i]
+        prev = df2.iloc[i - 1]
+        close_now = float(_as_float(row.get("close", 0.0), 0.0))
+        high_now = float(_as_float(row.get("high", close_now), close_now))
+        low_now = float(_as_float(row.get("low", close_now), close_now))
+        ts_now = str(row.get("time", ""))
+
+        if position is None:
+            sig = _backtest_entry_signal(prev, row, style_norm, cfg)
+            decision = str(sig.get("decision", "hold"))
+            if decision not in ["buy", "sell"]:
+                key = str(sig.get("reason_code", "NO_ENTRY") or "NO_ENTRY")
+                skip_reasons[key] = int(skip_reasons.get(key, 0)) + 1
+                continue
+            plan = _backtest_build_plan(
+                style=style_norm,
+                decision=decision,
+                entry_price=float(close_now),
+                df_ctx=df2.iloc[: i + 1].copy(),
+                cfg=cfg,
+            )
+            val = plan.get("validation", {}) if isinstance(plan.get("validation"), dict) else {}
+            if not bool(val.get("ok", False)):
+                key = str(val.get("reason_code", "PLAN_REJECT") or "PLAN_REJECT")
+                skip_reasons[key] = int(skip_reasons.get(key, 0)) + 1
+                continue
+
+            lev = float(max(1.0, _as_float(plan.get("leverage", 1.0), 1.0)))
+            entry_pct = float(max(0.1, _as_float(plan.get("entry_pct", 1.0), 1.0)))
+            margin = float(equity * (entry_pct / 100.0))
+            if margin < 5.0:
+                skip_reasons["MARGIN_TOO_SMALL"] = int(skip_reasons.get("MARGIN_TOO_SMALL", 0)) + 1
+                continue
+            if margin > equity:
+                margin = float(equity)
+
+            if decision == "buy":
+                entry_exec = float(close_now * (1.0 + slip_rate))
+            else:
+                entry_exec = float(close_now * (1.0 - slip_rate))
+            sl_roi = float(abs(_as_float(plan.get("sl_pct", 0.0), 0.0)))
+            tp_roi = float(abs(_as_float(plan.get("tp_pct", 0.0), 0.0)))
+            sl_price = _price_from_roi_target(entry_exec, decision, sl_roi, lev, "sl")
+            tp_price = _price_from_roi_target(entry_exec, decision, tp_roi, lev, "tp")
+            if (sl_price is None) or (tp_price is None):
+                skip_reasons["TARGET_PRICE_MISSING"] = int(skip_reasons.get("TARGET_PRICE_MISSING", 0)) + 1
+                continue
+            risk_usdt = float(max(1e-9, margin * (sl_roi / 100.0)))
+            position = {
+                "entry_time": ts_now,
+                "entry_price": float(entry_exec),
+                "side": str(decision),
+                "lev": float(lev),
+                "margin": float(margin),
+                "sl_roi": float(sl_roi),
+                "tp_roi": float(tp_roi),
+                "sl_price": float(sl_price),
+                "tp_price": float(tp_price),
+                "risk_usdt": float(risk_usdt),
+                "entry_bar": int(i),
+                "style": style_norm,
+            }
+            continue
+
+        side = str(position.get("side", "buy"))
+        hit_tp = False
+        hit_sl = False
+        if side == "buy":
+            hit_tp = bool(high_now >= float(position["tp_price"]))
+            hit_sl = bool(low_now <= float(position["sl_price"]))
+        else:
+            hit_tp = bool(low_now <= float(position["tp_price"]))
+            hit_sl = bool(high_now >= float(position["sl_price"]))
+
+        exit_reason = ""
+        exit_trigger_price = close_now
+        if hit_tp and hit_sl:
+            hit_tp = False
+            hit_sl = True
+        if hit_tp:
+            exit_reason = "TP"
+            exit_trigger_price = float(position["tp_price"])
+        elif hit_sl:
+            exit_reason = "SL"
+            exit_trigger_price = float(position["sl_price"])
+
+        hold_bars = int(i - int(position.get("entry_bar", i)))
+        if not exit_reason:
+            if style_norm == "스캘핑":
+                time_stop = int(max(4, _as_int(cfg.get("mean_reversion_time_stop_bars_scalp", 6), 6)))
+            elif style_norm == "단타":
+                time_stop = int(max(6, _as_int(cfg.get("mean_reversion_time_stop_bars_day", 8), 8)))
+            else:
+                time_stop = int(max(8, _as_int(cfg.get("mean_reversion_time_stop_bars_swing", 10), 10)))
+            if hold_bars >= time_stop:
+                exit_reason = "TIME_STOP"
+                exit_trigger_price = float(close_now)
+
+        if not exit_reason:
+            continue
+
+        if side == "buy":
+            exit_exec = float(exit_trigger_price * (1.0 - slip_rate))
+        else:
+            exit_exec = float(exit_trigger_price * (1.0 + slip_rate))
+        gross_roi = float(estimate_roi_from_price(float(position["entry_price"]), float(exit_exec), side, float(position["lev"])))
+        fee_roi = float((fee_rate * 2.0) * float(position["lev"]) * 100.0)
+        net_roi = float(gross_roi - fee_roi)
+        pnl_usdt = float(float(position["margin"]) * (net_roi / 100.0))
+        equity = float(equity + pnl_usdt)
+        peak_equity = float(max(peak_equity, equity))
+        if peak_equity > 0:
+            dd_pct = float(((equity - peak_equity) / peak_equity) * 100.0)
+            max_drawdown_pct = float(min(max_drawdown_pct, dd_pct))
+
+        r_mult = float(pnl_usdt / max(float(position["risk_usdt"]), 1e-9))
+        trades.append(
+            {
+                "entry_time": str(position["entry_time"]),
+                "exit_time": str(ts_now),
+                "side": "LONG" if side == "buy" else "SHORT",
+                "entry_price": float(position["entry_price"]),
+                "exit_price": float(exit_exec),
+                "leverage": float(position["lev"]),
+                "margin_usdt": float(position["margin"]),
+                "tp_roi": float(position["tp_roi"]),
+                "sl_roi": float(position["sl_roi"]),
+                "gross_roi": float(gross_roi),
+                "fee_roi": float(fee_roi),
+                "net_roi": float(net_roi),
+                "pnl_usdt": float(pnl_usdt),
+                "r_mult": float(r_mult),
+                "exit_reason": str(exit_reason),
+                "hold_bars": int(hold_bars),
+                "equity_after": float(equity),
+            }
+        )
+        position = None
+
+    if position is not None:
+        close_last = float(_as_float(df2.iloc[-1].get("close", position["entry_price"]), position["entry_price"]))
+        side = str(position.get("side", "buy"))
+        if side == "buy":
+            exit_exec = float(close_last * (1.0 - slip_rate))
+        else:
+            exit_exec = float(close_last * (1.0 + slip_rate))
+        gross_roi = float(estimate_roi_from_price(float(position["entry_price"]), float(exit_exec), side, float(position["lev"])))
+        fee_roi = float((fee_rate * 2.0) * float(position["lev"]) * 100.0)
+        net_roi = float(gross_roi - fee_roi)
+        pnl_usdt = float(float(position["margin"]) * (net_roi / 100.0))
+        equity = float(equity + pnl_usdt)
+        peak_equity = float(max(peak_equity, equity))
+        if peak_equity > 0:
+            dd_pct = float(((equity - peak_equity) / peak_equity) * 100.0)
+            max_drawdown_pct = float(min(max_drawdown_pct, dd_pct))
+        r_mult = float(pnl_usdt / max(float(position["risk_usdt"]), 1e-9))
+        trades.append(
+            {
+                "entry_time": str(position["entry_time"]),
+                "exit_time": str(df2.iloc[-1].get("time", "")),
+                "side": "LONG" if side == "buy" else "SHORT",
+                "entry_price": float(position["entry_price"]),
+                "exit_price": float(exit_exec),
+                "leverage": float(position["lev"]),
+                "margin_usdt": float(position["margin"]),
+                "tp_roi": float(position["tp_roi"]),
+                "sl_roi": float(position["sl_roi"]),
+                "gross_roi": float(gross_roi),
+                "fee_roi": float(fee_roi),
+                "net_roi": float(net_roi),
+                "pnl_usdt": float(pnl_usdt),
+                "r_mult": float(r_mult),
+                "exit_reason": "EOD_FORCE_CLOSE",
+                "hold_bars": int(max(0, len(df2) - 1 - int(position.get("entry_bar", 0)))),
+                "equity_after": float(equity),
+            }
+        )
+
+    trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
+    trade_count = int(len(trades_df))
+    if trade_count <= 0:
+        out["ok"] = True
+        out["reason_code"] = "NO_TRADES"
+        out["metrics"] = {
+            "trade_count": 0,
+            "win_rate_pct": 0.0,
+            "expectancy_usdt": 0.0,
+            "expectancy_r": 0.0,
+            "profit_factor": 0.0,
+            "max_drawdown_pct": float(max_drawdown_pct),
+            "start_equity": float(initial_equity_usdt),
+            "end_equity": float(equity),
+            "net_pnl_usdt": float(equity - float(initial_equity_usdt)),
+        }
+        out["skip_reasons"] = skip_reasons
+        return out
+
+    pnl = pd.to_numeric(trades_df["pnl_usdt"], errors="coerce").fillna(0.0)
+    rvals = pd.to_numeric(trades_df["r_mult"], errors="coerce").fillna(0.0)
+    wins = pnl[pnl > 0]
+    losses = pnl[pnl < 0]
+    win_rate = float((len(wins) / max(1, trade_count)) * 100.0)
+    profit_factor = float((wins.sum() / abs(losses.sum())) if len(losses) > 0 else (999.0 if len(wins) > 0 else 0.0))
+
+    out["ok"] = True
+    out["reason_code"] = "OK"
+    out["metrics"] = {
+        "trade_count": int(trade_count),
+        "win_rate_pct": float(win_rate),
+        "expectancy_usdt": float(pnl.mean()),
+        "expectancy_r": float(rvals.mean()),
+        "profit_factor": float(profit_factor),
+        "max_drawdown_pct": float(max_drawdown_pct),
+        "start_equity": float(initial_equity_usdt),
+        "end_equity": float(equity),
+        "net_pnl_usdt": float(equity - float(initial_equity_usdt)),
+        "avg_win_usdt": float(wins.mean()) if len(wins) > 0 else 0.0,
+        "avg_loss_usdt": float(losses.mean()) if len(losses) > 0 else 0.0,
+    }
+    out["trades"] = trades_df.to_dict(orient="records")
+    out["skip_reasons"] = skip_reasons
+    return out
+
+
+def run_backtest_harness_ccxt(
+    ex,
+    symbol: str,
+    timeframe: str,
+    bars: int,
+    cfg: Dict[str, Any],
+    *,
+    style: str,
+    initial_equity_usdt: float,
+    fee_bps_per_side: float,
+    slippage_bps_per_side: float,
+) -> Dict[str, Any]:
+    out = {"ok": False, "reason_code": "INIT"}
+    ohlcv = safe_fetch_ohlcv(ex, str(symbol), str(timeframe), limit=int(max(200, bars)))
+    if not ohlcv:
+        out["reason_code"] = "OHLCV_EMPTY"
+        return out
+    df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    sim = simulate_strategy_backtest(
+        df,
+        cfg,
+        style=str(style),
+        initial_equity_usdt=float(initial_equity_usdt),
+        fee_bps_per_side=float(fee_bps_per_side),
+        slippage_bps_per_side=float(slippage_bps_per_side),
+    )
+    sim["symbol"] = str(symbol)
+    sim["timeframe"] = str(timeframe)
+    sim["bars"] = int(bars)
+    return sim
 
 
 # =========================================================
@@ -25012,7 +27781,7 @@ config["ai_budget_hourly_limit"] = bz2.number_input(
     int(config.get("ai_budget_hourly_limit", 0) or 0),
     step=1,
 )
-config["ai_budget_daily_limit"] = bz3.number_input("일일", 10, 200000, int(config.get("ai_budget_daily_limit", 180) or 180), step=10)
+config["ai_budget_daily_limit"] = bz3.number_input("일일(0=무제한)", 0, 200000, int(config.get("ai_budget_daily_limit", 180) or 180), step=10)
 config["ai_budget_min_interval_sec"] = st.sidebar.number_input(
     "AI 최소 간격(초)",
     1,
@@ -25034,6 +27803,54 @@ config["ai_budget_adaptive_max_interval_sec"] = ba2.number_input(
     int(config.get("ai_budget_adaptive_max_interval_sec", 180) or 180),
     step=5,
 )
+fp1, fp2 = st.sidebar.columns(2)
+_fallback_opts = ["skip", "cache", "rules", "cache_or_rules"]
+_fallback_now = str(config.get("ai_budget_fallback_policy", "cache_or_rules") or "cache_or_rules").strip().lower()
+if _fallback_now not in _fallback_opts:
+    _fallback_now = "cache_or_rules"
+config["ai_budget_fallback_policy"] = fp1.selectbox(
+    "예산제한 대체",
+    _fallback_opts,
+    index=_fallback_opts.index(_fallback_now),
+    help="skip=스킵, cache=최근 AI 재사용, rules=초강신호 룰 기반, cache_or_rules=캐시 우선",
+)
+config["ai_cache_ttl_sec"] = fp2.number_input(
+    "AI 캐시 TTL(초)",
+    30,
+    3600,
+    int(config.get("ai_cache_ttl_sec", 600) or 600),
+    step=10,
+)
+ff1, ff2 = st.sidebar.columns(2)
+config["ai_fallback_min_conf"] = ff1.number_input("대체 최소 확신", 50, 100, int(config.get("ai_fallback_min_conf", 82) or 82), step=1)
+config["ai_fallback_min_ml_votes"] = ff2.number_input("대체 ML 최소표", 1, 8, int(config.get("ai_fallback_min_ml_votes", 4) or 4), step=1)
+config["ai_fallback_min_align"] = st.sidebar.number_input("대체 정렬 최소개수", 1, 8, int(config.get("ai_fallback_min_align", 4) or 4), step=1)
+
+try:
+    _rt_budget_ui = load_runtime()
+    _snap_budget_ui = ai_budget_status_snapshot(_rt_budget_ui, config, last=None, status=None, urgent=False)
+    _h_lim_txt = str(_snap_budget_ui.get("hour_limit", 0) or 0)
+    _d_lim_txt = str(_snap_budget_ui.get("day_limit", 0) or 0)
+    if int(_as_int(_snap_budget_ui.get("hour_limit", 0), 0)) <= 0:
+        _h_lim_txt = "∞"
+    if int(_as_int(_snap_budget_ui.get("day_limit", 0), 0)) <= 0:
+        _d_lim_txt = "∞"
+    _left = int(_as_int(_snap_budget_ui.get("next_allowed_sec", 0), 0))
+    _note = str(_snap_budget_ui.get("reason_note", "") or "")
+    with st.sidebar.expander("AI 예산 상태(읽기전용)"):
+        st.caption(
+            f"일일: {int(_as_int(_snap_budget_ui.get('day_calls', 0), 0))}/{_d_lim_txt} | "
+            f"시간: {int(_as_int(_snap_budget_ui.get('hour_calls', 0), 0))}/{_h_lim_txt}"
+        )
+        st.caption(
+            f"마지막 호출: {_epoch_to_kst_str(float(_as_float(_snap_budget_ui.get('last_call_epoch', 0.0), 0.0))) if float(_as_float(_snap_budget_ui.get('last_call_epoch', 0.0), 0.0)) > 0 else '-'}"
+        )
+        st.caption(f"다음 허용까지: {_left}s")
+        if str(_note).strip():
+            st.caption(_note[:220])
+except Exception:
+    pass
+
 ca1, ca2 = st.sidebar.columns(2)
 config["entry_convergence_min_votes"] = ca1.number_input(
     "수렴 최소표",
@@ -25987,6 +28804,21 @@ with t1:
             st.caption(f"OpenAI: {ai_txt}")
         except Exception:
             pass
+        try:
+            rt_budget_view = load_runtime()
+            budget_view = ai_budget_status_snapshot(rt_budget_view, config, last=None, status=None, urgent=False)
+            h_lim_v = int(_as_int(budget_view.get("hour_limit", 0), 0))
+            d_lim_v = int(_as_int(budget_view.get("day_limit", 0), 0))
+            h_lim_txt = "∞" if h_lim_v <= 0 else str(h_lim_v)
+            d_lim_txt = "∞" if d_lim_v <= 0 else str(d_lim_v)
+            next_left = int(_as_int(budget_view.get("next_allowed_sec", 0), 0))
+            st.caption(
+                f"AI Budget: day {int(_as_int(budget_view.get('day_calls',0),0))}/{d_lim_txt}, "
+                f"hour {int(_as_int(budget_view.get('hour_calls',0),0))}/{h_lim_txt}, "
+                f"next {next_left}s"
+            )
+        except Exception:
+            pass
 
         # ✅ 포지션/진입 정보(직관적 표시)
         st.subheader("📊 현재 포지션(스타일/목표 포함)")
@@ -26050,6 +28882,7 @@ with t1:
                     "AI호출": "✅" if cs.get("ai_called") else "—",
                     "AI결론": str(cs.get("ai_decision", "-")).upper(),
                     "확신도": cs.get("ai_confidence", "-"),
+                    "AI대체": cs.get("ai_fallback", ""),
                     "필요확신도": cs.get("min_conf_required", "-"),
                     "진입%": cs.get("ai_entry_pct", "-"),
                     "레버": cs.get("ai_leverage", "-"),
@@ -26113,7 +28946,7 @@ with t1:
                         base_last=last,
                     )
                     ob_ctx = orderbook_pressure_summary(safe_fetch_order_book(exchange, symbol, limit=20), depth=20)
-                    dyn_style = choose_dynamic_style(mtf_ctx, ob_ctx)
+                    dyn_style = choose_dynamic_style(mtf_ctx, ob_ctx, cfg=config)
                     chart_style_hint = normalize_style_name(dyn_style.get("style", "스캘핑"))
                     ai = ai_decide_trade(
                         df2,
@@ -26467,115 +29300,68 @@ with t4:
         st.rerun()
 
 with t5:
-    st.subheader("🧪 간이 백테스트(가벼운 규칙 기반, 버튼 실행형)")
-    st.caption("실제 주문이 아니라 과거 OHLCV로 '대략' 성능을 확인합니다. (기본 OFF, 클릭 시 실행)")
+    st.subheader("🧪 백테스트/시뮬레이션 하네스")
+    st.caption("실거래 규칙(스타일 보정/ROI 캡/플랜 검증)을 그대로 적용해 기대값(Expectancy)과 MDD를 계산합니다.")
 
     bt_col1, bt_col2, bt_col3 = st.columns(3)
     bt_symbol = bt_col1.selectbox("심볼", symbol_list, index=symbol_list.index(symbol) if symbol in symbol_list else 0)
     bt_tf = bt_col2.selectbox("타임프레임", ["1m", "3m", "5m", "15m", "1h"], index=["1m", "3m", "5m", "15m", "1h"].index(config.get("timeframe", "5m")))
     bt_n = bt_col3.number_input("최근 N봉", 200, 2000, 600, step=50)
 
-    bt_style = st.selectbox("전략 스타일", ["스캘핑", "단타", "스윙"], index=0)
+    bt_style = st.selectbox("전략 스타일", ["스캘핑", "단타", "스윙"], index=0, key="bt_style")
+    bt_c1, bt_c2, bt_c3 = st.columns(3)
+    bt_initial = bt_c1.number_input("초기자산(USDT)", 100.0, 1000000.0, 1000.0, step=100.0)
+    bt_fee_bps = bt_c2.number_input("수수료(bps/편도)", 0.0, 100.0, 5.0, step=0.5)
+    bt_slip_bps = bt_c3.number_input("슬리피지(bps/편도)", 0.0, 100.0, 2.0, step=0.5)
     run_bt = st.button("▶️ 백테스트 실행")
 
     if run_bt:
-        if ta is None and pta is None:
-            st.error("ta/pandas_ta 모듈 없음")
-        else:
-            try:
-                ohlcv = safe_fetch_ohlcv(exchange, bt_symbol, str(bt_tf), limit=int(bt_n))
-                if not ohlcv:
-                    raise RuntimeError("ohlcv_empty_or_timeout")
-                df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "vol"])
-                df["time"] = pd.to_datetime(df["time"], unit="ms")
-                df2, stt, last = calc_indicators(df, config)
-                if df2 is None or df2.empty:
-                    st.error("데이터 부족")
+        try:
+            sim = run_backtest_harness_ccxt(
+                exchange,
+                bt_symbol,
+                str(bt_tf),
+                int(bt_n),
+                config,
+                style=bt_style,
+                initial_equity_usdt=float(bt_initial),
+                fee_bps_per_side=float(bt_fee_bps),
+                slippage_bps_per_side=float(bt_slip_bps),
+            )
+            if not bool(sim.get("ok", False)):
+                st.error(f"백테스트 실패: {sim.get('reason_code','UNKNOWN')}")
+            else:
+                metrics = sim.get("metrics", {}) if isinstance(sim.get("metrics"), dict) else {}
+                st.caption(
+                    f"심볼 {sim.get('symbol','-')} | TF {sim.get('timeframe','-')} | bars {sim.get('bars','-')} | reason={sim.get('reason_code','')}"
+                )
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("거래수", str(int(metrics.get("trade_count", 0) or 0)))
+                c2.metric("승률", f"{float(metrics.get('win_rate_pct', 0.0) or 0.0):.1f}%")
+                c3.metric("Expectancy", f"{float(metrics.get('expectancy_usdt', 0.0) or 0.0):.3f} USDT/트레이드")
+                c4.metric("MDD", f"{float(metrics.get('max_drawdown_pct', 0.0) or 0.0):.2f}%")
+
+                c5, c6, c7, c8 = st.columns(4)
+                c5.metric("총손익", f"{float(metrics.get('net_pnl_usdt', 0.0) or 0.0):.2f} USDT")
+                c6.metric("종료자산", f"{float(metrics.get('end_equity', 0.0) or 0.0):.2f} USDT")
+                c7.metric("Profit Factor", f"{float(metrics.get('profit_factor', 0.0) or 0.0):.2f}")
+                c8.metric("Expectancy(R)", f"{float(metrics.get('expectancy_r', 0.0) or 0.0):.3f}")
+
+                trades = sim.get("trades", [])
+                if isinstance(trades, list) and trades:
+                    df_bt = pd.DataFrame(trades)
+                    st_dataframe_safe(df_for_display(df_bt.tail(120)), hide_index=True)
                 else:
-                    # 간이 시뮬: RSI 해소 + MA 추세 기반
-                    trades = []
-                    in_pos = False
-                    side = None
-                    entry_px = 0.0
-                    peak = 0.0
-                    equity = 0.0
-                    max_equity = 0.0
-                    max_dd = 0.0
+                    st.info("생성된 거래가 없습니다.")
 
-                    # 스타일별 목표(대략)
-                    tp = 1.8 if bt_style == "스캘핑" else 6.0
-                    sl = 1.2 if bt_style == "스캘핑" else 3.0
-
-                    for i in range(2, len(df2)):
-                        row = df2.iloc[i]
-                        prev = df2.iloc[i - 1]
-                        price = float(row["close"])
-
-                        # 간이 신호
-                        trend = "횡보/전환"
-                        if "MA_fast" in df2.columns and "MA_slow" in df2.columns:
-                            if float(row["MA_fast"]) > float(row["MA_slow"]) and price > float(row["MA_slow"]):
-                                trend = "상승추세"
-                            elif float(row["MA_fast"]) < float(row["MA_slow"]) and price < float(row["MA_slow"]):
-                                trend = "하락추세"
-                        rsi_prev = float(prev.get("RSI", 50))
-                        rsi_now = float(row.get("RSI", 50))
-                        rsi_buy = float(config.get("rsi_buy", 30))
-                        rsi_sell = float(config.get("rsi_sell", 70))
-
-                        rsi_resolve_long = (rsi_prev < rsi_buy) and (rsi_now >= rsi_buy)
-                        rsi_resolve_short = (rsi_prev > rsi_sell) and (rsi_now <= rsi_sell)
-
-                        if not in_pos:
-                            if trend == "상승추세" and rsi_resolve_long:
-                                in_pos = True
-                                side = "long"
-                                entry_px = price
-                                peak = price
-                            elif trend == "하락추세" and rsi_resolve_short:
-                                in_pos = True
-                                side = "short"
-                                entry_px = price
-                                peak = price
-                        else:
-                            # ROI 계산(레버 무시, 단순 퍼센트)
-                            if side == "long":
-                                roi = ((price - entry_px) / entry_px) * 100.0
-                                peak = max(peak, price)
-                            else:
-                                roi = ((entry_px - price) / entry_px) * 100.0
-                                peak = min(peak, price)
-
-                            if roi >= tp or roi <= -sl:
-                                trades.append(roi)
-                                equity += roi
-                                max_equity = max(max_equity, equity)
-                                max_dd = min(max_dd, equity - max_equity)
-                                in_pos = False
-                                side = None
-                                entry_px = 0.0
-
-                    if trades:
-                        wins = sum(1 for x in trades if x > 0)
-                        win_rate = wins / len(trades) * 100.0
-                        gains = sum(x for x in trades if x > 0)
-                        losses = -sum(x for x in trades if x < 0)
-                        pf = gains / losses if losses > 0 else float("inf") if gains > 0 else 0.0
-                        total_ret = sum(trades)
-                        avg_r = float(np.mean(trades))
-                        st.metric("총 수익률(단순합)", f"{total_ret:.2f}%")
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("거래수", str(len(trades)))
-                        c2.metric("승률", f"{win_rate:.1f}%")
-                        c3.metric("PF", f"{pf:.2f}" if pf != float("inf") else "inf")
-                        c4.metric("MDD(단순)", f"{max_dd:.2f}%")
-                        st.caption(f"평균 R(간이): {avg_r:.2f}")
-                        st.write(pd.DataFrame({"trade_roi_pct": trades}).tail(50))
-                    else:
-                        st.warning("조건에 맞는 거래가 없었습니다.")
-            except Exception as e:
-                st.error(f"백테스트 오류: {e}")
-                notify_admin_error("UI:BACKTEST", e, context={"symbol": bt_symbol, "tf": bt_tf, "n": int(bt_n)}, min_interval_sec=120.0)
+                skip_reasons = sim.get("skip_reasons", {})
+                if isinstance(skip_reasons, dict) and skip_reasons:
+                    rs = pd.DataFrame([{"reason_code": k, "count": int(v)} for k, v in skip_reasons.items()]).sort_values("count", ascending=False)
+                    st.caption("진입 스킵 사유(집계)")
+                    st_dataframe_safe(df_for_display(rs.head(20)), hide_index=True)
+        except Exception as e:
+            st.error(f"백테스트 오류: {e}")
+            notify_admin_error("UI:BACKTEST", e, context={"symbol": bt_symbol, "tf": bt_tf, "n": int(bt_n)}, min_interval_sec=120.0)
 
 
 st.caption("⚠️ 이 봇은 모의투자(IS_SANDBOX=True)에서 충분히 검증 후 사용하세요.")
