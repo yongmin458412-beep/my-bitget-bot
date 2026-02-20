@@ -7433,6 +7433,21 @@ def _retry_wrapper_append_row(fn):  # noqa: D401
 # =========================================================
 # ✅ 8) 거래소 연결
 # =========================================================
+def _safe_load_markets(ex, where: str = "") -> bool:
+    try:
+        _ccxt_call_with_timeout(lambda: ex.load_markets(), CCXT_TIMEOUT_SEC_PUBLIC, where=(where or "load_markets"))
+        return True
+    except FuturesTimeoutError:
+        try:
+            setattr(ex, "_wonyoti_ccxt_timeout_epoch", time.time())
+            setattr(ex, "_wonyoti_ccxt_timeout_where", str(where or "load_markets"))
+        except Exception:
+            pass
+        return False
+    except Exception:
+        return False
+
+
 @st.cache_resource
 def init_exchange():
     try:
@@ -7447,7 +7462,7 @@ def init_exchange():
             }
         )
         ex.set_sandbox_mode(IS_SANDBOX)
-        ex.load_markets()
+        _safe_load_markets(ex, where="init_exchange.load_markets")
         return ex
     except Exception:
         return None
@@ -7471,9 +7486,8 @@ def create_exchange_client_uncached() -> Optional[Any]:
             }
         )
         ex.set_sandbox_mode(IS_SANDBOX)
-        try:
-            ex.load_markets()
-        except Exception:
+        loaded = _safe_load_markets(ex, where="create_exchange_client_uncached.load_markets")
+        if not bool(loaded):
             # 네트워크 문제로 load_markets가 실패해도, 기존 cached exchange의 markets를 복사해
             # thread 전용 인스턴스를 최대한 살려둔다(스레드 정체/공유객체 fallback 방지).
             try:
@@ -14723,6 +14737,20 @@ def monitor_write_throttled(mon: Dict[str, Any], min_interval_sec: float = 1.0):
         mon["_last_write"] = time.time()
 
 
+def mon_mark_exchange_refresh(mon: Dict[str, Any], reason: str = "") -> None:
+    try:
+        t_kst = now_kst_str()
+        mon["loop_stage"] = "EXCHANGE_REFRESH"
+        mon["loop_stage_kst"] = t_kst
+        mon["last_heartbeat_epoch"] = time.time()
+        mon["last_heartbeat_kst"] = t_kst
+        if str(reason or "").strip():
+            mon["loop_stage_detail"] = str(reason)[:160]
+        monitor_write_throttled(mon, 0.2)
+    except Exception:
+        pass
+
+
 def mon_add_event(mon: Dict[str, Any], ev_type: str, symbol: str = "", message: str = "", extra: Optional[Dict[str, Any]] = None):
     try:
         ev = {"time_kst": now_kst_str(), "type": ev_type, "symbol": symbol, "message": message, "extra": extra or {}}
@@ -20140,6 +20168,7 @@ def telegram_thread(ex):
                 if t_after and t_after > float(ccxt_timeout_epoch_loop_start or 0):
                     where_now = str(getattr(ex, "_wonyoti_ccxt_timeout_where", "") or "").strip()
                     mon_add_event(mon, "CCXT_TIMEOUT", "", f"{where_now or 'unknown'}", {"where": where_now, "code": CODE_VERSION})
+                    mon_mark_exchange_refresh(mon, reason=f"timeout:{where_now or 'unknown'}")
                     ex_new = create_exchange_client_uncached()
                     if ex_new is not None:
                         ex = ex_new
@@ -20270,6 +20299,7 @@ def telegram_thread(ex):
                         try:
                             where_now = str(getattr(ex, "_wonyoti_ccxt_timeout_where", "") or "").strip()
                             mon_add_event(mon, "CCXT_REFRESH", "", "exchange refreshed(after fetch_positions timeout)", {"where": where_now, "code": CODE_VERSION})
+                            mon_mark_exchange_refresh(mon, reason=f"fetch_positions:{where_now or 'timeout'}")
                             ex_new = create_exchange_client_uncached()
                             if ex_new is not None:
                                 ex = ex_new
@@ -22730,6 +22760,7 @@ def telegram_thread(ex):
                         try:
                             where_now = str(getattr(ex, "_wonyoti_ccxt_timeout_where", "") or "").strip()
                             mon_add_event(mon, "CCXT_REFRESH", "", "exchange refreshed(after balance timeout)", {"where": where_now, "code": CODE_VERSION})
+                            mon_mark_exchange_refresh(mon, reason=f"balance:{where_now or 'timeout'}")
                             ex_new = create_exchange_client_uncached()
                             if ex_new is not None:
                                 ex = ex_new
@@ -23927,7 +23958,8 @@ def telegram_thread(ex):
                         except Exception:
                             pass
                         decision = ai.get("decision", "hold")
-                        conf = int(ai.get("confidence", 0))
+                        conf_raw = int(_as_int(ai.get("confidence", 0), 0))
+                        conf = int(conf_raw)
                         mon_add_scan(mon, stage="ai_result", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=conf, message=str(ai.get("reason_easy", ""))[:80])
 
                         # ✅ 주력 지표 수렴(3-of-N)과 AI 방향이 다르면 진입하지 않음(비용/과오류 방지)
@@ -23948,9 +23980,14 @@ def telegram_thread(ex):
                                         symbol=sym,
                                         tf=str(cfg.get("timeframe", "5m")),
                                         signal=raw,
-                                        score=int(ai.get("confidence", 0) or 0),
+                                        score=int(conf),
                                         message=str(cs.get("skip_reason", ""))[:140],
-                                        extra={"ml_dir": ml_dir, "ml_votes": int(ml.get("votes_max", 0) or 0)},
+                                        extra={
+                                            "ml_dir": ml_dir,
+                                            "ml_votes": int(ml.get("votes_max", 0) or 0),
+                                            "conf_raw": int(conf_raw),
+                                            "conf_final": int(conf),
+                                        },
                                     )
                         except Exception:
                             pass
@@ -24176,7 +24213,14 @@ def telegram_thread(ex):
                                 )
                         except Exception:
                             soft_penalty_note = ""
-                        skip_reason_merged = " / ".join([x for x in [sqz_skip_reason, pattern_skip_reason, soft_penalty_note] if str(x).strip()])
+                        existing_skip_reason = str(cs.get("skip_reason", "") or "").strip()
+                        skip_reason_merged = " / ".join(
+                            [
+                                x
+                                for x in [existing_skip_reason, sqz_skip_reason, pattern_skip_reason, soft_penalty_note]
+                                if str(x).strip()
+                            ]
+                        )
                         # 강제스캔 요약 라인(요구사항: /scan 결과는 짧게)
                         try:
                             if force_scan_pending and ((not force_scan_syms_set) or (sym in force_scan_syms_set)):
@@ -24188,6 +24232,7 @@ def telegram_thread(ex):
                             {
                                 "ai_called": True,
                                 "ai_decision": decision,
+                                "ai_confidence_raw": int(conf_raw),
                                 "ai_confidence": conf,
                                 "ai_entry_pct": float(ai.get("entry_pct", rule["entry_pct_min"])),
                                 "ai_leverage": int(ai.get("leverage", rule["lev_min"])),
@@ -24511,9 +24556,29 @@ def telegram_thread(ex):
                                 is_up = ("상승" in str(htf_trend))
                                 if is_down and decision == "buy":
                                     cs["skip_reason"] = f"장기추세({htf_tf}) 하락이라 롱 금지(STRICT)"
+                                    mon_add_scan(
+                                        mon,
+                                        stage="trade_skipped",
+                                        symbol=sym,
+                                        tf=str(htf_tf),
+                                        signal=str(decision),
+                                        score=int(conf),
+                                        message=str(cs.get("skip_reason", ""))[:160],
+                                        extra={"policy": "STRICT", "trend": str(htf_trend)},
+                                    )
                                     continue
                                 if is_up and decision == "sell":
                                     cs["skip_reason"] = f"장기추세({htf_tf}) 상승이라 숏 금지(STRICT)"
+                                    mon_add_scan(
+                                        mon,
+                                        stage="trade_skipped",
+                                        symbol=sym,
+                                        tf=str(htf_tf),
+                                        signal=str(decision),
+                                        score=int(conf),
+                                        message=str(cs.get("skip_reason", ""))[:160],
+                                        extra={"policy": "STRICT", "trend": str(htf_trend)},
+                                    )
                                     continue
                             elif cfg.get("trend_filter_enabled", True) and cfg.get("trend_filter_policy", "ALLOW_SCALP") == "ALLOW_SCALP" and regime_mode == "auto":
                                 # 역추세면 스캘핑 강제
@@ -25164,6 +25229,16 @@ def telegram_thread(ex):
                                 pass
                             if entry_usdt < 5:
                                 cs["skip_reason"] = "잔고 부족(진입금 너무 작음)"
+                                mon_add_scan(
+                                    mon,
+                                    stage="trade_skipped",
+                                    symbol=sym,
+                                    tf=str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
+                                    signal=str(decision),
+                                    score=int(conf),
+                                    message=str(cs.get("skip_reason", ""))[:140],
+                                    extra={"entry_usdt": float(entry_usdt), "min_entry_usdt": 5.0},
+                                )
                                 continue
 
                             plan_validation: Dict[str, Any] = {}
@@ -25265,6 +25340,16 @@ def telegram_thread(ex):
                             qty = to_precision_qty(ex, sym, (entry_usdt * lev) / max(px, 1e-9))
                             if qty <= 0:
                                 cs["skip_reason"] = "수량 계산 실패"
+                                mon_add_scan(
+                                    mon,
+                                    stage="trade_skipped",
+                                    symbol=sym,
+                                    tf=str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m")),
+                                    signal=str(decision),
+                                    score=int(conf),
+                                    message=str(cs.get("skip_reason", ""))[:140],
+                                    extra={"entry_usdt": float(entry_usdt), "lev": int(lev), "price": float(px), "qty": float(qty)},
+                                )
                                 continue
 
                             # ✅ 리스(리더) 확인: watchdog 복구 중 중복 주문 방지
@@ -26246,6 +26331,7 @@ def telegram_thread(ex):
                     try:
                         where_now = str(getattr(ex, "_wonyoti_ccxt_timeout_where", "") or "").strip()
                         mon_add_event(mon, "CCXT_REFRESH", "", "exchange refreshed(after scan timeout)", {"where": where_now, "code": CODE_VERSION})
+                        mon_mark_exchange_refresh(mon, reason=f"scan:{where_now or 'timeout'}")
                         ex_new = create_exchange_client_uncached()
                         if ex_new is not None:
                             ex = ex_new
