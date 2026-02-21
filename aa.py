@@ -1073,10 +1073,24 @@ def critical_tuning_recommended_values() -> Dict[str, Any]:
         "intra_day_scalp_min_conf": 55,
         "intra_day_day_min_conf": 65,
         "intra_day_swing_min_conf": 68,
+        "trend_filter_enabled": True,
+        "trend_filter_policy": "ALLOW_SCALP",
         "ai_mode": "veto",
         "ai_enable_scalp": False,
         "ai_enable_day": True,
         "ai_enable_swing": True,
+        "high_conf_override_enable": True,
+        "high_conf_override_ichimoku_enable": True,
+        "high_conf_override_htf_enable": True,
+        "high_conf_override_countertrend_short_enable": True,
+        "high_conf_override_abs_min_conf": 78,
+        "high_conf_override_margin_above_gate": 8,
+        "countertrend_short_gate_mode_scalp": "soft",
+        "countertrend_short_gate_mode_day": "soft",
+        "countertrend_short_soft_allow_min_conf_scalp": 72,
+        "countertrend_short_soft_allow_min_conf_day": 78,
+        "anti_drought_soften_countertrend_short_step": 2,
+        "anti_drought_disable_countertrend_short_step": 4,
         "universe_scan_max_per_cycle": 50,
         "universe_scan_rotation_enable": True,
         "universe_top_n": 150,
@@ -1724,6 +1738,8 @@ def default_settings() -> Dict[str, Any]:
         "anti_drought_disable_volume_obv_gate_step": 5,
         "anti_drought_soften_htf_gate_step": 2,
         "anti_drought_disable_htf_gate_step": 4,
+        "anti_drought_soften_countertrend_short_step": 2,
+        "anti_drought_disable_countertrend_short_step": 4,
         "anti_drought_min_conf_floor_scalp": 50,
         "anti_drought_min_conf_floor_day": 60,
         "anti_drought_min_conf_floor_swing": 60,
@@ -1734,8 +1750,8 @@ def default_settings() -> Dict[str, Any]:
         "show_last_entry_attempt_panel": True,
         # ✅ 고확신 게이트 오버라이드(하드 차단 대신 예외 진입, 리스크는 감산)
         "high_conf_override_enable": True,
-        "high_conf_override_abs_min_conf": 82,
-        "high_conf_override_margin_above_gate": 12,
+        "high_conf_override_abs_min_conf": 78,
+        "high_conf_override_margin_above_gate": 8,
         "high_conf_override_ichimoku_enable": True,
         "high_conf_override_htf_enable": True,
         "high_conf_override_countertrend_short_enable": True,
@@ -1819,6 +1835,10 @@ def default_settings() -> Dict[str, Any]:
         "htf_alignment_gate_mode_swing": "hard",
         "htf_alignment_soft_allow_min_conf_scalp": 75,
         "htf_alignment_soft_allow_min_conf_day": 80,
+        "countertrend_short_gate_mode_scalp": "soft",
+        "countertrend_short_gate_mode_day": "soft",
+        "countertrend_short_soft_allow_min_conf_scalp": 72,
+        "countertrend_short_soft_allow_min_conf_day": 78,
         # ✅ 스타일별 RR 하한(목표손절이 목표익절보다 커지는 케이스 방지)
         "scalp_rr_floor": 1.5,
         "day_rr_floor": 2.0,
@@ -14447,6 +14467,64 @@ def htf_soft_allow_min_conf(style: str, cfg: Dict[str, Any]) -> int:
         return 100
 
 
+def countertrend_short_gate_mode(style: str, cfg: Dict[str, Any], anti_step: int = 0) -> str:
+    try:
+        style_ko = normalize_style_name(style)
+        if style_ko == "스캘핑":
+            mode = str(cfg.get("countertrend_short_gate_mode_scalp", "soft") or "soft").strip().lower()
+        elif style_ko == "단타":
+            mode = str(cfg.get("countertrend_short_gate_mode_day", "soft") or "soft").strip().lower()
+        else:
+            mode = "hard"
+        if mode not in ["hard", "soft", "off"]:
+            mode = "hard" if style_ko == "스윙" else "soft"
+        if style_ko in ["스캘핑", "단타"]:
+            disable_step = int(
+                max(
+                    1,
+                    _as_int(
+                        cfg.get(
+                            "anti_drought_disable_countertrend_short_step",
+                            cfg.get("anti_drought_disable_htf_gate_step", 4),
+                        ),
+                        4,
+                    ),
+                )
+            )
+            soften_step = int(
+                max(
+                    1,
+                    _as_int(
+                        cfg.get(
+                            "anti_drought_soften_countertrend_short_step",
+                            cfg.get("anti_drought_soften_htf_gate_step", 2),
+                        ),
+                        2,
+                    ),
+                )
+            )
+            step_now = int(max(0, _as_int(anti_step, 0)))
+            if step_now >= disable_step:
+                mode = "off"
+            elif step_now >= soften_step and mode == "hard":
+                mode = "soft"
+        return mode
+    except Exception:
+        return "hard"
+
+
+def countertrend_short_soft_allow_min_conf(style: str, cfg: Dict[str, Any]) -> int:
+    try:
+        style_ko = normalize_style_name(style)
+        if style_ko == "스캘핑":
+            return int(max(0, min(100, _as_int(cfg.get("countertrend_short_soft_allow_min_conf_scalp", 72), 72))))
+        if style_ko == "단타":
+            return int(max(0, min(100, _as_int(cfg.get("countertrend_short_soft_allow_min_conf_day", 78), 78))))
+        return 100
+    except Exception:
+        return 100
+
+
 def apply_override_penalty(entry_pct: float, lev: int, rule: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[float, int, Dict[str, Any]]:
     try:
         ep = float(_as_float(entry_pct, 0.0))
@@ -15081,10 +15159,8 @@ JSON 형식:
         except Exception:
             pass
 
-        # ✅ 역추세 숏 엄격 필터:
-        # - 단기 추세(7/99) 상승일 때 숏은
-        #   (1) 명확한 약세 다이버전스 + (2) SQZ 음모멘텀 + (3) 종가 MA7 하향 이탈
-        #   3개 모두 충족 시에만 허용
+        # ✅ 역추세 숏 필터:
+        # - 기본은 안전하게 보수 운영(hard), 필요 시 soft/off + 고확신 예외로 진입 기회 확보
         try:
             if str(out.get("decision", "hold")) == "sell":
                 close_now = float(last["close"])
@@ -15110,10 +15186,64 @@ JSON 형식:
                         miss.append("SQZ음전환")
                     if not close_below_fast:
                         miss.append("MA7하향이탈")
-                    out["decision"] = "hold"
-                    out["reason_easy"] = f"상승추세 역숏 차단: 반전신호 약함({','.join(miss)})"
                     out["_reversal_blocked"] = True
                     out["_reversal_block_reason"] = "trend_up_short_block"
+
+                    conf_now = int(_as_int(out.get("confidence", 0), 0))
+                    if style_mandatory == "스캘핑":
+                        min_conf_gate_now = int(_as_int(cfg.get("intra_day_scalp_min_conf", style_rule("스캘핑").get("min_conf", 55)), 55))
+                    elif style_mandatory == "단타":
+                        min_conf_gate_now = int(_as_int(cfg.get("intra_day_day_min_conf", style_rule("단타").get("min_conf", 65)), 65))
+                    else:
+                        min_conf_gate_now = int(_as_int(cfg.get("intra_day_swing_min_conf", style_rule("스윙").get("min_conf", 68)), 68))
+                    anti_step_now = int(_as_int(cfg.get("_anti_drought_step", 0), 0))
+                    gate_mode_now = str(countertrend_short_gate_mode(style_mandatory, cfg, anti_step_now))
+                    soft_min_conf_now = int(countertrend_short_soft_allow_min_conf(style_mandatory, cfg))
+                    out["_countertrend_short_gate_mode"] = str(gate_mode_now)
+
+                    if gate_mode_now == "off":
+                        out.setdefault("_gate_overrides", [])
+                        if "countertrend_short" not in out["_gate_overrides"]:
+                            out["_gate_overrides"].append("countertrend_short")
+                        out["_gate_override_penalty_enable"] = True
+                        out["_reversal_block_overridden"] = True
+                        out["_reversal_override_threshold"] = 0
+                        out["reason_easy"] = (
+                            f"{str(out.get('reason_easy', '')).strip()} / "
+                            "상승추세 역숏(게이트 OFF by anti-drought)"
+                        ).strip(" /")
+                    elif high_conf_override_ok(
+                        conf_now,
+                        min_conf_gate_now,
+                        anti_step_now,
+                        cfg,
+                        gate_key="countertrend_short",
+                    ):
+                        thr_now = int(high_conf_override_threshold(min_conf_gate_now, anti_step_now, cfg))
+                        out.setdefault("_gate_overrides", [])
+                        if "countertrend_short" not in out["_gate_overrides"]:
+                            out["_gate_overrides"].append("countertrend_short")
+                        out["_gate_override_penalty_enable"] = True
+                        out["_reversal_block_overridden"] = True
+                        out["_reversal_override_threshold"] = int(thr_now)
+                        out["reason_easy"] = (
+                            f"{str(out.get('reason_easy', '')).strip()} / "
+                            f"상승추세 역숏(고확신 예외, conf {conf_now}>=thr {thr_now})"
+                        ).strip(" /")
+                    elif gate_mode_now == "soft" and conf_now >= soft_min_conf_now:
+                        out.setdefault("_gate_overrides", [])
+                        if "countertrend_short" not in out["_gate_overrides"]:
+                            out["_gate_overrides"].append("countertrend_short")
+                        out["_gate_override_penalty_enable"] = True
+                        out["_reversal_block_overridden"] = True
+                        out["_reversal_override_threshold"] = int(soft_min_conf_now)
+                        out["reason_easy"] = (
+                            f"{str(out.get('reason_easy', '')).strip()} / "
+                            f"상승추세 역숏(soft-allow, conf {conf_now}>=min {soft_min_conf_now})"
+                        ).strip(" /")
+                    else:
+                        out["decision"] = "hold"
+                        out["reason_easy"] = f"상승추세 역숏 차단: 반전신호 약함({','.join(miss)})"
         except Exception:
             pass
 
@@ -24148,6 +24278,8 @@ def telegram_thread(ex):
                             "htf_gate_mode_scalp_effective": str(cfg_effective.get("htf_alignment_gate_mode_scalp", cfg.get("htf_alignment_gate_mode_scalp", "soft"))),
                             "htf_gate_mode_day_effective": str(cfg_effective.get("htf_alignment_gate_mode_day", cfg.get("htf_alignment_gate_mode_day", "soft"))),
                             "htf_gate_mode_swing_effective": str(cfg_effective.get("htf_alignment_gate_mode_swing", cfg.get("htf_alignment_gate_mode_swing", "hard"))),
+                            "countertrend_short_gate_mode_scalp_effective": str(cfg_effective.get("countertrend_short_gate_mode_scalp", cfg.get("countertrend_short_gate_mode_scalp", "soft"))),
+                            "countertrend_short_gate_mode_day_effective": str(cfg_effective.get("countertrend_short_gate_mode_day", cfg.get("countertrend_short_gate_mode_day", "soft"))),
                             "effective_min_conf_scalp": int(_as_int(anti_drought_state.get("effective_min_conf_scalp", cfg_effective.get("intra_day_scalp_min_conf", 55)), 55)),
                             "effective_min_conf_day": int(_as_int(anti_drought_state.get("effective_min_conf_day", cfg_effective.get("intra_day_day_min_conf", 65)), 65)),
                             "effective_min_conf_swing": int(_as_int(anti_drought_state.get("effective_min_conf_swing", cfg_effective.get("intra_day_swing_min_conf", 68)), 68)),
@@ -26618,8 +26750,8 @@ def telegram_thread(ex):
                             except Exception:
                                 pass
 
-                            # ✅ 역추세 숏 하드 필터(최종 주문 직전):
-                            # 단기 상승추세에서 숏은 3조건(약세다이버전스+SQZ음전환+MA7하향이탈) 미충족 시 차단
+                            # ✅ 역추세 숏 필터(최종 주문 직전):
+                            # 기본은 보수적으로 관리하되, drought/고확신/soft-allow에서 예외 진입 허용
                             try:
                                 if str(decision) == "sell":
                                     ma_fast_cur = float(last.get("MA_fast")) if ("MA_fast" in df.columns and pd.notna(last.get("MA_fast"))) else None
@@ -26645,7 +26777,44 @@ def telegram_thread(ex):
                                             missing2.append("MA7하향이탈")
                                         min_conf_gate_current = int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0)))
                                         anti_step_now = int(_as_int((anti_drought_state or {}).get("step", 0), 0))
-                                        if high_conf_override_ok(int(conf), int(min_conf_gate_current), int(anti_step_now), cfg_effective, gate_key="countertrend_short"):
+                                        gate_mode_now = str(countertrend_short_gate_mode(str(style), cfg_effective, int(anti_step_now)))
+                                        soft_min_conf_now = int(countertrend_short_soft_allow_min_conf(str(style), cfg_effective))
+                                        cs["countertrend_short_gate_mode_effective"] = str(gate_mode_now)
+                                        if gate_mode_now == "off":
+                                            _append_gate_override_state(cs, "countertrend_short", int(conf), 0, "anti-drought off")
+                                            mon_add_scan(
+                                                mon,
+                                                stage="gate_overridden",
+                                                symbol=sym,
+                                                tf=str(cfg.get("timeframe", "5m")),
+                                                signal="sell",
+                                                score=int(conf),
+                                                message="countertrend_short_gate_off_by_anti_drought",
+                                                extra={
+                                                    "reason_code": "GATE_OVERRIDDEN",
+                                                    "gate": "countertrend_short",
+                                                    "mode": "off",
+                                                    "conf": int(conf),
+                                                    "threshold": 0,
+                                                    "trend_short": str(stt.get("추세", "")),
+                                                    "sqz_mom_pct": float(stt.get("_sqz_mom_pct", 0.0) or 0.0),
+                                                    "missing": list(missing2),
+                                                },
+                                            )
+                                            mon_add_entry_trace(
+                                                mon,
+                                                cfg_effective,
+                                                symbol=sym,
+                                                style=str(style),
+                                                event="ENTRY_CANDIDATE",
+                                                decision="sell",
+                                                conf=int(conf),
+                                                min_conf=int(min_conf_gate_current),
+                                                reason_code="GATE_OVERRIDDEN_COUNTERTREND_SHORT",
+                                                detail=f"countertrend gate off by anti-drought(step={int(anti_step_now)})",
+                                                extra={"mode": "off", "anti_step": int(anti_step_now), "missing": list(missing2)},
+                                            )
+                                        elif high_conf_override_ok(int(conf), int(min_conf_gate_current), int(anti_step_now), cfg_effective, gate_key="countertrend_short"):
                                             thr = int(high_conf_override_threshold(int(min_conf_gate_current), int(anti_step_now), cfg_effective))
                                             _append_gate_override_state(cs, "countertrend_short", int(conf), int(thr), ",".join(missing2))
                                             mon_add_scan(
@@ -26665,6 +26834,53 @@ def telegram_thread(ex):
                                                     "sqz_mom_pct": float(stt.get("_sqz_mom_pct", 0.0) or 0.0),
                                                     "missing": list(missing2),
                                                 },
+                                            )
+                                            mon_add_entry_trace(
+                                                mon,
+                                                cfg_effective,
+                                                symbol=sym,
+                                                style=str(style),
+                                                event="ENTRY_CANDIDATE",
+                                                decision="sell",
+                                                conf=int(conf),
+                                                min_conf=int(min_conf_gate_current),
+                                                reason_code="GATE_OVERRIDDEN_COUNTERTREND_SHORT",
+                                                detail=f"high-conf override(conf {int(conf)}>=thr {int(thr)})",
+                                                extra={"mode": str(gate_mode_now), "threshold": int(thr), "missing": list(missing2)},
+                                            )
+                                        elif gate_mode_now == "soft" and int(conf) >= int(soft_min_conf_now):
+                                            _append_gate_override_state(cs, "countertrend_short", int(conf), int(soft_min_conf_now), "soft_allow")
+                                            mon_add_scan(
+                                                mon,
+                                                stage="gate_overridden",
+                                                symbol=sym,
+                                                tf=str(cfg.get("timeframe", "5m")),
+                                                signal="sell",
+                                                score=int(conf),
+                                                message="countertrend_short_soft_allow",
+                                                extra={
+                                                    "reason_code": "GATE_OVERRIDDEN",
+                                                    "gate": "countertrend_short",
+                                                    "mode": "soft",
+                                                    "conf": int(conf),
+                                                    "threshold": int(soft_min_conf_now),
+                                                    "trend_short": str(stt.get("추세", "")),
+                                                    "sqz_mom_pct": float(stt.get("_sqz_mom_pct", 0.0) or 0.0),
+                                                    "missing": list(missing2),
+                                                },
+                                            )
+                                            mon_add_entry_trace(
+                                                mon,
+                                                cfg_effective,
+                                                symbol=sym,
+                                                style=str(style),
+                                                event="ENTRY_CANDIDATE",
+                                                decision="sell",
+                                                conf=int(conf),
+                                                min_conf=int(min_conf_gate_current),
+                                                reason_code="GATE_OVERRIDDEN_COUNTERTREND_SHORT",
+                                                detail=f"soft-allow(conf {int(conf)}>=min {int(soft_min_conf_now)})",
+                                                extra={"mode": "soft", "threshold": int(soft_min_conf_now), "missing": list(missing2)},
                                             )
                                         else:
                                             cs["skip_reason"] = f"상승추세 역숏 차단({','.join(missing2)})"
@@ -26689,7 +26905,7 @@ def telegram_thread(ex):
                                                 min_conf=int(min_conf_gate_current),
                                                 reason_code="COUNTERTREND_SHORT_BLOCK",
                                                 detail=str(cs.get("skip_reason", ""))[:220],
-                                                extra={"missing": list(missing2)},
+                                                extra={"mode": str(gate_mode_now), "missing": list(missing2)},
                                             )
                                             continue
                             except Exception:
@@ -30588,6 +30804,57 @@ with st.sidebar.expander("관망 완화(anti-drought, 10분 단계)"):
         int(_as_int(config.get("anti_drought_disable_htf_gate_step", 4), 4)),
         step=1,
         key="anti_drought_disable_htf_gate_step_key",
+    )
+    ac1, ac2 = st.columns(2)
+    config["countertrend_short_gate_mode_scalp"] = ac1.selectbox(
+        "역숏 게이트(스캘핑)",
+        ["soft", "hard", "off"],
+        index=["soft", "hard", "off"].index(str(config.get("countertrend_short_gate_mode_scalp", "soft")).lower())
+        if str(config.get("countertrend_short_gate_mode_scalp", "soft")).lower() in ["soft", "hard", "off"]
+        else 0,
+        key="countertrend_short_gate_mode_scalp_key",
+    )
+    config["countertrend_short_gate_mode_day"] = ac2.selectbox(
+        "역숏 게이트(단타)",
+        ["soft", "hard", "off"],
+        index=["soft", "hard", "off"].index(str(config.get("countertrend_short_gate_mode_day", "soft")).lower())
+        if str(config.get("countertrend_short_gate_mode_day", "soft")).lower() in ["soft", "hard", "off"]
+        else 0,
+        key="countertrend_short_gate_mode_day_key",
+    )
+    ac3, ac4 = st.columns(2)
+    config["countertrend_short_soft_allow_min_conf_scalp"] = ac3.number_input(
+        "역숏 soft-allow 최소conf(스캘핑)",
+        0,
+        100,
+        int(_as_int(config.get("countertrend_short_soft_allow_min_conf_scalp", 72), 72)),
+        step=1,
+        key="countertrend_short_soft_allow_min_conf_scalp_key",
+    )
+    config["countertrend_short_soft_allow_min_conf_day"] = ac4.number_input(
+        "역숏 soft-allow 최소conf(단타)",
+        0,
+        100,
+        int(_as_int(config.get("countertrend_short_soft_allow_min_conf_day", 78), 78)),
+        step=1,
+        key="countertrend_short_soft_allow_min_conf_day_key",
+    )
+    ac5, ac6 = st.columns(2)
+    config["anti_drought_soften_countertrend_short_step"] = ac5.number_input(
+        "anti: 역숏 hard→soft 단계",
+        1,
+        20,
+        int(_as_int(config.get("anti_drought_soften_countertrend_short_step", 2), 2)),
+        step=1,
+        key="anti_drought_soften_countertrend_short_step_key",
+    )
+    config["anti_drought_disable_countertrend_short_step"] = ac6.number_input(
+        "anti: 역숏 OFF 단계",
+        1,
+        20,
+        int(_as_int(config.get("anti_drought_disable_countertrend_short_step", 4), 4)),
+        step=1,
+        key="anti_drought_disable_countertrend_short_step_key",
     )
     ad11, ad12, ad13 = st.columns(3)
     config["anti_drought_min_conf_floor_scalp"] = ad11.number_input("스캘핑 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_scalp", 50), 50)), step=1, key="anti_drought_min_conf_floor_scalp_key")

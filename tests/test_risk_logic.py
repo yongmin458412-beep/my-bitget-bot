@@ -16,6 +16,7 @@ def _load_risk_symbols():
     keep_assigns = {"STYLE_RULES"}
     keep_funcs = {
         "_as_float",
+        "_as_int",
         "normalize_style_name",
         "style_rule",
         "hard_roi_limits_by_style",
@@ -27,6 +28,8 @@ def _load_risk_symbols():
         "_price_from_roi_target",
         "_pct_from_entry",
         "estimate_roi_from_price",
+        "countertrend_short_gate_mode",
+        "countertrend_short_soft_allow_min_conf",
         "_startup_reconcile_style_from_position",
     }
     body = []
@@ -228,6 +231,30 @@ class RiskLogicTest(unittest.TestCase):
         self.assertAlmostEqual(float(price_pct), 0.75, places=8)
         roi = estimate_roi(entry, float(tp), "short", lev)
         self.assertAlmostEqual(float(roi), target_roi, places=8)
+
+    def test_countertrend_gate_mode_softens_and_disables_by_anti_drought(self):
+        gate_mode = self.ns["countertrend_short_gate_mode"]
+        cfg = {
+            "countertrend_short_gate_mode_scalp": "hard",
+            "countertrend_short_gate_mode_day": "hard",
+            "anti_drought_soften_countertrend_short_step": 2,
+            "anti_drought_disable_countertrend_short_step": 4,
+        }
+        self.assertEqual(gate_mode("스캘핑", cfg, anti_step=0), "hard")
+        self.assertEqual(gate_mode("스캘핑", cfg, anti_step=2), "soft")
+        self.assertEqual(gate_mode("스캘핑", cfg, anti_step=4), "off")
+        self.assertEqual(gate_mode("단타", cfg, anti_step=3), "soft")
+        self.assertEqual(gate_mode("스윙", cfg, anti_step=10), "hard")
+
+    def test_countertrend_soft_allow_min_conf_by_style(self):
+        soft_min_conf = self.ns["countertrend_short_soft_allow_min_conf"]
+        cfg = {
+            "countertrend_short_soft_allow_min_conf_scalp": 72,
+            "countertrend_short_soft_allow_min_conf_day": 78,
+        }
+        self.assertEqual(soft_min_conf("스캘핑", cfg), 72)
+        self.assertEqual(soft_min_conf("단타", cfg), 78)
+        self.assertEqual(soft_min_conf("스윙", cfg), 100)
 
     def test_startup_reconcile_style_auto_by_leverage(self):
         fn = self.ns["_startup_reconcile_style_from_position"]
