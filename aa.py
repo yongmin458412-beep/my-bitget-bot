@@ -1722,6 +1722,18 @@ def default_settings() -> Dict[str, Any]:
         "anti_drought_min_conf_floor_day": 60,
         "anti_drought_min_conf_floor_swing": 60,
         "anti_drought_skip_window": 200,
+        # ✅ 고확신 게이트 오버라이드(하드 차단 대신 예외 진입, 리스크는 감산)
+        "high_conf_override_enable": True,
+        "high_conf_override_abs_min_conf": 82,
+        "high_conf_override_margin_above_gate": 12,
+        "high_conf_override_ichimoku_enable": True,
+        "high_conf_override_htf_enable": True,
+        "high_conf_override_countertrend_short_enable": True,
+        "high_conf_override_entry_pct_mult": 0.80,
+        "high_conf_override_lev_mult": 0.90,
+        "high_conf_override_anti_step_bonus_enable": True,
+        "high_conf_override_anti_step_conf_bonus_per_step": 1,
+        "high_conf_override_anti_step_conf_bonus_max": 5,
 
         # ✅ 무포지션(관망) 상태 분석 리포트
         "tg_enable_watch_report": True,
@@ -14321,6 +14333,90 @@ def _rr_min_by_style(style: str) -> float:
     return 1.4
 
 
+def _high_conf_override_gate_enabled(gate_key: str, cfg: Dict[str, Any]) -> bool:
+    try:
+        k = str(gate_key or "").strip().lower()
+        if k in ["ichimoku", "ichi", "ichimoku_primary"]:
+            return bool(cfg.get("high_conf_override_ichimoku_enable", True))
+        if k in ["htf", "htf_alignment", "htf_block"]:
+            return bool(cfg.get("high_conf_override_htf_enable", True))
+        if k in ["countertrend_short", "counter_short", "reverse_short"]:
+            return bool(cfg.get("high_conf_override_countertrend_short_enable", True))
+        return bool(cfg.get("high_conf_override_enable", True))
+    except Exception:
+        return False
+
+
+def high_conf_override_threshold(min_conf_gate: int, anti_step: int, cfg: Dict[str, Any]) -> int:
+    try:
+        base_abs = int(max(0, _as_int(cfg.get("high_conf_override_abs_min_conf", 82), 82)))
+        margin = int(max(0, _as_int(cfg.get("high_conf_override_margin_above_gate", 12), 12)))
+        thr = int(max(base_abs, int(max(0, _as_int(min_conf_gate, 0))) + margin))
+        if bool(cfg.get("high_conf_override_anti_step_bonus_enable", True)):
+            bonus_per_step = int(max(0, _as_int(cfg.get("high_conf_override_anti_step_conf_bonus_per_step", 1), 1)))
+            bonus_max = int(max(0, _as_int(cfg.get("high_conf_override_anti_step_conf_bonus_max", 5), 5)))
+            bonus = int(min(bonus_max, max(0, int(anti_step)) * bonus_per_step))
+            thr = int(thr - bonus)
+        return int(max(0, min(100, thr)))
+    except Exception:
+        return int(max(0, min(100, int(_as_int(min_conf_gate, 0)))))
+
+
+def high_conf_override_ok(conf: int, min_conf_gate: int, anti_step: int, cfg: Dict[str, Any], gate_key: str) -> bool:
+    try:
+        if not bool(cfg.get("high_conf_override_enable", True)):
+            return False
+        if not _high_conf_override_gate_enabled(gate_key, cfg):
+            return False
+        thr = int(high_conf_override_threshold(min_conf_gate=min_conf_gate, anti_step=anti_step, cfg=cfg))
+        return int(_as_int(conf, 0)) >= int(thr)
+    except Exception:
+        return False
+
+
+def apply_override_penalty(entry_pct: float, lev: int, rule: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[float, int, Dict[str, Any]]:
+    try:
+        ep = float(_as_float(entry_pct, 0.0))
+        lv = int(max(1, _as_int(lev, 1)))
+        e_mult = float(clamp(float(_as_float(cfg.get("high_conf_override_entry_pct_mult", 0.80), 0.80)), 0.1, 1.0))
+        l_mult = float(clamp(float(_as_float(cfg.get("high_conf_override_lev_mult", 0.90), 0.90)), 0.1, 1.0))
+        ep2_raw = float(clamp(ep * e_mult, float(_as_float(rule.get("entry_pct_min", ep), ep)), float(_as_float(rule.get("entry_pct_max", ep), ep))))
+        lv2_raw = int(clamp(int(round(float(lv) * l_mult)), int(max(1, _as_int(rule.get("lev_min", 1), 1))), int(max(1, _as_int(rule.get("lev_max", lv), lv)))))
+        ep2 = float(min(ep, ep2_raw))
+        lv2 = int(min(lv, lv2_raw))
+        meta = {
+            "entry_pct_mult": float(e_mult),
+            "lev_mult": float(l_mult),
+            "entry_pct_before": float(ep),
+            "entry_pct_after": float(ep2),
+            "lev_before": int(lv),
+            "lev_after": int(lv2),
+        }
+        return float(ep2), int(lv2), meta
+    except Exception:
+        return float(entry_pct), int(max(1, _as_int(lev, 1))), {}
+
+
+def _append_gate_override_state(cs: Dict[str, Any], gate: str, conf: int, threshold: int, reason: str = "") -> None:
+    try:
+        arr = list(cs.get("gate_overrides", []) or [])
+        g = str(gate or "").strip()
+        if g and g not in arr:
+            arr.append(g)
+        cs["gate_overrides"] = arr
+        parts = list(cs.get("gate_override_reasons", []) or [])
+        txt = f"{g}(conf {int(conf)} >= thr {int(threshold)})"
+        if str(reason or "").strip():
+            txt = f"{txt}: {str(reason)[:80]}"
+        parts.append(txt)
+        cs["gate_override_reasons"] = parts[-8:]
+        cs["gate_override_reason"] = " | ".join(cs["gate_override_reasons"])
+        cs["gate_override_text"] = f"OVERRIDE:{','.join([str(x) for x in arr])}"
+        cs["_override_penalty_enable"] = True
+    except Exception:
+        pass
+
+
 def _risk_guardrail(out: Dict[str, Any], df: pd.DataFrame, decision: str, mode: str, style: str, external: Dict[str, Any]) -> Dict[str, Any]:
     lev = max(1, int(out.get("leverage", 1)))
     sl_roi = float(out.get("sl_pct", 1.2))
@@ -14802,10 +14898,28 @@ JSON 형식:
             if style_mandatory in ["스캘핑", "단타"] and str(out.get("decision", "hold")) == "buy":
                 is_bear, bear_reason = htf_bearish_bias_for_intraday(mtf_context if isinstance(mtf_context, dict) else {})
                 if is_bear:
-                    out["decision"] = "hold"
-                    out["reason_easy"] = f"HTF 역방향 차단: {bear_reason}"
-                    out["_htf_blocked"] = True
-                    out["_htf_block_reason"] = str(bear_reason)
+                    conf_now = int(_as_int(out.get("confidence", 0), 0))
+                    if style_mandatory == "스캘핑":
+                        min_conf_gate_now = int(_as_int(cfg.get("intra_day_scalp_min_conf", style_rule("스캘핑").get("min_conf", 55)), 55))
+                    else:
+                        min_conf_gate_now = int(_as_int(cfg.get("intra_day_day_min_conf", style_rule("단타").get("min_conf", 65)), 65))
+                    anti_step_now = int(_as_int(cfg.get("_anti_drought_step", 0), 0))
+                    thr_now = int(high_conf_override_threshold(min_conf_gate_now, anti_step_now, cfg))
+                    if high_conf_override_ok(conf_now, min_conf_gate_now, anti_step_now, cfg, gate_key="htf"):
+                        out.setdefault("_gate_overrides", [])
+                        if "htf" not in out["_gate_overrides"]:
+                            out["_gate_overrides"].append("htf")
+                        out["_gate_override_penalty_enable"] = True
+                        out["_htf_blocked"] = True
+                        out["_htf_block_overridden"] = True
+                        out["_htf_block_reason"] = str(bear_reason)
+                        out["_htf_override_threshold"] = int(thr_now)
+                        out["reason_easy"] = f"{str(out.get('reason_easy', '')).strip()} / HTF 역방향 차단 신호(고확신 예외, conf {conf_now}>=thr {thr_now})"
+                    else:
+                        out["decision"] = "hold"
+                        out["reason_easy"] = f"HTF 역방향 차단: {bear_reason}"
+                        out["_htf_blocked"] = True
+                        out["_htf_block_reason"] = str(bear_reason)
         except Exception:
             pass
 
@@ -25755,19 +25869,59 @@ def telegram_thread(ex):
                             except Exception:
                                 pass
 
+                            try:
+                                cs["gate_overrides"] = []
+                                cs["gate_override_reasons"] = []
+                                cs["gate_override_reason"] = ""
+                                cs["gate_override_text"] = ""
+                                cs["gate_override_threshold"] = ""
+                                cs["_override_penalty_enable"] = False
+                            except Exception:
+                                pass
+
                             # ✅ 인트라데이 진입 1차 필터: 이치모쿠 구름 방향
                             # - 롱: below_cloud 금지 / 숏: above_cloud 금지
                             try:
                                 ichi_pos = str(stt.get("ICHI_PRICE_CLOUD", "") or "").strip().lower()
                                 if str(style) in ["스캘핑", "단타"]:
+                                    min_conf_gate_current = int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0)))
+                                    anti_step_now = int(_as_int((anti_drought_state or {}).get("step", 0), 0))
                                     if (str(decision) == "buy") and (ichi_pos == "below_cloud"):
-                                        cs["skip_reason"] = "이치모쿠 구름 역방향(롱 차단)"
-                                        mon_add_scan(mon, stage="trade_skipped", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=int(conf), message="ichimoku_primary_filter")
-                                        continue
+                                        if high_conf_override_ok(int(conf), int(min_conf_gate_current), int(anti_step_now), cfg_effective, gate_key="ichimoku"):
+                                            thr = int(high_conf_override_threshold(int(min_conf_gate_current), int(anti_step_now), cfg_effective))
+                                            _append_gate_override_state(cs, "ichimoku", int(conf), int(thr), "롱 below_cloud")
+                                            mon_add_scan(
+                                                mon,
+                                                stage="gate_overridden",
+                                                symbol=sym,
+                                                tf=str(cfg.get("timeframe", "5m")),
+                                                signal=str(decision),
+                                                score=int(conf),
+                                                message="ichimoku_primary_filter_overridden",
+                                                extra={"reason_code": "GATE_OVERRIDDEN", "gate": "ichimoku", "conf": int(conf), "threshold": int(thr), "style": str(style), "cloud_pos": str(ichi_pos)},
+                                            )
+                                        else:
+                                            cs["skip_reason"] = "이치모쿠 구름 역방향(롱 차단)"
+                                            mon_add_scan(mon, stage="trade_skipped", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=int(conf), message="ichimoku_primary_filter")
+                                            continue
                                     if (str(decision) == "sell") and (ichi_pos == "above_cloud"):
-                                        cs["skip_reason"] = "이치모쿠 구름 역방향(숏 차단)"
-                                        mon_add_scan(mon, stage="trade_skipped", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=int(conf), message="ichimoku_primary_filter")
-                                        continue
+                                        if high_conf_override_ok(int(conf), int(min_conf_gate_current), int(anti_step_now), cfg_effective, gate_key="ichimoku"):
+                                            thr = int(high_conf_override_threshold(int(min_conf_gate_current), int(anti_step_now), cfg_effective))
+                                            _append_gate_override_state(cs, "ichimoku", int(conf), int(thr), "숏 above_cloud")
+                                            mon_add_scan(
+                                                mon,
+                                                stage="gate_overridden",
+                                                symbol=sym,
+                                                tf=str(cfg.get("timeframe", "5m")),
+                                                signal=str(decision),
+                                                score=int(conf),
+                                                message="ichimoku_primary_filter_overridden",
+                                                extra={"reason_code": "GATE_OVERRIDDEN", "gate": "ichimoku", "conf": int(conf), "threshold": int(thr), "style": str(style), "cloud_pos": str(ichi_pos)},
+                                            )
+                                        else:
+                                            cs["skip_reason"] = "이치모쿠 구름 역방향(숏 차단)"
+                                            mon_add_scan(mon, stage="trade_skipped", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=int(conf), message="ichimoku_primary_filter")
+                                            continue
                             except Exception:
                                 pass
 
@@ -25820,18 +25974,34 @@ def telegram_thread(ex):
                                 if str(style) in ["스캘핑", "단타"] and str(decision) == "buy":
                                     htf_block, htf_reason = htf_bearish_bias_for_intraday(mtf_context if isinstance(mtf_context, dict) else {})
                                     if bool(htf_block):
-                                        cs["skip_reason"] = f"HTF 역추세 차단({htf_reason})"
-                                        mon_add_scan(
-                                            mon,
-                                            stage="trade_skipped",
-                                            symbol=sym,
-                                            tf="1h/4h",
-                                            signal=str(decision),
-                                            score=int(conf),
-                                            message="htf_alignment_block",
-                                            extra={"style": str(style), "reason": str(htf_reason)},
-                                        )
-                                        continue
+                                        min_conf_gate_current = int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0)))
+                                        anti_step_now = int(_as_int((anti_drought_state or {}).get("step", 0), 0))
+                                        if high_conf_override_ok(int(conf), int(min_conf_gate_current), int(anti_step_now), cfg_effective, gate_key="htf"):
+                                            thr = int(high_conf_override_threshold(int(min_conf_gate_current), int(anti_step_now), cfg_effective))
+                                            _append_gate_override_state(cs, "htf", int(conf), int(thr), str(htf_reason))
+                                            mon_add_scan(
+                                                mon,
+                                                stage="gate_overridden",
+                                                symbol=sym,
+                                                tf="1h/4h",
+                                                signal=str(decision),
+                                                score=int(conf),
+                                                message="htf_alignment_block_overridden",
+                                                extra={"reason_code": "GATE_OVERRIDDEN", "gate": "htf", "style": str(style), "reason": str(htf_reason), "conf": int(conf), "threshold": int(thr)},
+                                            )
+                                        else:
+                                            cs["skip_reason"] = f"HTF 역추세 차단({htf_reason})"
+                                            mon_add_scan(
+                                                mon,
+                                                stage="trade_skipped",
+                                                symbol=sym,
+                                                tf="1h/4h",
+                                                signal=str(decision),
+                                                score=int(conf),
+                                                message="htf_alignment_block",
+                                                extra={"style": str(style), "reason": str(htf_reason)},
+                                            )
+                                            continue
                             except Exception:
                                 pass
 
@@ -25980,18 +26150,42 @@ def telegram_thread(ex):
                                             missing2.append("SQZ음전환")
                                         if not below_fast2:
                                             missing2.append("MA7하향이탈")
-                                        cs["skip_reason"] = f"상승추세 역숏 차단({','.join(missing2)})"
-                                        mon_add_scan(
-                                            mon,
-                                            stage="trade_skipped",
-                                            symbol=sym,
-                                            tf=str(cfg.get("timeframe", "5m")),
-                                            signal="sell",
-                                            score=int(conf),
-                                            message=str(cs.get("skip_reason", ""))[:140],
-                                            extra={"trend_short": str(stt.get("추세", "")), "sqz_mom_pct": float(stt.get("_sqz_mom_pct", 0.0) or 0.0)},
-                                        )
-                                        continue
+                                        min_conf_gate_current = int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0)))
+                                        anti_step_now = int(_as_int((anti_drought_state or {}).get("step", 0), 0))
+                                        if high_conf_override_ok(int(conf), int(min_conf_gate_current), int(anti_step_now), cfg_effective, gate_key="countertrend_short"):
+                                            thr = int(high_conf_override_threshold(int(min_conf_gate_current), int(anti_step_now), cfg_effective))
+                                            _append_gate_override_state(cs, "countertrend_short", int(conf), int(thr), ",".join(missing2))
+                                            mon_add_scan(
+                                                mon,
+                                                stage="gate_overridden",
+                                                symbol=sym,
+                                                tf=str(cfg.get("timeframe", "5m")),
+                                                signal="sell",
+                                                score=int(conf),
+                                                message="countertrend_short_overridden",
+                                                extra={
+                                                    "reason_code": "GATE_OVERRIDDEN",
+                                                    "gate": "countertrend_short",
+                                                    "conf": int(conf),
+                                                    "threshold": int(thr),
+                                                    "trend_short": str(stt.get("추세", "")),
+                                                    "sqz_mom_pct": float(stt.get("_sqz_mom_pct", 0.0) or 0.0),
+                                                    "missing": list(missing2),
+                                                },
+                                            )
+                                        else:
+                                            cs["skip_reason"] = f"상승추세 역숏 차단({','.join(missing2)})"
+                                            mon_add_scan(
+                                                mon,
+                                                stage="trade_skipped",
+                                                symbol=sym,
+                                                tf=str(cfg.get("timeframe", "5m")),
+                                                signal="sell",
+                                                score=int(conf),
+                                                message=str(cs.get("skip_reason", ""))[:140],
+                                                extra={"trend_short": str(stt.get("추세", "")), "sqz_mom_pct": float(stt.get("_sqz_mom_pct", 0.0) or 0.0)},
+                                            )
+                                            continue
                             except Exception:
                                 pass
 
@@ -26391,6 +26585,36 @@ def telegram_thread(ex):
                                         ai2["entry_pct"] = float(entry_pct)
                                     except Exception:
                                         pass
+                            except Exception:
+                                pass
+
+                            # ✅ 고확신 게이트 오버라이드 발생 시 안전 감산(비중/레버리지만 감소)
+                            try:
+                                ov_list = list(cs.get("gate_overrides", []) or [])
+                                if decision in ["buy", "sell"] and bool(cs.get("_override_penalty_enable", False)) and ov_list:
+                                    entry_before = float(entry_pct)
+                                    lev_before = int(lev)
+                                    entry_pct, lev, ov_meta = apply_override_penalty(float(entry_pct), int(lev), rule, cfg_effective)
+                                    if float(entry_before) > 0:
+                                        scale_entry = float(entry_pct) / float(entry_before)
+                                        entry_usdt = float(max(0.0, float(entry_usdt) * float(scale_entry)))
+                                    ai2["entry_pct"] = float(entry_pct)
+                                    ai2["leverage"] = int(lev)
+                                    ai2["_gate_overrides"] = [str(x) for x in ov_list]
+                                    ai2["_gate_override_penalty"] = dict(ov_meta or {})
+                                    ai2["_gate_override_reason"] = str(cs.get("gate_override_reason", "") or "")
+                                    cs["gate_override_text"] = f"OVERRIDE:{','.join([str(x) for x in ov_list])}"
+                                    cs["gate_override_threshold"] = int(
+                                        high_conf_override_threshold(
+                                            int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                            int(_as_int((anti_drought_state or {}).get("step", 0), 0)),
+                                            cfg_effective,
+                                        )
+                                    )
+                                    ai2["reason_easy"] = (
+                                        f"{str(ai2.get('reason_easy', '')).strip()} | "
+                                        f"고확신 예외진입(게이트:{','.join([str(x) for x in ov_list])}), 비중/레버 감산"
+                                    ).strip(" |")
                             except Exception:
                                 pass
 
@@ -29601,6 +29825,73 @@ with st.sidebar.expander("관망 완화(anti-drought, 10분 단계)"):
     config["anti_drought_min_conf_floor_day"] = ad12.number_input("단타 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_day", 60), 60)), step=1, key="anti_drought_min_conf_floor_day_key")
     config["anti_drought_min_conf_floor_swing"] = ad13.number_input("스윙 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_swing", 60), 60)), step=1, key="anti_drought_min_conf_floor_swing_key")
 
+with st.sidebar.expander("Gates / Override"):
+    config["high_conf_override_enable"] = st.checkbox(
+        "고확신 게이트 오버라이드 사용",
+        value=bool(config.get("high_conf_override_enable", True)),
+        key="high_conf_override_enable_key",
+    )
+    ov1, ov2 = st.columns(2)
+    config["high_conf_override_abs_min_conf"] = ov1.number_input(
+        "절대 최소 확신(%)",
+        0,
+        100,
+        int(_as_int(config.get("high_conf_override_abs_min_conf", 82), 82)),
+        step=1,
+        key="high_conf_override_abs_min_conf_key",
+    )
+    config["high_conf_override_margin_above_gate"] = ov2.number_input(
+        "게이트 대비 여유(%)",
+        0,
+        50,
+        int(_as_int(config.get("high_conf_override_margin_above_gate", 12), 12)),
+        step=1,
+        key="high_conf_override_margin_above_gate_key",
+    )
+    ov3, ov4, ov5 = st.columns(3)
+    config["high_conf_override_ichimoku_enable"] = ov3.checkbox("이치모쿠", value=bool(config.get("high_conf_override_ichimoku_enable", True)), key="high_conf_override_ichimoku_enable_key")
+    config["high_conf_override_htf_enable"] = ov4.checkbox("HTF 정렬", value=bool(config.get("high_conf_override_htf_enable", True)), key="high_conf_override_htf_enable_key")
+    config["high_conf_override_countertrend_short_enable"] = ov5.checkbox("역추세 숏", value=bool(config.get("high_conf_override_countertrend_short_enable", True)), key="high_conf_override_countertrend_short_enable_key")
+    ov6, ov7 = st.columns(2)
+    config["high_conf_override_entry_pct_mult"] = ov6.number_input(
+        "오버라이드 비중 배수",
+        0.1,
+        1.0,
+        float(_as_float(config.get("high_conf_override_entry_pct_mult", 0.80), 0.80)),
+        step=0.05,
+        key="high_conf_override_entry_pct_mult_key",
+    )
+    config["high_conf_override_lev_mult"] = ov7.number_input(
+        "오버라이드 레버 배수",
+        0.1,
+        1.0,
+        float(_as_float(config.get("high_conf_override_lev_mult", 0.90), 0.90)),
+        step=0.05,
+        key="high_conf_override_lev_mult_key",
+    )
+    ov8, ov9, ov10 = st.columns(3)
+    config["high_conf_override_anti_step_bonus_enable"] = ov8.checkbox(
+        "anti-step 보너스",
+        value=bool(config.get("high_conf_override_anti_step_bonus_enable", True)),
+        key="high_conf_override_anti_step_bonus_enable_key",
+    )
+    config["high_conf_override_anti_step_conf_bonus_per_step"] = ov9.number_input(
+        "단계당 conf 보너스",
+        0,
+        5,
+        int(_as_int(config.get("high_conf_override_anti_step_conf_bonus_per_step", 1), 1)),
+        step=1,
+        key="high_conf_override_anti_step_conf_bonus_per_step_key",
+    )
+    config["high_conf_override_anti_step_conf_bonus_max"] = ov10.number_input(
+        "최대 보너스",
+        0,
+        20,
+        int(_as_int(config.get("high_conf_override_anti_step_conf_bonus_max", 5), 5)),
+        step=1,
+        key="high_conf_override_anti_step_conf_bonus_max_key",
+    )
+
 st.sidebar.subheader("⏱️ 주기 리포트")
 config["tg_enable_heartbeat_report"] = st.sidebar.checkbox(
     "💓 하트비트(요약) 전송",
@@ -30373,7 +30664,10 @@ try:
                     "단계시각": cs0.get("scan_stage_kst", ""),
                     "AI": str(cs0.get("ai_decision", "-")).upper() if cs0 else "-",
                     "확신": cs0.get("ai_confidence", ""),
-                    "스킵/근거": (cs0.get("skip_reason") or cs0.get("ai_reason_easy") or "")[:60],
+                    "스킵/근거": (
+                        ((str(cs0.get("gate_override_text", "") or "") + " | ") if str(cs0.get("gate_override_text", "") or "").strip() else "")
+                        + str(cs0.get("skip_reason") or cs0.get("ai_reason_easy") or "")
+                    )[:80],
                 }
             )
         st_dataframe_safe(df_for_display(pd.DataFrame(rows0)), hide_index=True)
@@ -30602,6 +30896,33 @@ with t1:
             if isinstance(skip_rows, list) and skip_rows:
                 st.caption("최근 스킵 사유 TOP 10")
                 st_dataframe_safe(df_for_display(pd.DataFrame(skip_rows[:10])), hide_index=True)
+            try:
+                sp = mon.get("scan_process", []) or []
+                if isinstance(sp, list) and sp:
+                    ov_rows: List[Dict[str, Any]] = []
+                    for rec in reversed(sp[-400:]):
+                        if not isinstance(rec, dict):
+                            continue
+                        if str(rec.get("stage", "")).lower().strip() != "gate_overridden":
+                            continue
+                        ex0 = rec.get("extra", {}) if isinstance(rec.get("extra", {}), dict) else {}
+                        ov_rows.append(
+                            {
+                                "time_kst": str(rec.get("time_kst", "")),
+                                "symbol": str(rec.get("symbol", "")),
+                                "gate": str(ex0.get("gate", "") or rec.get("message", "")),
+                                "conf": int(_as_int(ex0.get("conf", rec.get("score", 0)), 0)),
+                                "threshold": int(_as_int(ex0.get("threshold", 0), 0)),
+                                "note": str(rec.get("message", ""))[:80],
+                            }
+                        )
+                        if len(ov_rows) >= 10:
+                            break
+                    if ov_rows:
+                        st.caption("최근 게이트 오버라이드 10건")
+                        st_dataframe_safe(df_for_display(pd.DataFrame(ov_rows)), hide_index=True)
+            except Exception:
+                pass
         except Exception:
             pass
         try:
@@ -30757,7 +31078,10 @@ with t1:
                     "TP%": cs.get("ai_tp_pct", "-"),
                     "손익비": cs.get("ai_rr", "-"),
                     "AI지표": cs.get("ai_used", ""),
-                    "스킵/근거": (cs.get("skip_reason") or cs.get("ai_reason_easy") or "")[:160],
+                    "스킵/근거": (
+                        ((str(cs.get("gate_override_text", "") or "") + " | ") if str(cs.get("gate_override_text", "") or "").strip() else "")
+                        + str(cs.get("skip_reason") or cs.get("ai_reason_easy") or "")
+                    )[:180],
                 }
             )
         if rows:
