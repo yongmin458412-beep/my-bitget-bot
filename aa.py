@@ -1718,6 +1718,8 @@ def default_settings() -> Dict[str, Any]:
         "anti_drought_disable_pattern_gate_step": 4,
         "anti_drought_loosen_microfilters_step": 5,
         "anti_drought_disable_volume_obv_gate_step": 5,
+        "anti_drought_soften_htf_gate_step": 2,
+        "anti_drought_disable_htf_gate_step": 4,
         "anti_drought_min_conf_floor_scalp": 50,
         "anti_drought_min_conf_floor_day": 60,
         "anti_drought_min_conf_floor_swing": 60,
@@ -1807,6 +1809,12 @@ def default_settings() -> Dict[str, Any]:
         "volume_obv_gate_mode_day": "hard",    # hard|soft|off
         "volume_obv_gate_mode_swing": "hard",  # hard|soft|off
         "volume_obv_gate_soft_penalty_conf": 8,
+        # ✅ HTF 정렬 게이트(스타일별): hard|soft|off
+        "htf_alignment_gate_mode_scalp": "soft",
+        "htf_alignment_gate_mode_day": "soft",
+        "htf_alignment_gate_mode_swing": "hard",
+        "htf_alignment_soft_allow_min_conf_scalp": 75,
+        "htf_alignment_soft_allow_min_conf_day": 80,
         # ✅ 스타일별 RR 하한(목표손절이 목표익절보다 커지는 케이스 방지)
         "scalp_rr_floor": 1.5,
         "day_rr_floor": 2.0,
@@ -14381,6 +14389,42 @@ def high_conf_override_ok(conf: int, min_conf_gate: int, anti_step: int, cfg: Di
         return False
 
 
+def htf_alignment_gate_mode(style: str, cfg: Dict[str, Any], anti_step: int = 0) -> str:
+    try:
+        style_ko = normalize_style_name(style)
+        if style_ko == "스캘핑":
+            mode = str(cfg.get("htf_alignment_gate_mode_scalp", "soft") or "soft").strip().lower()
+        elif style_ko == "단타":
+            mode = str(cfg.get("htf_alignment_gate_mode_day", "soft") or "soft").strip().lower()
+        else:
+            mode = str(cfg.get("htf_alignment_gate_mode_swing", "hard") or "hard").strip().lower()
+        if mode not in ["hard", "soft", "off"]:
+            mode = "hard"
+        if style_ko in ["스캘핑", "단타"]:
+            disable_step = int(max(1, _as_int(cfg.get("anti_drought_disable_htf_gate_step", 4), 4)))
+            soften_step = int(max(1, _as_int(cfg.get("anti_drought_soften_htf_gate_step", 2), 2)))
+            step_now = int(max(0, _as_int(anti_step, 0)))
+            if step_now >= disable_step:
+                mode = "off"
+            elif step_now >= soften_step and mode == "hard":
+                mode = "soft"
+        return mode
+    except Exception:
+        return "hard"
+
+
+def htf_soft_allow_min_conf(style: str, cfg: Dict[str, Any]) -> int:
+    try:
+        style_ko = normalize_style_name(style)
+        if style_ko == "스캘핑":
+            return int(max(0, min(100, _as_int(cfg.get("htf_alignment_soft_allow_min_conf_scalp", 75), 75))))
+        if style_ko == "단타":
+            return int(max(0, min(100, _as_int(cfg.get("htf_alignment_soft_allow_min_conf_day", 80), 80))))
+        return 100
+    except Exception:
+        return 100
+
+
 def apply_override_penalty(entry_pct: float, lev: int, rule: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[float, int, Dict[str, Any]]:
     try:
         ep = float(_as_float(entry_pct, 0.0))
@@ -14911,8 +14955,21 @@ JSON 형식:
                     else:
                         min_conf_gate_now = int(_as_int(cfg.get("intra_day_day_min_conf", style_rule("단타").get("min_conf", 65)), 65))
                     anti_step_now = int(_as_int(cfg.get("_anti_drought_step", 0), 0))
+                    gate_mode = htf_alignment_gate_mode(style_mandatory, cfg, anti_step_now)
                     thr_now = int(high_conf_override_threshold(min_conf_gate_now, anti_step_now, cfg))
-                    if high_conf_override_ok(conf_now, min_conf_gate_now, anti_step_now, cfg, gate_key="htf"):
+                    soft_min_conf_now = int(htf_soft_allow_min_conf(style_mandatory, cfg))
+                    out["_htf_gate_mode"] = str(gate_mode)
+                    if gate_mode == "off":
+                        out.setdefault("_gate_overrides", [])
+                        if "htf" not in out["_gate_overrides"]:
+                            out["_gate_overrides"].append("htf")
+                        out["_gate_override_penalty_enable"] = True
+                        out["_htf_blocked"] = True
+                        out["_htf_block_overridden"] = True
+                        out["_htf_block_reason"] = str(bear_reason)
+                        out["_htf_override_threshold"] = 0
+                        out["reason_easy"] = f"{str(out.get('reason_easy', '')).strip()} / HTF bearish 신호(게이트 OFF by anti-drought)"
+                    elif high_conf_override_ok(conf_now, min_conf_gate_now, anti_step_now, cfg, gate_key="htf"):
                         out.setdefault("_gate_overrides", [])
                         if "htf" not in out["_gate_overrides"]:
                             out["_gate_overrides"].append("htf")
@@ -14921,7 +14978,21 @@ JSON 형식:
                         out["_htf_block_overridden"] = True
                         out["_htf_block_reason"] = str(bear_reason)
                         out["_htf_override_threshold"] = int(thr_now)
-                        out["reason_easy"] = f"{str(out.get('reason_easy', '')).strip()} / HTF 역방향 차단 신호(고확신 예외, conf {conf_now}>=thr {thr_now})"
+                        out["reason_easy"] = f"{str(out.get('reason_easy', '')).strip()} / HTF 역방향 신호(고확신 예외, conf {conf_now}>=thr {thr_now})"
+                    elif gate_mode == "soft" and conf_now >= soft_min_conf_now:
+                        out.setdefault("_gate_overrides", [])
+                        if "htf" not in out["_gate_overrides"]:
+                            out["_gate_overrides"].append("htf")
+                        out["_gate_override_penalty_enable"] = True
+                        out["_htf_blocked"] = True
+                        out["_htf_block_overridden"] = True
+                        out["_htf_block_reason"] = str(bear_reason)
+                        out["_htf_override_threshold"] = int(soft_min_conf_now)
+                        out["_htf_gate_mode"] = "soft_allow"
+                        out["reason_easy"] = (
+                            f"{str(out.get('reason_easy', '')).strip()} / "
+                            f"HTF 역방향 신호(soft-allow, conf {conf_now}>=min {soft_min_conf_now})"
+                        )
                     else:
                         out["decision"] = "hold"
                         out["reason_easy"] = f"HTF 역방향 차단: {bear_reason}"
@@ -16084,6 +16155,8 @@ def compute_anti_drought_state(cfg: Dict[str, Any], rt: Dict[str, Any], has_open
         "votes_reduce": 0,
         "pattern_gate_disabled": False,
         "micro_loosened": False,
+        "htf_gate_softened": False,
+        "htf_gate_disabled": False,
         "effective_min_conf_scalp": int(_as_int(cfg.get("intra_day_scalp_min_conf", 55), 55)),
         "effective_min_conf_day": int(_as_int(cfg.get("intra_day_day_min_conf", 65), 65)),
         "effective_min_conf_swing": int(_as_int(cfg.get("intra_day_swing_min_conf", 68), 68)),
@@ -16146,9 +16219,13 @@ def compute_anti_drought_state(cfg: Dict[str, Any], rt: Dict[str, Any], has_open
         disable_pattern_step = int(max(1, _as_int(cfg.get("anti_drought_disable_pattern_gate_step", 4), 4)))
         loosen_micro_step = int(max(1, _as_int(cfg.get("anti_drought_loosen_microfilters_step", 5), 5)))
         disable_volume_step = int(max(1, _as_int(cfg.get("anti_drought_disable_volume_obv_gate_step", 5), 5)))
+        soften_htf_step = int(max(1, _as_int(cfg.get("anti_drought_soften_htf_gate_step", 2), 2)))
+        disable_htf_step = int(max(1, _as_int(cfg.get("anti_drought_disable_htf_gate_step", 4), 4)))
         out["pattern_gate_disabled"] = bool(step_now >= disable_pattern_step)
         out["micro_loosened"] = bool(step_now >= loosen_micro_step)
         out["volume_obv_gate_disabled"] = bool(step_now >= disable_volume_step)
+        out["htf_gate_softened"] = bool(step_now >= soften_htf_step)
+        out["htf_gate_disabled"] = bool(step_now >= disable_htf_step)
 
         if bool(cfg.get("anti_drought_notify_tg", True)) and bool(out.get("step_changed", False)):
             every_steps = int(max(1, _as_int(cfg.get("anti_drought_notify_every_steps", 1), 1)))
@@ -16181,6 +16258,14 @@ def build_effective_cfg_with_anti_drought(cfg: Dict[str, Any], drought_state: Di
             eff["volume_obv_gate_mode_scalp"] = "off"
             eff["volume_obv_gate_mode_day"] = "off"
             eff["volume_obv_gate_mode_swing"] = "off"
+        if bool(drought_state.get("htf_gate_disabled", False)):
+            eff["htf_alignment_gate_mode_scalp"] = "off"
+            eff["htf_alignment_gate_mode_day"] = "off"
+        elif bool(drought_state.get("htf_gate_softened", False)):
+            if str(eff.get("htf_alignment_gate_mode_scalp", "soft")).strip().lower() == "hard":
+                eff["htf_alignment_gate_mode_scalp"] = "soft"
+            if str(eff.get("htf_alignment_gate_mode_day", "soft")).strip().lower() == "hard":
+                eff["htf_alignment_gate_mode_day"] = "soft"
 
         if bool(drought_state.get("micro_loosened", False)) and bool(eff.get("micro_entry_filter_enable", False)):
             eff["micro_max_spread_bps_scalp"] = float(min(25.0, _as_float(eff.get("micro_max_spread_bps_scalp", 12.0), 12.0) + 6.0))
@@ -24033,9 +24118,14 @@ def telegram_thread(ex):
                             "pattern_gate_disabled": bool(anti_drought_state.get("pattern_gate_disabled", False)),
                             "micro_loosened": bool(anti_drought_state.get("micro_loosened", False)),
                             "volume_obv_gate_disabled": bool(anti_drought_state.get("volume_obv_gate_disabled", False)),
+                            "htf_gate_softened": bool(anti_drought_state.get("htf_gate_softened", False)),
+                            "htf_gate_disabled": bool(anti_drought_state.get("htf_gate_disabled", False)),
                             "volume_obv_gate_mode_scalp_effective": str(cfg_effective.get("volume_obv_gate_mode_scalp", cfg.get("volume_obv_gate_mode_scalp", "soft"))),
                             "volume_obv_gate_mode_day_effective": str(cfg_effective.get("volume_obv_gate_mode_day", cfg.get("volume_obv_gate_mode_day", "hard"))),
                             "volume_obv_gate_mode_swing_effective": str(cfg_effective.get("volume_obv_gate_mode_swing", cfg.get("volume_obv_gate_mode_swing", "hard"))),
+                            "htf_gate_mode_scalp_effective": str(cfg_effective.get("htf_alignment_gate_mode_scalp", cfg.get("htf_alignment_gate_mode_scalp", "soft"))),
+                            "htf_gate_mode_day_effective": str(cfg_effective.get("htf_alignment_gate_mode_day", cfg.get("htf_alignment_gate_mode_day", "soft"))),
+                            "htf_gate_mode_swing_effective": str(cfg_effective.get("htf_alignment_gate_mode_swing", cfg.get("htf_alignment_gate_mode_swing", "hard"))),
                             "effective_min_conf_scalp": int(_as_int(anti_drought_state.get("effective_min_conf_scalp", cfg_effective.get("intra_day_scalp_min_conf", 55)), 55)),
                             "effective_min_conf_day": int(_as_int(anti_drought_state.get("effective_min_conf_day", cfg_effective.get("intra_day_day_min_conf", 65)), 65)),
                             "effective_min_conf_swing": int(_as_int(anti_drought_state.get("effective_min_conf_swing", cfg_effective.get("intra_day_swing_min_conf", 68)), 68)),
@@ -26059,6 +26149,8 @@ def telegram_thread(ex):
                                 cs["gate_override_reason"] = ""
                                 cs["gate_override_text"] = ""
                                 cs["gate_override_threshold"] = ""
+                                cs["htf_gate_mode_override"] = ""
+                                cs["htf_gate_mode_effective"] = ""
                                 cs["_override_penalty_enable"] = False
                             except Exception:
                                 pass
@@ -26212,9 +26304,48 @@ def telegram_thread(ex):
                                     if bool(htf_block):
                                         min_conf_gate_current = int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0)))
                                         anti_step_now = int(_as_int((anti_drought_state or {}).get("step", 0), 0))
-                                        if high_conf_override_ok(int(conf), int(min_conf_gate_current), int(anti_step_now), cfg_effective, gate_key="htf"):
+                                        gate_mode_now = str(htf_alignment_gate_mode(str(style), cfg_effective, int(anti_step_now)))
+                                        soft_min_conf_now = int(htf_soft_allow_min_conf(str(style), cfg_effective))
+                                        cs["htf_gate_mode_effective"] = str(gate_mode_now)
+                                        if gate_mode_now == "off":
+                                            _append_gate_override_state(cs, "htf", int(conf), 0, "anti-drought off")
+                                            cs["htf_gate_mode_override"] = "off"
+                                            mon_add_scan(
+                                                mon,
+                                                stage="gate_overridden",
+                                                symbol=sym,
+                                                tf="1h/4h",
+                                                signal=str(decision),
+                                                score=int(conf),
+                                                message="htf_gate_off_by_anti_drought",
+                                                extra={
+                                                    "reason_code": "GATE_OVERRIDDEN",
+                                                    "gate": "htf",
+                                                    "mode": "off",
+                                                    "style": str(style),
+                                                    "reason": str(htf_reason),
+                                                    "conf": int(conf),
+                                                    "threshold": 0,
+                                                    "anti_step": int(anti_step_now),
+                                                },
+                                            )
+                                            mon_add_entry_trace(
+                                                mon,
+                                                cfg_effective,
+                                                symbol=sym,
+                                                style=str(style),
+                                                event="ENTRY_CANDIDATE",
+                                                decision=str(decision),
+                                                conf=int(conf),
+                                                min_conf=int(min_conf_gate_current),
+                                                reason_code="GATE_OVERRIDDEN_HTF",
+                                                detail=f"HTF gate off by anti-drought(step={int(anti_step_now)})",
+                                                extra={"mode": "off", "anti_step": int(anti_step_now), "reason": str(htf_reason)},
+                                            )
+                                        elif high_conf_override_ok(int(conf), int(min_conf_gate_current), int(anti_step_now), cfg_effective, gate_key="htf"):
                                             thr = int(high_conf_override_threshold(int(min_conf_gate_current), int(anti_step_now), cfg_effective))
                                             _append_gate_override_state(cs, "htf", int(conf), int(thr), str(htf_reason))
+                                            cs["htf_gate_mode_override"] = str(gate_mode_now)
                                             mon_add_scan(
                                                 mon,
                                                 stage="gate_overridden",
@@ -26223,7 +26354,62 @@ def telegram_thread(ex):
                                                 signal=str(decision),
                                                 score=int(conf),
                                                 message="htf_alignment_block_overridden",
-                                                extra={"reason_code": "GATE_OVERRIDDEN", "gate": "htf", "style": str(style), "reason": str(htf_reason), "conf": int(conf), "threshold": int(thr)},
+                                                extra={
+                                                    "reason_code": "GATE_OVERRIDDEN",
+                                                    "gate": "htf",
+                                                    "mode": str(gate_mode_now),
+                                                    "style": str(style),
+                                                    "reason": str(htf_reason),
+                                                    "conf": int(conf),
+                                                    "threshold": int(thr),
+                                                },
+                                            )
+                                            mon_add_entry_trace(
+                                                mon,
+                                                cfg_effective,
+                                                symbol=sym,
+                                                style=str(style),
+                                                event="ENTRY_CANDIDATE",
+                                                decision=str(decision),
+                                                conf=int(conf),
+                                                min_conf=int(min_conf_gate_current),
+                                                reason_code="GATE_OVERRIDDEN_HTF",
+                                                detail=f"high-conf override(conf {int(conf)}>=thr {int(thr)})",
+                                                extra={"mode": str(gate_mode_now), "threshold": int(thr), "reason": str(htf_reason)},
+                                            )
+                                        elif gate_mode_now == "soft" and int(conf) >= int(soft_min_conf_now):
+                                            _append_gate_override_state(cs, "htf", int(conf), int(soft_min_conf_now), "soft_allow")
+                                            cs["htf_gate_mode_override"] = "soft"
+                                            mon_add_scan(
+                                                mon,
+                                                stage="gate_overridden",
+                                                symbol=sym,
+                                                tf="1h/4h",
+                                                signal=str(decision),
+                                                score=int(conf),
+                                                message="htf_alignment_soft_allow",
+                                                extra={
+                                                    "reason_code": "GATE_OVERRIDDEN",
+                                                    "gate": "htf",
+                                                    "mode": "soft",
+                                                    "style": str(style),
+                                                    "reason": str(htf_reason),
+                                                    "conf": int(conf),
+                                                    "threshold": int(soft_min_conf_now),
+                                                },
+                                            )
+                                            mon_add_entry_trace(
+                                                mon,
+                                                cfg_effective,
+                                                symbol=sym,
+                                                style=str(style),
+                                                event="ENTRY_CANDIDATE",
+                                                decision=str(decision),
+                                                conf=int(conf),
+                                                min_conf=int(min_conf_gate_current),
+                                                reason_code="GATE_OVERRIDDEN_HTF",
+                                                detail=f"soft-allow(conf {int(conf)}>=min {int(soft_min_conf_now)})",
+                                                extra={"mode": "soft", "threshold": int(soft_min_conf_now), "reason": str(htf_reason)},
                                             )
                                         else:
                                             cs["skip_reason"] = f"HTF 역추세 차단({htf_reason})"
@@ -26235,7 +26421,7 @@ def telegram_thread(ex):
                                                 signal=str(decision),
                                                 score=int(conf),
                                                 message="htf_alignment_block",
-                                                extra={"style": str(style), "reason": str(htf_reason)},
+                                                extra={"style": str(style), "reason": str(htf_reason), "mode": str(gate_mode_now)},
                                             )
                                             mon_add_entry_trace(
                                                 mon,
@@ -26248,7 +26434,7 @@ def telegram_thread(ex):
                                                 min_conf=int(min_conf_gate_current),
                                                 reason_code="HTF_ALIGNMENT_BLOCK",
                                                 detail=str(cs.get("skip_reason", ""))[:220],
-                                                extra={"reason": str(htf_reason)},
+                                                extra={"reason": str(htf_reason), "mode": str(gate_mode_now)},
                                             )
                                             continue
                             except Exception:
@@ -30322,6 +30508,65 @@ with st.sidebar.expander("관망 완화(anti-drought, 10분 단계)"):
         step=0.05,
         key="volume_confirm_min_ratio_key",
     )
+    ah1, ah2, ah3 = st.columns(3)
+    config["htf_alignment_gate_mode_scalp"] = ah1.selectbox(
+        "HTF 게이트(스캘핑)",
+        ["soft", "hard", "off"],
+        index=["soft", "hard", "off"].index(str(config.get("htf_alignment_gate_mode_scalp", "soft")).lower())
+        if str(config.get("htf_alignment_gate_mode_scalp", "soft")).lower() in ["soft", "hard", "off"]
+        else 0,
+        key="htf_alignment_gate_mode_scalp_key",
+    )
+    config["htf_alignment_gate_mode_day"] = ah2.selectbox(
+        "HTF 게이트(단타)",
+        ["soft", "hard", "off"],
+        index=["soft", "hard", "off"].index(str(config.get("htf_alignment_gate_mode_day", "soft")).lower())
+        if str(config.get("htf_alignment_gate_mode_day", "soft")).lower() in ["soft", "hard", "off"]
+        else 0,
+        key="htf_alignment_gate_mode_day_key",
+    )
+    config["htf_alignment_gate_mode_swing"] = ah3.selectbox(
+        "HTF 게이트(스윙)",
+        ["hard", "soft", "off"],
+        index=["hard", "soft", "off"].index(str(config.get("htf_alignment_gate_mode_swing", "hard")).lower())
+        if str(config.get("htf_alignment_gate_mode_swing", "hard")).lower() in ["hard", "soft", "off"]
+        else 0,
+        key="htf_alignment_gate_mode_swing_key",
+    )
+    ah4, ah5 = st.columns(2)
+    config["htf_alignment_soft_allow_min_conf_scalp"] = ah4.number_input(
+        "HTF soft-allow 최소conf(스캘핑)",
+        0,
+        100,
+        int(_as_int(config.get("htf_alignment_soft_allow_min_conf_scalp", 75), 75)),
+        step=1,
+        key="htf_alignment_soft_allow_min_conf_scalp_key",
+    )
+    config["htf_alignment_soft_allow_min_conf_day"] = ah5.number_input(
+        "HTF soft-allow 최소conf(단타)",
+        0,
+        100,
+        int(_as_int(config.get("htf_alignment_soft_allow_min_conf_day", 80), 80)),
+        step=1,
+        key="htf_alignment_soft_allow_min_conf_day_key",
+    )
+    ah6, ah7 = st.columns(2)
+    config["anti_drought_soften_htf_gate_step"] = ah6.number_input(
+        "anti: HTF hard→soft 단계",
+        1,
+        20,
+        int(_as_int(config.get("anti_drought_soften_htf_gate_step", 2), 2)),
+        step=1,
+        key="anti_drought_soften_htf_gate_step_key",
+    )
+    config["anti_drought_disable_htf_gate_step"] = ah7.number_input(
+        "anti: HTF OFF 단계",
+        1,
+        20,
+        int(_as_int(config.get("anti_drought_disable_htf_gate_step", 4), 4)),
+        step=1,
+        key="anti_drought_disable_htf_gate_step_key",
+    )
     ad11, ad12, ad13 = st.columns(3)
     config["anti_drought_min_conf_floor_scalp"] = ad11.number_input("스캘핑 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_scalp", 50), 50)), step=1, key="anti_drought_min_conf_floor_scalp_key")
     config["anti_drought_min_conf_floor_day"] = ad12.number_input("단타 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_day", 60), 60)), step=1, key="anti_drought_min_conf_floor_day_key")
@@ -31201,9 +31446,21 @@ try:
                     "AI": str(cs0.get("ai_decision", "-")).upper() if cs0 else "-",
                     "확신": cs0.get("ai_confidence", ""),
                     "스킵/근거": (
-                        ((str(cs0.get("gate_override_text", "") or "") + " | ") if str(cs0.get("gate_override_text", "") or "").strip() else "")
+                        (
+                            (
+                                str(cs0.get("gate_override_text", "") or "")
+                                + (
+                                    f" (mode {str(cs0.get('htf_gate_mode_override', '') or '').strip()})"
+                                    if ("htf" in str(cs0.get("gate_override_text", "") or "").lower() and str(cs0.get("htf_gate_mode_override", "") or "").strip())
+                                    else ""
+                                )
+                                + " | "
+                            )
+                            if str(cs0.get("gate_override_text", "") or "").strip()
+                            else ""
+                        )
                         + str(cs0.get("skip_reason") or cs0.get("ai_reason_easy") or "")
-                    )[:80],
+                    )[:110],
                 }
             )
         st_dataframe_safe(df_for_display(pd.DataFrame(rows0)), hide_index=True)
@@ -31394,13 +31651,29 @@ with t1:
             scalp_mode_eff = str(ad.get("volume_obv_gate_mode_scalp_effective", config.get("volume_obv_gate_mode_scalp", "soft"))).lower()
             day_mode_eff = str(ad.get("volume_obv_gate_mode_day_effective", config.get("volume_obv_gate_mode_day", "hard"))).lower()
             swing_mode_eff = str(ad.get("volume_obv_gate_mode_swing_effective", config.get("volume_obv_gate_mode_swing", "hard"))).lower()
+            htf_scalp_mode_eff = str(ad.get("htf_gate_mode_scalp_effective", config.get("htf_alignment_gate_mode_scalp", "soft"))).lower()
+            htf_day_mode_eff = str(ad.get("htf_gate_mode_day_effective", config.get("htf_alignment_gate_mode_day", "soft"))).lower()
+            htf_swing_mode_eff = str(ad.get("htf_gate_mode_swing_effective", config.get("htf_alignment_gate_mode_swing", "hard"))).lower()
             if bool(ad.get("volume_obv_gate_disabled", False)):
                 scalp_mode_eff = "off"
                 day_mode_eff = "off"
                 swing_mode_eff = "off"
+            if bool(ad.get("htf_gate_disabled", False)):
+                htf_scalp_mode_eff = "off"
+                htf_day_mode_eff = "off"
+            elif bool(ad.get("htf_gate_softened", False)):
+                if htf_scalp_mode_eff == "hard":
+                    htf_scalp_mode_eff = "soft"
+                if htf_day_mode_eff == "hard":
+                    htf_day_mode_eff = "soft"
             st.caption(
                 f"볼륨/OBV 게이트: 스캘핑 {scalp_mode_eff} | 단타 {day_mode_eff} | 스윙 {swing_mode_eff}"
                 f" | invalid bypass {'ON' if bool(config.get('volume_obv_gate_bypass_on_invalid_volume', True)) else 'OFF'}"
+            )
+            st.caption(
+                f"HTF 게이트: 스캘핑 {htf_scalp_mode_eff} | 단타 {htf_day_mode_eff} | 스윙 {htf_swing_mode_eff}"
+                f" | anti-soft {'ON' if bool(ad.get('htf_gate_softened', False)) else 'OFF'}"
+                f" | anti-off {'ON' if bool(ad.get('htf_gate_disabled', False)) else 'OFF'}"
             )
             try:
                 coins_map = mon.get("coins", {}) if isinstance(mon.get("coins", {}), dict) else {}
@@ -31530,6 +31803,11 @@ with t1:
                 "volume_obv_gate_mode_day": str(config.get("volume_obv_gate_mode_day", "hard")),
                 "volume_obv_gate_mode_swing": str(config.get("volume_obv_gate_mode_swing", "hard")),
                 "effective_volume_obv_gate_disabled": bool(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("volume_obv_gate_disabled", False)),
+                "htf_alignment_gate_mode_scalp": str(config.get("htf_alignment_gate_mode_scalp", "soft")),
+                "htf_alignment_gate_mode_day": str(config.get("htf_alignment_gate_mode_day", "soft")),
+                "htf_alignment_gate_mode_swing": str(config.get("htf_alignment_gate_mode_swing", "hard")),
+                "effective_htf_gate_softened": bool(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("htf_gate_softened", False)),
+                "effective_htf_gate_disabled": bool(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("htf_gate_disabled", False)),
                 "entry_trace_enable": bool(config.get("entry_trace_enable", True)),
                 "entry_trace_keep_last_n": int(_as_int(config.get("entry_trace_keep_last_n", 200), 200)),
                 "order_postonly_retry_without_postonly": bool(config.get("order_postonly_retry_without_postonly", True)),
@@ -31655,9 +31933,21 @@ with t1:
                     "손익비": cs.get("ai_rr", "-"),
                     "AI지표": cs.get("ai_used", ""),
                     "스킵/근거": (
-                        ((str(cs.get("gate_override_text", "") or "") + " | ") if str(cs.get("gate_override_text", "") or "").strip() else "")
+                        (
+                            (
+                                str(cs.get("gate_override_text", "") or "")
+                                + (
+                                    f" (mode {str(cs.get('htf_gate_mode_override', '') or '').strip()})"
+                                    if ("htf" in str(cs.get("gate_override_text", "") or "").lower() and str(cs.get("htf_gate_mode_override", "") or "").strip())
+                                    else ""
+                                )
+                                + " | "
+                            )
+                            if str(cs.get("gate_override_text", "") or "").strip()
+                            else ""
+                        )
                         + str(cs.get("skip_reason") or cs.get("ai_reason_easy") or "")
-                    )[:180],
+                    )[:210],
                 }
             )
         if rows:
