@@ -1722,6 +1722,10 @@ def default_settings() -> Dict[str, Any]:
         "anti_drought_min_conf_floor_day": 60,
         "anti_drought_min_conf_floor_swing": 60,
         "anti_drought_skip_window": 200,
+        # ✅ 진입 추적(후보→차단→주문→실패/체결)
+        "entry_trace_enable": True,
+        "entry_trace_keep_last_n": 200,
+        "show_last_entry_attempt_panel": True,
         # ✅ 고확신 게이트 오버라이드(하드 차단 대신 예외 진입, 리스크는 감산)
         "high_conf_override_enable": True,
         "high_conf_override_abs_min_conf": 82,
@@ -1786,6 +1790,8 @@ def default_settings() -> Dict[str, Any]:
         "entry_prefer_limit": True,
         "entry_post_only": True,
         "entry_fallback_to_market": True,
+        "order_postonly_retry_without_postonly": True,
+        "order_retry_max": 1,
         "entry_limit_timeout_sec_scalp": 4,
         "entry_limit_timeout_sec_day": 6,
         "entry_limit_timeout_sec_swing": 15,
@@ -1799,6 +1805,7 @@ def default_settings() -> Dict[str, Any]:
         "volume_obv_gate_min_nonzero_ratio": 0.30,
         "volume_obv_gate_mode_scalp": "soft",  # hard|soft|off
         "volume_obv_gate_mode_day": "hard",    # hard|soft|off
+        "volume_obv_gate_mode_swing": "hard",  # hard|soft|off
         "volume_obv_gate_soft_penalty_conf": 8,
         # ✅ 스타일별 RR 하한(목표손절이 목표익절보다 커지는 케이스 방지)
         "scalp_rr_floor": 1.5,
@@ -15454,8 +15461,24 @@ JSON 형식:
 def monitor_init():
     mon = read_json_safe(
         MONITOR_FILE,
-        {"coins": {}, "events": [], "scan_process": [], "skip_events": [], "anti_drought": {}},
-    ) or {"coins": {}, "events": [], "scan_process": [], "skip_events": [], "anti_drought": {}}
+        {
+            "coins": {},
+            "events": [],
+            "scan_process": [],
+            "skip_events": [],
+            "entry_trace": [],
+            "last_entry_attempt": {},
+            "anti_drought": {},
+        },
+    ) or {
+        "coins": {},
+        "events": [],
+        "scan_process": [],
+        "skip_events": [],
+        "entry_trace": [],
+        "last_entry_attempt": {},
+        "anti_drought": {},
+    }
     try:
         if not isinstance(mon.get("coins", {}), dict):
             mon["coins"] = {}
@@ -15465,6 +15488,10 @@ def monitor_init():
             mon["scan_process"] = []
         if not isinstance(mon.get("skip_events", []), list):
             mon["skip_events"] = []
+        if not isinstance(mon.get("entry_trace", []), list):
+            mon["entry_trace"] = []
+        if not isinstance(mon.get("last_entry_attempt", {}), dict):
+            mon["last_entry_attempt"] = {}
         if not isinstance(mon.get("anti_drought", {}), dict):
             mon["anti_drought"] = {}
     except Exception:
@@ -15590,6 +15617,47 @@ def mon_add_scan(mon: Dict[str, Any], stage: str, symbol: str, tf: str = "", sig
             monitor_write_throttled(mon, min_interval_sec=0.8)
         except Exception:
             pass
+    except Exception:
+        pass
+
+
+def mon_add_entry_trace(
+    mon: Dict[str, Any],
+    cfg: Dict[str, Any],
+    symbol: str,
+    style: str,
+    event: str,
+    decision: str,
+    conf: Any,
+    min_conf: Any,
+    reason_code: str,
+    detail: str = "",
+    extra: Optional[Dict[str, Any]] = None,
+):
+    try:
+        if not bool((cfg or {}).get("entry_trace_enable", True)):
+            return
+        keep_n = int(max(20, _as_int((cfg or {}).get("entry_trace_keep_last_n", 200), 200)))
+        rec = {
+            "ts": float(time.time()),
+            "kst": now_kst_str(),
+            "symbol": str(symbol or ""),
+            "style": str(style or ""),
+            "event": str(event or ""),
+            "decision": str(decision or ""),
+            "conf": int(_as_int(conf, 0)),
+            "min_conf": int(_as_int(min_conf, 0)),
+            "reason_code": str(reason_code or ""),
+            "detail": str(detail or "")[:220],
+            "extra": (extra if isinstance(extra, dict) else {}),
+        }
+        mon.setdefault("entry_trace", [])
+        mon["entry_trace"].append(rec)
+        mon["entry_trace"] = mon["entry_trace"][-keep_n:]
+        if str(event or "") in ["ORDER_SUBMIT", "ORDER_FAILED", "ORDER_FILLED", "ENTRY_BLOCKED"]:
+            mon["last_entry_attempt"] = dict(rec)
+        mon["last_heartbeat_epoch"] = float(time.time())
+        mon["last_heartbeat_kst"] = rec.get("kst", now_kst_str())
     except Exception:
         pass
 
@@ -15815,6 +15883,35 @@ def get_top_skip_reasons(mon: Dict[str, Any], n: int = 10, window: int = 200) ->
                 continue
             key = reason[:120]
             counts[key] = int(counts.get(key, 0) or 0) + 1
+        ranked = sorted(counts.items(), key=lambda x: (-int(x[1]), str(x[0])))
+        return ranked[:n_safe]
+    except Exception:
+        return []
+
+
+def get_top_entry_blockers(mon: Dict[str, Any], n: int = 10, window: int = 200) -> List[Tuple[str, int]]:
+    """
+    최근 ENTRY_BLOCKED 이벤트 기준 상위 차단 사유(reason_code) 집계.
+    """
+    try:
+        n_safe = max(1, int(n))
+        w_safe = max(1, int(window))
+        trace = (mon or {}).get("entry_trace", []) or []
+        if not isinstance(trace, list):
+            return []
+        recent = trace[-w_safe:]
+        counts: Dict[str, int] = {}
+        for ev in recent:
+            if not isinstance(ev, dict):
+                continue
+            if str(ev.get("event", "")).strip().upper() != "ENTRY_BLOCKED":
+                continue
+            rc = str(ev.get("reason_code", "") or "").strip()
+            if not rc:
+                rc = str(ev.get("detail", "") or "").strip()[:80]
+            if not rc:
+                rc = "OTHER_BLOCK"
+            counts[rc] = int(counts.get(rc, 0) or 0) + 1
         ranked = sorted(counts.items(), key=lambda x: (-int(x[1]), str(x[0])))
         return ranked[:n_safe]
     except Exception:
@@ -16083,6 +16180,7 @@ def build_effective_cfg_with_anti_drought(cfg: Dict[str, Any], drought_state: Di
         if bool(drought_state.get("volume_obv_gate_disabled", False)):
             eff["volume_obv_gate_mode_scalp"] = "off"
             eff["volume_obv_gate_mode_day"] = "off"
+            eff["volume_obv_gate_mode_swing"] = "off"
 
         if bool(drought_state.get("micro_loosened", False)) and bool(eff.get("micro_entry_filter_enable", False)):
             eff["micro_max_spread_bps_scalp"] = float(min(25.0, _as_float(eff.get("micro_max_spread_bps_scalp", 12.0), 12.0) + 6.0))
@@ -23937,6 +24035,7 @@ def telegram_thread(ex):
                             "volume_obv_gate_disabled": bool(anti_drought_state.get("volume_obv_gate_disabled", False)),
                             "volume_obv_gate_mode_scalp_effective": str(cfg_effective.get("volume_obv_gate_mode_scalp", cfg.get("volume_obv_gate_mode_scalp", "soft"))),
                             "volume_obv_gate_mode_day_effective": str(cfg_effective.get("volume_obv_gate_mode_day", cfg.get("volume_obv_gate_mode_day", "hard"))),
+                            "volume_obv_gate_mode_swing_effective": str(cfg_effective.get("volume_obv_gate_mode_swing", cfg.get("volume_obv_gate_mode_swing", "hard"))),
                             "effective_min_conf_scalp": int(_as_int(anti_drought_state.get("effective_min_conf_scalp", cfg_effective.get("intra_day_scalp_min_conf", 55)), 55)),
                             "effective_min_conf_day": int(_as_int(anti_drought_state.get("effective_min_conf_day", cfg_effective.get("intra_day_day_min_conf", 65)), 65)),
                             "effective_min_conf_swing": int(_as_int(anti_drought_state.get("effective_min_conf_swing", cfg_effective.get("intra_day_swing_min_conf", 68)), 68)),
@@ -25691,6 +25790,28 @@ def telegram_thread(ex):
                             pass
 
                         if decision in ["buy", "sell"] and (int(conf) >= int(min_conf_gate) or bool(scalp_force_entry_pre)):
+                            trace_style_hint = normalize_style_name(dynamic_style_info.get("style", "스캘핑"))
+                            trace_tf_hint = str(ai.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m"))
+                            try:
+                                mon_add_entry_trace(
+                                    mon,
+                                    cfg_effective,
+                                    symbol=sym,
+                                    style=str(trace_style_hint),
+                                    event="ENTRY_CANDIDATE",
+                                    decision=str(decision),
+                                    conf=int(conf),
+                                    min_conf=int(min_conf_gate),
+                                    reason_code="ENTRY_CANDIDATE",
+                                    detail=str(ai.get("reason_easy", "") or cs.get("ai_reason_easy", ""))[:220],
+                                    extra={
+                                        "tf": trace_tf_hint,
+                                        "scalp_force_entry_pre": bool(scalp_force_entry_pre),
+                                        "min_conf_gate": int(min_conf_gate),
+                                    },
+                                )
+                            except Exception:
+                                pass
                             is_soft_entry = bool(int(conf) < int(min_conf_strict))
                             # ✅ 강제스캔(scan_only) 또는 auto_trade OFF/정지/주말이면 신규진입 금지
                             if (not entry_allowed_global) or (forced_ai and force_scan_only):
@@ -25713,6 +25834,28 @@ def telegram_thread(ex):
                                         signal=str(decision),
                                         score=conf,
                                         message=f"신규진입 금지({why})",
+                                        extra={"forced_ai": forced_ai, "force_scan_only": force_scan_only, "trade_enabled": trade_enabled},
+                                    )
+                                    reason_code_block = "ENTRY_DISABLED"
+                                    if forced_ai and force_scan_only:
+                                        reason_code_block = "FORCE_SCAN_ONLY"
+                                    elif not trade_enabled:
+                                        reason_code_block = "AUTO_TRADE_OFF"
+                                    elif paused_now:
+                                        reason_code_block = "PAUSED_UNTIL"
+                                    elif cfg.get("no_trade_weekend", False) and (now_kst().weekday() in [5, 6]):
+                                        reason_code_block = "WEEKEND_BLOCK"
+                                    mon_add_entry_trace(
+                                        mon,
+                                        cfg_effective,
+                                        symbol=sym,
+                                        style=str(trace_style_hint),
+                                        event="ENTRY_BLOCKED",
+                                        decision=str(decision),
+                                        conf=int(conf),
+                                        min_conf=int(min_conf_gate),
+                                        reason_code=reason_code_block,
+                                        detail=str(cs.get("skip_reason", why))[:220],
                                         extra={"forced_ai": forced_ai, "force_scan_only": force_scan_only, "trade_enabled": trade_enabled},
                                     )
                                 except Exception:
@@ -25740,6 +25883,19 @@ def telegram_thread(ex):
                                         message="max_open_positions_total",
                                         extra={"active": len(active_syms), "max": int(max_pos_total_eff)},
                                     )
+                                    mon_add_entry_trace(
+                                        mon,
+                                        cfg_effective,
+                                        symbol=sym,
+                                        style=str(trace_style_hint),
+                                        event="ENTRY_BLOCKED",
+                                        decision=str(decision),
+                                        conf=int(conf),
+                                        min_conf=int(min_conf_gate),
+                                        reason_code="MAX_POSITIONS",
+                                        detail=str(cs.get("skip_reason", ""))[:220],
+                                        extra={"active": len(active_syms), "max": int(max_pos_total_eff)},
+                                    )
                                     continue
                             except Exception:
                                 pass
@@ -25761,6 +25917,19 @@ def telegram_thread(ex):
                                             signal=str(decision),
                                             score=conf,
                                             message="max_open_positions_low_conf",
+                                            extra={"low_open": low_open, "max_low": int(max_pos_low_conf), "threshold": int(low_conf_th)},
+                                        )
+                                        mon_add_entry_trace(
+                                            mon,
+                                            cfg_effective,
+                                            symbol=sym,
+                                            style=str(trace_style_hint),
+                                            event="ENTRY_BLOCKED",
+                                            decision=str(decision),
+                                            conf=int(conf),
+                                            min_conf=int(min_conf_gate),
+                                            reason_code="MAX_LOW_CONF_POSITIONS",
+                                            detail=str(cs.get("skip_reason", ""))[:220],
                                             extra={"low_open": low_open, "max_low": int(max_pos_low_conf), "threshold": int(low_conf_th)},
                                         )
                                         continue
@@ -25819,6 +25988,8 @@ def telegram_thread(ex):
                             except Exception:
                                 pass
 
+                            trace_style_hint = str(style)
+
                             # ✅ 스타일별 확신도 게이트
                             # - 스캘핑: 55~60 허용(공격적)
                             # - 단타/스윙: 70 이상(보수적)
@@ -25865,6 +26036,19 @@ def telegram_thread(ex):
                                         message="style_min_conf_gate",
                                         extra={"style": str(style), "gate": int(style_conf_gate), "conf": int(conf)},
                                     )
+                                    mon_add_entry_trace(
+                                        mon,
+                                        cfg_effective,
+                                        symbol=sym,
+                                        style=str(style),
+                                        event="ENTRY_BLOCKED",
+                                        decision=str(decision),
+                                        conf=int(conf),
+                                        min_conf=int(style_conf_gate),
+                                        reason_code="MIN_CONF_STYLE",
+                                        detail=str(cs.get("skip_reason", ""))[:220],
+                                        extra={"style": str(style), "gate": int(style_conf_gate), "conf": int(conf)},
+                                    )
                                     continue
                             except Exception:
                                 pass
@@ -25903,6 +26087,19 @@ def telegram_thread(ex):
                                         else:
                                             cs["skip_reason"] = "이치모쿠 구름 역방향(롱 차단)"
                                             mon_add_scan(mon, stage="trade_skipped", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=int(conf), message="ichimoku_primary_filter")
+                                            mon_add_entry_trace(
+                                                mon,
+                                                cfg_effective,
+                                                symbol=sym,
+                                                style=str(style),
+                                                event="ENTRY_BLOCKED",
+                                                decision=str(decision),
+                                                conf=int(conf),
+                                                min_conf=int(min_conf_gate_current),
+                                                reason_code="ICHIMOKU_BLOCK",
+                                                detail=str(cs.get("skip_reason", ""))[:220],
+                                                extra={"cloud_pos": str(ichi_pos)},
+                                            )
                                             continue
                                     if (str(decision) == "sell") and (ichi_pos == "above_cloud"):
                                         if high_conf_override_ok(int(conf), int(min_conf_gate_current), int(anti_step_now), cfg_effective, gate_key="ichimoku"):
@@ -25921,6 +26118,19 @@ def telegram_thread(ex):
                                         else:
                                             cs["skip_reason"] = "이치모쿠 구름 역방향(숏 차단)"
                                             mon_add_scan(mon, stage="trade_skipped", symbol=sym, tf=str(cfg.get("timeframe", "5m")), signal=str(decision), score=int(conf), message="ichimoku_primary_filter")
+                                            mon_add_entry_trace(
+                                                mon,
+                                                cfg_effective,
+                                                symbol=sym,
+                                                style=str(style),
+                                                event="ENTRY_BLOCKED",
+                                                decision=str(decision),
+                                                conf=int(conf),
+                                                min_conf=int(min_conf_gate_current),
+                                                reason_code="ICHIMOKU_BLOCK",
+                                                detail=str(cs.get("skip_reason", ""))[:220],
+                                                extra={"cloud_pos": str(ichi_pos)},
+                                            )
                                             continue
                             except Exception:
                                 pass
@@ -25941,6 +26151,19 @@ def telegram_thread(ex):
                                         message=str(cs.get("skip_reason", ""))[:160],
                                         extra={"policy": "STRICT", "trend": str(htf_trend)},
                                     )
+                                    mon_add_entry_trace(
+                                        mon,
+                                        cfg_effective,
+                                        symbol=sym,
+                                        style=str(style),
+                                        event="ENTRY_BLOCKED",
+                                        decision=str(decision),
+                                        conf=int(conf),
+                                        min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                        reason_code="STRICT_TREND_BLOCK",
+                                        detail=str(cs.get("skip_reason", ""))[:220],
+                                        extra={"trend": str(htf_trend), "policy": "STRICT"},
+                                    )
                                     continue
                                 if is_up and decision == "sell":
                                     cs["skip_reason"] = f"장기추세({htf_tf}) 상승이라 숏 금지(STRICT)"
@@ -25953,6 +26176,19 @@ def telegram_thread(ex):
                                         score=int(conf),
                                         message=str(cs.get("skip_reason", ""))[:160],
                                         extra={"policy": "STRICT", "trend": str(htf_trend)},
+                                    )
+                                    mon_add_entry_trace(
+                                        mon,
+                                        cfg_effective,
+                                        symbol=sym,
+                                        style=str(style),
+                                        event="ENTRY_BLOCKED",
+                                        decision=str(decision),
+                                        conf=int(conf),
+                                        min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                        reason_code="STRICT_TREND_BLOCK",
+                                        detail=str(cs.get("skip_reason", ""))[:220],
+                                        extra={"trend": str(htf_trend), "policy": "STRICT"},
                                     )
                                     continue
                             elif cfg.get("trend_filter_enabled", True) and cfg.get("trend_filter_policy", "ALLOW_SCALP") == "ALLOW_SCALP" and regime_mode == "auto":
@@ -26000,6 +26236,19 @@ def telegram_thread(ex):
                                                 score=int(conf),
                                                 message="htf_alignment_block",
                                                 extra={"style": str(style), "reason": str(htf_reason)},
+                                            )
+                                            mon_add_entry_trace(
+                                                mon,
+                                                cfg_effective,
+                                                symbol=sym,
+                                                style=str(style),
+                                                event="ENTRY_BLOCKED",
+                                                decision=str(decision),
+                                                conf=int(conf),
+                                                min_conf=int(min_conf_gate_current),
+                                                reason_code="HTF_ALIGNMENT_BLOCK",
+                                                detail=str(cs.get("skip_reason", ""))[:220],
+                                                extra={"reason": str(htf_reason)},
                                             )
                                             continue
                             except Exception:
@@ -26066,6 +26315,42 @@ def telegram_thread(ex):
                                                     "vol_valid": bool(vol_valid),
                                                     "obv_ok": bool(obv_ok),
                                                     "vol_dbg": str(vol_dbg),
+                                                },
+                                            )
+                                            mon_add_entry_trace(
+                                                mon,
+                                                cfg_effective,
+                                                symbol=sym,
+                                                style=str(style),
+                                                event="ENTRY_BLOCKED",
+                                                decision=str(decision),
+                                                conf=int(conf),
+                                                min_conf=int(style_conf_gate_now),
+                                                reason_code="VOLUME_OBV_BLOCK_HARD",
+                                                detail=str(cs.get("skip_reason", ""))[:220],
+                                                extra={
+                                                    "vol_ratio": float(vol_now),
+                                                    "vol_need": float(vol_min),
+                                                    "vol_valid": bool(vol_valid),
+                                                    "obv_ok": bool(obv_ok),
+                                                },
+                                            )
+                                            mon_add_entry_trace(
+                                                mon,
+                                                cfg_effective,
+                                                symbol=sym,
+                                                style=str(style),
+                                                event="ENTRY_BLOCKED",
+                                                decision=str(decision),
+                                                conf=int(conf),
+                                                min_conf=int(style_conf_gate_now),
+                                                reason_code="VOLUME_OBV_SOFT_CONF_BLOCK",
+                                                detail=str(cs.get("skip_reason", ""))[:220],
+                                                extra={
+                                                    "vol_ratio": float(vol_now),
+                                                    "vol_need": float(vol_min),
+                                                    "vol_valid": bool(vol_valid),
+                                                    "obv_ok": bool(obv_ok),
                                                 },
                                             )
                                             continue
@@ -26185,6 +26470,19 @@ def telegram_thread(ex):
                                                 message=str(cs.get("skip_reason", ""))[:140],
                                                 extra={"trend_short": str(stt.get("추세", "")), "sqz_mom_pct": float(stt.get("_sqz_mom_pct", 0.0) or 0.0)},
                                             )
+                                            mon_add_entry_trace(
+                                                mon,
+                                                cfg_effective,
+                                                symbol=sym,
+                                                style=str(style),
+                                                event="ENTRY_BLOCKED",
+                                                decision="sell",
+                                                conf=int(conf),
+                                                min_conf=int(min_conf_gate_current),
+                                                reason_code="COUNTERTREND_SHORT_BLOCK",
+                                                detail=str(cs.get("skip_reason", ""))[:220],
+                                                extra={"missing": list(missing2)},
+                                            )
                                             continue
                             except Exception:
                                 pass
@@ -26247,6 +26545,19 @@ def telegram_thread(ex):
                                         message="highrisk_requires_swing",
                                         extra={"mode": str(mode), "style": str(style), "trend_short": str(stt.get("추세", "")), "trend_long": str(htf_trend)},
                                     )
+                                    mon_add_entry_trace(
+                                        mon,
+                                        cfg_effective,
+                                        symbol=sym,
+                                        style=str(style),
+                                        event="ENTRY_BLOCKED",
+                                        decision=str(decision),
+                                        conf=int(conf),
+                                        min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                        reason_code="HIGHRISK_REQUIRES_SWING",
+                                        detail=str(cs.get("skip_reason", ""))[:220],
+                                        extra={"mode": str(mode), "style": str(style)},
+                                    )
                                 except Exception:
                                     pass
                                 continue
@@ -26307,6 +26618,19 @@ def telegram_thread(ex):
                                         "orderbook_context": (dict(orderbook_context) if isinstance(orderbook_context, dict) else {}),
                                         "derivatives_context": (dict(derivatives_context) if isinstance(derivatives_context, dict) else {}),
                                     },
+                                )
+                                mon_add_entry_trace(
+                                    mon,
+                                    cfg_effective,
+                                    symbol=sym,
+                                    style=str(style),
+                                    event="ENTRY_BLOCKED",
+                                    decision=str(decision),
+                                    conf=int(conf),
+                                    min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                    reason_code=str(reason_code),
+                                    detail=str(cs.get("skip_reason", ""))[:220],
+                                    extra=dict(micro_gate if isinstance(micro_gate, dict) else {}),
                                 )
                                 continue
 
@@ -26786,6 +27110,19 @@ def telegram_thread(ex):
                                     message=str(cs.get("skip_reason", ""))[:140],
                                     extra={"entry_usdt": float(entry_usdt), "min_entry_usdt": 5.0},
                                 )
+                                mon_add_entry_trace(
+                                    mon,
+                                    cfg_effective,
+                                    symbol=sym,
+                                    style=str(style),
+                                    event="ENTRY_BLOCKED",
+                                    decision=str(decision),
+                                    conf=int(conf),
+                                    min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                    reason_code="SIZE_TOO_SMALL",
+                                    detail=str(cs.get("skip_reason", ""))[:220],
+                                    extra={"entry_usdt": float(entry_usdt), "min_entry_usdt": 5.0},
+                                )
                                 continue
 
                             plan_validation: Dict[str, Any] = {}
@@ -26874,6 +27211,19 @@ def telegram_thread(ex):
                                             "trade_plan_validation": dict(plan_validation),
                                         },
                                     )
+                                    mon_add_entry_trace(
+                                        mon,
+                                        cfg_effective,
+                                        symbol=sym,
+                                        style=str(style),
+                                        event="ENTRY_BLOCKED",
+                                        decision=str(decision),
+                                        conf=int(conf),
+                                        min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                        reason_code=str(reason_code),
+                                        detail=str(reason_txt)[:220],
+                                        extra=dict(plan_validation),
+                                    )
                                     continue
                             except Exception:
                                 plan_validation = {}
@@ -26897,6 +27247,19 @@ def telegram_thread(ex):
                                     message=str(cs.get("skip_reason", ""))[:140],
                                     extra={"entry_usdt": float(entry_usdt), "lev": int(lev), "price": float(px), "qty": float(qty)},
                                 )
+                                mon_add_entry_trace(
+                                    mon,
+                                    cfg_effective,
+                                    symbol=sym,
+                                    style=str(style),
+                                    event="ENTRY_BLOCKED",
+                                    decision=str(decision),
+                                    conf=int(conf),
+                                    min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                    reason_code="QTY_INVALID",
+                                    detail=str(cs.get("skip_reason", ""))[:220],
+                                    extra={"entry_usdt": float(entry_usdt), "lev": int(lev), "price": float(px), "qty": float(qty)},
+                                )
                                 continue
 
                             # ✅ 리스(리더) 확인: watchdog 복구 중 중복 주문 방지
@@ -26912,6 +27275,19 @@ def telegram_thread(ex):
                                         signal=str(decision),
                                         score=conf,
                                         message="리스 상실(리더 아님) → 주문 스킵",
+                                        extra={"leader": lease_now.get("id", ""), "until_kst": lease_now.get("until_kst", "")},
+                                    )
+                                    mon_add_entry_trace(
+                                        mon,
+                                        cfg_effective,
+                                        symbol=sym,
+                                        style=str(style),
+                                        event="ENTRY_BLOCKED",
+                                        decision=str(decision),
+                                        conf=int(conf),
+                                        min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                        reason_code="NOT_LEADER",
+                                        detail=str(cs.get("skip_reason", ""))[:220],
                                         extra={"leader": lease_now.get("id", ""), "until_kst": lease_now.get("until_kst", "")},
                                     )
                                     continue
@@ -27004,41 +27380,117 @@ def telegram_thread(ex):
                             except Exception:
                                 use_pullback = False
 
-                            if use_pullback and float(_as_float(pullback_limit_price, 0.0)) > 0:
-                                ok, err_order = smart_order_safe_ex(
-                                    ex,
-                                    sym,
-                                    decision,
-                                    qty,
-                                    params={"postOnly": bool(cfg.get("entry_post_only", True))},
-                                    prefer_limit=True,
-                                    limit_timeout_sec=float(max(2.0, pullback_timeout_sec)),
-                                    limit_price_override=float(pullback_limit_price),
-                                    fallback_to_market=bool(cfg.get("entry_fallback_to_market", True)),
-                                )
-                                entry_order_mode = "지정가(눌림목)"
-                            else:
-                                style_now_for_order = normalize_style_name(style)
-                                if style_now_for_order == "스윙":
-                                    timeout_sec = float(max(2.0, _as_float(cfg.get("entry_limit_timeout_sec_swing", 15), 15)))
-                                elif style_now_for_order == "단타":
-                                    timeout_sec = float(max(2.0, _as_float(cfg.get("entry_limit_timeout_sec_day", 6), 6)))
+                            order_tf = str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m"))
+                            post_only_pref = bool(cfg.get("entry_post_only", True))
+                            order_retry_max = int(max(0, _as_int(cfg.get("order_retry_max", 1), 1)))
+                            retry_without_postonly = bool(cfg.get("order_postonly_retry_without_postonly", True))
+                            max_attempts = int(max(1, 1 + order_retry_max))
+                            order_submit_try = 0
+                            ok = False
+                            err_order = ""
+                            while (not ok) and (order_submit_try < max_attempts):
+                                order_submit_try += 1
+                                post_only_flag = bool(post_only_pref)
+                                if order_submit_try > 1 and retry_without_postonly:
+                                    post_only_flag = False
+                                order_params = {"postOnly": bool(post_only_flag)}
+                                if use_pullback and float(_as_float(pullback_limit_price, 0.0)) > 0:
+                                    mon_add_entry_trace(
+                                        mon,
+                                        cfg_effective,
+                                        symbol=sym,
+                                        style=str(style),
+                                        event="ORDER_SUBMIT",
+                                        decision=str(decision),
+                                        conf=int(conf),
+                                        min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                        reason_code="ORDER_SUBMIT",
+                                        detail=f"pullback_limit try#{order_submit_try}",
+                                        extra={
+                                            "side": str(decision),
+                                            "qty": float(qty),
+                                            "limit_price": float(_as_float(pullback_limit_price, 0.0)),
+                                            "postOnly": bool(post_only_flag),
+                                            "timeout_sec": float(max(2.0, pullback_timeout_sec)),
+                                        },
+                                    )
+                                    ok, err_order = smart_order_safe_ex(
+                                        ex,
+                                        sym,
+                                        decision,
+                                        qty,
+                                        params=order_params,
+                                        prefer_limit=True,
+                                        limit_timeout_sec=float(max(2.0, pullback_timeout_sec)),
+                                        limit_price_override=float(pullback_limit_price),
+                                        fallback_to_market=bool(cfg.get("entry_fallback_to_market", True)),
+                                    )
+                                    entry_order_mode = "지정가(눌림목)"
                                 else:
-                                    timeout_sec = float(max(2.0, _as_float(cfg.get("entry_limit_timeout_sec_scalp", 4), 4)))
-                                ok, err_order = smart_order_safe_ex(
-                                    ex,
-                                    sym,
-                                    decision,
-                                    qty,
-                                    params={"postOnly": bool(cfg.get("entry_post_only", True))},
-                                    prefer_limit=bool(cfg.get("entry_prefer_limit", True)),
-                                    limit_timeout_sec=timeout_sec,
-                                    fallback_to_market=bool(cfg.get("entry_fallback_to_market", True)),
-                                )
+                                    style_now_for_order = normalize_style_name(style)
+                                    if style_now_for_order == "스윙":
+                                        timeout_sec = float(max(2.0, _as_float(cfg.get("entry_limit_timeout_sec_swing", 15), 15)))
+                                    elif style_now_for_order == "단타":
+                                        timeout_sec = float(max(2.0, _as_float(cfg.get("entry_limit_timeout_sec_day", 6), 6)))
+                                    else:
+                                        timeout_sec = float(max(2.0, _as_float(cfg.get("entry_limit_timeout_sec_scalp", 4), 4)))
+                                    mon_add_entry_trace(
+                                        mon,
+                                        cfg_effective,
+                                        symbol=sym,
+                                        style=str(style),
+                                        event="ORDER_SUBMIT",
+                                        decision=str(decision),
+                                        conf=int(conf),
+                                        min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                        reason_code="ORDER_SUBMIT",
+                                        detail=f"smart_order try#{order_submit_try}",
+                                        extra={
+                                            "side": str(decision),
+                                            "qty": float(qty),
+                                            "prefer_limit": bool(cfg.get("entry_prefer_limit", True)),
+                                            "postOnly": bool(post_only_flag),
+                                            "timeout_sec": float(timeout_sec),
+                                        },
+                                    )
+                                    ok, err_order = smart_order_safe_ex(
+                                        ex,
+                                        sym,
+                                        decision,
+                                        qty,
+                                        params=order_params,
+                                        prefer_limit=bool(cfg.get("entry_prefer_limit", True)),
+                                        limit_timeout_sec=timeout_sec,
+                                        fallback_to_market=bool(cfg.get("entry_fallback_to_market", True)),
+                                    )
+                                if not ok:
+                                    err_txt_try = str(err_order or "")
+                                    mon_add_entry_trace(
+                                        mon,
+                                        cfg_effective,
+                                        symbol=sym,
+                                        style=str(style),
+                                        event="ORDER_FAILED",
+                                        decision=str(decision),
+                                        conf=int(conf),
+                                        min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                        reason_code="ORDER_FAILED",
+                                        detail=err_txt_try[:220],
+                                        extra={"attempt": int(order_submit_try), "postOnly": bool(post_only_flag)},
+                                    )
+                                    if order_submit_try >= max_attempts:
+                                        break
+                                    if not retry_without_postonly:
+                                        break
+                                    if bool(post_only_flag):
+                                        err_low = err_txt_try.lower()
+                                        if not any(x in err_low for x in ["post", "maker", "immediate", "timeinforce", "po"]):
+                                            # postOnly 사유가 아니라면 재시도 효과가 낮아 중단
+                                            break
                             if not ok:
                                 try:
                                     if use_pullback and str(err_order or "").lower().strip() == "limit_not_filled":
-                                        tf_now = str(ai2.get("decision_tf", cfg.get("timeframe", "5m")) or cfg.get("timeframe", "5m"))
+                                        tf_now = str(order_tf)
                                         msg0 = f"눌림목 지정가 미체결({int(max(1, pullback_wait_candles))}캔들 대기 후 취소)"
                                         cs["skip_reason"] = msg0
                                         mon_add_scan(
@@ -27056,6 +27508,19 @@ def telegram_thread(ex):
                                                 "reason": str(pullback_reason)[:160],
                                             },
                                         )
+                                        mon_add_entry_trace(
+                                            mon,
+                                            cfg_effective,
+                                            symbol=sym,
+                                            style=str(style),
+                                            event="ORDER_FAILED",
+                                            decision=str(decision),
+                                            conf=int(conf),
+                                            min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                            reason_code="LIMIT_NOT_FILLED",
+                                            detail=str(msg0)[:220],
+                                            extra={"limit_price": float(_as_float(pullback_limit_price, 0.0)), "timeout_sec": float(max(2.0, pullback_timeout_sec))},
+                                        )
                                         continue
                                     msg0 = f"주문 실패: {str(err_order or '')}".strip()
                                     if len(msg0) > 160:
@@ -27072,6 +27537,19 @@ def telegram_thread(ex):
                                         extra={"qty": qty, "entry_usdt": entry_usdt, "lev": lev, "style": style},
                                     )
                                     mon_add_event(mon, "ORDER_FAIL", sym, "ENTRY 주문 실패", {"err": str(err_order or ""), "qty": qty, "entry_usdt": entry_usdt, "lev": lev, "style": style})
+                                    mon_add_entry_trace(
+                                        mon,
+                                        cfg_effective,
+                                        symbol=sym,
+                                        style=str(style),
+                                        event="ORDER_FAILED",
+                                        decision=str(decision),
+                                        conf=int(conf),
+                                        min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                        reason_code="ORDER_FAILED",
+                                        detail=str(msg0)[:220],
+                                        extra={"qty": float(qty), "entry_usdt": float(entry_usdt), "lev": int(lev)},
+                                    )
                                 except Exception:
                                     pass
                                 continue
@@ -27087,6 +27565,22 @@ def telegram_thread(ex):
                                     entry_order_mode = "스마트(지정가우선→시장가)"
                             except Exception:
                                 entry_order_mode = "스마트(지정가우선→시장가)"
+                            try:
+                                mon_add_entry_trace(
+                                    mon,
+                                    cfg_effective,
+                                    symbol=sym,
+                                    style=str(style),
+                                    event="ORDER_FILLED",
+                                    decision=str(decision),
+                                    conf=int(conf),
+                                    min_conf=int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0))),
+                                    reason_code="ORDER_FILLED",
+                                    detail=str(entry_order_mode)[:220],
+                                    extra={"fill_mode": str(err_order or ""), "qty": float(qty), "entry_usdt": float(entry_usdt), "lev": int(lev)},
+                                )
+                            except Exception:
+                                pass
                             if True:
                                 trade_id = uuid.uuid4().hex[:10]
                                 mon_add_scan(
@@ -29772,7 +30266,7 @@ with st.sidebar.expander("관망 완화(anti-drought, 10분 단계)"):
         value=bool(config.get("volume_obv_gate_enable", True)),
         key="volume_obv_gate_enable_key",
     )
-    ad16, ad17 = st.columns(2)
+    ad16, ad17, ad17b = st.columns(3)
     config["volume_obv_gate_mode_scalp"] = ad16.selectbox(
         "스캘핑 볼륨게이트",
         ["soft", "hard", "off"],
@@ -29788,6 +30282,14 @@ with st.sidebar.expander("관망 완화(anti-drought, 10분 단계)"):
         if str(config.get("volume_obv_gate_mode_day", "hard")).lower() in ["hard", "soft", "off"]
         else 0,
         key="volume_obv_gate_mode_day_key",
+    )
+    config["volume_obv_gate_mode_swing"] = ad17b.selectbox(
+        "스윙 볼륨게이트",
+        ["hard", "soft", "off"],
+        index=["hard", "soft", "off"].index(str(config.get("volume_obv_gate_mode_swing", "hard")).lower())
+        if str(config.get("volume_obv_gate_mode_swing", "hard")).lower() in ["hard", "soft", "off"]
+        else 0,
+        key="volume_obv_gate_mode_swing_key",
     )
     ad18, ad19 = st.columns(2)
     config["volume_obv_gate_bypass_on_invalid_volume"] = ad18.checkbox(
@@ -29824,6 +30326,40 @@ with st.sidebar.expander("관망 완화(anti-drought, 10분 단계)"):
     config["anti_drought_min_conf_floor_scalp"] = ad11.number_input("스캘핑 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_scalp", 50), 50)), step=1, key="anti_drought_min_conf_floor_scalp_key")
     config["anti_drought_min_conf_floor_day"] = ad12.number_input("단타 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_day", 60), 60)), step=1, key="anti_drought_min_conf_floor_day_key")
     config["anti_drought_min_conf_floor_swing"] = ad13.number_input("스윙 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_swing", 60), 60)), step=1, key="anti_drought_min_conf_floor_swing_key")
+
+with st.sidebar.expander("Entry Trace / Order Retry"):
+    config["entry_trace_enable"] = st.checkbox(
+        "진입 추적 로그 사용",
+        value=bool(config.get("entry_trace_enable", True)),
+        key="entry_trace_enable_key",
+    )
+    config["show_last_entry_attempt_panel"] = st.checkbox(
+        "진입 시도 패널 표시",
+        value=bool(config.get("show_last_entry_attempt_panel", True)),
+        key="show_last_entry_attempt_panel_key",
+    )
+    config["entry_trace_keep_last_n"] = st.number_input(
+        "진입 추적 보관 개수",
+        50,
+        1000,
+        int(_as_int(config.get("entry_trace_keep_last_n", 200), 200)),
+        step=10,
+        key="entry_trace_keep_last_n_key",
+    )
+    er1, er2 = st.columns(2)
+    config["order_postonly_retry_without_postonly"] = er1.checkbox(
+        "postOnly 실패시 일반주문 재시도",
+        value=bool(config.get("order_postonly_retry_without_postonly", True)),
+        key="order_postonly_retry_without_postonly_key",
+    )
+    config["order_retry_max"] = er2.number_input(
+        "주문 재시도 횟수",
+        0,
+        3,
+        int(_as_int(config.get("order_retry_max", 1), 1)),
+        step=1,
+        key="order_retry_max_key",
+    )
 
 with st.sidebar.expander("Gates / Override"):
     config["high_conf_override_enable"] = st.checkbox(
@@ -30857,11 +31393,13 @@ with t1:
             )
             scalp_mode_eff = str(ad.get("volume_obv_gate_mode_scalp_effective", config.get("volume_obv_gate_mode_scalp", "soft"))).lower()
             day_mode_eff = str(ad.get("volume_obv_gate_mode_day_effective", config.get("volume_obv_gate_mode_day", "hard"))).lower()
+            swing_mode_eff = str(ad.get("volume_obv_gate_mode_swing_effective", config.get("volume_obv_gate_mode_swing", "hard"))).lower()
             if bool(ad.get("volume_obv_gate_disabled", False)):
                 scalp_mode_eff = "off"
                 day_mode_eff = "off"
+                swing_mode_eff = "off"
             st.caption(
-                f"볼륨/OBV 게이트: 스캘핑 {scalp_mode_eff} | 단타 {day_mode_eff}"
+                f"볼륨/OBV 게이트: 스캘핑 {scalp_mode_eff} | 단타 {day_mode_eff} | 스윙 {swing_mode_eff}"
                 f" | invalid bypass {'ON' if bool(config.get('volume_obv_gate_bypass_on_invalid_volume', True)) else 'OFF'}"
             )
             try:
@@ -30896,6 +31434,39 @@ with t1:
             if isinstance(skip_rows, list) and skip_rows:
                 st.caption("최근 스킵 사유 TOP 10")
                 st_dataframe_safe(df_for_display(pd.DataFrame(skip_rows[:10])), hide_index=True)
+            try:
+                if bool(config.get("show_last_entry_attempt_panel", True)):
+                    st.subheader("🎯 마지막 진입 시도")
+                    last_attempt = mon.get("last_entry_attempt", {}) if isinstance(mon.get("last_entry_attempt", {}), dict) else {}
+                    if last_attempt:
+                        st.write(
+                            {
+                                "시간": str(last_attempt.get("kst", "")),
+                                "코인": str(last_attempt.get("symbol", "")),
+                                "스타일": str(last_attempt.get("style", "")),
+                                "이벤트": str(last_attempt.get("event", "")),
+                                "사유코드": str(last_attempt.get("reason_code", "")),
+                                "결정": str(last_attempt.get("decision", "")),
+                                "확신/게이트": f"{int(_as_int(last_attempt.get('conf', 0), 0))}/{int(_as_int(last_attempt.get('min_conf', 0), 0))}",
+                                "상세": str(last_attempt.get("detail", ""))[:220],
+                            }
+                        )
+                    else:
+                        st.caption("진입 시도 로그 없음")
+
+                    blocker_top = get_top_entry_blockers(
+                        mon,
+                        n=10,
+                        window=int(max(50, _as_int(config.get("entry_trace_keep_last_n", 200), 200))),
+                    )
+                    if blocker_top:
+                        st.caption("최근 진입 차단 TOP 10")
+                        st_dataframe_safe(
+                            df_for_display(pd.DataFrame([{"reason_code": str(k), "count": int(v)} for k, v in blocker_top])),
+                            hide_index=True,
+                        )
+            except Exception:
+                pass
             try:
                 sp = mon.get("scan_process", []) or []
                 if isinstance(sp, list) and sp:
@@ -30957,7 +31528,12 @@ with t1:
                 "effective_micro_filter_loosened": bool(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("micro_loosened", False)),
                 "volume_obv_gate_mode_scalp": str(config.get("volume_obv_gate_mode_scalp", "soft")),
                 "volume_obv_gate_mode_day": str(config.get("volume_obv_gate_mode_day", "hard")),
+                "volume_obv_gate_mode_swing": str(config.get("volume_obv_gate_mode_swing", "hard")),
                 "effective_volume_obv_gate_disabled": bool(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("volume_obv_gate_disabled", False)),
+                "entry_trace_enable": bool(config.get("entry_trace_enable", True)),
+                "entry_trace_keep_last_n": int(_as_int(config.get("entry_trace_keep_last_n", 200), 200)),
+                "order_postonly_retry_without_postonly": bool(config.get("order_postonly_retry_without_postonly", True)),
+                "order_retry_max": int(_as_int(config.get("order_retry_max", 1), 1)),
             }
             st.json(eff)
 
