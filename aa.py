@@ -1717,6 +1717,7 @@ def default_settings() -> Dict[str, Any]:
         "anti_drought_votes_reduce_after_step": 3,
         "anti_drought_disable_pattern_gate_step": 4,
         "anti_drought_loosen_microfilters_step": 5,
+        "anti_drought_disable_volume_obv_gate_step": 5,
         "anti_drought_min_conf_floor_scalp": 50,
         "anti_drought_min_conf_floor_day": 60,
         "anti_drought_min_conf_floor_swing": 60,
@@ -1781,6 +1782,12 @@ def default_settings() -> Dict[str, Any]:
         "pullback_wait_timeout_sec_max": 25,
         # ✅ 거래량/OBV 확인(페이크아웃 차단)
         "volume_confirm_min_ratio": 1.15,
+        "volume_obv_gate_enable": True,
+        "volume_obv_gate_bypass_on_invalid_volume": True,
+        "volume_obv_gate_min_nonzero_ratio": 0.30,
+        "volume_obv_gate_mode_scalp": "soft",  # hard|soft|off
+        "volume_obv_gate_mode_day": "hard",    # hard|soft|off
+        "volume_obv_gate_soft_penalty_conf": 8,
         # ✅ 스타일별 RR 하한(목표손절이 목표익절보다 커지는 케이스 방지)
         "scalp_rr_floor": 1.5,
         "day_rr_floor": 2.0,
@@ -11595,6 +11602,22 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
     if cfg.get("use_vol", True) and "VOL_SPIKE" in df2.columns:
         used.append("거래량")
         status["거래량"] = "🔥 거래량 급증" if int(last.get("VOL_SPIKE", 0)) == 1 else "⚪ 보통"
+    try:
+        vol_ratio_now0, vol_valid0, vol_dbg0 = volume_ratio_info(
+            df2,
+            period=int(cfg.get("ai_call_volume_spike_period", 20) or 20),
+            min_nonzero_ratio=float(_as_float(cfg.get("volume_obv_gate_min_nonzero_ratio", 0.30), 0.30)),
+        )
+        status["_volume_ratio_now"] = float(vol_ratio_now0)
+        status["_volume_valid"] = bool(vol_valid0)
+        status["_volume_info"] = str(vol_dbg0)
+        # OBV는 거래량 기반 지표이므로 volume invalid면 신뢰도 낮음
+        status["_obv_valid"] = bool(vol_valid0)
+    except Exception:
+        status["_volume_ratio_now"] = 0.0
+        status["_volume_valid"] = False
+        status["_volume_info"] = "volume_info_error"
+        status["_obv_valid"] = False
 
     # Squeeze Momentum (SQZ)
     if cfg.get("use_sqz", True) and "SQZ_MOM_PCT" in df2.columns:
@@ -11977,16 +12000,39 @@ def calc_indicators(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame
 # =========================================================
 # ✅ 11.1) 급등/급락 이벤트 진입 시그널(가격행동 기반)
 # =========================================================
+def volume_ratio_info(
+    df: pd.DataFrame,
+    period: int = 20,
+    min_nonzero_ratio: float = 0.30,
+    eps: float = 1e-12,
+) -> Tuple[float, bool, str]:
+    try:
+        p = int(max(3, int(period or 20)))
+        if df is None or df.empty or len(df) < (p + 1):
+            return 0.0, False, "no_df"
+        vv_raw = df["vol"] if "vol" in df.columns else df.get("volume", None)
+        if vv_raw is None:
+            return 0.0, False, "no_vol_col"
+        vv = pd.to_numeric(vv_raw, errors="coerce").astype(float)
+        if vv.empty:
+            return 0.0, False, "empty_vol"
+        wnd = vv.iloc[-(p + 1):-1]
+        if wnd.empty:
+            return 0.0, False, "no_window"
+        v_now = float(vv.iloc[-1]) if pd.notna(vv.iloc[-1]) else 0.0
+        v_ma = float(np.nanmean(wnd.values.astype(float))) if len(wnd) > 0 else 0.0
+        nz_ratio = float(np.nanmean((wnd.values.astype(float) > 0).astype(float))) if len(wnd) > 0 else 0.0
+        valid = bool((v_ma > float(eps)) and (nz_ratio >= float(min_nonzero_ratio)))
+        ratio = float(v_now / v_ma) if valid else 0.0
+        return ratio, valid, f"v_ma={v_ma:.4g}, nz={nz_ratio:.2f}"
+    except Exception as e:
+        return 0.0, False, f"err:{type(e).__name__}"
+
+
 def current_volume_ratio(df: pd.DataFrame, period: int = 20) -> float:
     try:
-        if df is None or df.empty or len(df) < (int(period) + 1):
-            return 0.0
-        vv = pd.to_numeric(df["vol"], errors="coerce").astype(float)
-        v_now = float(vv.iloc[-1])
-        v_ma = float(vv.iloc[-(int(period) + 1):-1].mean())
-        if v_ma <= 0:
-            return 0.0
-        return float(v_now / v_ma)
+        ratio, _valid, _dbg = volume_ratio_info(df, period=int(period or 20))
+        return float(ratio)
     except Exception:
         return 0.0
 
@@ -14768,18 +14814,56 @@ JSON 형식:
         try:
             dec0 = str(out.get("decision", "hold"))
             if style_mandatory in ["스캘핑", "단타"] and dec0 in ["buy", "sell"]:
-                vol_ratio_now = float(current_volume_ratio(df, period=int(cfg.get("ai_call_volume_spike_period", 20) or 20)))
+                gate_mode = "hard" if style_mandatory == "단타" else "soft"
+                if style_mandatory == "스캘핑":
+                    gate_mode = str(cfg.get("volume_obv_gate_mode_scalp", "soft") or "soft").strip().lower()
+                elif style_mandatory == "단타":
+                    gate_mode = str(cfg.get("volume_obv_gate_mode_day", "hard") or "hard").strip().lower()
+                if gate_mode not in ["hard", "soft", "off"]:
+                    gate_mode = "hard" if style_mandatory == "단타" else "soft"
+                if not bool(cfg.get("volume_obv_gate_enable", True)):
+                    gate_mode = "off"
+                anti_step = int(_as_int(cfg.get("_anti_drought_step", 0), 0))
+                anti_disable_step = int(max(1, _as_int(cfg.get("anti_drought_disable_volume_obv_gate_step", 5), 5)))
+                if anti_step >= anti_disable_step:
+                    gate_mode = "off"
+
+                vol_ratio_now, vol_valid, vol_dbg = volume_ratio_info(
+                    df,
+                    period=int(cfg.get("ai_call_volume_spike_period", 20) or 20),
+                    min_nonzero_ratio=float(_as_float(cfg.get("volume_obv_gate_min_nonzero_ratio", 0.30), 0.30)),
+                )
                 vol_min = float(max(1.0, _as_float(cfg.get("volume_confirm_min_ratio", 1.15), 1.15)))
                 vol_ok = bool(vol_ratio_now >= vol_min)
                 obv_bull = bool(status.get("_obv_div_bull", False))
                 obv_bear = bool(status.get("_obv_div_bear", False))
                 obv_ok = bool(obv_bull if dec0 == "buy" else obv_bear)
-                if not (vol_ok or obv_ok):
-                    out["decision"] = "hold"
-                    out["reason_easy"] = f"거래량/OBV 확인 미충족(거래량 {vol_ratio_now:.2f}x, OBV 다이버전스 없음)"
-                    out["_volume_blocked"] = True
-                    out["_volume_ratio_now"] = float(vol_ratio_now)
-                    out["_volume_ratio_need"] = float(vol_min)
+                out["_volume_ratio_now"] = float(vol_ratio_now)
+                out["_volume_ratio_need"] = float(vol_min)
+                out["_volume_valid"] = bool(vol_valid)
+                out["_volume_info"] = str(vol_dbg)
+                out["_volume_gate_mode"] = str(gate_mode)
+                if (not vol_valid) and bool(cfg.get("volume_obv_gate_bypass_on_invalid_volume", True)):
+                    out["_volume_bypassed_invalid"] = True
+                elif gate_mode == "off":
+                    out["_volume_gate_off"] = True
+                elif not (vol_ok or obv_ok):
+                    if gate_mode == "soft":
+                        penalty = int(max(0, _as_int(cfg.get("volume_obv_gate_soft_penalty_conf", 8), 8)))
+                        conf_before = int(_as_int(out.get("confidence", 0), 0))
+                        conf_after = int(max(0, conf_before - penalty))
+                        out["confidence"] = int(conf_after)
+                        out["_volume_soft_penalty"] = int(penalty)
+                        suffix = f"거래량/OBV 약함(soft -{penalty}, {vol_ratio_now:.2f}x, {vol_dbg})"
+                        out["reason_easy"] = (str(out.get("reason_easy", "") or "").strip() + " / " + suffix).strip(" /")
+                    else:
+                        out["decision"] = "hold"
+                        out["reason_easy"] = f"거래량/OBV 확인 미충족(거래량 {vol_ratio_now:.2f}x, obv_ok={obv_ok}, {vol_dbg})"
+                        out["_volume_blocked"] = True
+                        out["_volume_ratio_now"] = float(vol_ratio_now)
+                        out["_volume_ratio_need"] = float(vol_min)
+                        out["_volume_info"] = str(vol_dbg)
+                        out["_volume_gate_mode"] = str(gate_mode)
         except Exception:
             pass
 
@@ -15649,25 +15733,38 @@ def _skip_reason_gate(reason: str) -> str:
 def _watch_gate_top(mon: Dict[str, Any], symbols: List[str], top_n: int = 3) -> List[Tuple[str, int]]:
     try:
         recent = (mon or {}).get("skip_events", []) or []
-        if isinstance(recent, list) and recent:
-            counts_evt: Dict[str, int] = {}
-            for ev in recent[-200:]:
-                if not isinstance(ev, dict):
-                    continue
-                reason = str(ev.get("reason", "") or ev.get("reason_code", "") or "").strip()
-                gate = _skip_reason_gate(reason)
-                counts_evt[gate] = int(counts_evt.get(gate, 0) or 0) + 1
-            ranked_evt = sorted(counts_evt.items(), key=lambda x: (-int(x[1]), str(x[0])))
-            if ranked_evt:
-                return ranked_evt[: max(1, int(top_n))]
         coins = (mon or {}).get("coins", {}) or {}
-        counts: Dict[str, int] = {}
+        counts_coin: Dict[str, int] = {}
         for s in symbols:
             cs = coins.get(s, {}) if isinstance(coins, dict) else {}
             reason = str((cs or {}).get("skip_reason") or (cs or {}).get("ai_reason_easy") or "").strip()
             gate = _skip_reason_gate(reason)
-            counts[gate] = int(counts.get(gate, 0) or 0) + 1
-        ranked = sorted(counts.items(), key=lambda x: (-int(x[1]), str(x[0])))
+            counts_coin[gate] = int(counts_coin.get(gate, 0) or 0) + 1
+
+        if isinstance(recent, list) and recent:
+            counts_evt: Dict[str, int] = {}
+            generic_evt = 0
+            total_evt = 0
+            for ev in recent[-200:]:
+                if not isinstance(ev, dict):
+                    continue
+                reason = str(ev.get("reason", "") or ev.get("reason_code", "") or "").strip()
+                if reason:
+                    total_evt += 1
+                    if reason in ["진입 조건 미달/보류", "NO_ENTRY", "no_entry"]:
+                        generic_evt += 1
+                gate = _skip_reason_gate(reason)
+                counts_evt[gate] = int(counts_evt.get(gate, 0) or 0) + 1
+            counts_merged = dict(counts_evt)
+            generic_dominant = bool(total_evt > 0 and (generic_evt / max(1, total_evt)) >= 0.7)
+            top_evt_gate = max(counts_evt.items(), key=lambda x: int(x[1]))[0] if counts_evt else ""
+            if generic_dominant or top_evt_gate == "other":
+                for gk, gv in counts_coin.items():
+                    counts_merged[gk] = int(counts_merged.get(gk, 0) or 0) + int(gv)
+            ranked_evt = sorted(counts_merged.items(), key=lambda x: (-int(x[1]), str(x[0])))
+            if ranked_evt and any(int(v) > 0 for _k, v in ranked_evt):
+                return ranked_evt[: max(1, int(top_n))]
+        ranked = sorted(counts_coin.items(), key=lambda x: (-int(x[1]), str(x[0])))
         return ranked[: max(1, int(top_n))]
     except Exception:
         return []
@@ -15837,8 +15934,10 @@ def compute_anti_drought_state(cfg: Dict[str, Any], rt: Dict[str, Any], has_open
 
         disable_pattern_step = int(max(1, _as_int(cfg.get("anti_drought_disable_pattern_gate_step", 4), 4)))
         loosen_micro_step = int(max(1, _as_int(cfg.get("anti_drought_loosen_microfilters_step", 5), 5)))
+        disable_volume_step = int(max(1, _as_int(cfg.get("anti_drought_disable_volume_obv_gate_step", 5), 5)))
         out["pattern_gate_disabled"] = bool(step_now >= disable_pattern_step)
         out["micro_loosened"] = bool(step_now >= loosen_micro_step)
+        out["volume_obv_gate_disabled"] = bool(step_now >= disable_volume_step)
 
         if bool(cfg.get("anti_drought_notify_tg", True)) and bool(out.get("step_changed", False)):
             every_steps = int(max(1, _as_int(cfg.get("anti_drought_notify_every_steps", 1), 1)))
@@ -15859,12 +15958,17 @@ def build_effective_cfg_with_anti_drought(cfg: Dict[str, Any], drought_state: Di
         if not bool((drought_state or {}).get("active", False)):
             return eff
 
+        eff["_anti_drought_active"] = True
+        eff["_anti_drought_step"] = int(_as_int((drought_state or {}).get("step", 0), 0))
         eff["intra_day_scalp_min_conf"] = int(_as_int(drought_state.get("effective_min_conf_scalp", eff.get("intra_day_scalp_min_conf", 55)), 55))
         eff["intra_day_day_min_conf"] = int(_as_int(drought_state.get("effective_min_conf_day", eff.get("intra_day_day_min_conf", 65)), 65))
         eff["intra_day_swing_min_conf"] = int(_as_int(drought_state.get("effective_min_conf_swing", eff.get("intra_day_swing_min_conf", 68)), 68))
 
         if bool(drought_state.get("pattern_gate_disabled", False)):
             eff["pattern_gate_entry"] = False
+        if bool(drought_state.get("volume_obv_gate_disabled", False)):
+            eff["volume_obv_gate_mode_scalp"] = "off"
+            eff["volume_obv_gate_mode_day"] = "off"
 
         if bool(drought_state.get("micro_loosened", False)) and bool(eff.get("micro_entry_filter_enable", False)):
             eff["micro_max_spread_bps_scalp"] = float(min(25.0, _as_float(eff.get("micro_max_spread_bps_scalp", 12.0), 12.0) + 6.0))
@@ -23716,6 +23820,9 @@ def telegram_thread(ex):
                             "votes_reduce": int(_as_int(anti_drought_state.get("votes_reduce", 0), 0)),
                             "pattern_gate_disabled": bool(anti_drought_state.get("pattern_gate_disabled", False)),
                             "micro_loosened": bool(anti_drought_state.get("micro_loosened", False)),
+                            "volume_obv_gate_disabled": bool(anti_drought_state.get("volume_obv_gate_disabled", False)),
+                            "volume_obv_gate_mode_scalp_effective": str(cfg_effective.get("volume_obv_gate_mode_scalp", cfg.get("volume_obv_gate_mode_scalp", "soft"))),
+                            "volume_obv_gate_mode_day_effective": str(cfg_effective.get("volume_obv_gate_mode_day", cfg.get("volume_obv_gate_mode_day", "hard"))),
                             "effective_min_conf_scalp": int(_as_int(anti_drought_state.get("effective_min_conf_scalp", cfg_effective.get("intra_day_scalp_min_conf", 55)), 55)),
                             "effective_min_conf_day": int(_as_int(anti_drought_state.get("effective_min_conf_day", cfg_effective.get("intra_day_day_min_conf", 65)), 65)),
                             "effective_min_conf_swing": int(_as_int(anti_drought_state.get("effective_min_conf_swing", cfg_effective.get("intra_day_swing_min_conf", 68)), 68)),
@@ -23939,6 +24046,9 @@ def telegram_thread(ex):
                                 "bb": stt.get("BB", ""),
                                 "macd": stt.get("MACD", ""),
                                 "vol": stt.get("거래량", ""),
+                                "volume_valid": bool(stt.get("_volume_valid", False)),
+                                "volume_info": str(stt.get("_volume_info", "")),
+                                "obv_valid": bool(stt.get("_obv_valid", False)),
                                 "sqz": stt.get("SQZ", ""),
                                 "sqz_mom_pct": stt.get("_sqz_mom_pct", ""),
                                 "sqz_bias": stt.get("_sqz_bias", ""),
@@ -25002,7 +25112,7 @@ def telegram_thread(ex):
                                 stt,
                                 sym,
                                 mode,
-                                cfg,
+                                cfg_effective,
                                 external=ext_for_ai,
                                 trend_long=str(htf_trend or ""),
                                 sr_context=sr_ctx,
@@ -25728,26 +25838,120 @@ def telegram_thread(ex):
                             # ✅ 거래량/OBV 확인: 스캘핑/단타는 둘 중 하나가 있어야 진입 허용
                             try:
                                 if str(style) in ["스캘핑", "단타"] and str(decision) in ["buy", "sell"]:
-                                    try:
-                                        vol_now = float(vol_ratio) if vol_ratio is not None else float(current_volume_ratio(df, period=int(cfg.get("ai_call_volume_spike_period", 20) or 20)))
-                                    except Exception:
-                                        vol_now = 0.0
-                                    vol_min = float(max(1.0, _as_float(cfg.get("volume_confirm_min_ratio", 1.15), 1.15)))
+                                    style_conf_gate_now = int(_as_int(cs.get("style_conf_gate", min_conf_gate), _as_int(min_conf_gate, 0)))
+                                    gate_mode = "hard" if str(style) == "단타" else "soft"
+                                    if str(style) == "스캘핑":
+                                        gate_mode = str(cfg_effective.get("volume_obv_gate_mode_scalp", "soft") or "soft").strip().lower()
+                                    elif str(style) == "단타":
+                                        gate_mode = str(cfg_effective.get("volume_obv_gate_mode_day", "hard") or "hard").strip().lower()
+                                    if gate_mode not in ["hard", "soft", "off"]:
+                                        gate_mode = "hard" if str(style) == "단타" else "soft"
+                                    if not bool(cfg_effective.get("volume_obv_gate_enable", True)):
+                                        gate_mode = "off"
+                                    anti_step_now = int(_as_int((anti_drought_state or {}).get("step", 0), 0))
+                                    anti_disable_step = int(max(1, _as_int(cfg_effective.get("anti_drought_disable_volume_obv_gate_step", 5), 5)))
+                                    if anti_step_now >= anti_disable_step:
+                                        gate_mode = "off"
+
+                                    vol_now, vol_valid, vol_dbg = volume_ratio_info(
+                                        df,
+                                        period=int(cfg_effective.get("ai_call_volume_spike_period", 20) or 20),
+                                        min_nonzero_ratio=float(_as_float(cfg_effective.get("volume_obv_gate_min_nonzero_ratio", 0.30), 0.30)),
+                                    )
+                                    vol_min = float(max(1.0, _as_float(cfg_effective.get("volume_confirm_min_ratio", 1.15), 1.15)))
                                     vol_ok = bool(vol_now >= vol_min)
                                     obv_ok = bool(stt.get("_obv_div_bull", False)) if str(decision) == "buy" else bool(stt.get("_obv_div_bear", False))
-                                    if not (vol_ok or obv_ok):
-                                        cs["skip_reason"] = f"거래량/OBV 미충족(vol {vol_now:.2f}x < {vol_min:.2f}x)"
+                                    cs["volume_obv_gate_mode_effective"] = str(gate_mode)
+                                    cs["volume_ratio_now"] = float(vol_now)
+                                    cs["volume_ratio_need"] = float(vol_min)
+                                    cs["volume_valid"] = bool(vol_valid)
+                                    cs["volume_info"] = str(vol_dbg)
+                                    cs["obv_valid"] = bool(stt.get("_obv_valid", vol_valid))
+
+                                    if (not vol_valid) and bool(cfg_effective.get("volume_obv_gate_bypass_on_invalid_volume", True)):
+                                        cs["_volume_bypassed_invalid"] = True
+                                        cs["volume_obv_gate_effective"] = "bypass_invalid"
+                                    elif gate_mode == "off":
+                                        cs["volume_obv_gate_effective"] = "off"
+                                    elif not (vol_ok or obv_ok):
+                                        if gate_mode == "hard":
+                                            cs["skip_reason"] = (
+                                                f"거래량/OBV 하드게이트 미충족(vol {vol_now:.2f}x < {vol_min:.2f}x, "
+                                                f"obv_ok={obv_ok}, {vol_dbg})"
+                                            )
+                                            mon_add_scan(
+                                                mon,
+                                                stage="trade_skipped",
+                                                symbol=sym,
+                                                tf=str(cfg.get("timeframe", "5m")),
+                                                signal=str(decision),
+                                                score=int(conf),
+                                                message="volume_obv_gate",
+                                                extra={
+                                                    "reason_code": "VOLUME_OBV_BLOCK",
+                                                    "style": str(style),
+                                                    "mode": str(gate_mode),
+                                                    "vol_ratio": float(vol_now),
+                                                    "vol_need": float(vol_min),
+                                                    "vol_valid": bool(vol_valid),
+                                                    "obv_ok": bool(obv_ok),
+                                                    "vol_dbg": str(vol_dbg),
+                                                },
+                                            )
+                                            continue
+                                        penalty = int(max(0, _as_int(cfg_effective.get("volume_obv_gate_soft_penalty_conf", 8), 8)))
+                                        conf_before_soft = int(conf)
+                                        conf = int(max(0, conf_before_soft - penalty))
+                                        cs["_volume_soft_penalty"] = int(penalty)
+                                        cs["ai_confidence_final"] = int(conf)
+                                        cs["ai_confidence"] = int(conf)
+                                        cs["skip_reason"] = (
+                                            f"거래량/OBV 약함(soft -{penalty}, {vol_now:.2f}x, {vol_dbg})"
+                                        )
                                         mon_add_scan(
                                             mon,
-                                            stage="trade_skipped",
+                                            stage="gate_soft_penalty",
                                             symbol=sym,
                                             tf=str(cfg.get("timeframe", "5m")),
                                             signal=str(decision),
                                             score=int(conf),
-                                            message="volume_obv_gate",
-                                            extra={"style": str(style), "vol_ratio": float(vol_now), "vol_need": float(vol_min), "obv_ok": bool(obv_ok)},
+                                            message=str(cs.get("skip_reason", ""))[:140],
+                                            extra={
+                                                "reason_code": "VOLUME_OBV_SOFT",
+                                                "style": str(style),
+                                                "conf_before": int(conf_before_soft),
+                                                "conf_after": int(conf),
+                                                "penalty": int(penalty),
+                                                "vol_ratio": float(vol_now),
+                                                "vol_need": float(vol_min),
+                                                "vol_valid": bool(vol_valid),
+                                                "obv_ok": bool(obv_ok),
+                                            },
                                         )
-                                        continue
+                                        if int(conf) < int(style_conf_gate_now):
+                                            cs["skip_reason"] = (
+                                                f"거래량/OBV soft감점 후 확신도 부족({int(conf)}% < {int(style_conf_gate_now)}%, "
+                                                f"vol {vol_now:.2f}x, {vol_dbg})"
+                                            )
+                                            mon_add_scan(
+                                                mon,
+                                                stage="trade_skipped",
+                                                symbol=sym,
+                                                tf=str(cfg.get("timeframe", "5m")),
+                                                signal=str(decision),
+                                                score=int(conf),
+                                                message=str(cs.get("skip_reason", ""))[:140],
+                                                extra={
+                                                    "reason_code": "VOLUME_OBV_SOFT_CONF_BLOCK",
+                                                    "style": str(style),
+                                                    "gate": int(style_conf_gate_now),
+                                                    "vol_ratio": float(vol_now),
+                                                    "vol_need": float(vol_min),
+                                                    "vol_valid": bool(vol_valid),
+                                                    "obv_ok": bool(obv_ok),
+                                                },
+                                            )
+                                            continue
                             except Exception:
                                 pass
 
@@ -27429,6 +27633,15 @@ def telegram_thread(ex):
 
                         else:
                             # AI 결과가 HOLD이거나, 확신도/조건 미달로 진입하지 않음
+                            best_reason = ""
+                            try:
+                                best_reason = str(
+                                    (cs.get("skip_reason") or cs.get("ai_reason_easy") or (ai.get("reason_easy", "") if isinstance(ai, dict) else "") or "")
+                                ).strip()
+                            except Exception:
+                                best_reason = ""
+                            if not best_reason:
+                                best_reason = "진입 조건 미달/보류"
                             mon_add_scan(
                                 mon,
                                 stage="trade_skipped",
@@ -27436,8 +27649,15 @@ def telegram_thread(ex):
                                 tf=str(cfg.get("timeframe", "5m")),
                                 signal=str(decision),
                                 score=conf,
-                                message="진입 조건 미달/보류",
-                                extra={"decision": decision, "confidence": conf, "min_conf": int(rule.get("min_conf", 0))},
+                                message=str(best_reason)[:180],
+                                extra={
+                                    "reason_code": "NO_ENTRY",
+                                    "decision": decision,
+                                    "confidence": conf,
+                                    "min_conf": int(rule.get("min_conf", 0)),
+                                    "skip_reason": str(cs.get("skip_reason", "") or ""),
+                                    "ai_reason_easy": str(cs.get("ai_reason_easy", "") or ""),
+                                },
                             )
 
                         time.sleep(0.4)
@@ -27496,10 +27716,11 @@ def telegram_thread(ex):
                                         f"/{int(_as_int((anti_drought_state or {}).get('effective_min_conf_day', cfg_effective.get('intra_day_day_min_conf', 65)), 65))}"
                                         f"/{int(_as_int((anti_drought_state or {}).get('effective_min_conf_swing', cfg_effective.get('intra_day_swing_min_conf', 68)), 68))}"
                                     )
-                                    lines.append(
-                                        f"- anti-drought 게이트: 패턴 {'OFF' if bool((anti_drought_state or {}).get('pattern_gate_disabled', False)) else 'ON'}"
-                                        f", 마이크로 {'완화' if bool((anti_drought_state or {}).get('micro_loosened', False)) else '기본'}"
-                                    )
+                                lines.append(
+                                    f"- anti-drought 게이트: 패턴 {'OFF' if bool((anti_drought_state or {}).get('pattern_gate_disabled', False)) else 'ON'}"
+                                    f", 마이크로 {'완화' if bool((anti_drought_state or {}).get('micro_loosened', False)) else '기본'}"
+                                    f", 볼륨/OBV {'OFF' if bool((anti_drought_state or {}).get('volume_obv_gate_disabled', False)) else '기본'}"
+                                )
 
                                 top_reasons = _watch_reason_top(mon, list(scan_symbols_loop), top_n=3)
                                 if top_reasons:
@@ -27513,12 +27734,17 @@ def telegram_thread(ex):
                                         lines.append(f"  · {gate} x{int(cnt)}")
 
                                 coins_now = mon.get("coins", {}) if isinstance(mon.get("coins", {}), dict) else {}
+                                invalid_volume_detected = False
                                 for sym0 in list(scan_symbols_loop)[:3]:
                                     cs0 = coins_now.get(sym0, {}) if isinstance(coins_now, dict) else {}
+                                    if not bool(cs0.get("volume_valid", True)):
+                                        invalid_volume_detected = True
                                     lines.append(
                                         f"- {sym0}: {str(cs0.get('ai_decision','-')).upper()}({cs0.get('ai_confidence','-')}%)"
                                         f" / {str(cs0.get('skip_reason') or cs0.get('ai_reason_easy') or '-')[:40]}"
                                     )
+                                if invalid_volume_detected and bool(cfg.get("volume_obv_gate_bypass_on_invalid_volume", True)):
+                                    lines.append("- ⚠️ Volume data invalid(sandbox) 감지: 볼륨/OBV 게이트 bypass 활성")
 
                                 tg_send(
                                     "\n".join(lines),
@@ -29308,6 +29534,68 @@ with st.sidebar.expander("관망 완화(anti-drought, 10분 단계)"):
     ad9, ad10 = st.columns(2)
     config["anti_drought_loosen_microfilters_step"] = ad9.number_input("마이크로필터 완화 단계", 1, 20, int(_as_int(config.get("anti_drought_loosen_microfilters_step", 5), 5)), step=1, key="anti_drought_loosen_microfilters_step_key")
     config["anti_drought_skip_window"] = ad10.number_input("스킵 집계 윈도우", 50, 500, int(_as_int(config.get("anti_drought_skip_window", 200), 200)), step=10, key="anti_drought_skip_window_key")
+    ad14, ad15 = st.columns(2)
+    config["anti_drought_disable_volume_obv_gate_step"] = ad14.number_input(
+        "볼륨/OBV 게이트 OFF 단계",
+        1,
+        20,
+        int(_as_int(config.get("anti_drought_disable_volume_obv_gate_step", 5), 5)),
+        step=1,
+        key="anti_drought_disable_volume_obv_gate_step_key",
+    )
+    config["volume_obv_gate_enable"] = ad15.checkbox(
+        "볼륨/OBV 게이트 사용",
+        value=bool(config.get("volume_obv_gate_enable", True)),
+        key="volume_obv_gate_enable_key",
+    )
+    ad16, ad17 = st.columns(2)
+    config["volume_obv_gate_mode_scalp"] = ad16.selectbox(
+        "스캘핑 볼륨게이트",
+        ["soft", "hard", "off"],
+        index=["soft", "hard", "off"].index(str(config.get("volume_obv_gate_mode_scalp", "soft")).lower())
+        if str(config.get("volume_obv_gate_mode_scalp", "soft")).lower() in ["soft", "hard", "off"]
+        else 0,
+        key="volume_obv_gate_mode_scalp_key",
+    )
+    config["volume_obv_gate_mode_day"] = ad17.selectbox(
+        "단타 볼륨게이트",
+        ["hard", "soft", "off"],
+        index=["hard", "soft", "off"].index(str(config.get("volume_obv_gate_mode_day", "hard")).lower())
+        if str(config.get("volume_obv_gate_mode_day", "hard")).lower() in ["hard", "soft", "off"]
+        else 0,
+        key="volume_obv_gate_mode_day_key",
+    )
+    ad18, ad19 = st.columns(2)
+    config["volume_obv_gate_bypass_on_invalid_volume"] = ad18.checkbox(
+        "볼륨 invalid 시 bypass",
+        value=bool(config.get("volume_obv_gate_bypass_on_invalid_volume", True)),
+        key="volume_obv_gate_bypass_on_invalid_volume_key",
+    )
+    config["volume_obv_gate_soft_penalty_conf"] = ad19.number_input(
+        "soft 감점(conf)",
+        0,
+        30,
+        int(_as_int(config.get("volume_obv_gate_soft_penalty_conf", 8), 8)),
+        step=1,
+        key="volume_obv_gate_soft_penalty_conf_key",
+    )
+    ad20, ad21 = st.columns(2)
+    config["volume_obv_gate_min_nonzero_ratio"] = ad20.number_input(
+        "볼륨 유효 최소 비율",
+        0.0,
+        1.0,
+        float(_as_float(config.get("volume_obv_gate_min_nonzero_ratio", 0.30), 0.30)),
+        step=0.05,
+        key="volume_obv_gate_min_nonzero_ratio_key",
+    )
+    config["volume_confirm_min_ratio"] = ad21.number_input(
+        "볼륨 확인 배수",
+        0.5,
+        5.0,
+        float(_as_float(config.get("volume_confirm_min_ratio", 1.15), 1.15)),
+        step=0.05,
+        key="volume_confirm_min_ratio_key",
+    )
     ad11, ad12, ad13 = st.columns(3)
     config["anti_drought_min_conf_floor_scalp"] = ad11.number_input("스캘핑 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_scalp", 50), 50)), step=1, key="anti_drought_min_conf_floor_scalp_key")
     config["anti_drought_min_conf_floor_day"] = ad12.number_input("단타 conf 하한", 0, 100, int(_as_int(config.get("anti_drought_min_conf_floor_day", 60), 60)), step=1, key="anti_drought_min_conf_floor_day_key")
@@ -30273,6 +30561,40 @@ with t1:
                 f"게이트 상태: 패턴 {'OFF(완화)' if bool(ad.get('pattern_gate_disabled', False)) else 'ON'}"
                 f" | 마이크로 {'완화' if bool(ad.get('micro_loosened', False)) else '기본'}"
             )
+            scalp_mode_eff = str(ad.get("volume_obv_gate_mode_scalp_effective", config.get("volume_obv_gate_mode_scalp", "soft"))).lower()
+            day_mode_eff = str(ad.get("volume_obv_gate_mode_day_effective", config.get("volume_obv_gate_mode_day", "hard"))).lower()
+            if bool(ad.get("volume_obv_gate_disabled", False)):
+                scalp_mode_eff = "off"
+                day_mode_eff = "off"
+            st.caption(
+                f"볼륨/OBV 게이트: 스캘핑 {scalp_mode_eff} | 단타 {day_mode_eff}"
+                f" | invalid bypass {'ON' if bool(config.get('volume_obv_gate_bypass_on_invalid_volume', True)) else 'OFF'}"
+            )
+            try:
+                coins_map = mon.get("coins", {}) if isinstance(mon.get("coins", {}), dict) else {}
+                vol_rows: List[Dict[str, Any]] = []
+                invalid_found = False
+                for sym0 in list(coins_map.keys())[:3]:
+                    cs0 = coins_map.get(sym0, {}) if isinstance(coins_map, dict) else {}
+                    v_ok = bool(cs0.get("volume_valid", False))
+                    if not v_ok:
+                        invalid_found = True
+                    vol_rows.append(
+                        {
+                            "코인": str(sym0),
+                            "volume_valid": "✅" if v_ok else "❌",
+                            "obv_valid": "✅" if bool(cs0.get("obv_valid", False)) else "❌",
+                            "vol_ratio": f"{float(_as_float(cs0.get('volume_ratio_now', cs0.get('_volume_ratio_now', 0.0)), 0.0)):.2f}x",
+                            "info": str(cs0.get("volume_info", cs0.get("_volume_info", "")))[:80],
+                        }
+                    )
+                if vol_rows:
+                    st.caption("거래량 유효성(상위 3 코인)")
+                    st_dataframe_safe(df_for_display(pd.DataFrame(vol_rows)), hide_index=True)
+                if invalid_found:
+                    st.warning("⚠️ Volume data invalid (sandbox). Volume/OBV gate will be bypassed.")
+            except Exception:
+                pass
             skip_rows = ad.get("skip_top", [])
             if not (isinstance(skip_rows, list) and skip_rows):
                 topx = get_top_skip_reasons(mon, n=10, window=int(max(50, _as_int(config.get("anti_drought_skip_window", 200), 200))))
@@ -30312,6 +30634,9 @@ with t1:
                 "effective_min_conf_swing": int(_as_int(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("effective_min_conf_swing", config.get("intra_day_swing_min_conf", 68)), 68)),
                 "effective_pattern_gate_entry": (not bool(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("pattern_gate_disabled", False))) and bool(config.get("pattern_gate_entry", True)),
                 "effective_micro_filter_loosened": bool(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("micro_loosened", False)),
+                "volume_obv_gate_mode_scalp": str(config.get("volume_obv_gate_mode_scalp", "soft")),
+                "volume_obv_gate_mode_day": str(config.get("volume_obv_gate_mode_day", "hard")),
+                "effective_volume_obv_gate_disabled": bool(((mon.get("anti_drought") or {}) if isinstance(mon.get("anti_drought"), dict) else {}).get("volume_obv_gate_disabled", False)),
             }
             st.json(eff)
 
