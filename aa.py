@@ -1063,9 +1063,13 @@ CRITICAL_TUNING_ENFORCE_KEY = "critical_tuning_force_apply"
 def critical_tuning_recommended_values() -> Dict[str, Any]:
     return {
         "pattern_gate_entry": False,
+        "ai_cost_saver_strict": False,
         "ai_call_require_volume_spike": False,
         "ai_call_require_disparity": False,
         "ai_call_filters_block_ai": False,
+        "entry_require_fresh_start_signal": False,
+        "sqz_dependency_gate_entry": False,
+        "sqz_priority_entry_strict": False,
         "intra_day_scalp_min_conf": 55,
         "intra_day_day_min_conf": 65,
         "intra_day_swing_min_conf": 68,
@@ -2888,13 +2892,13 @@ def load_settings() -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                if bool(cfg.get("ai_call_require_volume_spike", True)):
+                if bool(cfg.get("ai_call_require_volume_spike", False)):
                     cfg["ai_call_require_volume_spike"] = False
                     changed = True
             except Exception:
                 pass
             try:
-                if bool(cfg.get("ai_call_require_disparity", True)):
+                if bool(cfg.get("ai_call_require_disparity", False)):
                     cfg["ai_call_require_disparity"] = False
                     changed = True
             except Exception:
@@ -2983,6 +2987,24 @@ def load_settings() -> Dict[str, Any]:
                     cfg["critical_tuning_applied_kst"] = str(cfg.get("critical_tuning_applied_kst", "") or "")
                 except Exception:
                     pass
+        # v31 이후에도, 사용자가 opt-out 하지 않은 경우 핵심 튜닝은 매 기동 시 강제 유지
+        try:
+            do_guard_apply = bool((not saved_opt_out) and saved_force_apply)
+            if do_guard_apply:
+                guard_applied_keys: List[str] = []
+                for k, v in critical_tuning_recommended_values().items():
+                    try:
+                        if not _setting_value_eq(cfg.get(k), v):
+                            cfg[k] = v
+                            guard_applied_keys.append(str(k))
+                            changed = True
+                    except Exception:
+                        continue
+                if guard_applied_keys:
+                    cfg["critical_tuning_guard_applied_kst"] = now_kst_str()
+                    cfg["critical_tuning_guard_keys"] = guard_applied_keys[:64]
+        except Exception:
+            pass
         cfg["settings_schema_version"] = base_ver
         if changed:
             try:
@@ -20021,7 +20043,7 @@ def _maybe_switch_style_for_open_position(
         allow_ai_switch = (
             bool(cfg.get("style_switch_ai_enable", False))
             and (not bool(cfg.get("exit_trailing_protect_enable", False)))
-            and (not bool(cfg.get("ai_cost_saver_strict", True)))
+            and (not bool(cfg.get("ai_cost_saver_strict", False)))
         )
         rec = _style_for_entry(sym, dec, short_trend, long_trend, cfg, allow_ai=bool(allow_ai_switch))
         rec_style = rec.get("style", cur_style)
@@ -21131,7 +21153,7 @@ def telegram_thread(ex):
             except Exception:
                 pass
             use_external_now = bool(cfg.get("use_external_context", True))
-            if bool(cfg.get("ai_cost_saver_strict", True)):
+            if bool(cfg.get("ai_cost_saver_strict", False)):
                 use_external_now = False
             if use_external_now:
                 try:
@@ -24808,7 +24830,7 @@ def telegram_thread(ex):
                                     need = int(need_base)
                                 ml_dir = str(ml.get("dir", "hold") or "hold")
                                 ml_votes = int(ml.get("votes_max", 0) or 0)
-                                need_fresh = bool(cfg.get("entry_require_fresh_start_signal", True))
+                                need_fresh = bool(cfg.get("entry_require_fresh_start_signal", False))
                                 fresh_long = bool(stt.get("_fresh_long_recent", stt.get("_fresh_long_trigger", False)))
                                 fresh_short = bool(stt.get("_fresh_short_recent", stt.get("_fresh_short_trigger", False)))
                                 fresh_ok = True
@@ -24822,7 +24844,7 @@ def telegram_thread(ex):
                                 sqz_priority = (
                                     bool(cfg.get("use_sqz", True))
                                     and bool(cfg.get("sqz_dependency_enable", True))
-                                    and bool(cfg.get("sqz_priority_entry_strict", True))
+                                    and bool(cfg.get("sqz_priority_entry_strict", False))
                                     and float(cfg.get("sqz_dependency_weight", 0.80) or 0.80) >= 0.80
                                 )
                                 sqz_ok = True
@@ -24923,7 +24945,7 @@ def telegram_thread(ex):
                                     vol_ratio = float(current_volume_ratio(df, period=int(cfg.get("ai_call_volume_spike_period", 20) or 20)))
                                 except Exception:
                                     vol_ratio = None
-                            if call_ai and bool(cfg.get("ai_call_require_volume_spike", True)):
+                            if call_ai and bool(cfg.get("ai_call_require_volume_spike", False)):
                                 per = max(5, int(cfg.get("ai_call_volume_spike_period", 20) or 20))
                                 mul = float(cfg.get("ai_call_volume_spike_mul", 1.5) or 1.5)
                                 try:
@@ -24939,7 +24961,7 @@ def telegram_thread(ex):
                                 except Exception:
                                     pass
 
-                            if call_ai and bool(cfg.get("ai_call_require_disparity", True)):
+                            if call_ai and bool(cfg.get("ai_call_require_disparity", False)):
                                 ma_p = max(5, int(cfg.get("ai_call_disparity_ma_period", 20) or 20))
                                 max_abs = float(cfg.get("ai_call_disparity_max_abs_pct", 4.0) or 4.0)
                                 try:
@@ -24983,7 +25005,7 @@ def telegram_thread(ex):
                                 pass
                         # ✅ 비용 절감 strict: 약한 조건에서는 AI 호출 자체를 스킵
                         try:
-                            if call_ai and (not forced_ai) and (not event_override) and bool(cfg.get("ai_cost_saver_strict", True)) and (not (no_pos_aggressive and int(align_max) >= 4)):
+                            if call_ai and (not forced_ai) and (not event_override) and bool(cfg.get("ai_cost_saver_strict", False)) and (not (no_pos_aggressive and int(align_max) >= 4)):
                                 ml_votes_now = int(ml.get("votes_max", 0) or 0)
                                 need_votes_now = max(2, int(cfg.get("entry_convergence_min_votes", 2) or 2))
                                 strong_sig_now = bool(stt.get("_pullback_candidate", False)) or bool(stt.get("_rsi_resolve_long", False)) or bool(stt.get("_rsi_resolve_short", False))
@@ -25404,7 +25426,7 @@ def telegram_thread(ex):
                             )
                         except Exception:
                             pass
-                        if bool(cfg.get("ai_cost_saver_strict", True)):
+                        if bool(cfg.get("ai_cost_saver_strict", False)):
                             ext_for_ai = {"enabled": False}
                         else:
                             ext_for_ai = ext if chart_style_hint in ["단타", "스윙"] else {"enabled": False}
@@ -25517,8 +25539,8 @@ def telegram_thread(ex):
                             if raw_decision in ["buy", "sell"] and bool(cfg.get("use_sqz", True)) and bool(cfg.get("sqz_dependency_enable", True)):
                                 w = float(cfg.get("sqz_dependency_weight", 0.80) or 0.80)
                                 w = float(clamp(w, 0.0, 1.0))
-                                gate = bool(cfg.get("sqz_dependency_gate_entry", True))
-                                override = bool(cfg.get("sqz_dependency_override_ai", True))
+                                gate = bool(cfg.get("sqz_dependency_gate_entry", False))
+                                override = bool(cfg.get("sqz_dependency_override_ai", False))
                                 soft_mode = bool(cfg.get("sqz_soft_penalty_enable", True))
                                 bias = int(stt.get("_sqz_bias", 0) or 0)
                                 mom_pct = float(stt.get("_sqz_mom_pct", 0.0) or 0.0)
@@ -25529,7 +25551,7 @@ def telegram_thread(ex):
                                 sqz_fire_up_recent = bool(stt.get("_sqz_fire_up_recent", sqz_fire_up))
                                 sqz_fire_down_recent = bool(stt.get("_sqz_fire_down_recent", sqz_fire_down))
                                 sqz_thr = float(max(0.001, abs(float(cfg.get("sqz_mom_threshold_pct", 0.05) or 0.05))))
-                                strict_sqz = bool(cfg.get("sqz_priority_entry_strict", True)) and (w >= 0.80)
+                                strict_sqz = bool(cfg.get("sqz_priority_entry_strict", False)) and (w >= 0.80)
 
                                 if strict_sqz:
                                     allow_buy = bool(raw_decision == "buy" and sqz_fire_up_recent)
@@ -26034,7 +26056,7 @@ def telegram_thread(ex):
                                 stt.get("추세", ""),
                                 htf_trend,
                                 cfg,
-                                allow_ai=bool(cfg.get("style_entry_ai_enable", False)) and (not bool(cfg.get("ai_cost_saver_strict", True))),
+                                allow_ai=bool(cfg.get("style_entry_ai_enable", False)) and (not bool(cfg.get("ai_cost_saver_strict", False))),
                             )
                             style = normalize_style_name(style_info.get("style", "스캘핑"))
                             cs["style_reco"] = style
@@ -30221,7 +30243,7 @@ config["ai_recall_cooldown_sec"] = st.sidebar.number_input(
 )
 config["ai_cost_saver_strict"] = st.sidebar.checkbox(
     "AI 절약모드(강화)",
-    value=bool(config.get("ai_cost_saver_strict", True)),
+    value=bool(config.get("ai_cost_saver_strict", False)),
     help="ON이면 스타일 AI를 끄고, 약한 신호에서는 AI 호출 자체를 건너뜁니다.",
 )
 ai_mode_opts = ["off", "veto", "confirm", "advisory"]
@@ -31083,9 +31105,9 @@ config["ma_slow"] = m2.number_input("MA 장기", 50, 300, int(config.get("ma_slo
 
 with st.sidebar.expander("🔥 스퀴즈 모멘텀(SQZ) 설정"):
     config["sqz_dependency_enable"] = st.checkbox("SQZ 의존(진입 필터)", value=bool(config.get("sqz_dependency_enable", True)))
-    config["sqz_dependency_gate_entry"] = st.checkbox("SQZ 중립이면 진입 억제", value=bool(config.get("sqz_dependency_gate_entry", True)))
-    config["sqz_dependency_override_ai"] = st.checkbox("SQZ 반대면 AI 신호 무시", value=bool(config.get("sqz_dependency_override_ai", True)))
-    config["sqz_priority_entry_strict"] = st.checkbox("SQZ 시작 신호 엄격모드", value=bool(config.get("sqz_priority_entry_strict", True)))
+    config["sqz_dependency_gate_entry"] = st.checkbox("SQZ 중립이면 진입 억제", value=bool(config.get("sqz_dependency_gate_entry", False)))
+    config["sqz_dependency_override_ai"] = st.checkbox("SQZ 반대면 AI 신호 무시", value=bool(config.get("sqz_dependency_override_ai", False)))
+    config["sqz_priority_entry_strict"] = st.checkbox("SQZ 시작 신호 엄격모드", value=bool(config.get("sqz_priority_entry_strict", False)))
     config["sqz_dependency_weight"] = st.slider("SQZ 의존도(가중치)", 0.5, 1.0, float(config.get("sqz_dependency_weight", 0.80) or 0.80), step=0.05)
     c_sq1, c_sq2 = st.columns(2)
     config["sqz_mom_threshold_pct"] = c_sq1.number_input("모멘텀 기준(%)", 0.005, 1.0, float(config.get("sqz_mom_threshold_pct", 0.05) or 0.05), step=0.01)
