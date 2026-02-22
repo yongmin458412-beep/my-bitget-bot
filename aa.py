@@ -1070,9 +1070,9 @@ def critical_tuning_recommended_values() -> Dict[str, Any]:
         "entry_require_fresh_start_signal": False,
         "sqz_dependency_gate_entry": False,
         "sqz_priority_entry_strict": False,
-        "intra_day_scalp_min_conf": 55,
-        "intra_day_day_min_conf": 65,
-        "intra_day_swing_min_conf": 68,
+        "intra_day_scalp_min_conf": 52,
+        "intra_day_day_min_conf": 62,
+        "intra_day_swing_min_conf": 72,
         "trend_filter_enabled": True,
         "trend_filter_policy": "ALLOW_SCALP",
         "ai_mode": "veto",
@@ -1596,7 +1596,7 @@ def default_settings() -> Dict[str, Any]:
         # ✅ AI 비용 절약(강화): 자동 스캔에서 불필요한 호출 최소화
         # - strict ON: 스타일 AI 비활성 + 외부시황 AI 입력 제외 + 약한 신호는 AI 호출 스킵
         "ai_cost_saver_strict": False,
-        "ai_mode": "veto",  # off|veto|confirm|advisory
+        "ai_mode": "advisory",  # off|veto|confirm|advisory
         "ai_enable_scalp": False,
         "ai_enable_day": True,
         "ai_enable_swing": True,
@@ -1715,8 +1715,8 @@ def default_settings() -> Dict[str, Any]:
         # - 무포지션 상태에서 마지막 진입 이후 시간이 길어질수록 min_conf를 소폭 완화
         # - 또한 수렴표(3-of-N)의 N을 최대 1만 낮춰 AI 호출 기회를 확보
         "entry_relax_enable": True,
-        "entry_relax_after_min": 15,
-        "entry_relax_step_min": 10,
+        "entry_relax_after_min": 10,
+        "entry_relax_step_min": 8,
         "entry_relax_conf_per_step": 2.0,
         "entry_relax_max_conf_bonus": 10.0,
         "entry_relax_reduce_votes_enable": True,
@@ -1725,7 +1725,7 @@ def default_settings() -> Dict[str, Any]:
         # ✅ 관망 장기화(anti-drought): 무포지션이 길어질수록 단계적으로 진입 게이트 완화
         # - 테스트 단계: 진입 기준만 완화, 레버리지/포지션 사이징/손절거리 규칙은 건드리지 않음
         "anti_drought_enable": True,
-        "anti_drought_start_min": 20,
+        "anti_drought_start_min": 10,
         "anti_drought_step_min": 10,
         "anti_drought_max_steps": 6,
         "anti_drought_notify_tg": True,
@@ -1774,8 +1774,8 @@ def default_settings() -> Dict[str, Any]:
         "style_ai_cache_sec": 600,        # 동일 입력의 스타일 AI 결과 캐시(초)
         "style_auto_enable": True,
         "style_lock_minutes": 20,  # 전환 최소 유지 시간
-        "scalp_max_hold_minutes": 25,          # 스캘핑 포지션 최대 보유(넘으면 스윙 전환 검토)
-        "scalp_to_swing_min_roi": -12.0,       # 너무 큰 손실이면 전환 대신 정리 유도(기본)
+        "scalp_max_hold_minutes": 45,          # 스캘핑 포지션 최대 보유(넘으면 스윙 전환 검토)
+        "scalp_to_swing_min_roi": -4.0,        # 너무 큰 손실이면 전환 대신 정리 유도(기본)
         "scalp_to_swing_require_long_align": True,  # 장기추세까지 맞아야 스윙 전환
         # ✅ 스캘핑→스윙 전환(보유시간) 안전장치:
         # - 이미 익절에 거의 도달했거나(또는 충분히 수익 구간이면) 전환으로 손절만 넓히지 않게 스킵
@@ -1846,11 +1846,11 @@ def default_settings() -> Dict[str, Any]:
         "day_entry_pct_mult": 0.85,
         "day_lev_cap": 10,
         # ✅ 스캘핑: "가격 변동폭(%)" 기준 가드레일(레버가 높아도 TP/SL이 과도해지지 않게)
-        "scalp_sl_price_pct_min": 0.25,
-        "scalp_sl_price_pct_max": 0.75,
-        "scalp_tp_price_pct_min": 0.35,
-        "scalp_tp_price_pct_max": 2.00,
-        "scalp_rr_min_price": 1.20,  # 가격 기준 최소 RR(TP>=SL*RR)
+        "scalp_sl_price_pct_min": 0.45,
+        "scalp_sl_price_pct_max": 0.90,
+        "scalp_tp_price_pct_min": 0.90,
+        "scalp_tp_price_pct_max": 1.80,
+        "scalp_rr_min_price": 1.30,  # 가격 기준 최소 RR(TP>=SL*RR)
         # SR 타깃 조정(프로 트레이더 방식)
         # - 프론트런: 저항/지지 직전에 익절
         # - 브리딩룸: 손절을 레벨 바깥으로 약간 여유
