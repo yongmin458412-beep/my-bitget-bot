@@ -50,21 +50,23 @@ def detect_structural_stop(
     session_levels = structure["session_levels"]
 
     if side == Side.LONG:
+        # 👑 전일저점을 최우선으로 (전고점 SL 구조)
         candidates = [
+            ("previous_day_low", session_levels.get("prev_day_low")),
             ("retest_low", setup_context.get("retest_low")),
             ("recent_swing_low", next((price for price in reversed(recent_entry_swings.get("swing_lows", [])) if price < entry_price), None)),
             ("liquidity_sweep_low", setup_context.get("sweep_low")),
             ("range_low", range_boundaries.get("range_low")),
-            ("previous_day_low", session_levels.get("prev_day_low")),
             ("higher_timeframe_swing_low", next((price for price in reversed(recent_structure_swings.get("swing_lows", [])) if price < entry_price), None)),
         ]
     else:
+        # 👑 전일고점을 최우선으로 (전저점 SL 구조)
         candidates = [
+            ("previous_day_high", session_levels.get("prev_day_high")),
             ("retest_high", setup_context.get("retest_high")),
             ("recent_swing_high", next((price for price in reversed(recent_entry_swings.get("swing_highs", [])) if price > entry_price), None)),
             ("liquidity_sweep_high", setup_context.get("sweep_high")),
             ("range_high", range_boundaries.get("range_high")),
-            ("previous_day_high", session_levels.get("prev_day_high")),
             ("higher_timeframe_swing_high", next((price for price in reversed(recent_structure_swings.get("swing_highs", [])) if price > entry_price), None)),
         ]
 

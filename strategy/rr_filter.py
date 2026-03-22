@@ -46,6 +46,41 @@ def compute_structural_rr(entry_price: float, stop_price: float, target_price: f
     return reward / risk
 
 
+def compute_quadrant_targets(entry_price: float, stop_price: float, side: Side) -> dict[str, float]:
+    """
+    손익비 1:2 기준으로 TP 4등분 계산.
+
+    TP1(25%): 1R, TP2(50%): 2R, TP3(75%): 3R, TP4(100%): 4R
+    부분익절: TP1 25% | TP2 50% | TP3 25% | TP4 0%
+    """
+    if side == Side.LONG:
+        risk = entry_price - stop_price
+    else:
+        risk = stop_price - entry_price
+
+    if risk <= 0:
+        return {}
+
+    # 1:2 손익비이므로 최종 TP는 4R
+    if side == Side.LONG:
+        tp1 = entry_price + risk * 1.0  # 1R
+        tp2 = entry_price + risk * 2.0  # 2R
+        tp3 = entry_price + risk * 3.0  # 3R
+        tp4 = entry_price + risk * 4.0  # 4R
+    else:
+        tp1 = entry_price - risk * 1.0  # 1R
+        tp2 = entry_price - risk * 2.0  # 2R
+        tp3 = entry_price - risk * 3.0  # 3R
+        tp4 = entry_price - risk * 4.0  # 4R
+
+    return {
+        "tp1": tp1,  # 25% close
+        "tp2": tp2,  # 50% close
+        "tp3": tp3,  # 25% close
+        "tp4": tp4,  # 0% (전량청산용)
+    }
+
+
 def evaluate_trade_viability(
     signal_context: SignalContext,
     stop_price: float,
