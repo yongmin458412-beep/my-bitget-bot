@@ -421,17 +421,53 @@ class TradingApplication(CommandProvider):
                 preferred_rr_to_tp2_choch=self.settings.ev.preferred_rr_to_tp2_choch,
                 reject_trade_if_targets_are_inside_range_middle=self.settings.strategy.reject_trade_if_targets_are_inside_range_middle,
             )
-            candidate.rr_to_tp1 = viability.rr_to_tp1
-            candidate.rr_to_tp2 = viability.rr_to_tp2
-            candidate.rr_to_best_target = viability.rr_to_best_target
-            candidate.expected_r = viability.rr_to_tp2 or viability.rr_to_best_target or candidate.expected_r
-            if viability.target_plan:
-                candidate.target_plan = viability.target_plan
-                candidate.tp1_price = float(viability.target_plan[0]["price"])
-                if len(viability.target_plan) > 1:
-                    candidate.tp2_price = float(viability.target_plan[1]["price"])
-                if len(viability.target_plan) > 2:
-                    candidate.tp3_price = float(viability.target_plan[2]["price"])
+            # 👑 SL 기반 TP 계산: SL이 1이면 TP는 2배
+            if candidate.stop_price is not None and candidate.stop_price > 0:
+                from strategy.rr_filter import compute_quadrant_targets
+                quadrants = compute_quadrant_targets(
+                    entry_price=candidate.entry_price,
+                    stop_price=candidate.stop_price,
+                    side=candidate.side
+                )
+                if quadrants:
+                    candidate.tp1_price = quadrants.get("tp1")
+                    candidate.tp2_price = quadrants.get("tp2")
+                    candidate.tp3_price = quadrants.get("tp3")
+                    # 4등분 TP를 target_plan으로 변환
+                    candidate.target_plan = [
+                        {"price": quadrants["tp1"], "reason": "quadrant_1R_25pct", "priority": 1},
+                        {"price": quadrants["tp2"], "reason": "quadrant_2R_50pct", "priority": 2},
+                        {"price": quadrants["tp3"], "reason": "quadrant_3R_25pct", "priority": 3},
+                    ]
+                    # RR 재계산
+                    candidate.rr_to_tp1 = 1.0  # 1R by definition
+                    candidate.rr_to_tp2 = 2.0  # 2R by definition
+                    candidate.rr_to_best_target = 2.0
+                    candidate.expected_r = 2.0
+                else:
+                    candidate.rr_to_tp1 = viability.rr_to_tp1
+                    candidate.rr_to_tp2 = viability.rr_to_tp2
+                    candidate.rr_to_best_target = viability.rr_to_best_target
+                    candidate.expected_r = viability.rr_to_tp2 or viability.rr_to_best_target or candidate.expected_r
+                    if viability.target_plan:
+                        candidate.target_plan = viability.target_plan
+                        candidate.tp1_price = float(viability.target_plan[0]["price"])
+                        if len(viability.target_plan) > 1:
+                            candidate.tp2_price = float(viability.target_plan[1]["price"])
+                        if len(viability.target_plan) > 2:
+                            candidate.tp3_price = float(viability.target_plan[2]["price"])
+            else:
+                candidate.rr_to_tp1 = viability.rr_to_tp1
+                candidate.rr_to_tp2 = viability.rr_to_tp2
+                candidate.rr_to_best_target = viability.rr_to_best_target
+                candidate.expected_r = viability.rr_to_tp2 or viability.rr_to_best_target or candidate.expected_r
+                if viability.target_plan:
+                    candidate.target_plan = viability.target_plan
+                    candidate.tp1_price = float(viability.target_plan[0]["price"])
+                    if len(viability.target_plan) > 1:
+                        candidate.tp2_price = float(viability.target_plan[1]["price"])
+                    if len(viability.target_plan) > 2:
+                        candidate.tp3_price = float(viability.target_plan[2]["price"])
             candidate.ev_metrics = {
                 **candidate.ev_metrics,
                 **viability.to_dict(),
