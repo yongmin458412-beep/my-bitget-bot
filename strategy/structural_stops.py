@@ -103,9 +103,9 @@ def detect_structural_stop(
     # ── 합성 SL fallback: 모든 구조적 SL 실패 시 ATR 기반 SL 생성 ──
     if atr_value > 0:
         if side == Side.LONG:
-            synth_stop = entry_price - atr_value * 1.5
+            synth_stop = entry_price - atr_value * 2.0
         else:
-            synth_stop = entry_price + atr_value * 1.5
+            synth_stop = entry_price + atr_value * 2.0
         if use_atr_buffer:
             synth_stop = apply_atr_buffer(synth_stop, atr_value, side, multiplier=atr_buffer_multiplier)
         risk_pct = _normalized_risk_pct(entry_price, synth_stop)
