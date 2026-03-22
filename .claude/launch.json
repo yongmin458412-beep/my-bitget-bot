@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["run_streamlit.py"],
+      "port": 8501
+    },
+    {
+      "name": "bot",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["run_bot.py"],
+      "port": 0
+    }
+  ]
+}

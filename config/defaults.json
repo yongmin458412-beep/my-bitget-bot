@@ -1,0 +1,193 @@
+{
+  "mode": "DEMO",
+  "strategy_vincent_enabled": true,
+  "strategy_liquidity_reclaim_enabled": true,
+  "strategy_session_breakout_enabled": true,
+  "strategy_momentum_pullback_enabled": true,
+  "max_active_strategy_groups": 10,
+  "max_candidate_signals_per_symbol": 3,
+  "max_primary_signals_per_symbol": 1,
+  "regime_router_enabled": false,
+  "signal_conflict_resolution_enabled": true,
+  "strategy_cooldown_minutes": 1,
+  "symbol_cooldown_minutes": 1,
+  "reject_overlapping_strategy_signals": true,
+  "merge_same_direction_signals": true,
+  "block_opposite_signals_same_window": true,
+  "timeframes": {
+    "entry": "3m",
+    "confirm": "5m",
+    "structure": "15m"
+  },
+  "universe": {
+    "active_universe_size": 30,
+    "include_btc_eth_always": true,
+    "min_24h_quote_volume": 0.0,
+    "max_spread_bps": 100.0,
+    "min_listing_age_hours": 0,
+    "refresh_seconds": 60,
+    "instant_volume_spike_multiplier": 2.0
+  },
+  "strategy": {
+    "enabled": {
+      "break_retest": true,
+      "liquidity_raid": true,
+      "fair_value_gap": true,
+      "order_block": true,
+      "choch": true
+    },
+    "min_signal_score": 0.15,
+    "range_middle_exclusion": 0.05,
+    "trend_weight": 1.2,
+    "raid_weight": 1.15,
+    "max_chase_atr_multiple": 1.5,
+    "retest_tolerance_atr": 0.8,
+    "confirmation_volume_multiple": 1.0,
+    "merge_nearby_target_threshold_pct": 0.0015,
+    "reject_trade_if_targets_are_inside_range_middle": false,
+    "max_target_atr_multiple": 4.0
+  },
+  "strategy_router": {
+    "max_active_strategy_groups": 10,
+    "max_candidate_signals_per_symbol": 3,
+    "max_primary_signals_per_symbol": 1,
+    "regime_router_enabled": false,
+    "signal_conflict_resolution_enabled": true,
+    "strategy_cooldown_minutes": 1,
+    "symbol_cooldown_minutes": 1,
+    "reject_overlapping_strategy_signals": true,
+    "merge_same_direction_signals": true,
+    "block_opposite_signals_same_window": true
+  },
+  "ev": {
+    "min_ev": 0.005,
+    "min_expected_r": 0.4,
+    "min_historical_win_rate": 0.2,
+    "estimated_maker_fee_bps": 1.0,
+    "estimated_taker_fee_bps": 6.0,
+    "slippage_bps": 1.0,
+    "news_penalty_high": 0.1,
+    "funding_penalty_minutes": 10,
+    "market_impact_penalty_bps": 1.0,
+    "min_rr_to_tp1_break_retest": 0.4,
+    "preferred_rr_to_tp2_break_retest": 0.8,
+    "min_rr_to_tp1_liquidity_raid": 0.4,
+    "preferred_rr_to_tp2_liquidity_raid": 0.8,
+    "min_rr_to_tp1_fair_value_gap": 0.4,
+    "preferred_rr_to_tp2_fair_value_gap": 0.8,
+    "min_rr_to_tp1_order_block": 0.4,
+    "preferred_rr_to_tp2_order_block": 0.8,
+    "min_rr_to_tp1_choch": 0.4,
+    "preferred_rr_to_tp2_choch": 0.8
+  },
+  "risk": {
+    "stop_mode": "structure",
+    "target_mode": "structure",
+    "use_atr_buffer_for_stop": true,
+    "atr_buffer_multiplier": 0.15,
+    "min_stop_distance_pct": 0.002,
+    "max_stop_distance_pct": 0.04,
+    "enable_structural_tp1_tp2_tp3": true,
+    "risk_per_trade": 0.015,
+    "min_risk_per_trade": 0.01,
+    "max_risk_per_trade": 0.025,
+    "max_concurrent_positions": 15,
+    "max_daily_loss_r": 3.0,
+    "max_consecutive_losses": 4,
+    "cooldown_minutes_after_loss": 30,
+    "max_daily_orders": 500,
+    "max_position_hold_minutes": 45,
+    "max_account_drawdown_pct": 20.0,
+    "kill_switch_unrealized_loss_pct": 15.0,
+    "allow_multiple_positions_per_symbol": false,
+    "funding_block_before_minutes": 5,
+    "funding_block_after_minutes": 3,
+    "event_block_before_minutes": 10,
+    "event_block_after_minutes": 10,
+    "partial_tp_ratio": 0.5,
+    "tp1_partial_close_pct": 0.5,
+    "tp2_partial_close_pct": 0.25,
+    "tp3_partial_close_pct": 0.15,
+    "move_sl_to_be_after_tp1": true,
+    "break_even_buffer_r": 0.2,
+    "be_offset_r": 0.1,
+    "trailing_stop_enabled": true,
+    "hard_stop_loss_pct": null
+  },
+  "execution": {
+    "maker_first": true,
+    "taker_fallback": false,
+    "taker_fallback_volatility_threshold": 0.9,
+    "max_requote_attempts": 2,
+    "maker_timeout_seconds": 15,
+    "split_entry_count": 1,
+    "split_exit_count": 2,
+    "use_exchange_plan_orders": false,
+    "default_leverage": 20.0,
+    "per_strategy_leverage": {
+      "break_retest": 20.0,
+      "liquidity_raid": 20.0,
+      "fair_value_gap": 20.0,
+      "order_block": 20.0,
+      "choch": 15.0
+    }
+  },
+  "news": {
+    "enabled": true,
+    "poll_seconds": 180,
+    "ai_analysis_mode": "important_only",
+    "ai_cooldown_minutes_after_failure": 180,
+    "daily_summary_hour_kst": 8,
+    "high_impact_alerts": true,
+    "duplicate_cache_hours": 24,
+    "block_high_impact_entries": false,
+    "max_items_per_source": 20
+  },
+  "telegram": {
+    "enabled": true,
+    "admin_ids": [],
+    "poll_seconds": 5,
+    "send_daily_summary": true,
+    "send_weekly_summary": true,
+    "allow_close_commands": true,
+    "startup_alert_enabled": true,
+    "startup_alert_timeout_seconds": 15,
+    "heartbeat_alert_enabled": false,
+    "heartbeat_minutes": 60
+  },
+  "dashboard": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8501,
+    "refresh_seconds": 15
+  },
+  "database": {
+    "sqlite_path": "data/trading_bot.sqlite3"
+  },
+  "logging": {
+    "level": "INFO",
+    "directory": "logs"
+  },
+  "exchange": {
+    "base_url": "https://api.bitget.com",
+    "ws_public_url": "wss://ws.bitget.com/v2/ws/public",
+    "ws_private_url": "wss://ws.bitget.com/v2/ws/private",
+    "demo_header": "1",
+    "product_types": [
+      "USDT-FUTURES",
+      "USDC-FUTURES",
+      "COIN-FUTURES"
+    ],
+    "request_timeout_seconds": 15,
+    "max_retries": 5,
+    "recv_window_ms": 30000,
+    "live_confirmation_required": true,
+    "live_streamlit_confirmed": false
+  },
+  "runtime": {
+    "scan_interval_seconds": 10,
+    "healthcheck_seconds": 30,
+    "state_file": "state/runtime_state.json",
+    "graceful_shutdown_seconds": 20
+  }
+}

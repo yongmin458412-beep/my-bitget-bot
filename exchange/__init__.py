@@ -1,0 +1,2 @@
+"""Bitget exchange adapters."""
+

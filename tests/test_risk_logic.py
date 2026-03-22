@@ -9,6 +9,9 @@ import numpy as np
 
 AA_PATH = Path(__file__).resolve().parents[1] / "aa.py"
 
+if not AA_PATH.exists():
+    raise unittest.SkipTest("Legacy aa.py removed — these tests extracted risk logic from the monolith. Use test_risk_engine.py instead.")
+
 
 def _load_risk_symbols():
     source = AA_PATH.read_text(encoding="utf-8")
