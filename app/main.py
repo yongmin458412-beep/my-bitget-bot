@@ -433,11 +433,12 @@ class TradingApplication(CommandProvider):
                     candidate.tp1_price = quadrants.get("tp1")
                     candidate.tp2_price = quadrants.get("tp2")
                     candidate.tp3_price = quadrants.get("tp3")
-                    # 4등분 TP를 target_plan으로 변환
+                    # TP1-3: 각 50% | TP4: 전량청산
                     candidate.target_plan = [
-                        {"price": quadrants["tp1"], "reason": "quadrant_1R_25pct", "priority": 1},
-                        {"price": quadrants["tp2"], "reason": "quadrant_2R_50pct", "priority": 2},
-                        {"price": quadrants["tp3"], "reason": "quadrant_3R_25pct", "priority": 3},
+                        {"price": quadrants["tp1"], "reason": "tp1_50pct_of_remaining", "priority": 1},
+                        {"price": quadrants["tp2"], "reason": "tp2_50pct_of_remaining", "priority": 2},
+                        {"price": quadrants["tp3"], "reason": "tp3_50pct_of_remaining", "priority": 3},
+                        {"price": quadrants["tp4"], "reason": "tp4_full_close", "priority": 4},
                     ]
                     # RR 재계산
                     candidate.rr_to_tp1 = 1.0  # 1R by definition

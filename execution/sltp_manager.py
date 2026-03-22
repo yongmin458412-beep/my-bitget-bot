@@ -192,27 +192,25 @@ class SLTPManager:
             trade.tp3_done = True
         elif tp3_hit and trade.remaining_quantity > 0 and not trade.tp3_done:
             milestone_action = "partial_tp3"
-            target_closed_pct = (
-                self.settings.risk.tp1_partial_close_pct
-                + self.settings.risk.tp2_partial_close_pct
-                + self.settings.risk.tp3_partial_close_pct
-            )
-            trade.tp1_done = True
-            trade.tp2_done = True
+            # TP3: 남은 수량의 50% 익절
+            close_qty = trade.remaining_quantity * 0.5
             trade.tp3_done = True
         elif tp2_hit and trade.remaining_quantity > 0 and not trade.tp2_done:
             milestone_action = "partial_tp2"
-            target_closed_pct = self.settings.risk.tp1_partial_close_pct + self.settings.risk.tp2_partial_close_pct
-            trade.tp1_done = True
+            # TP2: 남은 수량의 50% 익절
+            close_qty = trade.remaining_quantity * 0.5
             trade.tp2_done = True
         elif tp1_hit and trade.remaining_quantity > 0 and not trade.tp1_done:
             milestone_action = "partial_tp1"
-            target_closed_pct = self.settings.risk.tp1_partial_close_pct
+            # TP1: 남은 수량의 50% 익절
+            close_qty = trade.remaining_quantity * 0.5
             trade.tp1_done = True
 
         if milestone_action is not None and trade.remaining_quantity > 0:
-            desired_remaining = max(0.0, trade.quantity * (1.0 - target_closed_pct))
-            close_qty = min(trade.remaining_quantity, max(0.0, trade.remaining_quantity - desired_remaining))
+            # 이미 close_qty가 설정됨 (남은 수량의 50%)
+            if "close_qty" not in locals():
+                desired_remaining = max(0.0, trade.quantity * (1.0 - target_closed_pct))
+                close_qty = min(trade.remaining_quantity, max(0.0, trade.remaining_quantity - desired_remaining))
             if milestone_action == "final_target_exit":
                 close_qty = trade.remaining_quantity
             if close_qty > 0:
