@@ -160,6 +160,10 @@ class TradingApplication(CommandProvider):
         await self.telegram_bot.start()
         await self._notify_startup_attempt()
         await self._restore_runtime_guarded()
+        # API 키 로딩 확인 (Railway 디버그용)
+        _key = self.settings.secrets.bitget_demo_api_key or self.settings.secrets.bitget_api_key
+        _key_preview = f"{_key[:6]}...{_key[-4:]}" if len(_key) > 10 else ("(비어있음)" if not _key else _key)
+        self.logger.info(f"API 키 상태: {_key_preview} | 모드: {self.settings.mode.value}")
         self._log_event("시스템 시작", "봇이 시작되었고 상태 복원을 완료했습니다.")
         await self.telegram_bot.broadcast_admins("봇 재시작/장애 복구\n- 상태 복원 완료\n- 기본 모드 안전 확인")
         self.state_store.set_status(BotStatus.RUNNING.value)

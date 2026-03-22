@@ -263,12 +263,13 @@ class RuntimeConfig(BaseModel):
 
 
 class EnvSecrets(BaseSettings):
-    """Secret settings sourced from .env."""
+    """Secret settings sourced from .env or OS environment variables."""
 
     model_config = SettingsConfigDict(
-        env_file=str(ENV_PATH),
+        env_file=str(ENV_PATH) if ENV_PATH.exists() else None,
         env_file_encoding="utf-8",
         extra="ignore",
+        case_sensitive=False,
     )
 
     bitget_api_key: str = ""
@@ -278,10 +279,30 @@ class EnvSecrets(BaseSettings):
     bitget_demo_api_secret: str = ""
     bitget_demo_api_passphrase: str = ""
     openai_api_key: str = ""
-    openai_model: str = "gpt-5.4-mini"
+    openai_model: str = "gpt-4o-mini"
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     live_trading_enabled: bool = False
+
+    def model_post_init(self, __context: Any) -> None:
+        """os.environ 직접 읽기 fallback (Railway 등 일부 환경 대응)."""
+        import os
+        if not self.bitget_demo_api_key:
+            object.__setattr__(self, "bitget_demo_api_key", os.environ.get("BITGET_DEMO_API_KEY", ""))
+        if not self.bitget_demo_api_secret:
+            object.__setattr__(self, "bitget_demo_api_secret", os.environ.get("BITGET_DEMO_API_SECRET", ""))
+        if not self.bitget_demo_api_passphrase:
+            object.__setattr__(self, "bitget_demo_api_passphrase", os.environ.get("BITGET_DEMO_API_PASSPHRASE", ""))
+        if not self.bitget_api_key:
+            object.__setattr__(self, "bitget_api_key", os.environ.get("BITGET_API_KEY", ""))
+        if not self.bitget_api_secret:
+            object.__setattr__(self, "bitget_api_secret", os.environ.get("BITGET_API_SECRET", ""))
+        if not self.bitget_api_passphrase:
+            object.__setattr__(self, "bitget_api_passphrase", os.environ.get("BITGET_API_PASSPHRASE", ""))
+        if not self.openai_api_key:
+            object.__setattr__(self, "openai_api_key", os.environ.get("OPENAI_API_KEY", ""))
+        if not self.telegram_bot_token:
+            object.__setattr__(self, "telegram_bot_token", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
 
 
 class AppSettings(BaseModel):
