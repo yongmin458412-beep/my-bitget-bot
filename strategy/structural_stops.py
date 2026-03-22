@@ -32,8 +32,8 @@ def detect_structural_stop(
     *,
     use_atr_buffer: bool = True,
     atr_buffer_multiplier: float = 0.15,
-    min_stop_distance_pct: float = 0.002,
-    max_stop_distance_pct: float = 0.02,
+    min_stop_distance_pct: float = 0.005,
+    max_stop_distance_pct: float = 0.04,
 ) -> tuple[float | None, str | None, dict[str, Any]]:
     """Pick the best structural invalidation level for the setup."""
 

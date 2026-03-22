@@ -91,6 +91,7 @@ def evaluate_trade_viability(
     entry_price: float,
     side: Side,
     strategy_name: str,
+    min_stop_distance_pct: float = 0.005,
     min_rr_to_tp1_break_retest: float,
     preferred_rr_to_tp2_break_retest: float,
     min_rr_to_tp1_liquidity_raid: float,
@@ -104,6 +105,25 @@ def evaluate_trade_viability(
     reject_trade_if_targets_are_inside_range_middle: bool = True,
 ) -> TradeViabilityResult:
     """Evaluate structural targets as a gating filter rather than a target generator."""
+
+    # SL이 최소 거리보다 가까우면 거래 거부
+    if stop_price > 0:
+        if side == Side.LONG:
+            risk_pct = (entry_price - stop_price) / entry_price
+        else:
+            risk_pct = (stop_price - entry_price) / entry_price
+        if risk_pct < min_stop_distance_pct:
+            return TradeViabilityResult(
+                rr_to_tp1=0.0,
+                rr_to_tp2=0.0,
+                rr_to_best_target=0.0,
+                fees_impact=fees_r,
+                slippage_impact=slippage_r,
+                expected_value_proxy=-(fees_r + slippage_r),
+                approved=False,
+                reject_reason=f"stop_too_close (risk_pct={risk_pct:.4f}<{min_stop_distance_pct:.4f})",
+                target_plan=[],
+            )
 
     if not targets:
         return TradeViabilityResult(

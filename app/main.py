@@ -420,6 +420,7 @@ class TradingApplication(CommandProvider):
                 min_rr_to_tp1_choch=self.settings.ev.min_rr_to_tp1_choch,
                 preferred_rr_to_tp2_choch=self.settings.ev.preferred_rr_to_tp2_choch,
                 reject_trade_if_targets_are_inside_range_middle=self.settings.strategy.reject_trade_if_targets_are_inside_range_middle,
+                min_stop_distance_pct=self.settings.risk.min_stop_distance_pct,
             )
             # 👑 SL 기반 TP 계산: SL이 1이면 TP는 2배
             if candidate.stop_price is not None and candidate.stop_price > 0:
