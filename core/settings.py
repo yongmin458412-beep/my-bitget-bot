@@ -118,7 +118,8 @@ class RiskConfig(BaseModel):
     max_consecutive_losses: int = 4
     cooldown_minutes_after_loss: int = 30
     max_daily_orders: int = 40
-    max_position_hold_minutes: int = 90
+    max_position_hold_minutes: int = 30
+    stale_eviction_minutes: int = 30  # 새 진입 시 이 시간 초과 포지션 먼저 정리
     max_account_drawdown_pct: float = 8.0
     kill_switch_unrealized_loss_pct: float = 4.0
     allow_multiple_positions_per_symbol: bool = False

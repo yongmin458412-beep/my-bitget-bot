@@ -587,15 +587,32 @@ class TradingApplication(CommandProvider):
             funding_blocked=funding_minutes_away is not None and funding_minutes_away <= self.settings.risk.funding_block_before_minutes,
         )
         if approved is None:
-            self.logger.info("리스크 엔진 거절", extra={"extra_data": {"symbol": sym, "blockers": best_signal.blockers[:3]}})
-            payload = self._signal_payload(
-                best_signal,
-                SignalStatus.BLOCKED.value,
-                expected_value=ev.expected_value,
-                blockers=list(dict.fromkeys(best_signal.blockers)),
-            )
-            self.trade_journal.log_signal(payload)
-            return
+            # max_concurrent_positions 차단 시: 횡보 포지션 먼저 정리 후 재시도
+            if "max_concurrent_positions" in best_signal.blockers:
+                evicted = await self._evict_stale_positions()
+                if evicted:
+                    # 슬롯이 생겼으므로 재승인 시도
+                    best_signal.blockers.clear()
+                    approved = self.risk_engine.approve(
+                        signal=best_signal,
+                        contract=contract,
+                        account_equity=self.last_balance.get("balance", 0.0),
+                        open_positions=self.state_store.state.open_positions,
+                        runtime_metrics=self._runtime_metrics(),
+                        atr_value=best_signal.risk_per_unit,
+                        news_blocked=bool(news_blocks),
+                        funding_blocked=funding_minutes_away is not None and funding_minutes_away <= self.settings.risk.funding_block_before_minutes,
+                    )
+            if approved is None:
+                self.logger.info("리스크 엔진 거절", extra={"extra_data": {"symbol": sym, "blockers": best_signal.blockers[:3]}})
+                payload = self._signal_payload(
+                    best_signal,
+                    SignalStatus.BLOCKED.value,
+                    expected_value=ev.expected_value,
+                    blockers=list(dict.fromkeys(best_signal.blockers)),
+                )
+                self.trade_journal.log_signal(payload)
+                return
         best_signal.tp1_price = approved.tp1_price
         best_signal.tp2_price = approved.tp2_price
         best_signal.tp3_price = approved.tp3_price
@@ -1475,6 +1492,57 @@ class TradingApplication(CommandProvider):
             return losses
         except Exception:
             return []
+
+    async def _evict_stale_positions(self) -> bool:
+        """횡보 판정 포지션 정리: 새 진입 슬롯 확보.
+
+        stale_eviction_minutes 이상 보유 중이고 TP1도 미도달한 포지션을
+        오래된 것부터 최대 1개 정리한다.
+        """
+        from datetime import datetime, timezone
+
+        threshold_minutes = self.settings.risk.stale_eviction_minutes
+        now = datetime.now(tz=timezone.utc)
+        open_positions = self.state_store.state.open_positions
+
+        # 오래된 순으로 정렬
+        stale_candidates: list[tuple[float, str]] = []
+        for symbol, pos in open_positions.items():
+            entry_time_str = pos.get("entry_time") or pos.get("created_at")
+            if not entry_time_str:
+                continue
+            try:
+                entry_time = datetime.fromisoformat(str(entry_time_str).replace("Z", "+00:00"))
+                hold_minutes = (now - entry_time).total_seconds() / 60
+            except Exception:
+                continue
+            if hold_minutes < threshold_minutes:
+                continue
+            # TP1 미도달 포지션만 (TP1 이미 익절한 포지션은 유지)
+            managed = self.sltp_manager._managed.get(symbol)
+            if managed and managed.tp1_done:
+                continue  # TP1 이미 도달 → 유지
+            stale_candidates.append((hold_minutes, symbol))
+
+        if not stale_candidates:
+            return False
+
+        # 가장 오래된 포지션 정리
+        stale_candidates.sort(reverse=True)
+        _, evict_symbol = stale_candidates[0]
+        hold_min = stale_candidates[0][0]
+
+        self.logger.info(
+            "횡보 포지션 정리 (슬롯 확보)",
+            extra={"extra_data": {"symbol": evict_symbol, "hold_minutes": round(hold_min, 1)}},
+        )
+        await self.telegram_bot.broadcast_admins(
+            f"⏱ 횡보 포지션 정리: {evict_symbol}\n"
+            f"- 보유시간: {round(hold_min)}분 (기준: {threshold_minutes}분)\n"
+            f"- 사유: 새 진입 슬롯 확보 (max_concurrent_positions)"
+        )
+        result = await self._close_symbol_internal(evict_symbol, enforce_permission=False, source="stale_eviction")
+        return "closed" in result.lower() or "청산" in result
 
     async def _ensure_contracts_loaded(self) -> None:
         """Populate contract metadata if not already cached."""
