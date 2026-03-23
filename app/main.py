@@ -441,10 +441,10 @@ class TradingApplication(CommandProvider):
                         {"price": quadrants["tp3"], "reason": "tp3_50pct_of_remaining", "priority": 3},
                         {"price": quadrants["tp4"], "reason": "tp4_full_close", "priority": 4},
                     ]
-                    # RR 재계산
-                    candidate.rr_to_tp1 = 1.0  # 1R by definition
-                    candidate.rr_to_tp2 = 2.0  # 2R by definition
-                    candidate.rr_to_best_target = 2.0
+                    # RR 재계산 (1:2 구조)
+                    candidate.rr_to_tp1 = 0.5   # TP1 = 0.5R
+                    candidate.rr_to_tp2 = 1.0   # TP2 = 1.0R
+                    candidate.rr_to_best_target = 2.0  # 최종 TP4 = 2.0R
                     candidate.expected_r = 2.0
                 else:
                     candidate.rr_to_tp1 = viability.rr_to_tp1

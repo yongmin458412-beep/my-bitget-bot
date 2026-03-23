@@ -48,10 +48,14 @@ def compute_structural_rr(entry_price: float, stop_price: float, target_price: f
 
 def compute_quadrant_targets(entry_price: float, stop_price: float, side: Side) -> dict[str, float]:
     """
-    손익비 1:2 기준으로 TP 4등분 계산.
+    손익비 1:2 — 최종 TP를 SL 거리의 2배로 잡고 4등분.
 
-    TP1(25%): 1R, TP2(50%): 2R, TP3(75%): 3R, TP4(100%): 4R
-    부분익절: TP1 25% | TP2 50% | TP3 25% | TP4 0%
+    SL 거리 = risk
+    최종 목표 = risk × 2  (1:2 손익비)
+    TP1 = 0.5R (목표의 25%)  — 남은 수량 50% 익절
+    TP2 = 1.0R (목표의 50%)  — 남은 수량 50% 익절
+    TP3 = 1.5R (목표의 75%)  — 남은 수량 50% 익절
+    TP4 = 2.0R (목표의 100%) — 전량청산
     """
     if side == Side.LONG:
         risk = entry_price - stop_price
@@ -61,23 +65,23 @@ def compute_quadrant_targets(entry_price: float, stop_price: float, side: Side) 
     if risk <= 0:
         return {}
 
-    # 1:2 손익비이므로 최종 TP는 4R
+    # 1:2 손익비: 최종 목표 = risk × 2, 이걸 4등분
     if side == Side.LONG:
-        tp1 = entry_price + risk * 1.0  # 1R
-        tp2 = entry_price + risk * 2.0  # 2R
-        tp3 = entry_price + risk * 3.0  # 3R
-        tp4 = entry_price + risk * 4.0  # 4R
+        tp1 = entry_price + risk * 0.5   # 0.5R
+        tp2 = entry_price + risk * 1.0   # 1.0R
+        tp3 = entry_price + risk * 1.5   # 1.5R
+        tp4 = entry_price + risk * 2.0   # 2.0R (최종)
     else:
-        tp1 = entry_price - risk * 1.0  # 1R
-        tp2 = entry_price - risk * 2.0  # 2R
-        tp3 = entry_price - risk * 3.0  # 3R
-        tp4 = entry_price - risk * 4.0  # 4R
+        tp1 = entry_price - risk * 0.5   # 0.5R
+        tp2 = entry_price - risk * 1.0   # 1.0R
+        tp3 = entry_price - risk * 1.5   # 1.5R
+        tp4 = entry_price - risk * 2.0   # 2.0R (최종)
 
     return {
-        "tp1": tp1,  # 25% close
-        "tp2": tp2,  # 50% close
-        "tp3": tp3,  # 25% close
-        "tp4": tp4,  # 0% (전량청산용)
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "tp4": tp4,
     }
 
 
