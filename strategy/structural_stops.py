@@ -50,8 +50,9 @@ def detect_structural_stop(
     session_levels = structure["session_levels"]
 
     if side == Side.LONG:
-        # 👑 전일저점을 최우선으로 (전고점 SL 구조)
+        # 👑 패턴 무효화 레벨 > 전일저점 > 구조적 레벨 순서
         candidates = [
+            ("pattern_invalidation", setup_context.get("pattern_invalidation_low")),  # 전략별 매물대/오더블록 하단
             ("previous_day_low", session_levels.get("prev_day_low")),
             ("retest_low", setup_context.get("retest_low")),
             ("recent_swing_low", next((price for price in reversed(recent_entry_swings.get("swing_lows", [])) if price < entry_price), None)),
@@ -60,8 +61,9 @@ def detect_structural_stop(
             ("higher_timeframe_swing_low", next((price for price in reversed(recent_structure_swings.get("swing_lows", [])) if price < entry_price), None)),
         ]
     else:
-        # 👑 전일고점을 최우선으로 (전저점 SL 구조)
+        # 👑 패턴 무효화 레벨 > 전일고점 > 구조적 레벨 순서
         candidates = [
+            ("pattern_invalidation", setup_context.get("pattern_invalidation_high")),  # 전략별 매물대/오더블록 상단
             ("previous_day_high", session_levels.get("prev_day_high")),
             ("retest_high", setup_context.get("retest_high")),
             ("recent_swing_high", next((price for price in reversed(recent_entry_swings.get("swing_highs", [])) if price > entry_price), None)),

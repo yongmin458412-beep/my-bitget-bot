@@ -184,6 +184,9 @@ class CHoCHStrategy(BaseStrategy):
             "recent_swings_structure": structure["recent_swings_structure"],
             "retest_low": choch_level if side == Side.LONG else None,
             "retest_high": choch_level if side == Side.SHORT else None,
+            # 패턴 무효화: CHoCH 구조 전환 레벨
+            "pattern_invalidation_low": choch_level if side == Side.LONG else None,
+            "pattern_invalidation_high": choch_level if side == Side.SHORT else None,
         }
         stop, stop_reason, stop_meta = detect_structural_stop(
             signal_context=context, setup_context=setup_context

@@ -136,6 +136,9 @@ class MomentumPullbackStrategy(BaseStrategy):
             "recent_swings_structure": structure["recent_swings_structure"],
             "retest_low": stop_hint_low if side == Side.LONG else None,
             "retest_high": stop_hint_low if side == Side.SHORT else None,
+            # 패턴 무효화: 모멘텀 트리거 레벨
+            "pattern_invalidation_low": stop_hint_low if side == Side.LONG else None,
+            "pattern_invalidation_high": trigger_level if side == Side.SHORT else None,
         }
         stop, stop_reason, stop_meta = detect_structural_stop(signal_context=context, setup_context=setup_context)
         if stop is None or stop_reason is None:

@@ -166,6 +166,9 @@ class OrderBlockStrategy(BaseStrategy):
             "recent_swings_structure": structure["recent_swings_structure"],
             "retest_low": ob_low if side == Side.LONG else None,
             "retest_high": ob_high if side == Side.SHORT else None,
+            # 패턴 무효화: 오더블록 경계 (매물대 고점/저점)
+            "pattern_invalidation_low": ob_low if side == Side.LONG else None,
+            "pattern_invalidation_high": ob_high if side == Side.SHORT else None,
         }
         stop, stop_reason, stop_meta = detect_structural_stop(
             signal_context=context, setup_context=setup_context

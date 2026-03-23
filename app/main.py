@@ -908,14 +908,17 @@ class TradingApplication(CommandProvider):
                         extra={"extra_data": {"symbol": contract.symbol, "reason": close_reason, "filled_qty": float(fill.size), "fill_price": float(fill.price)}}
                     )
                 elif position:
+                    # 원래 청산 사유 보존 (stop_out, final_target_exit, time_stop 등)
+                    human_reason = self._human_action_reason(close_reason)
+                    chart_label = self._exit_chart_label(close_reason)
                     try:
                         await self._finalize_position_close(
                             contract=contract,
                             position=position,
                             exit_price=float(fill.price),
-                            exit_reason="close_order_filled",
-                            chart_label="청산",
-                            chart_notes=[f"Close 주문이 체결되었습니다. (체결가: {float(fill.price):,.4f})"],
+                            exit_reason=close_reason,
+                            chart_label=chart_label,
+                            chart_notes=[f"{human_reason} (체결가: {float(fill.price):,.4f})", f"손절사유: {position.get('stop_reason', '')}"],
                         )
                     finally:
                         # 에러 여부 무관하게 반드시 order 제거 (재시도 루프 방지)
@@ -1359,8 +1362,9 @@ class TradingApplication(CommandProvider):
         return float(getattr(ticker, "bid_price", 0.0) or getattr(ticker, "last_price", 0.0) or getattr(ticker, "mark_price", 0.0) or 0.0)
 
     def _primary_target_from_plan(self, target_plan: list[dict[str, Any]], side: str, entry_price: float) -> float | None:
-        """Extract the primary structural target price from the target plan."""
+        """Extract the furthest (TP4 = 2.0R) target price from the target plan."""
 
+        result: float | None = None
         for item in target_plan:
             if not isinstance(item, dict):
                 continue
@@ -1369,24 +1373,108 @@ class TradingApplication(CommandProvider):
                 continue
             price = float(raw_price)
             if side == "long" and price > entry_price:
-                return price
+                if result is None or price > result:
+                    result = price  # 가장 먼 타겟 (최고가)
             if side == "short" and price < entry_price:
-                return price
-        return None
+                if result is None or price < result:
+                    result = price  # 가장 먼 타겟 (최저가)
+        return result
 
     def _human_action_reason(self, action: str) -> str:
         """Translate internal exit action keys into Korean labels."""
 
         mapping = {
-            "partial_tp1": "목표익절1 도달, 50% 분할익절",
-            "partial_tp2": "목표익절2 도달, 25% 분할익절",
-            "partial_tp3": "목표익절3 도달, 15% 분할익절",
-            "final_target_exit": "목표익절4 도달, 전량익절",
-            "stop_out": "손절 청산",
-            "time_stop": "시간 제한 청산",
-            "move_stop": "손절 BE 이동",
+            "partial_tp1": "TP1 도달 (0.5R), 잔량 50% 익절",
+            "partial_tp2": "TP2 도달 (1.0R), 잔량 50% 익절",
+            "partial_tp3": "TP3 도달 (1.5R), 잔량 50% 익절",
+            "final_target_exit": "TP4 도달 (2.0R), 전량 익절",
+            "stop_out": "손절 (SL 도달)",
+            "time_stop": "시간 제한 청산 (최대 보유시간 초과)",
+            "move_stop": "손절 → BE 이동 (손실 제로화)",
+            "manual_close": "수동 청산",
+            "close_order_filled": "청산 주문 체결",
         }
         return mapping.get(action, action.replace("_", " "))
+
+    def _exit_chart_label(self, action: str) -> str:
+        """Return a short chart label for exit type."""
+
+        mapping = {
+            "stop_out": "손절 청산",
+            "final_target_exit": "TP4 전량익절",
+            "time_stop": "시간초과 청산",
+            "manual_close": "수동 청산",
+            "close_order_filled": "청산",
+        }
+        return mapping.get(action, "청산")
+
+    def _build_stop_retrospective(self, position: dict[str, Any], exit_price: float) -> list[str]:
+        """손절 회고: 왜 손절됐는지 분석하고 개선점을 제시."""
+
+        lines: list[str] = []
+        entry_price = float(position.get("entry_price") or 0.0)
+        stop_price = float(position.get("stop_price") or 0.0)
+        side = position.get("side", "long")
+        stop_reason = position.get("stop_reason", "unknown")
+        strategy = position.get("display_name") or position.get("chosen_strategy") or position.get("strategy", "")
+        rationale = position.get("rationale") or {}
+        entry_reason = rationale.get("entry_reason_title", "")
+        hold_minutes = 0
+        if position.get("entry_time"):
+            try:
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                entry_time = datetime.fromisoformat(str(position["entry_time"]).replace("Z", "+00:00"))
+                hold_minutes = int((now - entry_time).total_seconds() / 60)
+            except Exception:
+                pass
+
+        # 1. SL 분석
+        if stop_price > 0 and entry_price > 0:
+            risk_pct = abs(entry_price - stop_price) / entry_price * 100
+            lines.append(f"- SL 거리: {risk_pct:.2f}% ({stop_reason})")
+
+        # 2. TP1 도달 여부
+        tp1 = float(position.get("tp1_price") or 0.0)
+        if tp1 > 0:
+            if (side == "long" and exit_price < tp1) or (side == "short" and exit_price > tp1):
+                lines.append("- TP1 미도달: 진입 타이밍/방향 재검토 필요")
+            else:
+                lines.append("- TP1 도달 후 손절: BE 이동이 늦었을 가능성")
+
+        # 3. 보유 시간
+        if hold_minutes > 0:
+            lines.append(f"- 보유시간: {hold_minutes}분")
+            if hold_minutes < 5:
+                lines.append("- ⚡ 즉각 손절 → 진입 시점이 너무 이르거나 변동성 급등 구간")
+
+        # 4. 전략별 패턴
+        if entry_reason:
+            lines.append(f"- 진입근거: {entry_reason}")
+
+        # 5. 최근 손절 패턴 분석
+        recent_losses = self._get_recent_stop_losses(strategy, limit=5)
+        if len(recent_losses) >= 3:
+            lines.append(f"- ⚠️ 최근 {len(recent_losses)}건 연속 손절 — {strategy} 전략 일시 중단 검토")
+
+        return lines
+
+    def _get_recent_stop_losses(self, strategy: str, limit: int = 5) -> list[dict[str, Any]]:
+        """최근 손절 기록 조회 (연속 손절 패턴 감지)."""
+
+        try:
+            closed = self.persistence.list_closed_trades(limit=20)
+            losses = []
+            for trade in closed:
+                if trade.get("exit_reason") != "stop_out":
+                    break  # 연속 손절 체인만 카운트
+                if strategy and trade.get("chosen_strategy") == strategy:
+                    losses.append(trade)
+                if len(losses) >= limit:
+                    break
+            return losses
+        except Exception:
+            return []
 
     async def _ensure_contracts_loaded(self) -> None:
         """Populate contract metadata if not already cached."""
@@ -1654,9 +1742,33 @@ class TradingApplication(CommandProvider):
             }
         )
         self.sltp_manager.remove(contract.symbol)
-        await self.telegram_bot.broadcast_admins(
-            f"포지션 종료\n- 심볼: {contract.symbol}\n- 사유: {self._human_action_reason(exit_reason)}\n- 손익: {realized_pnl:,.2f} USDT"
-        )
+        # 상세 청산 알림
+        entry_price = float(position.get("entry_price") or 0.0)
+        stop_reason = position.get("stop_reason", "")
+        strategy_name = position.get("display_name") or position.get("chosen_strategy") or position.get("strategy", "")
+        side = position.get("side", "long")
+        pnl_emoji = "+" if realized_pnl >= 0 else ""
+        pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
+        if side == "short":
+            pnl_pct = -pnl_pct
+        close_msg_lines = [
+            f"{'✅' if realized_pnl >= 0 else '❌'} 포지션 종료: {contract.symbol}",
+            f"- 전략: {strategy_name}",
+            f"- 방향: {'LONG' if side == 'long' else 'SHORT'}",
+            f"- 사유: {self._human_action_reason(exit_reason)}",
+            f"- 진입가: {entry_price:,.4f} → 청산가: {exit_price:,.4f}",
+            f"- 손익: {pnl_emoji}{realized_pnl:,.2f} USDT ({pnl_pct:+.2f}%)",
+        ]
+        if stop_reason:
+            close_msg_lines.append(f"- SL 기준: {stop_reason}")
+        # 손절 시 회고 분석
+        if exit_reason == "stop_out" and realized_pnl < 0:
+            retrospective = self._build_stop_retrospective(position, exit_price)
+            if retrospective:
+                close_msg_lines.append("")
+                close_msg_lines.append("📝 손절 회고:")
+                close_msg_lines.extend(retrospective)
+        await self.telegram_bot.broadcast_admins("\n".join(close_msg_lines))
         await self._broadcast_trade_chart(
             contract=contract,
             event_label=chart_label,

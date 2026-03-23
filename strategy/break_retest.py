@@ -154,6 +154,9 @@ class BreakRetestStrategy(BaseStrategy):
                 "retest_low": min(last_low, level_value) if side == Side.LONG else None,
                 "retest_high": max(last_high, level_value) if side == Side.SHORT else None,
                 "fvg_zone": fvg_zone,
+                # 패턴 무효화: 리테스트 레벨 (브레이크 포인트)
+                "pattern_invalidation_low": min(last_low, level_value) if side == Side.LONG else None,
+                "pattern_invalidation_high": max(last_high, level_value) if side == Side.SHORT else None,
             }
             stop, stop_reason, stop_meta = detect_structural_stop(signal_context=context, setup_context=setup_context)
             if stop is None or stop_reason is None:

@@ -154,6 +154,9 @@ class FairValueGapStrategy(BaseStrategy):
             "recent_swings_structure": structure["recent_swings_structure"],
             "retest_low": fvg_low if side == Side.LONG else None,
             "retest_high": fvg_high if side == Side.SHORT else None,
+            # 패턴 무효화: FVG 공백 경계
+            "pattern_invalidation_low": fvg_low if side == Side.LONG else None,
+            "pattern_invalidation_high": fvg_high if side == Side.SHORT else None,
         }
         stop, stop_reason, stop_meta = detect_structural_stop(
             signal_context=context, setup_context=setup_context

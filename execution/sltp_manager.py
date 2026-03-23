@@ -271,8 +271,9 @@ class SLTPManager:
         side: Side,
         entry_price: float,
     ) -> float | None:
-        """Pick the primary structural target price from the target plan."""
+        """Pick the furthest target (TP4 = 2.0R) from the target plan."""
 
+        result: float | None = None
         for item in target_plan:
             if not isinstance(item, dict):
                 continue
@@ -281,7 +282,9 @@ class SLTPManager:
                 continue
             price = float(raw_price)
             if side == Side.LONG and price > entry_price:
-                return price
+                if result is None or price > result:
+                    result = price  # 가장 먼 타겟 (최고가)
             if side == Side.SHORT and price < entry_price:
-                return price
-        return None
+                if result is None or price < result:
+                    result = price  # 가장 먼 타겟 (최저가)
+        return result

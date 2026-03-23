@@ -103,6 +103,9 @@ class LiquidityRaidStrategy(BaseStrategy):
                 "atr": atr_value,
                 "sweep_low": float(previous["low"]) if side == Side.LONG else None,
                 "sweep_high": float(previous["high"]) if side == Side.SHORT else None,
+                # 패턴 무효화: 유동성 스윕 지점 (매물대 경계)
+                "pattern_invalidation_low": float(previous["low"]) if side == Side.LONG else None,
+                "pattern_invalidation_high": float(previous["high"]) if side == Side.SHORT else None,
                 "range_boundaries": structure["range_boundaries"],
                 "recent_swings_entry": structure["recent_swings_entry"],
                 "recent_swings_structure": structure["recent_swings_structure"],

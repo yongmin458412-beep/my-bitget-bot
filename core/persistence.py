@@ -672,6 +672,14 @@ class SQLitePersistence:
             ),
         )
 
+    def list_closed_trades(self, limit: int = 20) -> list[dict[str, Any]]:
+        """최근 종료된 거래 목록 (최신순)."""
+
+        return self.fetchall(
+            "SELECT * FROM trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT ?",
+            (limit,),
+        )
+
     def save_symbol_scores(self, rows: list[dict[str, Any]]) -> None:
         """Persist symbol ranking output."""
 

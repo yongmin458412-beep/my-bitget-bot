@@ -100,6 +100,9 @@ class SessionBreakoutStrategy(BaseStrategy):
                 "recent_swings_structure": structure["recent_swings_structure"],
                 "retest_low": min(last_low, breakout_level) if side == Side.LONG else None,
                 "retest_high": max(last_high, breakout_level) if side == Side.SHORT else None,
+                # 패턴 무효화: 세션 레인지 경계
+                "pattern_invalidation_low": session_low if side == Side.LONG else None,
+                "pattern_invalidation_high": session_high if side == Side.SHORT else None,
             }
             stop, stop_reason, stop_meta = detect_structural_stop(signal_context=context, setup_context=setup_context)
             if stop is None or stop_reason is None:
