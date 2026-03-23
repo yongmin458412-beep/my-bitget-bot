@@ -61,8 +61,8 @@ class StrategyRouterConfig(BaseModel):
     max_primary_signals_per_symbol: int = 1
     regime_router_enabled: bool = True
     signal_conflict_resolution_enabled: bool = True
-    strategy_cooldown_minutes: int = 15
-    symbol_cooldown_minutes: int = 10
+    strategy_cooldown_minutes: float = 15
+    symbol_cooldown_minutes: float = 10
     reject_overlapping_strategy_signals: bool = True
     merge_same_direction_signals: bool = True
     block_opposite_signals_same_window: bool = True
