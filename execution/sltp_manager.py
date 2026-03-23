@@ -256,12 +256,9 @@ class SLTPManager:
         if action in ("partial_tp1",):
             trade.tp1_done = False
         elif action in ("partial_tp2",):
-            trade.tp1_done = False
-            trade.tp2_done = False
+            trade.tp2_done = False  # tp1은 이미 완료된 상태 유지
         elif action in ("partial_tp3",):
-            trade.tp1_done = False
-            trade.tp2_done = False
-            trade.tp3_done = False
+            trade.tp3_done = False  # tp1/tp2는 이미 완료된 상태 유지
         elif action in ("final_target_exit",):
             trade.tp1_done = False
             trade.tp2_done = False

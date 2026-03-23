@@ -177,24 +177,41 @@ class RiskEngine:
         self,
         signal: StrategySignal,
     ) -> tuple[list[dict[str, Any]], float, float, float | None]:
-        """Convert one structural anchor target into 25/50/75% scale-out levels."""
+        """Build 1:2 RR scale-out levels (TP1=0.5R, TP2=1.0R, TP3=1.5R) from stop_price."""
 
         raw_plan = [dict(item) for item in signal.target_plan if isinstance(item, dict)]
         primary = self._pick_primary_target(signal, raw_plan)
+        reordered_plan = raw_plan if primary is None else ([primary] + [item for item in raw_plan if item != primary])
+
+        # TP1/2/3가 이미 compute_quadrant_targets로 설정된 경우 그대로 사용 (1:2 RR 보존)
+        if signal.tp1_price and signal.tp1_price > 0 and signal.tp2_price and signal.tp2_price > 0:
+            return reordered_plan, signal.tp1_price, signal.tp2_price, signal.tp3_price
+
+        # stop_price 기반 1:2 RR 직접 계산 (fallback)
+        if signal.stop_price and signal.stop_price > 0:
+            risk = abs(signal.entry_price - signal.stop_price)
+            if signal.side == Side.LONG:
+                tp1 = signal.entry_price + risk * 0.5
+                tp2 = signal.entry_price + risk * 1.0
+                tp3 = signal.entry_price + risk * 1.5
+            else:
+                tp1 = signal.entry_price - risk * 0.5
+                tp2 = signal.entry_price - risk * 1.0
+                tp3 = signal.entry_price - risk * 1.5
+            return reordered_plan, tp1, tp2, tp3
+
+        # 구조적 타겟 기반 fallback (stop_price 없을 때)
         if primary is None:
             return raw_plan, signal.tp1_price, signal.tp2_price, signal.tp3_price
-
         primary_price = float(primary["price"])
         delta = primary_price - signal.entry_price
         if signal.side == Side.LONG and delta <= 0:
             return raw_plan, signal.tp1_price, signal.tp2_price, signal.tp3_price
         if signal.side == Side.SHORT and delta >= 0:
             return raw_plan, signal.tp1_price, signal.tp2_price, signal.tp3_price
-
-        reordered_plan = [primary] + [item for item in raw_plan if item != primary]
-        tp1 = signal.entry_price + delta * 0.25
-        tp2 = signal.entry_price + delta * 0.50
-        tp3 = signal.entry_price + delta * 0.75
+        tp1 = signal.entry_price + delta * 0.5
+        tp2 = signal.entry_price + delta * 1.0
+        tp3 = signal.entry_price + delta * 1.5
         return reordered_plan, tp1, tp2, tp3
 
     def _pick_primary_target(
