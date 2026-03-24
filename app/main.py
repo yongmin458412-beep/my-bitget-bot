@@ -752,7 +752,18 @@ class TradingApplication(CommandProvider):
                 raise
             except Exception as exc:  # noqa: BLE001
                 import traceback as _tb
-                self._log_event("주문 동기화 오류", f"{exc}\n{_tb.format_exc()}", level="ERROR")
+                _tb_str = _tb.format_exc()
+                self._log_event("주문 동기화 오류", f"{exc}\n{_tb_str}", level="ERROR")
+                self.logger.error(
+                    "주문 동기화 루프 예외",
+                    extra={"extra_data": {
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "traceback": _tb_str,
+                        "open_orders": list(self.state_store.state.open_orders.keys()),
+                        "open_positions": list(self.state_store.state.open_positions.keys()),
+                    }},
+                )
             await asyncio.sleep(5)
 
     async def _health_loop(self) -> None:
@@ -852,9 +863,20 @@ class TradingApplication(CommandProvider):
     async def _process_pending_fills(self) -> None:
         """Look up fills for pending orders (both entry and close)."""
 
+        open_order_count = len(self.state_store.state.open_orders)
+        if open_order_count:
+            self.logger.info(
+                "주문 체결 조회 시작",
+                extra={"extra_data": {"open_order_count": open_order_count, "symbols": list(self.state_store.state.open_orders.keys())}},
+            )
+
         for client_oid, order in list(self.state_store.state.open_orders.items()):
             contract = self.contracts_by_symbol.get(order["symbol"])
             if contract is None:
+                self.logger.warning(
+                    "주문의 심볼이 유니버스에 없음 — 건너뜀",
+                    extra={"extra_data": {"client_order_id": client_oid, "symbol": order.get("symbol")}},
+                )
                 continue
 
             # Check if this is a reduce-only (close) order
@@ -864,6 +886,18 @@ class TradingApplication(CommandProvider):
                 contract.product_type,
                 symbol=contract.symbol,
                 order_id=order.get("exchange_order_id"),
+            )
+            self.logger.info(
+                "체결 조회 결과",
+                extra={"extra_data": {
+                    "symbol": contract.symbol,
+                    "client_order_id": client_oid,
+                    "exchange_order_id": order.get("exchange_order_id"),
+                    "is_close_order": is_close_order,
+                    "fill_count": len(fills),
+                    "latest_fill_size": float(fills[-1].size) if fills else None,
+                    "latest_fill_price": float(fills[-1].price) if fills else None,
+                }},
             )
             if not fills:
                 # Only apply fallback logic for entry orders, not close orders
@@ -957,11 +991,31 @@ class TradingApplication(CommandProvider):
             # Entry order fill
             if not fill or fill.price is None or fill.size is None or fill.size <= 0:
                 self.logger.warning(
-                    "Entry order fill invalid - missing price or size",
-                    extra={"extra_data": {"symbol": contract.symbol, "fill": str(fill)}}
+                    "진입 체결 무효 — size 누락 또는 0 (알림 생략, 주문 유지)",
+                    extra={"extra_data": {
+                        "symbol": contract.symbol,
+                        "client_order_id": client_oid,
+                        "exchange_order_id": order.get("exchange_order_id"),
+                        "fill_price": float(fill.price) if fill and fill.price is not None else None,
+                        "fill_size": float(fill.size) if fill and fill.size is not None else None,
+                        "fill_raw": fill.raw if fill else None,
+                    }}
                 )
                 continue
 
+            self.logger.info(
+                "진입 체결 확인 — _finalize_market_entry 호출",
+                extra={"extra_data": {
+                    "symbol": contract.symbol,
+                    "client_order_id": client_oid,
+                    "exchange_order_id": order.get("exchange_order_id"),
+                    "fill_price": float(fill.price),
+                    "fill_size": float(fill.size),
+                    "side": order.get("side"),
+                    "strategy": order.get("strategy"),
+                    "leverage": order.get("leverage"),
+                }},
+            )
             fill_payload = {
                 **order,
                 "client_order_id": client_oid,
@@ -981,6 +1035,20 @@ class TradingApplication(CommandProvider):
                         "체결 경로: pending fill sync",
                     ],
                 )
+                self.logger.info(
+                    "진입 완료 처리 성공",
+                    extra={"extra_data": {"symbol": contract.symbol, "client_order_id": client_oid}},
+                )
+            except Exception as _exc:
+                self.logger.error(
+                    "진입 완료 처리 중 예외 — 주문은 강제 제거됨",
+                    extra={"extra_data": {
+                        "symbol": contract.symbol,
+                        "client_order_id": client_oid,
+                        "error": str(_exc),
+                    }},
+                )
+                raise
             finally:
                 # 에러 여부 무관하게 반드시 order 제거 (재시도 루프 방지)
                 self.state_store.remove_order(client_oid)
@@ -1730,6 +1798,20 @@ class TradingApplication(CommandProvider):
     ) -> None:
         """Apply entry fill bookkeeping and send text/photo alerts."""
 
+        self.logger.info(
+            "진입 완료 처리 시작",
+            extra={"extra_data": {
+                "symbol": contract.symbol,
+                "client_order_id": fill_payload.get("client_order_id"),
+                "exchange_order_id": fill_payload.get("exchange_order_id"),
+                "side": fill_payload.get("side"),
+                "filled_quantity": fill_payload.get("filled_quantity"),
+                "avg_fill_price": fill_payload.get("avg_fill_price"),
+                "leverage": fill_payload.get("leverage"),
+                "strategy": fill_payload.get("strategy"),
+                "chart_label": chart_label,
+            }},
+        )
         self.fill_handler.on_entry_filled(fill_payload)
         self.sltp_manager.register_payload(fill_payload)
         self.state_store.remove_order(fill_payload["client_order_id"])
