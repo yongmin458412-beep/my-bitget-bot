@@ -454,10 +454,26 @@ class TelegramBotService:
                     chart_path = None
                 if chart_path:
                     tf_label = next((l for l, t in _CHART_TFS if t == tf), tf)
+                    # SL/TP 가격 표시 (있으면)
+                    pos_data = (await self.router.provider.get_positions_payload())
+                    pos = next((p for p in pos_data if p.get("symbol") == sym), {})
+                    sl = float(pos.get("stop_price") or 0)
+                    tp1 = float(pos.get("tp1_price") or 0)
+                    ret = float(pos.get("position_return_pct") or 0)
+                    pnl = float(pos.get("unrealized_pnl") or 0)
+                    cap_lines = [f"📷 {sym} {tf_label}"]
+                    if ret != 0 or pnl != 0:
+                        cap_lines.append(f"수익률: {ret:+.2f}% ({pnl:+,.2f} USDT)")
+                    if sl > 0:
+                        cap_lines.append(f"🔴 SL: {sl:,.4f}")
+                    if tp1 > 0:
+                        cap_lines.append(f"🟢 TP1: {tp1:,.4f}")
+                    if sl <= 0 and tp1 <= 0:
+                        cap_lines.append("⚠️ SL/TP 미설정")
                     await self.send_photo(
                         chat_id,
                         chart_path,
-                        caption=f"📷 {sym} {tf_label} | SL/TP 표시",
+                        caption="\n".join(cap_lines),
                         keyboard=_tf_keyboard(sym, selected_tf=tf),
                     )
                 else:

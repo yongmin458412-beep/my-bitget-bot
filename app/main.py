@@ -1682,6 +1682,8 @@ class TradingApplication(CommandProvider):
         chart_marker: dict[str, Any] | None = None,
         rr_to_tp1: float | None = None,
         rr_to_tp2: float | None = None,
+        candle_limit: int = 180,
+        wide_view: bool = False,
     ) -> Path | None:
         """Render a chart snapshot and return the local file path."""
 
@@ -1691,7 +1693,7 @@ class TradingApplication(CommandProvider):
                 contract.product_type,
                 contract.symbol,
                 chart_timeframe,
-                limit=180,
+                limit=candle_limit,
                 ttl_seconds=0,
             )
             if frame.empty:
@@ -1729,6 +1731,7 @@ class TradingApplication(CommandProvider):
                 chart_marker=chart_marker or {},
                 rr_to_tp1=rr_to_tp1,
                 rr_to_tp2=rr_to_tp2,
+                wide_view=wide_view,
             )
             return render_trade_chart(frame, spec, output_dir=ROOT_DIR / "data" / "chart_snapshots")
         except Exception as exc:  # noqa: BLE001
@@ -2127,6 +2130,8 @@ class TradingApplication(CommandProvider):
             strategy_name=str(position.get("strategy") or ""),
             timeframe=timeframe,
             notes=[f"실시간 포지션 차트 ({timeframe})"],
+            candle_limit=350,
+            wide_view=True,
         )
         return str(path) if path else None
 

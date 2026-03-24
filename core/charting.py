@@ -55,6 +55,7 @@ class TradeChartSpec:
     rr_to_tp2: float | None = None
     indicators: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    wide_view: bool = False  # 포지션 차트용: 캔들 많이 표시 + Y축 자동 스케일
 
 
 _FONT_READY = False
@@ -425,7 +426,8 @@ def render_trade_chart(
 
     _ensure_korean_font()
     output_root = ensure_directory(output_dir)
-    frame = df.copy().tail(140).sort_index()
+    tail_n = 300 if spec.wide_view else 140
+    frame = df.copy().tail(tail_n).sort_index()
     frame.index = pd.DatetimeIndex(pd.to_datetime(frame.index)).tz_localize(None)
     frame["ema20"] = _ema(frame["close"], 20)
     frame["ema50"] = _ema(frame["close"], 50)
@@ -498,12 +500,22 @@ def render_trade_chart(
     if spec.chart_marker:
         _draw_context_marker(ax_price, frame, spec.chart_marker)
 
-    # ── Y축 줌: 진입/TP/SL 구간 중심으로 확대 ─────────────────────────────
+    # ── Y축 줌 ─────────────────────────────
     key_prices = [p for p in [
         spec.entry_price, spec.stop_price,
         spec.tp1_price, spec.tp2_price, spec.tp3_price, spec.tp4_price, spec.final_target_price,
     ] if p is not None and np.isfinite(p)]
-    if key_prices:
+    if spec.wide_view:
+        # wide_view: 전체 캔들 범위 + SL/TP 가격도 포함 → 축소 차트
+        candle_lo = float(frame["low"].min())
+        candle_hi = float(frame["high"].max())
+        all_prices = [candle_lo, candle_hi] + key_prices
+        y_lo_raw = min(all_prices)
+        y_hi_raw = max(all_prices)
+        y_range = y_hi_raw - y_lo_raw
+        padding = y_range * 0.05
+        ax_price.set_ylim(y_lo_raw - padding, y_hi_raw + padding)
+    elif key_prices:
         atr_val = float(frame["atr14"].iloc[-1]) if "atr14" in frame.columns and not frame["atr14"].empty else (
             abs(max(key_prices) - min(key_prices)) * 0.5 or spec.entry_price * 0.005
         )
