@@ -423,7 +423,7 @@ class TelegramBotService:
         # /chart_{sym}          → 봉 선택 메시지 표시
         # /chart_{sym}_{tf}     → 해당 봉 차트 사진 전송
         # ─────────────────────────────────────────────────────────
-        _CHART_TFS = [("1분봉", "1m"), ("3분봉", "3m"), ("5분봉", "5m"), ("10분봉", "10m"), ("15분봉", "15m")]
+        _CHART_TFS = [("1분봉", "1m"), ("3분봉", "3m"), ("5분봉", "5m"), ("15분봉", "15m"), ("30분봉", "30m")]
 
         def _tf_keyboard(sym: str, selected_tf: str | None = None) -> dict:
             tf_row = [
