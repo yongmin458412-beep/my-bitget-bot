@@ -83,6 +83,8 @@ class TradingApplication(CommandProvider):
         self.last_daily_summary_date: str | None = None
         self.last_weekly_summary_key: str | None = None
         self.last_heartbeat_sent_at: datetime | None = None
+        # stop_reason 반복 손절 쿨다운: {stop_reason: cooldown_until_datetime}
+        self._stop_reason_cooldowns: dict[str, datetime] = {}
         self._build_components()
 
     def _build_components(self) -> None:
@@ -527,6 +529,20 @@ class TradingApplication(CommandProvider):
         if best_signal.score < self.settings.strategy.min_signal_score:
             self.logger.info("신호 스코어 미달", extra={"extra_data": {"symbol": sym, "strategy": best_signal.strategy.value, "score": best_signal.score, "min_score": self.settings.strategy.min_signal_score}})
             blockers = list(dict.fromkeys(best_signal.blockers + ["low_score"]))
+            self.trade_journal.log_signal(
+                self._signal_payload(best_signal, SignalStatus.BLOCKED.value, expected_value=-1.0, blockers=blockers)
+            )
+            return
+        # stop_reason 쿨다운 체크: 같은 손절 이유 N회 연속 시 해당 패턴 차단
+        signal_stop_reason = getattr(best_signal, "stop_reason", None) or ""
+        if signal_stop_reason and self._is_stop_reason_cooled_down(signal_stop_reason):
+            cooldown_until = self._stop_reason_cooldowns.get(signal_stop_reason)
+            remain_min = int((cooldown_until - datetime.now(UTC)).total_seconds() / 60) if cooldown_until else 0
+            self.logger.info(
+                "🚫 stop_reason 쿨다운 — 진입 차단",
+                extra={"extra_data": {"symbol": sym, "stop_reason": signal_stop_reason, "remain_minutes": remain_min}},
+            )
+            blockers = list(dict.fromkeys(best_signal.blockers + [f"stop_reason_cooldown:{signal_stop_reason}"]))
             self.trade_journal.log_signal(
                 self._signal_payload(best_signal, SignalStatus.BLOCKED.value, expected_value=-1.0, blockers=blockers)
             )
@@ -1525,6 +1541,60 @@ class TradingApplication(CommandProvider):
         }
         return mapping.get(action, "청산")
 
+    def _update_stop_reason_cooldown(self, stop_reason: str) -> bool:
+        """같은 stop_reason이 N회 연속 손절되면 쿨다운 등록. 쿨다운 신규 등록 시 True 반환."""
+        if not stop_reason or stop_reason in ("unknown", ""):
+            return False
+        threshold = self.settings.risk.stop_reason_cooldown_threshold
+        cooldown_min = self.settings.risk.stop_reason_cooldown_minutes
+
+        # 최근 closed_trades에서 같은 stop_reason 연속 손절 횟수 계산
+        try:
+            closed = self.persistence.list_closed_trades(limit=threshold + 5)
+            consecutive = 0
+            for trade in closed:
+                if trade.get("exit_reason") not in ("stop_out", "time_stop"):
+                    break  # 연속 체인 끊김
+                if trade.get("stop_reason") != stop_reason:
+                    break  # 다른 이유면 체인 끊김
+                consecutive += 1
+                if consecutive >= threshold:
+                    break
+        except Exception:
+            return False
+
+        # 이번 손절 포함하면 threshold 도달
+        if consecutive + 1 >= threshold:
+            cooldown_until = datetime.now(UTC) + timedelta(minutes=cooldown_min)
+            self._stop_reason_cooldowns[stop_reason] = cooldown_until
+            self.logger.warning(
+                "🚫 stop_reason 반복 손절 쿨다운 등록",
+                extra={"extra_data": {
+                    "stop_reason": stop_reason,
+                    "consecutive": consecutive + 1,
+                    "cooldown_until": cooldown_until.isoformat(),
+                    "cooldown_minutes": cooldown_min,
+                }},
+            )
+            return True
+        return False
+
+    def _is_stop_reason_cooled_down(self, stop_reason: str) -> bool:
+        """해당 stop_reason이 현재 쿨다운 중이면 True 반환. 만료된 쿨다운은 자동 해제."""
+        if not stop_reason:
+            return False
+        cooldown_until = self._stop_reason_cooldowns.get(stop_reason)
+        if cooldown_until is None:
+            return False
+        if datetime.now(UTC) >= cooldown_until:
+            del self._stop_reason_cooldowns[stop_reason]
+            self.logger.info(
+                "✅ stop_reason 쿨다운 해제",
+                extra={"extra_data": {"stop_reason": stop_reason}},
+            )
+            return False
+        return True
+
     def _build_stop_retrospective(self, position: dict[str, Any], exit_price: float) -> list[str]:
         """손절 회고: 왜 손절됐는지 분석하고 개선점을 제시."""
 
@@ -1979,6 +2049,17 @@ class TradingApplication(CommandProvider):
                 })
             except Exception as _exc:  # noqa: BLE001
                 self.logger.warning("손절 회고 DB 저장 실패", extra={"extra_data": {"error": str(_exc)}})
+            # 같은 손절 이유 연속 N회 → 쿨다운 등록
+            if stop_reason:
+                newly_blocked = self._update_stop_reason_cooldown(stop_reason)
+                if newly_blocked:
+                    cooldown_until = self._stop_reason_cooldowns.get(stop_reason)
+                    cooldown_str = cooldown_until.strftime("%H:%M") if cooldown_until else "?"
+                    close_msg_lines.append("")
+                    close_msg_lines.append(
+                        f"🚫 [{stop_reason}] 패턴 {self.settings.risk.stop_reason_cooldown_threshold}회 연속 손절 → "
+                        f"{self.settings.risk.stop_reason_cooldown_minutes}분 쿨다운 ({cooldown_str}까지)"
+                    )
         await self.telegram_bot.broadcast_admins("\n".join(close_msg_lines))
         await self._broadcast_trade_chart(
             contract=contract,

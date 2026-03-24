@@ -117,6 +117,9 @@ class RiskConfig(BaseModel):
     max_daily_loss_r: float = 3.0
     max_consecutive_losses: int = 4
     cooldown_minutes_after_loss: int = 30
+    # 같은 손절 이유 연속 발동 시 쿨다운
+    stop_reason_cooldown_threshold: int = 3       # N회 연속 같은 이유 손절 시 쿨다운
+    stop_reason_cooldown_minutes: int = 120       # 쿨다운 지속 시간(분)
     max_daily_orders: int = 40
     max_position_hold_minutes: int = 30
     stale_eviction_minutes: int = 30  # 새 진입 시 이 시간 초과 포지션 먼저 정리
@@ -225,6 +228,15 @@ class DatabaseConfig(BaseModel):
 
     sqlite_path: str = "data/trading_bot.sqlite3"
 
+    @classmethod
+    def resolve_sqlite_path(cls) -> str:
+        """Railway Volume이 마운트된 경우 /data 경로 우선 사용."""
+        import os
+        data_dir = os.environ.get("DATA_DIR", "").strip()
+        if data_dir:
+            return f"{data_dir.rstrip('/')}/trading_bot.sqlite3"
+        return "data/trading_bot.sqlite3"
+
 
 class LoggingConfig(BaseModel):
     """Logging configuration."""
@@ -328,8 +340,11 @@ class AppSettings(BaseModel):
 
     @property
     def db_path(self) -> Path:
-        """Return absolute SQLite path."""
-
+        """Return absolute SQLite path. Railway Volume(DATA_DIR) 우선."""
+        import os
+        data_dir = os.environ.get("DATA_DIR", "").strip()
+        if data_dir:
+            return Path(data_dir) / "trading_bot.sqlite3"
         return ROOT_DIR / self.database.sqlite_path
 
     @property
