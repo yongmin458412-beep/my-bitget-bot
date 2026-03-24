@@ -701,6 +701,47 @@ class SQLitePersistence:
             (limit,),
         )
 
+    def get_regime_strategy_stats(
+        self,
+        strategy: str,
+        regime: str,
+        days: int = 30,
+        min_trades: int = 1,
+    ) -> dict[str, Any]:
+        """레짐 + 전략 조합의 최근 성과 통계 반환.
+
+        Returns:
+            total: 거래 수
+            wins: 수익 거래 수
+            win_rate: 승률 (0.0~1.0)
+            avg_pnl_r: 평균 R 손익
+            sufficient: min_trades 이상이면 True
+        """
+        rows = self.fetchall(
+            """
+            SELECT realized_pnl, pnl_r
+            FROM trades
+            WHERE status = 'closed'
+              AND chosen_strategy = ?
+              AND market_regime = ?
+              AND closed_at >= datetime('now', ? || ' days')
+            ORDER BY closed_at DESC
+            """,
+            (strategy, regime, f"-{days}"),
+        )
+        total = len(rows)
+        if total == 0:
+            return {"total": 0, "wins": 0, "win_rate": 0.0, "avg_pnl_r": 0.0, "sufficient": False}
+        wins = sum(1 for r in rows if (r.get("realized_pnl") or 0) > 0)
+        pnl_rs = [r.get("pnl_r") or 0.0 for r in rows]
+        return {
+            "total": total,
+            "wins": wins,
+            "win_rate": wins / total,
+            "avg_pnl_r": sum(pnl_rs) / total,
+            "sufficient": total >= min_trades,
+        }
+
     def save_symbol_scores(self, rows: list[dict[str, Any]]) -> None:
         """Persist symbol ranking output."""
 

@@ -533,6 +533,53 @@ class TradingApplication(CommandProvider):
                 self._signal_payload(best_signal, SignalStatus.BLOCKED.value, expected_value=-1.0, blockers=blockers)
             )
             return
+        # ─── 레짐별 전략 성과 체크 ─────────────────────────────────────────────
+        # (레짐 + 전략) 조합의 최근 30일 성과를 조회해 부진하면 점수 감산 또는 차단
+        _regime_val = regime.regime.value if hasattr(regime, "regime") else str(regime or "")
+        _strat_val = best_signal.strategy.value
+        _rs_stats = self.persistence.get_regime_strategy_stats(
+            strategy=_strat_val,
+            regime=_regime_val,
+            days=30,
+            min_trades=1,
+        )
+        _SOFT_PENALTY_THRESHOLD = 0.45   # 승률 45% 미만 + 5건 이상 → 점수 30% 감산
+        _HARD_BLOCK_THRESHOLD   = 0.25   # 승률 25% 미만 + 8건 이상 → 진입 차단
+        _SOFT_MIN_TRADES = 5
+        _HARD_MIN_TRADES = 8
+        if _rs_stats["sufficient"] and _rs_stats["total"] >= _HARD_MIN_TRADES and _rs_stats["win_rate"] < _HARD_BLOCK_THRESHOLD:
+            self.logger.info(
+                "🚫 레짐-전략 성과 부진 → 진입 차단",
+                extra={"extra_data": {
+                    "symbol": sym, "strategy": _strat_val, "regime": _regime_val,
+                    "win_rate": round(_rs_stats["win_rate"], 3), "total": _rs_stats["total"],
+                }},
+            )
+            blockers = list(dict.fromkeys(best_signal.blockers + [f"regime_strategy_block:{_regime_val}:{_strat_val}"]))
+            self.trade_journal.log_signal(
+                self._signal_payload(best_signal, SignalStatus.BLOCKED.value, expected_value=-1.0, blockers=blockers)
+            )
+            return
+        if _rs_stats["sufficient"] and _rs_stats["total"] >= _SOFT_MIN_TRADES and _rs_stats["win_rate"] < _SOFT_PENALTY_THRESHOLD:
+            original_score = best_signal.score
+            best_signal.score = round(best_signal.score * 0.70, 4)
+            self.logger.info(
+                "⚠️ 레짐-전략 성과 부진 → 점수 30% 감산",
+                extra={"extra_data": {
+                    "symbol": sym, "strategy": _strat_val, "regime": _regime_val,
+                    "win_rate": round(_rs_stats["win_rate"], 3), "total": _rs_stats["total"],
+                    "score_before": original_score, "score_after": best_signal.score,
+                }},
+            )
+            # 감산 후 min_score 미달이면 차단
+            if best_signal.score < self.settings.strategy.min_signal_score:
+                blockers = list(dict.fromkeys(best_signal.blockers + [f"regime_strategy_penalty:{_regime_val}:{_strat_val}"]))
+                self.trade_journal.log_signal(
+                    self._signal_payload(best_signal, SignalStatus.BLOCKED.value, expected_value=-1.0, blockers=blockers)
+                )
+                return
+        # ──────────────────────────────────────────────────────────────────────
+
         # stop_reason 쿨다운 체크: 같은 손절 이유 N회 연속 시 해당 패턴 차단
         signal_stop_reason = getattr(best_signal, "stop_reason", None) or ""
         if signal_stop_reason and self._is_stop_reason_cooled_down(signal_stop_reason):
