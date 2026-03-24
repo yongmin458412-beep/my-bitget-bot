@@ -955,7 +955,7 @@ class TradingApplication(CommandProvider):
                 continue
 
             # Entry order fill
-            if not fill or fill.price is None or fill.size is None:
+            if not fill or fill.price is None or fill.size is None or fill.size <= 0:
                 self.logger.warning(
                     "Entry order fill invalid - missing price or size",
                     extra={"extra_data": {"symbol": contract.symbol, "fill": str(fill)}}
@@ -971,15 +971,19 @@ class TradingApplication(CommandProvider):
                 "filled_quantity": float(fill.size),
                 "quantity": order.get("quantity") or float(fill.size),
             }
-            await self._finalize_market_entry(
-                contract=contract,
-                fill_payload=fill_payload,
-                chart_label="진입",
-                chart_notes=[
-                    f"전략: {order.get('strategy', '-')}",
-                    "체결 경로: pending fill sync",
-                ],
-            )
+            try:
+                await self._finalize_market_entry(
+                    contract=contract,
+                    fill_payload=fill_payload,
+                    chart_label="진입",
+                    chart_notes=[
+                        f"전략: {order.get('strategy', '-')}",
+                        "체결 경로: pending fill sync",
+                    ],
+                )
+            finally:
+                # 에러 여부 무관하게 반드시 order 제거 (재시도 루프 방지)
+                self.state_store.remove_order(client_oid)
 
     async def _process_managed_exits(self) -> None:
         """Apply TP/SL logic to active positions."""
