@@ -419,29 +419,57 @@ class TelegramBotService:
             return
 
         # ─────────────────────────────────────────────────────────
-        # 📷 차트 보기: 실시간 차트 사진 + [청산] 버튼
+        # 📷 차트 보기: 봉 선택 → 차트 생성
+        # /chart_{sym}          → 봉 선택 메시지 표시
+        # /chart_{sym}_{tf}     → 해당 봉 차트 사진 전송
         # ─────────────────────────────────────────────────────────
-        if cmd.startswith("/chart_"):
-            sym = cmd[len("/chart_"):]
-            try:
-                chart_path = await self.router.provider.get_position_chart(sym)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("get_position_chart failed", extra={"extra_data": {"symbol": sym, "error": str(exc)}})
-                chart_path = None
-            if chart_path:
-                close_kb = {
-                    "inline_keyboard": [[
-                        {"text": f"🚨 {sym} 청산", "callback_data": f"/close_{sym}"}
-                    ]]
+        _CHART_TFS = [("1분봉", "1m"), ("3분봉", "3m"), ("5분봉", "5m"), ("10분봉", "10m"), ("15분봉", "15m")]
+
+        def _tf_keyboard(sym: str, selected_tf: str | None = None) -> dict:
+            tf_row = [
+                {
+                    "text": f"{'✅ ' if selected_tf == tf else ''}{label}",
+                    "callback_data": f"/chart_{sym}_{tf}",
                 }
-                await self.send_photo(
-                    chat_id,
-                    chart_path,
-                    caption=f"📷 {sym} 실시간 차트",
-                    keyboard=close_kb,
-                )
+                for label, tf in _CHART_TFS
+            ]
+            return {
+                "inline_keyboard": [
+                    tf_row,
+                    [{"text": f"🚨 {sym} 청산", "callback_data": f"/close_{sym}"}],
+                ]
+            }
+
+        if cmd.startswith("/chart_"):
+            rest = cmd[len("/chart_"):]
+            # 마지막 토큰이 알려진 타임프레임인지 확인
+            known_tfs = {tf for _, tf in _CHART_TFS}
+            parts = rest.rsplit("_", 1)
+            if len(parts) == 2 and parts[1] in known_tfs:
+                sym, tf = parts[0], parts[1]
+                try:
+                    chart_path = await self.router.provider.get_position_chart(sym, timeframe=tf)
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("get_position_chart failed", extra={"extra_data": {"symbol": sym, "tf": tf, "error": str(exc)}})
+                    chart_path = None
+                if chart_path:
+                    tf_label = next((l for l, t in _CHART_TFS if t == tf), tf)
+                    await self.send_photo(
+                        chat_id,
+                        chart_path,
+                        caption=f"📷 {sym} {tf_label} | SL/TP 표시",
+                        keyboard=_tf_keyboard(sym, selected_tf=tf),
+                    )
+                else:
+                    await self.send_message(chat_id, f"⚪ {sym} 차트 생성 실패 (포지션 없음 또는 오류)")
             else:
-                await self.send_message(chat_id, f"⚪ {sym} 포지션 없음 또는 차트 생성 실패")
+                # 타임프레임 미선택 → 봉 선택 버튼 표시
+                sym = rest
+                await self.send_message(
+                    chat_id,
+                    f"📊 {sym} — 차트 봉 선택",
+                    keyboard=_tf_keyboard(sym),
+                )
             return
 
         # ─────────────────────────────────────────────────────────

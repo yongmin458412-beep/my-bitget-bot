@@ -2091,7 +2091,7 @@ class TradingApplication(CommandProvider):
             )
         return payloads
 
-    async def get_position_chart(self, symbol: str) -> str | None:
+    async def get_position_chart(self, symbol: str, timeframe: str = "5m") -> str | None:
         """Render a chart snapshot for the given open position and return the file path."""
 
         position = self.state_store.state.open_positions.get(symbol)
@@ -2106,21 +2106,27 @@ class TradingApplication(CommandProvider):
         mark_price = float(position.get("mark_price") or 0.0)
         if mark_price <= 0:
             mark_price = entry_price
+
+        def _price(key: str) -> float | None:
+            v = float(position.get(key) or 0.0)
+            return v if v > 0 else None
+
         path = await self._build_trade_chart(
             contract=contract,
-            event_label="포지션",
+            event_label=f"포지션 ({timeframe})",
             side=side,
             entry_price=entry_price,
             current_price=mark_price,
-            stop_price=float(position.get("stop_price") or 0) or None,
-            tp1_price=float(position.get("tp1_price") or 0) or None,
-            tp2_price=float(position.get("tp2_price") or 0) or None,
-            tp3_price=float(position.get("tp3_price") or 0) or None,
-            tp4_price=float(position.get("tp4_price") or 0) or None,
+            stop_price=_price("stop_price"),
+            tp1_price=_price("tp1_price"),
+            tp2_price=_price("tp2_price"),
+            tp3_price=_price("tp3_price"),
+            tp4_price=_price("tp4_price"),
             quantity=float(position.get("quantity") or 0) or None,
             leverage=float(position.get("leverage") or 1) or None,
             strategy_name=str(position.get("strategy") or ""),
-            notes=["실시간 포지션 차트"],
+            timeframe=timeframe,
+            notes=[f"실시간 포지션 차트 ({timeframe})"],
         )
         return str(path) if path else None
 
