@@ -311,6 +311,14 @@ class OrderManager:
             self._pending_by_signal.pop(signal_id, None)
         self.state_store.remove_order(client_oid)
 
+        # taker_fallback=true 이면 시장가 전환, false 이면 취소만
+        if not self.settings.execution.taker_fallback:
+            self.logger.info(
+                "지정가 미체결 취소 (핵심 레벨 도달 실패)",
+                extra={"extra_data": {"symbol": contract.symbol, "client_order_id": client_oid}},
+            )
+            return None
+
         fallback_order = OrderRequest(
             symbol=contract.symbol,
             product_type=contract.product_type,

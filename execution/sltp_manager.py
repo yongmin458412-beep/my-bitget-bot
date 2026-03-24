@@ -23,6 +23,7 @@ class ManagedTrade:
     tp1_price: float
     tp2_price: float
     tp3_price: float | None
+    tp4_price: float | None
     final_target_price: float | None
     quantity: float
     remaining_quantity: float
@@ -33,6 +34,7 @@ class ManagedTrade:
     tp1_done: bool = False
     tp2_done: bool = False
     tp3_done: bool = False
+    tp4_done: bool = False
     break_even_moved: bool = False
 
 
@@ -57,11 +59,13 @@ class SLTPManager:
         tp1 = approved_trade.tp1_price
         tp2 = approved_trade.tp2_price
         tp3 = approved_trade.tp3_price
+        tp4 = approved_trade.tp4_price
 
         # 실제 체결가가 TP를 이미 넘어선 경우 → 해당 TP skip (즉시 청산 방지)
         tp1_done = False
         tp2_done = False
         tp3_done = False
+        tp4_done = False
         if side == Side.LONG:
             if tp1 is not None and fill >= tp1:
                 tp1_done = True
@@ -70,6 +74,8 @@ class SLTPManager:
                 tp2_done = True
             if tp3 is not None and fill >= tp3:
                 tp3_done = True
+            if tp4 is not None and fill >= tp4:
+                tp4_done = True
         else:
             if tp1 is not None and fill <= tp1:
                 tp1_done = True
@@ -78,6 +84,8 @@ class SLTPManager:
                 tp2_done = True
             if tp3 is not None and fill <= tp3:
                 tp3_done = True
+            if tp4 is not None and fill <= tp4:
+                tp4_done = True
 
         managed = ManagedTrade(
             symbol=approved_trade.signal.symbol,
@@ -87,6 +95,7 @@ class SLTPManager:
             tp1_price=tp1,
             tp2_price=tp2,
             tp3_price=tp3,
+            tp4_price=tp4,
             final_target_price=self._extract_final_target_price(approved_trade.target_plan, side, fill),
             quantity=approved_trade.quantity,
             remaining_quantity=approved_trade.quantity,
@@ -97,6 +106,7 @@ class SLTPManager:
             tp1_done=tp1_done,
             tp2_done=tp2_done,
             tp3_done=tp3_done,
+            tp4_done=tp4_done,
         )
         self._managed[managed.symbol] = managed
         return managed
@@ -112,11 +122,13 @@ class SLTPManager:
         tp1 = float(payload.get("tp1_price") or 0.0) or None
         tp2 = float(payload.get("tp2_price") or 0.0) or None
         tp3 = float(payload.get("tp3_price") or 0.0) or None
+        tp4 = float(payload.get("tp4_price") or 0.0) or None
 
         # 실제 체결가가 TP를 이미 넘어선 경우 → 즉시 청산 방지
         tp1_done = bool(payload.get("tp1_done", False))
         tp2_done = bool(payload.get("tp2_done", False))
         tp3_done = bool(payload.get("tp3_done", False))
+        tp4_done = bool(payload.get("tp4_done", False))
         if not tp1_done and tp1 is not None:
             if (side == Side.LONG and fill >= tp1) or (side == Side.SHORT and fill <= tp1):
                 tp1_done = True
@@ -127,6 +139,9 @@ class SLTPManager:
         if not tp3_done and tp3 is not None:
             if (side == Side.LONG and fill >= tp3) or (side == Side.SHORT and fill <= tp3):
                 tp3_done = True
+        if not tp4_done and tp4 is not None:
+            if (side == Side.LONG and fill >= tp4) or (side == Side.SHORT and fill <= tp4):
+                tp4_done = True
 
         managed = ManagedTrade(
             symbol=payload["symbol"],
@@ -136,6 +151,7 @@ class SLTPManager:
             tp1_price=tp1,
             tp2_price=tp2,
             tp3_price=tp3,
+            tp4_price=tp4,
             final_target_price=self._extract_final_target_price(
                 payload.get("target_plan") if isinstance(payload.get("target_plan"), list) else [],
                 side,
@@ -152,6 +168,7 @@ class SLTPManager:
             tp1_done=tp1_done,
             tp2_done=tp2_done,
             tp3_done=tp3_done,
+            tp4_done=tp4_done,
             break_even_moved=bool(payload.get("break_even_moved", False)),
         )
         self._managed[managed.symbol] = managed
@@ -173,46 +190,40 @@ class SLTPManager:
             tp1_hit = trade.tp1_price is not None and trade.tp1_price > 0 and mark_price >= trade.tp1_price
             tp2_hit = trade.tp2_price is not None and trade.tp2_price > 0 and mark_price >= trade.tp2_price
             tp3_hit = trade.tp3_price is not None and trade.tp3_price > 0 and mark_price >= trade.tp3_price
-            final_target_hit = trade.final_target_price is not None and mark_price >= trade.final_target_price
+            tp4_hit = trade.tp4_price is not None and trade.tp4_price > 0 and mark_price >= trade.tp4_price
             stop_hit = trade.stop_price > 0 and mark_price <= trade.stop_price
         else:
             tp1_hit = trade.tp1_price is not None and trade.tp1_price > 0 and mark_price <= trade.tp1_price
             tp2_hit = trade.tp2_price is not None and trade.tp2_price > 0 and mark_price <= trade.tp2_price
             tp3_hit = trade.tp3_price is not None and trade.tp3_price > 0 and mark_price <= trade.tp3_price
-            final_target_hit = trade.final_target_price is not None and mark_price <= trade.final_target_price
+            tp4_hit = trade.tp4_price is not None and trade.tp4_price > 0 and mark_price <= trade.tp4_price
             stop_hit = trade.stop_price > 0 and mark_price >= trade.stop_price
 
+        # 4분할 익절: 각 TP에서 초기 수량의 25% 청산
+        quarter = trade.quantity * 0.25
         milestone_action: str | None = None
-        target_closed_pct = 0.0
-        if final_target_hit and trade.remaining_quantity > 0:
-            milestone_action = "final_target_exit"
-            target_closed_pct = 1.0
-            trade.tp1_done = True
-            trade.tp2_done = True
+        close_qty = 0.0
+        if tp4_hit and trade.remaining_quantity > 0 and not trade.tp4_done:
+            milestone_action = "partial_tp4"
+            close_qty = trade.remaining_quantity  # TP4 = 전량 청산 (남은 25%)
+            trade.tp4_done = True
             trade.tp3_done = True
+            trade.tp2_done = True
+            trade.tp1_done = True
         elif tp3_hit and trade.remaining_quantity > 0 and not trade.tp3_done:
             milestone_action = "partial_tp3"
-            # TP3: 남은 수량의 50% 익절
-            close_qty = trade.remaining_quantity * 0.5
+            close_qty = min(quarter, trade.remaining_quantity)
             trade.tp3_done = True
         elif tp2_hit and trade.remaining_quantity > 0 and not trade.tp2_done:
             milestone_action = "partial_tp2"
-            # TP2: 남은 수량의 50% 익절
-            close_qty = trade.remaining_quantity * 0.5
+            close_qty = min(quarter, trade.remaining_quantity)
             trade.tp2_done = True
         elif tp1_hit and trade.remaining_quantity > 0 and not trade.tp1_done:
             milestone_action = "partial_tp1"
-            # TP1: 남은 수량의 50% 익절
-            close_qty = trade.remaining_quantity * 0.5
+            close_qty = min(quarter, trade.remaining_quantity)
             trade.tp1_done = True
 
         if milestone_action is not None and trade.remaining_quantity > 0:
-            # 이미 close_qty가 설정됨 (남은 수량의 50%)
-            if "close_qty" not in locals():
-                desired_remaining = max(0.0, trade.quantity * (1.0 - target_closed_pct))
-                close_qty = min(trade.remaining_quantity, max(0.0, trade.remaining_quantity - desired_remaining))
-            if milestone_action == "final_target_exit":
-                close_qty = trade.remaining_quantity
             if close_qty > 0:
                 actions.append({"action": milestone_action, "symbol": symbol, "quantity": close_qty, "pending_fill": True})
             if (
@@ -256,13 +267,16 @@ class SLTPManager:
         if action in ("partial_tp1",):
             trade.tp1_done = False
         elif action in ("partial_tp2",):
-            trade.tp2_done = False  # tp1은 이미 완료된 상태 유지
+            trade.tp2_done = False
         elif action in ("partial_tp3",):
-            trade.tp3_done = False  # tp1/tp2는 이미 완료된 상태 유지
+            trade.tp3_done = False
+        elif action in ("partial_tp4",):
+            trade.tp4_done = False
         elif action in ("final_target_exit",):
             trade.tp1_done = False
             trade.tp2_done = False
             trade.tp3_done = False
+            trade.tp4_done = False
         self.logger.warning("TP action reverted", extra={"extra_data": {"symbol": symbol, "action": action}})
 
     def _extract_final_target_price(

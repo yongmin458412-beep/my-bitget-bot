@@ -120,7 +120,7 @@
     "taker_fallback": false,
     "taker_fallback_volatility_threshold": 0.9,
     "max_requote_attempts": 2,
-    "maker_timeout_seconds": 15,
+    "maker_timeout_seconds": 300,
     "split_entry_count": 1,
     "split_exit_count": 2,
     "use_exchange_plan_orders": false,

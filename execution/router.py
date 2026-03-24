@@ -48,12 +48,22 @@ class OrderRouter:
             rationale.append("급변장 taker fallback 허용")
 
         if maker_allowed and not use_taker:
+            # 핵심 레벨 지정가 진입: optimal_entry_price가 있으면 해당 가격에 대기
+            optimal = getattr(signal, "optimal_entry_price", None)
             if signal.side == Side.LONG:
-                price = round_to_step(best_bid, contract.price_step, mode="down") if contract.price_step else best_bid
                 order_side = "buy"
+                if optimal and 0 < optimal < best_ask:
+                    price = round_to_step(optimal, contract.price_step, mode="down") if contract.price_step else optimal
+                    rationale.append(f"핵심 레벨 지정가 {price:.6g}")
+                else:
+                    price = round_to_step(best_bid, contract.price_step, mode="down") if contract.price_step else best_bid
             else:
-                price = round_to_step(best_ask, contract.price_step, mode="up") if contract.price_step else best_ask
                 order_side = "sell"
+                if optimal and optimal > best_bid:
+                    price = round_to_step(optimal, contract.price_step, mode="up") if contract.price_step else optimal
+                    rationale.append(f"핵심 레벨 지정가 {price:.6g}")
+                else:
+                    price = round_to_step(best_ask, contract.price_step, mode="up") if contract.price_step else best_ask
             # price_step가 너무 커서 반올림 결과가 0이 되면 원래 가격 사용
             if not price or price <= 0:
                 price = best_bid if signal.side == Side.LONG else best_ask

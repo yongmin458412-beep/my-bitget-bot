@@ -434,6 +434,7 @@ class TradingApplication(CommandProvider):
                     candidate.tp1_price = quadrants.get("tp1")
                     candidate.tp2_price = quadrants.get("tp2")
                     candidate.tp3_price = quadrants.get("tp3")
+                    candidate.tp4_price = quadrants.get("tp4")
                     # TP1-3: 각 50% | TP4: 전량청산
                     candidate.target_plan = [
                         {"price": quadrants["tp1"], "reason": "tp1_50pct_of_remaining", "priority": 1},
@@ -616,6 +617,7 @@ class TradingApplication(CommandProvider):
         best_signal.tp1_price = approved.tp1_price
         best_signal.tp2_price = approved.tp2_price
         best_signal.tp3_price = approved.tp3_price
+        best_signal.tp4_price = approved.tp4_price
         best_signal.target_plan = approved.target_plan
         best_signal.rr_to_tp1 = approved.rr_to_tp1
         best_signal.rr_to_tp2 = approved.rr_to_tp2
@@ -1047,6 +1049,7 @@ class TradingApplication(CommandProvider):
                         tp1_price=float(position.get("tp1_price") or 0.0) or None,
                         tp2_price=float(position.get("tp2_price") or 0.0) or None,
                         tp3_price=float(position.get("tp3_price") or 0.0) or None,
+                        tp4_price=float(position.get("tp4_price") or 0.0) or None,
                         final_target_price=self._primary_target_from_plan(
                             position.get("target_plan") or [],
                             str(position.get("side", "long")),
@@ -1340,6 +1343,7 @@ class TradingApplication(CommandProvider):
             "tp1_price": signal.tp1_price,
             "tp2_price": signal.tp2_price,
             "tp3_price": signal.tp3_price,
+            "tp4_price": signal.tp4_price,
             "stop_reason": signal.stop_reason,
             "target_plan": signal.target_plan,
             "target_reasons": [item.get("reason", "") for item in signal.target_plan[:3]],
@@ -1552,7 +1556,7 @@ class TradingApplication(CommandProvider):
         contracts = await self.exchange.get_all_contracts()
         self.contracts_by_symbol = {contract.symbol: contract for contract in contracts}
 
-    async def _build_trade_chart(
+    async def _build_trade_chart(  # noqa: PLR0913
         self,
         *,
         contract: ContractConfig,
@@ -1564,6 +1568,7 @@ class TradingApplication(CommandProvider):
         tp1_price: float | None = None,
         tp2_price: float | None = None,
         tp3_price: float | None = None,
+        tp4_price: float | None = None,
         final_target_price: float | None = None,
         quantity: float | None = None,
         entry_notional_usdt: float | None = None,
@@ -1611,6 +1616,7 @@ class TradingApplication(CommandProvider):
                 tp1_price=tp1_price,
                 tp2_price=tp2_price,
                 tp3_price=tp3_price,
+                tp4_price=tp4_price,
                 final_target_price=final_target_price,
                 quantity=quantity,
                 entry_notional_usdt=entry_notional_usdt,
@@ -1651,6 +1657,7 @@ class TradingApplication(CommandProvider):
         tp1_price: float | None = None,
         tp2_price: float | None = None,
         tp3_price: float | None = None,
+        tp4_price: float | None = None,
         final_target_price: float | None = None,
         quantity: float | None = None,
         entry_notional_usdt: float | None = None,
@@ -1682,6 +1689,7 @@ class TradingApplication(CommandProvider):
             tp1_price=tp1_price,
             tp2_price=tp2_price,
             tp3_price=tp3_price,
+            tp4_price=tp4_price,
             final_target_price=final_target_price,
             quantity=quantity,
             entry_notional_usdt=entry_notional_usdt,
@@ -1750,6 +1758,7 @@ class TradingApplication(CommandProvider):
             tp1_price=float(fill_payload.get("tp1_price") or 0.0) or None,
             tp2_price=float(fill_payload.get("tp2_price") or 0.0) or None,
             tp3_price=float(fill_payload.get("tp3_price") or 0.0) or None,
+            tp4_price=float(fill_payload.get("tp4_price") or 0.0) or None,
             final_target_price=final_target_price,
             quantity=filled_quantity or None,
             entry_notional_usdt=fill_price * filled_quantity,
@@ -1830,12 +1839,33 @@ class TradingApplication(CommandProvider):
         if stop_reason:
             close_msg_lines.append(f"- SL 기준: {stop_reason}")
         # 손절 시 회고 분석
-        if exit_reason == "stop_out" and realized_pnl < 0:
+        if exit_reason in ("stop_out", "time_stop") and realized_pnl < 0:
             retrospective = self._build_stop_retrospective(position, exit_price)
             if retrospective:
                 close_msg_lines.append("")
                 close_msg_lines.append("📝 손절 회고:")
                 close_msg_lines.extend(retrospective)
+            # 손절 회고 DB 저장
+            try:
+                hold_min = 0.0
+                if position.get("entry_time"):
+                    from datetime import datetime as _dt, timezone as _tz
+                    _et = _dt.fromisoformat(str(position["entry_time"]).replace("Z", "+00:00"))
+                    hold_min = (_dt.now(_tz.utc) - _et).total_seconds() / 60
+                self.trade_journal.log_retrospective({
+                    "symbol": symbol,
+                    "strategy": str(position.get("display_name") or position.get("chosen_strategy") or position.get("strategy", "")),
+                    "exit_reason": exit_reason,
+                    "stop_reason": stop_reason,
+                    "entry_price": float(position.get("entry_price") or 0.0),
+                    "stop_price": float(position.get("stop_price") or 0.0),
+                    "exit_price": exit_price,
+                    "hold_minutes": round(hold_min, 1),
+                    "pnl_r": round(realized_pnl / max(abs(float(position.get("entry_price") or 1.0) - float(position.get("stop_price") or 1.0)), 1e-9), 2),
+                    "lessons": retrospective,
+                })
+            except Exception as _exc:  # noqa: BLE001
+                self.logger.warning("손절 회고 DB 저장 실패", extra={"extra_data": {"error": str(_exc)}})
         await self.telegram_bot.broadcast_admins("\n".join(close_msg_lines))
         await self._broadcast_trade_chart(
             contract=contract,
@@ -1847,6 +1877,7 @@ class TradingApplication(CommandProvider):
             tp1_price=float(position.get("tp1_price") or 0.0) or None,
             tp2_price=float(position.get("tp2_price") or 0.0) or None,
             tp3_price=float(position.get("tp3_price") or 0.0) or None,
+            tp4_price=float(position.get("tp4_price") or 0.0) or None,
             final_target_price=self._primary_target_from_plan(
                 position.get("target_plan") or [],
                 str(position.get("side", "long")),
@@ -2737,6 +2768,7 @@ class TradingApplication(CommandProvider):
                 tp1_price=float(tp1_price),
                 tp2_price=None,
                 tp3_price=None,
+                tp4_price=None,
                 final_target_price=tp1_price,
                 quantity=qty_result.quantity,
                 entry_notional_usdt=good_entry * qty_result.quantity,

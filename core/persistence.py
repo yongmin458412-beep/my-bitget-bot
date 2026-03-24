@@ -261,8 +261,27 @@ INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_news_items_created_at ON news_items(created_at)",
 ]
 
+SCHEMA_STATEMENTS.append("""
+    CREATE TABLE IF NOT EXISTS stop_retrospectives (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        strategy TEXT NOT NULL,
+        exit_reason TEXT NOT NULL,
+        stop_reason TEXT,
+        entry_price REAL,
+        stop_price REAL,
+        exit_price REAL,
+        hold_minutes REAL,
+        pnl_r REAL,
+        lessons_json TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    )
+""")
+
+
 TABLE_MIGRATIONS: dict[str, dict[str, str]] = {
     "signals": {
+        "tp4_price": "REAL",
         "entry_price": "REAL",
         "stop_price": "REAL",
         "tp1_price": "REAL",
@@ -285,6 +304,7 @@ TABLE_MIGRATIONS: dict[str, dict[str, str]] = {
     },
     "trades": {
         "tp3_price": "REAL",
+        "tp4_price": "REAL",
         "rr_to_tp1": "REAL",
         "rr_to_tp2": "REAL",
         "rr_to_best_target": "REAL",
@@ -304,6 +324,7 @@ TABLE_MIGRATIONS: dict[str, dict[str, str]] = {
     },
     "positions": {
         "tp3_price": "REAL",
+        "tp4_price": "REAL",
         "stop_reason": "TEXT",
         "target_plan_json": "TEXT",
         "rr_to_tp1": "REAL",

@@ -216,6 +216,12 @@ class OrderBlockStrategy(BaseStrategy):
                 color="#22c55e" if side == Side.LONG else "#ef4444",
             ),
         )
+        # 지정가 진입: 오더블록 경계에서 대기
+        if side == Side.SHORT:
+            _optimal = ob_high if ob_high > last_close else None
+        else:
+            _optimal = ob_low if ob_low < last_close else None
+
         return StrategySignal(
             symbol=context.symbol,
             product_type=context.product_type,
@@ -226,6 +232,7 @@ class OrderBlockStrategy(BaseStrategy):
             tp1_price=tp1,
             tp2_price=tp2,
             tp3_price=tp3,
+            optimal_entry_price=_optimal,
             score=min(0.94, confidence + 0.04),
             confidence=confidence,
             expected_r=rr_to_tp2,

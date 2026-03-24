@@ -75,6 +75,8 @@ class StrategySignal:
     fees_r: float
     slippage_r: float
     tp3_price: float | None = None
+    tp4_price: float | None = None
+    optimal_entry_price: float | None = None  # S/R 핵심 레벨 지정가 진입가
     stop_reason: str = ""
     target_plan: list[dict[str, Any]] = field(default_factory=list)
     rr_to_tp1: float = 0.0

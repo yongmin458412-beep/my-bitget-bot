@@ -27,6 +27,7 @@ class ApprovedTrade:
     tp1_price: float
     tp2_price: float
     tp3_price: float | None
+    tp4_price: float | None
     risk_amount: float
     stop_reason: str = ""
     target_plan: list[dict[str, Any]] = field(default_factory=list)
@@ -128,7 +129,7 @@ class RiskEngine:
             signal.blockers.append(sizing.reason)
             return None
 
-        execution_target_plan, tp1_price, tp2_price, tp3_price = self._build_execution_targets(signal)
+        execution_target_plan, tp1_price, tp2_price, tp3_price, tp4_price = self._build_execution_targets(signal)
 
         return ApprovedTrade(
             signal=signal,
@@ -138,6 +139,7 @@ class RiskEngine:
             tp1_price=tp1_price,
             tp2_price=tp2_price,
             tp3_price=tp3_price,
+            tp4_price=tp4_price,
             risk_amount=sizing.risk_amount,
             stop_reason=signal.stop_reason,
             target_plan=execution_target_plan,
@@ -176,16 +178,16 @@ class RiskEngine:
     def _build_execution_targets(
         self,
         signal: StrategySignal,
-    ) -> tuple[list[dict[str, Any]], float, float, float | None]:
-        """Build 1:2 RR scale-out levels (TP1=0.5R, TP2=1.0R, TP3=1.5R) from stop_price."""
+    ) -> tuple[list[dict[str, Any]], float, float, float | None, float | None]:
+        """Build 1:2 RR scale-out levels (TP1=0.5R, TP2=1.0R, TP3=1.5R, TP4=2.0R) from stop_price."""
 
         raw_plan = [dict(item) for item in signal.target_plan if isinstance(item, dict)]
         primary = self._pick_primary_target(signal, raw_plan)
         reordered_plan = raw_plan if primary is None else ([primary] + [item for item in raw_plan if item != primary])
 
-        # TP1/2/3가 이미 compute_quadrant_targets로 설정된 경우 그대로 사용 (1:2 RR 보존)
+        # TP1/2/3/4가 이미 compute_quadrant_targets로 설정된 경우 그대로 사용 (1:2 RR 보존)
         if signal.tp1_price and signal.tp1_price > 0 and signal.tp2_price and signal.tp2_price > 0:
-            return reordered_plan, signal.tp1_price, signal.tp2_price, signal.tp3_price
+            return reordered_plan, signal.tp1_price, signal.tp2_price, signal.tp3_price, signal.tp4_price
 
         # stop_price 기반 1:2 RR 직접 계산 (fallback)
         if signal.stop_price and signal.stop_price > 0:
@@ -194,25 +196,28 @@ class RiskEngine:
                 tp1 = signal.entry_price + risk * 0.5
                 tp2 = signal.entry_price + risk * 1.0
                 tp3 = signal.entry_price + risk * 1.5
+                tp4 = signal.entry_price + risk * 2.0
             else:
                 tp1 = signal.entry_price - risk * 0.5
                 tp2 = signal.entry_price - risk * 1.0
                 tp3 = signal.entry_price - risk * 1.5
-            return reordered_plan, tp1, tp2, tp3
+                tp4 = signal.entry_price - risk * 2.0
+            return reordered_plan, tp1, tp2, tp3, tp4
 
         # 구조적 타겟 기반 fallback (stop_price 없을 때)
         if primary is None:
-            return raw_plan, signal.tp1_price, signal.tp2_price, signal.tp3_price
+            return raw_plan, signal.tp1_price, signal.tp2_price, signal.tp3_price, signal.tp4_price
         primary_price = float(primary["price"])
         delta = primary_price - signal.entry_price
         if signal.side == Side.LONG and delta <= 0:
-            return raw_plan, signal.tp1_price, signal.tp2_price, signal.tp3_price
+            return raw_plan, signal.tp1_price, signal.tp2_price, signal.tp3_price, signal.tp4_price
         if signal.side == Side.SHORT and delta >= 0:
-            return raw_plan, signal.tp1_price, signal.tp2_price, signal.tp3_price
+            return raw_plan, signal.tp1_price, signal.tp2_price, signal.tp3_price, signal.tp4_price
         tp1 = signal.entry_price + delta * 0.5
         tp2 = signal.entry_price + delta * 1.0
         tp3 = signal.entry_price + delta * 1.5
-        return reordered_plan, tp1, tp2, tp3
+        tp4 = signal.entry_price + delta * 2.0
+        return reordered_plan, tp1, tp2, tp3, tp4
 
     def _pick_primary_target(
         self,

@@ -154,6 +154,13 @@ class LiquidityRaidStrategy(BaseStrategy):
                     color="#22c55e" if side == Side.LONG else "#ef4444",
                 ),
             )
+            # 지정가 진입: 핵심 레벨에서 대기
+            _optimal = level_price
+            if side == Side.SHORT and _optimal <= entry:
+                _optimal = None  # 현재가보다 낮으면 지정가 무의미
+            elif side == Side.LONG and _optimal >= entry:
+                _optimal = None  # 현재가보다 높으면 지정가 무의미
+
             return StrategySignal(
                 symbol=context.symbol,
                 product_type=context.product_type,
@@ -164,6 +171,7 @@ class LiquidityRaidStrategy(BaseStrategy):
                 tp1_price=tp1,
                 tp2_price=tp2,
                 tp3_price=tp3,
+                optimal_entry_price=_optimal,
                 score=min(0.94, confidence + 0.05),
                 confidence=confidence,
                 expected_r=expected_r,

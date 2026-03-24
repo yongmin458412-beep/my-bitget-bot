@@ -182,6 +182,44 @@ class TradeJournal:
             return ""
         return str(plan[index].get("reason") or "")
 
+    def log_retrospective(self, payload: dict[str, Any]) -> None:
+        """손절/시간초과 청산 시 회고 분석을 DB에 저장."""
+
+        with self.persistence.connection() as conn:
+            conn.execute(
+                """INSERT INTO stop_retrospectives
+                   (symbol, strategy, exit_reason, stop_reason,
+                    entry_price, stop_price, exit_price,
+                    hold_minutes, pnl_r, lessons_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    payload.get("symbol", ""),
+                    payload.get("strategy", ""),
+                    payload.get("exit_reason", ""),
+                    payload.get("stop_reason", ""),
+                    payload.get("entry_price"),
+                    payload.get("stop_price"),
+                    payload.get("exit_price"),
+                    payload.get("hold_minutes"),
+                    payload.get("pnl_r"),
+                    json.dumps(payload.get("lessons", []), ensure_ascii=False),
+                    datetime.now(tz=UTC).isoformat(timespec="seconds"),
+                ),
+            )
+
+    def recent_stop_retrospectives(self, strategy: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+        """최근 손절 회고 기록 조회."""
+
+        if strategy:
+            return self.persistence.fetchall(
+                "SELECT * FROM stop_retrospectives WHERE strategy = ? ORDER BY created_at DESC LIMIT ?",
+                (strategy, limit),
+            )
+        return self.persistence.fetchall(
+            "SELECT * FROM stop_retrospectives ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+
     def _build_rule_summary(self, signal: dict[str, Any] | None, trade: dict[str, Any] | None) -> dict[str, Any]:
         """Build a human-readable structural explanation payload."""
 

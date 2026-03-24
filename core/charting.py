@@ -35,6 +35,7 @@ class TradeChartSpec:
     tp1_price: float | None = None
     tp2_price: float | None = None
     tp3_price: float | None = None
+    tp4_price: float | None = None
     final_target_price: float | None = None
     quantity: float | None = None
     entry_notional_usdt: float | None = None
@@ -500,7 +501,7 @@ def render_trade_chart(
     # ── Y축 줌: 진입/TP/SL 구간 중심으로 확대 ─────────────────────────────
     key_prices = [p for p in [
         spec.entry_price, spec.stop_price,
-        spec.tp1_price, spec.tp2_price, spec.tp3_price, spec.final_target_price,
+        spec.tp1_price, spec.tp2_price, spec.tp3_price, spec.tp4_price, spec.final_target_price,
     ] if p is not None and np.isfinite(p)]
     if key_prices:
         atr_val = float(frame["atr14"].iloc[-1]) if "atr14" in frame.columns and not frame["atr14"].empty else (
@@ -540,7 +541,8 @@ def render_trade_chart(
     _annotate_level(ax_price, spec.tp1_price, "#2dd4bf", "TP1", linestyle="-.", percent_label=_pct(spec.tp1_price))
     _annotate_level(ax_price, spec.tp2_price, "#00d084", "TP2", percent_label=_pct(spec.tp2_price))
     _annotate_level(ax_price, spec.tp3_price, "#22c55e", "TP3", percent_label=_pct(spec.tp3_price))
-    _annotate_level(ax_price, spec.final_target_price, "#16a34a", "TP4", percent_label=_pct(spec.final_target_price))
+    _tp4 = spec.tp4_price or spec.final_target_price
+    _annotate_level(ax_price, _tp4, "#16a34a", "TP4", percent_label=_pct(_tp4))
 
     ax_price.set_ylabel("")
     ax_volume.set_ylabel("")
