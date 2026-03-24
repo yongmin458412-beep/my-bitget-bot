@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from core.settings import AppSettings
 from core.utils import chunk_text
 
 from .commands import TelegramCommandRouter
+from .formatters import format_single_position
 from .keyboards import default_admin_keyboard
 
 
@@ -201,8 +203,9 @@ class TelegramBotService:
         photo_path: str | Path,
         *,
         caption: str = "",
+        keyboard: dict[str, Any] | None = None,
     ) -> None:
-        """Send a local image file to Telegram."""
+        """Send a local image file to Telegram, optionally with an inline keyboard."""
 
         if not self.enabled:
             return
@@ -213,9 +216,11 @@ class TelegramBotService:
                 extra={"extra_data": {"chat_id": str(chat_id), "photo_path": str(path)}},
             )
             return
-        data = {"chat_id": str(chat_id)}
+        data: dict[str, Any] = {"chat_id": str(chat_id)}
         if caption:
             data["caption"] = caption[:1024]
+        if keyboard is not None:
+            data["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
         try:
             with path.open("rb") as handle:
                 response = await self._client.post(
@@ -390,8 +395,69 @@ class TelegramBotService:
         if self.settings.telegram.admin_ids and user_id not in self.settings.telegram.admin_ids:
             await self.send_message(chat_id, "관리자만 사용할 수 있습니다.")
             return
-        response = await self.router.dispatch(text.strip())
-        keyboard = default_admin_keyboard() if text.strip() == "/start" else None
+
+        cmd = text.strip()
+
+        # ─────────────────────────────────────────────────────────
+        # 💼 포지션: 심볼별 개별 메시지 + [차트 보기] [청산] 버튼
+        # ─────────────────────────────────────────────────────────
+        if cmd in ("/positions", "positions"):
+            positions = await self.router.provider.get_positions_payload()
+            if not positions:
+                await self.send_message(chat_id, "📊 포지션\n\n⚪ 없음(관망)")
+                return
+            for pos in positions:
+                sym = str(pos.get("symbol", "?"))
+                block = format_single_position(pos)
+                kb = {
+                    "inline_keyboard": [[
+                        {"text": "📷 차트 보기", "callback_data": f"/chart_{sym}"},
+                        {"text": "🚨 청산", "callback_data": f"/close_{sym}"},
+                    ]]
+                }
+                await self.send_message(chat_id, f"📊 {sym}\n\n{block}", keyboard=kb)
+            return
+
+        # ─────────────────────────────────────────────────────────
+        # 📷 차트 보기: 실시간 차트 사진 + [청산] 버튼
+        # ─────────────────────────────────────────────────────────
+        if cmd.startswith("/chart_"):
+            sym = cmd[len("/chart_"):]
+            try:
+                chart_path = await self.router.provider.get_position_chart(sym)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("get_position_chart failed", extra={"extra_data": {"symbol": sym, "error": str(exc)}})
+                chart_path = None
+            if chart_path:
+                close_kb = {
+                    "inline_keyboard": [[
+                        {"text": f"🚨 {sym} 청산", "callback_data": f"/close_{sym}"}
+                    ]]
+                }
+                await self.send_photo(
+                    chat_id,
+                    chart_path,
+                    caption=f"📷 {sym} 실시간 차트",
+                    keyboard=close_kb,
+                )
+            else:
+                await self.send_message(chat_id, f"⚪ {sym} 포지션 없음 또는 차트 생성 실패")
+            return
+
+        # ─────────────────────────────────────────────────────────
+        # 🚨 개별 청산: /close_BTCUSDT 형태 (close_all 제외)
+        # ─────────────────────────────────────────────────────────
+        if cmd.startswith("/close_") and cmd != "/closeall":
+            sym = cmd[len("/close_"):]
+            result = await self.router.provider.close_symbol(sym)
+            await self.send_message(chat_id, result)
+            return
+
+        # ─────────────────────────────────────────────────────────
+        # 기존 커맨드 라우팅
+        # ─────────────────────────────────────────────────────────
+        response = await self.router.dispatch(cmd)
+        keyboard = default_admin_keyboard() if cmd == "/start" else None
         await self.send_chunks(chat_id, response)
         if keyboard is not None:
             await self.send_message(chat_id, "빠른 메뉴", keyboard=keyboard)

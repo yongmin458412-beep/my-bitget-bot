@@ -2091,6 +2091,39 @@ class TradingApplication(CommandProvider):
             )
         return payloads
 
+    async def get_position_chart(self, symbol: str) -> str | None:
+        """Render a chart snapshot for the given open position and return the file path."""
+
+        position = self.state_store.state.open_positions.get(symbol)
+        if not position:
+            return None
+        await self._ensure_contracts_loaded()
+        contract = self.contracts_by_symbol.get(symbol)
+        if contract is None:
+            return None
+        side = str(position.get("side") or "long").lower()
+        entry_price = float(position.get("entry_price") or 0.0)
+        mark_price = float(position.get("mark_price") or 0.0)
+        if mark_price <= 0:
+            mark_price = entry_price
+        path = await self._build_trade_chart(
+            contract=contract,
+            event_label="포지션",
+            side=side,
+            entry_price=entry_price,
+            current_price=mark_price,
+            stop_price=float(position.get("stop_price") or 0) or None,
+            tp1_price=float(position.get("tp1_price") or 0) or None,
+            tp2_price=float(position.get("tp2_price") or 0) or None,
+            tp3_price=float(position.get("tp3_price") or 0) or None,
+            tp4_price=float(position.get("tp4_price") or 0) or None,
+            quantity=float(position.get("quantity") or 0) or None,
+            leverage=float(position.get("leverage") or 1) or None,
+            strategy_name=str(position.get("strategy") or ""),
+            notes=["실시간 포지션 차트"],
+        )
+        return str(path) if path else None
+
     async def get_balance_payload(self) -> dict[str, Any]:
         """Return cached balance."""
 

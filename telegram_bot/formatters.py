@@ -163,6 +163,36 @@ def format_positions(positions: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def format_single_position(position: dict[str, Any]) -> str:
+    """Format a single position block (for per-symbol Telegram messages)."""
+
+    side = position.get("side_display") or ("롱" if str(position.get("side")).lower() == "long" else "숏")
+    pnl = float(position.get("unrealized_pnl", 0) or 0)
+    ret = float(position.get("position_return_pct", 0) or 0)
+    tgt = float(position.get("target_pnl_pct", 0) or 0)
+    final_tp = float(position.get("final_tp_price", 0) or 0)
+    entry = float(position.get("entry_price", 0) or 0)
+    sl = float(position.get("stop_price", 0) or 0)
+    lev = float(position.get("leverage", 1) or 1)
+    strategy = str(position.get("strategy", "") or "-")
+    entry_notional = float(position.get("entry_notional_usdt", 0) or 0)
+    if entry_notional <= 0:
+        qty = float(position.get("quantity", 0) or 0)
+        entry_notional = entry * qty
+    tgt_lev = tgt * lev
+    target_usdt = entry_notional * tgt / 100.0
+    pnl_color = "🟢" if ret >= 0 else "🔴"
+    direction_arrow = "📈" if side == "롱" else "📉"
+    lines = [
+        f"{pnl_color} {direction_arrow} {side} | 전략: {strategy} | {lev:.0f}배",
+        f"수익률: {ret:+.2f}% ({pnl:+,.2f} USDT)",
+        f"목표: {tgt:+.2f}% × {lev:.0f}배 = {tgt_lev:+.2f}% → +{target_usdt:,.2f} USDT"
+        + (f" (TP {_fmt_price(final_tp)})" if final_tp > 0 else ""),
+        f"진입가: {_fmt_price(entry)}" + (f" | SL: {_fmt_price(sl)}" if sl > 0 else ""),
+    ]
+    return "\n".join(lines)
+
+
 def format_news_alert(item: dict[str, Any]) -> str:
     """Format high-impact news alert."""
 
