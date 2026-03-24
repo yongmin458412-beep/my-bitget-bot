@@ -1084,7 +1084,10 @@ class TradingApplication(CommandProvider):
                 mark_price = ticker.last_price or ticker.mark_price
             if not mark_price:
                 continue
-            actions = self.sltp_manager.evaluate_price(symbol, float(mark_price))
+            actions = self.sltp_manager.evaluate_price(
+                symbol, float(mark_price),
+                open_position_count=len(self.state_store.state.open_positions),
+            )
             if not actions:
                 continue
             contract = self.contracts_by_symbol.get(symbol)

@@ -179,7 +179,7 @@ class SLTPManager:
 
         self._managed.pop(symbol, None)
 
-    def evaluate_price(self, symbol: str, mark_price: float) -> list[dict[str, Any]]:
+    def evaluate_price(self, symbol: str, mark_price: float, *, open_position_count: int = 1) -> list[dict[str, Any]]:
         """Return actions to execute for a managed trade."""
 
         trade = self._managed.get(symbol)
@@ -240,7 +240,13 @@ class SLTPManager:
                 actions.append({"action": "move_stop", "symbol": symbol, "new_stop_price": trade.stop_price})
 
         hold_minutes = (datetime.now(tz=UTC) - trade.opened_at).total_seconds() / 60
-        if hold_minutes >= self.settings.risk.max_position_hold_minutes and trade.remaining_quantity > 0:
+        # 보유시간 초과 청산은 포지션 3개 이상일 때만 작동 (1~2개면 시간만으로 강제 청산하지 않음)
+        min_positions_for_time_stop = 3
+        if (
+            hold_minutes >= self.settings.risk.max_position_hold_minutes
+            and trade.remaining_quantity > 0
+            and open_position_count >= min_positions_for_time_stop
+        ):
             actions.append({"action": "time_stop", "symbol": symbol, "quantity": trade.remaining_quantity})
             trade.remaining_quantity = 0.0
         elif stop_hit and trade.remaining_quantity > 0:
