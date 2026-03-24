@@ -384,7 +384,7 @@ class FillDetail(BaseModel):
             order_id=str(payload.get("orderId", "")),
             symbol=str(payload.get("symbol", "")).upper(),
             price=as_float(payload.get("priceAvg") or payload.get("fillPrice") or payload.get("price")),
-            size=as_float(payload.get("sizeQty") or payload.get("size")),
+            size=as_float(payload.get("sizeQty") or payload.get("size") or payload.get("baseVolume")),
             side=str(payload.get("side", "")),
             fee=as_float(payload.get("fee")),
             pnl=as_float(payload.get("profit")),
