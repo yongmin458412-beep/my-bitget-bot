@@ -1003,14 +1003,35 @@ class TradingApplication(CommandProvider):
                 )
                 continue
 
+            # 부분체결 감지: fill 합계 < 주문수량 99% → 완전체결 대기, 알림 금지
+            valid_fills = [f for f in fills if f.size and f.size > 0 and f.price and f.price > 0]
+            total_filled = sum(float(f.size) for f in valid_fills)
+            order_quantity = float(order.get("quantity") or 0.0)
+            if order_quantity > 0 and total_filled < order_quantity * 0.99:
+                self.logger.info(
+                    "진입 부분 체결 — 완전 체결 대기 (알림/처리 보류)",
+                    extra={"extra_data": {
+                        "symbol": contract.symbol,
+                        "client_order_id": client_oid,
+                        "total_filled": total_filled,
+                        "order_quantity": order_quantity,
+                        "fill_pct": round(total_filled / order_quantity * 100, 2),
+                    }},
+                )
+                continue
+
+            # 전량(또는 99%↑) 체결: 가중평균가 계산 후 진입 확정
+            total_value = sum(float(f.price) * float(f.size) for f in valid_fills)
+            avg_fill_price = total_value / max(total_filled, 1e-10)
             self.logger.info(
                 "진입 체결 확인 — _finalize_market_entry 호출",
                 extra={"extra_data": {
                     "symbol": contract.symbol,
                     "client_order_id": client_oid,
                     "exchange_order_id": order.get("exchange_order_id"),
-                    "fill_price": float(fill.price),
-                    "fill_size": float(fill.size),
+                    "avg_fill_price": avg_fill_price,
+                    "total_filled": total_filled,
+                    "order_quantity": order_quantity,
                     "side": order.get("side"),
                     "strategy": order.get("strategy"),
                     "leverage": order.get("leverage"),
@@ -1020,10 +1041,10 @@ class TradingApplication(CommandProvider):
                 **order,
                 "client_order_id": client_oid,
                 "exchange_order_id": order.get("exchange_order_id"),
-                "avg_fill_price": float(fill.price),
-                "price": float(fill.price),
-                "filled_quantity": float(fill.size),
-                "quantity": order.get("quantity") or float(fill.size),
+                "avg_fill_price": avg_fill_price,
+                "price": avg_fill_price,
+                "filled_quantity": total_filled,
+                "quantity": order.get("quantity") or total_filled,
             }
             try:
                 await self._finalize_market_entry(
