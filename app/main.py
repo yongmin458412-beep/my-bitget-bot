@@ -595,6 +595,34 @@ class TradingApplication(CommandProvider):
             )
             return
         self.logger.info("✅ 진입 신호 승인!", extra={"extra_data": {"symbol": sym, "strategy": best_signal.strategy.value, "side": best_signal.side, "score": best_signal.score, "entry": best_signal.entry_price}})
+
+        # ─── S/R 기반 진입가 최적화 ─────────────────────────────────────────
+        # 롱 → 현재가 아래 가장 가까운 지지 레벨 / 숏 → 현재가 위 가장 가까운 저항 레벨
+        _current_price = float(ticker.last_price or ticker.bid_price)
+        _atr_limit = best_signal.risk_per_unit  # 1 ATR 이내 레벨만 사용
+        _side_val = best_signal.side.value if hasattr(best_signal.side, "value") else str(best_signal.side)
+        _support_keys = {"prev_day_low", "asia_low", "london_low", "swing_low_4h", "range_low_recent"}
+        _resist_keys = {"prev_day_high", "asia_high", "london_high", "swing_high_4h", "range_high_recent"}
+        if _side_val == "long" and _current_price > 0:
+            _candidates = [
+                v for k, v in levels.levels.items()
+                if k in _support_keys and 0 < v < _current_price and (_current_price - v) <= _atr_limit
+            ]
+            if _candidates:
+                _sr_entry = max(_candidates)  # 현재가에 가장 가까운 지지
+                best_signal.optimal_entry_price = _sr_entry
+                self.logger.info("📍 S/R 지지 레벨 진입가 설정", extra={"extra_data": {"symbol": sym, "sr_entry": _sr_entry, "current": _current_price}})
+        elif _side_val == "short" and _current_price > 0:
+            _candidates = [
+                v for k, v in levels.levels.items()
+                if k in _resist_keys and v > _current_price and (v - _current_price) <= _atr_limit
+            ]
+            if _candidates:
+                _sr_entry = min(_candidates)  # 현재가에 가장 가까운 저항
+                best_signal.optimal_entry_price = _sr_entry
+                self.logger.info("📍 S/R 저항 레벨 진입가 설정", extra={"extra_data": {"symbol": sym, "sr_entry": _sr_entry, "current": _current_price}})
+        # ────────────────────────────────────────────────────────────────────
+
         best_signal.chosen_strategy = best_signal.strategy.value
         best_signal.conflict_resolution_decision = best_signal.conflict_resolution_decision or routing_decision.decision
         best_signal.candidate_strategies = best_signal.candidate_strategies or [item.strategy.value for item in approved_candidates]
@@ -1579,10 +1607,11 @@ class TradingApplication(CommandProvider):
         """Translate internal exit action keys into Korean labels."""
 
         mapping = {
-            "partial_tp1": "TP1 도달 (0.5R), 잔량 50% 익절",
-            "partial_tp2": "TP2 도달 (1.0R), 잔량 50% 익절",
-            "partial_tp3": "TP3 도달 (1.5R), 잔량 50% 익절",
-            "final_target_exit": "TP4 도달 (2.0R), 전량 익절",
+            "partial_tp1": "TP1 도달 (1R), 50% 익절 + 본절 이동",
+            "partial_tp2": "TP2 도달, 추가 익절",
+            "partial_tp3": "TP3 도달, 추가 익절",
+            "final_target_exit": "최종 목표 도달, 전량 익절",
+            "trailing_stop": "트레일링 스탑 도달, 나머지 전량 익절",
             "stop_out": "손절 (SL 도달)",
             "time_stop": "시간 제한 청산 (최대 보유시간 초과)",
             "move_stop": "손절 → BE 이동 (손실 제로화)",
@@ -1596,7 +1625,8 @@ class TradingApplication(CommandProvider):
 
         mapping = {
             "stop_out": "손절 청산",
-            "final_target_exit": "TP4 전량익절",
+            "final_target_exit": "전량익절",
+            "trailing_stop": "트레일링 익절",
             "time_stop": "시간초과 청산",
             "manual_close": "수동 청산",
             "close_order_filled": "청산",

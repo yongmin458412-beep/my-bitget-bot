@@ -36,6 +36,10 @@ class ManagedTrade:
     tp3_done: bool = False
     tp4_done: bool = False
     break_even_moved: bool = False
+    # 트레일링 스탑 필드
+    trailing_active: bool = False
+    trailing_extreme: float = 0.0   # 롱: 최고가 / 숏: 최저가 추적
+    trailing_atr: float = 0.0       # 트레일링 거리 (= initial_risk)
 
 
 class SLTPManager:
@@ -55,8 +59,13 @@ class SLTPManager:
 
         fill = actual_fill_price or approved_trade.signal.entry_price
         side = approved_trade.signal.side
+        initial_risk = max(abs(fill - approved_trade.stop_price), 1e-9)
 
-        tp1 = approved_trade.tp1_price
+        # TP1 = 1R (진입가 + 리스크 거리), TP2~4는 트레일링으로 대체
+        if side == Side.LONG:
+            tp1 = fill + initial_risk
+        else:
+            tp1 = fill - initial_risk
         tp2 = approved_trade.tp2_price
         tp3 = approved_trade.tp3_price
         tp4 = approved_trade.tp4_price
@@ -119,7 +128,14 @@ class SLTPManager:
         fill = float(
             payload.get("avg_fill_price") or payload.get("entry_price") or payload.get("price")
         )
-        tp1 = float(payload.get("tp1_price") or 0.0) or None
+        stop_price = float(payload.get("stop_price") or 0)
+        initial_risk = max(abs(fill - stop_price), 1e-9)
+
+        # TP1 = 1R (진입가 + 리스크 거리), TP2~4는 트레일링으로 대체
+        if side == Side.LONG:
+            tp1 = fill + initial_risk
+        else:
+            tp1 = fill - initial_risk
         tp2 = float(payload.get("tp2_price") or 0.0) or None
         tp3 = float(payload.get("tp3_price") or 0.0) or None
         tp4 = float(payload.get("tp4_price") or 0.0) or None
@@ -180,67 +196,70 @@ class SLTPManager:
         self._managed.pop(symbol, None)
 
     def evaluate_price(self, symbol: str, mark_price: float, *, open_position_count: int = 1) -> list[dict[str, Any]]:
-        """Return actions to execute for a managed trade."""
+        """Return actions to execute for a managed trade.
+
+        TP 전략: 1R 본전 + ATR 트레일링
+          - TP1: 1R 도달 시 50% 청산 + SL → 본절 이동
+          - 나머지 50%: ATR 트레일링 스탑으로 추세 추적
+        """
 
         trade = self._managed.get(symbol)
         if trade is None:
             return []
         actions: list[dict[str, Any]] = []
-        if trade.side == Side.LONG:
-            tp1_hit = trade.tp1_price is not None and trade.tp1_price > 0 and mark_price >= trade.tp1_price
-            tp2_hit = trade.tp2_price is not None and trade.tp2_price > 0 and mark_price >= trade.tp2_price
-            tp3_hit = trade.tp3_price is not None and trade.tp3_price > 0 and mark_price >= trade.tp3_price
-            tp4_hit = trade.tp4_price is not None and trade.tp4_price > 0 and mark_price >= trade.tp4_price
-            stop_hit = trade.stop_price > 0 and mark_price <= trade.stop_price
-        else:
-            tp1_hit = trade.tp1_price is not None and trade.tp1_price > 0 and mark_price <= trade.tp1_price
-            tp2_hit = trade.tp2_price is not None and trade.tp2_price > 0 and mark_price <= trade.tp2_price
-            tp3_hit = trade.tp3_price is not None and trade.tp3_price > 0 and mark_price <= trade.tp3_price
-            tp4_hit = trade.tp4_price is not None and trade.tp4_price > 0 and mark_price <= trade.tp4_price
-            stop_hit = trade.stop_price > 0 and mark_price >= trade.stop_price
+        is_long = trade.side == Side.LONG
 
-        # 4분할 익절: 각 TP에서 초기 수량의 25% 청산
-        quarter = trade.quantity * 0.25
-        milestone_action: str | None = None
-        close_qty = 0.0
-        if tp4_hit and trade.remaining_quantity > 0 and not trade.tp4_done:
-            milestone_action = "partial_tp4"
-            close_qty = trade.remaining_quantity  # TP4 = 전량 청산 (남은 25%)
-            trade.tp4_done = True
-            trade.tp3_done = True
-            trade.tp2_done = True
-            trade.tp1_done = True
-        elif tp3_hit and trade.remaining_quantity > 0 and not trade.tp3_done:
-            milestone_action = "partial_tp3"
-            close_qty = min(quarter, trade.remaining_quantity)
-            trade.tp3_done = True
-        elif tp2_hit and trade.remaining_quantity > 0 and not trade.tp2_done:
-            milestone_action = "partial_tp2"
-            close_qty = min(quarter, trade.remaining_quantity)
-            trade.tp2_done = True
-        elif tp1_hit and trade.remaining_quantity > 0 and not trade.tp1_done:
-            milestone_action = "partial_tp1"
-            close_qty = min(quarter, trade.remaining_quantity)
+        # ── 1) TP1 (1R) 체크: 50% 청산 ─────────────────────────────────────
+        tp1_hit = False
+        if trade.tp1_price is not None and trade.tp1_price > 0:
+            tp1_hit = mark_price >= trade.tp1_price if is_long else mark_price <= trade.tp1_price
+
+        stop_hit = False
+        if trade.stop_price > 0:
+            stop_hit = mark_price <= trade.stop_price if is_long else mark_price >= trade.stop_price
+
+        if tp1_hit and trade.remaining_quantity > 0 and not trade.tp1_done:
+            half = trade.quantity * 0.50
+            close_qty = min(half, trade.remaining_quantity)
+            actions.append({"action": "partial_tp1", "symbol": symbol, "quantity": close_qty, "pending_fill": True})
             trade.tp1_done = True
 
-        if milestone_action is not None and trade.remaining_quantity > 0:
-            if close_qty > 0:
-                actions.append({"action": milestone_action, "symbol": symbol, "quantity": close_qty, "pending_fill": True})
-            if (
-                milestone_action != "final_target_exit"
-                and self.settings.risk.move_sl_to_be_after_tp1
-                and not trade.break_even_moved
-                and trade.remaining_quantity > 0
-            ):
-                if trade.side == Side.LONG:
-                    trade.stop_price = trade.entry_price + trade.initial_risk * self.settings.risk.be_offset_r
+            # SL → 본절 이동
+            if not trade.break_even_moved:
+                be_offset = trade.initial_risk * self.settings.risk.be_offset_r
+                if is_long:
+                    trade.stop_price = trade.entry_price + be_offset
                 else:
-                    trade.stop_price = trade.entry_price - trade.initial_risk * self.settings.risk.be_offset_r
+                    trade.stop_price = trade.entry_price - be_offset
                 trade.break_even_moved = True
                 actions.append({"action": "move_stop", "symbol": symbol, "new_stop_price": trade.stop_price})
 
+            # 트레일링 스탑 활성화
+            trade.trailing_active = True
+            trade.trailing_atr = trade.initial_risk
+            trade.trailing_extreme = mark_price
+
+        # ── 2) 트레일링 스탑 추적 ──────────────────────────────────────────
+        if trade.trailing_active and trade.remaining_quantity > 0:
+            # 최고가/최저가 갱신
+            if is_long:
+                if mark_price > trade.trailing_extreme:
+                    trade.trailing_extreme = mark_price
+                trailing_stop = trade.trailing_extreme - trade.trailing_atr
+                trailing_hit = mark_price <= trailing_stop
+            else:
+                if mark_price < trade.trailing_extreme:
+                    trade.trailing_extreme = mark_price
+                trailing_stop = trade.trailing_extreme + trade.trailing_atr
+                trailing_hit = mark_price >= trailing_stop
+
+            if trailing_hit:
+                actions.append({"action": "trailing_stop", "symbol": symbol, "quantity": trade.remaining_quantity})
+                trade.remaining_quantity = 0.0
+                return actions
+
+        # ── 3) 보유시간 초과 (3개 이상 포지션일 때만) ────────────────────────
         hold_minutes = (datetime.now(tz=UTC) - trade.opened_at).total_seconds() / 60
-        # 보유시간 초과 청산은 포지션 3개 이상일 때만 작동 (1~2개면 시간만으로 강제 청산하지 않음)
         min_positions_for_time_stop = 3
         if (
             hold_minutes >= self.settings.risk.max_position_hold_minutes
@@ -249,8 +268,11 @@ class SLTPManager:
         ):
             actions.append({"action": "time_stop", "symbol": symbol, "quantity": trade.remaining_quantity})
             trade.remaining_quantity = 0.0
+
+        # ── 4) 손절 ────────────────────────────────────────────────────────
         elif stop_hit and trade.remaining_quantity > 0:
             actions.append({"action": "stop_out", "symbol": symbol, "quantity": trade.remaining_quantity})
+
         return actions
 
     def confirm_partial_fill(self, symbol: str, filled_quantity: float) -> None:
