@@ -85,9 +85,9 @@ class StrategyName(str, Enum):
         """Return a human-readable Korean label."""
 
         labels = {
-            StrategyName.BREAK_RETEST: "브레이크 앤 리테스트",
-            StrategyName.LIQUIDITY_RAID: "Liquidity Reclaim",
-            StrategyName.FAIR_VALUE_GAP: "Fair Value Gap (FVG)",
+            StrategyName.BREAK_RETEST: "브레이크 리테스트",
+            StrategyName.LIQUIDITY_RAID: "유동성 리클레임",
+            StrategyName.FAIR_VALUE_GAP: "공정가치 갭 (FVG)",
             StrategyName.ORDER_BLOCK: "오더 블록 (OB)",
             StrategyName.CHOCH: "추세전환 (CHoCH)",
             StrategyName.MANUAL_DEMO: "수동 데모",
