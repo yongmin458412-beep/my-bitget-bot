@@ -82,15 +82,15 @@ class EVConfig(BaseModel):
     news_penalty_high: float = 0.2
     funding_penalty_minutes: int = 20
     market_impact_penalty_bps: float = 1.5
-    min_rr_to_tp1_break_retest: float = 1.3
+    min_rr_to_tp1_break_retest: float = 0.8
     preferred_rr_to_tp2_break_retest: float = 1.8
-    min_rr_to_tp1_liquidity_raid: float = 1.5
+    min_rr_to_tp1_liquidity_raid: float = 1.0
     preferred_rr_to_tp2_liquidity_raid: float = 2.0
-    min_rr_to_tp1_fair_value_gap: float = 1.4
+    min_rr_to_tp1_fair_value_gap: float = 0.9
     preferred_rr_to_tp2_fair_value_gap: float = 2.0
-    min_rr_to_tp1_order_block: float = 1.3
+    min_rr_to_tp1_order_block: float = 0.8
     preferred_rr_to_tp2_order_block: float = 1.8
-    min_rr_to_tp1_choch: float = 1.5
+    min_rr_to_tp1_choch: float = 1.0
     preferred_rr_to_tp2_choch: float = 2.2
 
 

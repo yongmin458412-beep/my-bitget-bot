@@ -640,6 +640,21 @@ class TradingApplication(CommandProvider):
             return
 
         runtime_metrics = self._runtime_metrics()
+        # 뉴스 방향과 신호 방향이 일치하면 차단하지 않음
+        # bearish 뉴스 → long만 차단, short은 통과 / bullish 뉴스 → short만 차단, long은 통과
+        _signal_side = best_signal.side.value if hasattr(best_signal.side, "value") else str(best_signal.side)
+        _opposing_news = [
+            nb for nb in news_blocks
+            if not (
+                (_signal_side == "long" and str(nb.get("direction_bias", "")).lower() == "bullish")
+                or (_signal_side == "short" and str(nb.get("direction_bias", "")).lower() == "bearish")
+            )
+        ]
+        if news_blocks and not _opposing_news:
+            self.logger.info(
+                "뉴스 블록 방향 일치 → 차단 해제",
+                extra={"extra_data": {"symbol": sym, "side": _signal_side, "news_direction": [nb.get("direction_bias") for nb in news_blocks]}},
+            )
         approved = self.risk_engine.approve(
             signal=best_signal,
             contract=contract,
@@ -647,7 +662,7 @@ class TradingApplication(CommandProvider):
             open_positions=self.state_store.state.open_positions,
             runtime_metrics=runtime_metrics,
             atr_value=best_signal.risk_per_unit,
-            news_blocked=bool(news_blocks),
+            news_blocked=bool(_opposing_news),
             funding_blocked=funding_minutes_away is not None and funding_minutes_away <= self.settings.risk.funding_block_before_minutes,
         )
         if approved is None:
@@ -664,7 +679,7 @@ class TradingApplication(CommandProvider):
                         open_positions=self.state_store.state.open_positions,
                         runtime_metrics=self._runtime_metrics(),
                         atr_value=best_signal.risk_per_unit,
-                        news_blocked=bool(news_blocks),
+                        news_blocked=bool(_opposing_news),
                         funding_blocked=funding_minutes_away is not None and funding_minutes_away <= self.settings.risk.funding_block_before_minutes,
                     )
             if approved is None:

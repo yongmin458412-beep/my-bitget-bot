@@ -16,7 +16,7 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt,
 from core.enums import OrderStatus, ProductType
 from core.logger import get_logger
 from core.settings import AppSettings
-from core.utils import as_float
+from core.utils import as_float, round_to_step
 
 from .bitget_models import (
     AccountSummary,
@@ -557,6 +557,8 @@ class BitgetRestClient:
                 f"최소 주문 수량 미달: {order.quantity} < {contract.min_order_size}"
             )
         if order.price is not None and contract.price_step:
+            # 부동소수점 오차 방지: 검증 전 가격을 tick size에 맞게 정규화
+            order.price = round_to_step(order.price, contract.price_step, mode="nearest")
             remainder = round(order.price / contract.price_step, 6) % 1
             if remainder > 1e-3 and remainder < (1 - 1e-3):
                 errors.append("가격이 tick size 배수가 아닙니다.")
