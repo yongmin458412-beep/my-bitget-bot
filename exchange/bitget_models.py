@@ -58,8 +58,8 @@ class ContractConfig(BaseModel):
                 payload.get("minTradeNum") or payload.get("minTradeUSDT") or payload.get("minTradeAmount")
             ),
             size_step=as_float(payload.get("sizeMultiplier") or payload.get("minTradeNum")),
-            price_step=as_float(payload.get("priceMultiplier") or payload.get("pricePlace")),
-            price_precision=int(as_float(payload.get("pricePlace"))),
+            price_step=as_float(payload.get("priceMultiplier")) or (10 ** -int(as_float(payload.get("pricePlace") or 0)) if payload.get("pricePlace") else 0.0),
+            price_precision=int(as_float(payload.get("pricePlace") or 0)),
             size_precision=int(as_float(payload.get("volumePlace"))),
             min_leverage=as_float(payload.get("minLever")) or None,
             max_leverage=as_float(payload.get("maxLever")) or None,
