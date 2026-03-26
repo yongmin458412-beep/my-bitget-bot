@@ -405,11 +405,9 @@ def _summary_text(spec: TradeChartSpec) -> str:
         parts.append(f"레버 {spec.leverage:.0f}배")
     rr_parts: list[str] = []
     if spec.rr_to_tp1 is not None:
-        rr_parts.append(f"1R:{spec.rr_to_tp1:.2f}")
-    if spec.rr_to_tp2 is not None:
-        rr_parts.append(f"2R:{spec.rr_to_tp2:.2f}")
-    if rr_parts:
-        parts.append(" / ".join(rr_parts))
+        rr_parts.append(f"TP1: 1R (50%)")
+    rr_parts.append("트레일링 (50%)")
+    parts.append(" + ".join(rr_parts))
     return "  |  ".join(parts)
 
 
