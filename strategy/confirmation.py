@@ -36,6 +36,32 @@ def volume_recovered(df: pd.DataFrame, multiple: float = 1.05) -> bool:
     return float(df["volume"].iloc[-1]) >= float(baseline * multiple)
 
 
+def rejection_candle_bullish(df: pd.DataFrame) -> bool:
+    """롱: 지지에서 긴 아랫꼬리 + 양봉 마감 (거부 캔들)."""
+
+    if len(df) < 1:
+        return False
+    c = df.iloc[-1]
+    lower_wick = min(c["open"], c["close"]) - c["low"]
+    total_range = c["high"] - c["low"]
+    if total_range <= 0:
+        return False
+    return c["close"] > c["open"] and lower_wick / total_range >= 0.50
+
+
+def rejection_candle_bearish(df: pd.DataFrame) -> bool:
+    """숏: 저항에서 긴 윗꼬리 + 음봉 마감 (거부 캔들)."""
+
+    if len(df) < 1:
+        return False
+    c = df.iloc[-1]
+    upper_wick = c["high"] - max(c["open"], c["close"])
+    total_range = c["high"] - c["low"]
+    if total_range <= 0:
+        return False
+    return c["close"] < c["open"] and upper_wick / total_range >= 0.50
+
+
 def mss_bullish(df: pd.DataFrame) -> bool:
     """Mini market-structure shift for long setups."""
 

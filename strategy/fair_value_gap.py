@@ -18,7 +18,7 @@ from .base import (
     build_chart_zone,
     build_entry_reason,
 )
-from .confirmation import bearish_confirmation, bullish_confirmation
+from .confirmation import rejection_candle_bearish, rejection_candle_bullish
 from .rr_filter import compute_structural_rr
 from .structural_stops import detect_structural_stop
 from .structural_targets import detect_structural_targets
@@ -92,27 +92,32 @@ class FairValueGapStrategy(BaseStrategy):
                 fvg_high = float(right["low"])
                 if fvg_high <= fvg_low:
                     continue
-                midpoint = fvg_low + (fvg_high - fvg_low) * self.entry_fill_ratio
-                price_in_gap = fvg_low <= last_close <= midpoint
+                fvg_size = fvg_high - fvg_low
+                # 롱: FVG 하단(지지) 근처 40% 영역에서만 진입
+                entry_zone_top = fvg_low + fvg_size * 0.40
+                price_in_zone = fvg_low <= last_close <= entry_zone_top
+                midpoint = fvg_low + fvg_size * self.entry_fill_ratio
             else:
                 # 베어리시 FVG: 왼쪽 캔들 하단 > 오른쪽 캔들 상단
                 fvg_high = float(left["low"])
                 fvg_low = float(right["high"])
                 if fvg_low >= fvg_high:
                     continue
-                midpoint = fvg_high - (fvg_high - fvg_low) * self.entry_fill_ratio
-                price_in_gap = midpoint <= last_close <= fvg_high
+                fvg_size = fvg_high - fvg_low
+                # 숏: FVG 상단(저항) 근처 40% 영역에서만 진입
+                entry_zone_bottom = fvg_high - fvg_size * 0.40
+                price_in_zone = entry_zone_bottom <= last_close <= fvg_high
+                midpoint = fvg_high - fvg_size * self.entry_fill_ratio
 
-            fvg_size = fvg_high - fvg_low
             if fvg_size < atr_value * self.min_fvg_atr_multiple:
                 continue
-            if not price_in_gap:
+            if not price_in_zone:
                 continue
 
-            # 확인 캔들 체크
+            # 거부 캔들 확인: 지지/저항에서 반전 캔들 필수
             confirmed = (
-                bullish_confirmation(df_3m.tail(2)) if side == Side.LONG
-                else bearish_confirmation(df_3m.tail(2))
+                rejection_candle_bullish(df_3m.tail(2)) if side == Side.LONG
+                else rejection_candle_bearish(df_3m.tail(2))
             )
             if not confirmed:
                 continue
@@ -186,11 +191,11 @@ class FairValueGapStrategy(BaseStrategy):
 
         fvg_size = fvg_high - fvg_low
         entry_reason = build_entry_reason(
-            title=f"FVG 공백 진입 ({'롱' if side == Side.LONG else '숏'})",
+            title=f"FVG {'지지' if side == Side.LONG else '저항'} 거부 진입 ({'롱' if side == Side.LONG else '숏'})",
             lines=[
                 f"FVG 구간 {fvg_low:,.4f} ~ {fvg_high:,.4f} (크기 {fvg_size:.4f})",
-                f"가격이 FVG 중간선 {fvg_midpoint:,.4f} 에 진입 — 기관 미채움 구간.",
-                f"확인 캔들 완성, 구조적 손절 {stop:,.4f} ({stop_reason})",
+                f"{'지지(FVG 하단)' if side == Side.LONG else '저항(FVG 상단)'}에서 거부 캔들 확인.",
+                f"구조적 손절 {stop:,.4f} ({stop_reason})",
             ],
             chart_levels=[
                 build_chart_level("FVG 상단", fvg_high, color="#f59e0b"),
