@@ -36,7 +36,7 @@ class CHoCHStrategy(BaseStrategy):
 
     lookback_swings: int = 20            # 스윙 탐색 범위 (캔들 수)
     min_swing_atr_multiple: float = 1.5  # 스윙 고저 최소 크기
-    max_retest_distance_atr: float = 0.5 # 리테스트 허용 거리
+    max_retest_distance_atr: float = 0.8 # 리테스트 허용 거리 (완화)
     merge_nearby_target_threshold_pct: float = 0.0015
     name: StrategyName = StrategyName.CHOCH
 

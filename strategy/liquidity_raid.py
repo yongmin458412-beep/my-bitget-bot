@@ -50,7 +50,7 @@ def _sweep_candidates(context: SignalContext, side: Side) -> list[tuple[str, flo
 class LiquidityRaidStrategy(BaseStrategy):
     """JadeCap-style liquidity raid reversal."""
 
-    volume_multiple: float = 1.1
+    volume_multiple: float = 0.9  # 볼륨 조건 완화 (0.9x = 거의 제한 없음)
     range_middle_exclusion: float = 0.2
     merge_nearby_target_threshold_pct: float = 0.0015
     name: StrategyName = StrategyName.LIQUIDITY_RAID

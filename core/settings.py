@@ -82,16 +82,16 @@ class EVConfig(BaseModel):
     news_penalty_high: float = 0.2
     funding_penalty_minutes: int = 20
     market_impact_penalty_bps: float = 1.5
-    min_rr_to_tp1_break_retest: float = 0.8
-    preferred_rr_to_tp2_break_retest: float = 1.8
-    min_rr_to_tp1_liquidity_raid: float = 1.0
-    preferred_rr_to_tp2_liquidity_raid: float = 2.0
-    min_rr_to_tp1_fair_value_gap: float = 0.9
-    preferred_rr_to_tp2_fair_value_gap: float = 2.0
-    min_rr_to_tp1_order_block: float = 0.8
-    preferred_rr_to_tp2_order_block: float = 1.8
-    min_rr_to_tp1_choch: float = 1.0
-    preferred_rr_to_tp2_choch: float = 2.2
+    min_rr_to_tp1_break_retest: float = 0.4
+    preferred_rr_to_tp2_break_retest: float = 1.2
+    min_rr_to_tp1_liquidity_raid: float = 0.5
+    preferred_rr_to_tp2_liquidity_raid: float = 1.5
+    min_rr_to_tp1_fair_value_gap: float = 0.4
+    preferred_rr_to_tp2_fair_value_gap: float = 1.2
+    min_rr_to_tp1_order_block: float = 0.4
+    preferred_rr_to_tp2_order_block: float = 1.2
+    min_rr_to_tp1_choch: float = 0.5
+    preferred_rr_to_tp2_choch: float = 1.5
 
 
 class RiskConfig(BaseModel):
@@ -118,8 +118,8 @@ class RiskConfig(BaseModel):
     max_consecutive_losses: int = 4
     cooldown_minutes_after_loss: int = 30
     # 같은 손절 이유 연속 발동 시 쿨다운
-    stop_reason_cooldown_threshold: int = 3       # N회 연속 같은 이유 손절 시 쿨다운
-    stop_reason_cooldown_minutes: int = 120       # 쿨다운 지속 시간(분)
+    stop_reason_cooldown_threshold: int = 5       # N회 연속 같은 이유 손절 시 쿨다운
+    stop_reason_cooldown_minutes: int = 30        # 쿨다운 지속 시간(분)
     max_daily_orders: int = 40
     max_position_hold_minutes: int = 30
     stale_eviction_minutes: int = 30  # 새 진입 시 이 시간 초과 포지션 먼저 정리
@@ -256,7 +256,7 @@ class ExchangeConfig(BaseModel):
         default_factory=lambda: [
             ProductType.USDT_FUTURES,
             ProductType.USDC_FUTURES,
-            ProductType.COIN_FUTURES,
+            # ProductType.COIN_FUTURES,  # ETH 마진 없어서 항상 실패 → 비활성화
         ]
     )
     request_timeout_seconds: int = 15

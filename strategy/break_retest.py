@@ -135,9 +135,10 @@ class BreakRetestStrategy(BaseStrategy):
 
             if not retest_zone_hit:
                 continue
-            if side == Side.LONG and not (bullish_confirmation(df_3m.tail(3)) and bullish_confirmation(df_5m.tail(3))):
+            # 3m confirmation만으로 충분 (5m은 선택)
+            if side == Side.LONG and not bullish_confirmation(df_3m.tail(3)):
                 continue
-            if side == Side.SHORT and not (bearish_confirmation(df_3m.tail(3)) and bearish_confirmation(df_5m.tail(3))):
+            if side == Side.SHORT and not bearish_confirmation(df_3m.tail(3)):
                 continue
             if not volume_recovered(df_3m, self.volume_multiple):
                 continue

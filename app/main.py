@@ -81,6 +81,7 @@ class TradingApplication(CommandProvider):
         self.latest_news_alerts: list[dict[str, Any]] = []
         self.last_balance: dict[str, Any] = {"balance": 0.0, "used_margin": 0.0, "unrealized_pnl": 0.0, "realized_pnl": 0.0}
         self.last_daily_summary_date: str | None = None
+        self._last_entry_timestamp: datetime | None = None  # anti-drought 타이머
         self.last_weekly_summary_key: str | None = None
         self.last_heartbeat_sent_at: datetime | None = None
         # stop_reason 반복 손절 쿨다운: {stop_reason: cooldown_until_datetime}
@@ -533,6 +534,21 @@ class TradingApplication(CommandProvider):
                 self._signal_payload(best_signal, SignalStatus.BLOCKED.value, expected_value=-1.0, blockers=blockers)
             )
             return
+        # ─── anti-drought: 장기 관망 시 min_signal_score 완화 ────────────────────
+        _last_entry_ts = getattr(self, "_last_entry_timestamp", None)
+        if _last_entry_ts:
+            _drought_min = (datetime.now(UTC) - _last_entry_ts).total_seconds() / 60
+            if _drought_min >= 60:
+                # 1시간+: 10%, 2시간+: 20%, 3시간+: 30% 완화 (최대)
+                _drought_relief = min(0.30, (_drought_min - 60) * 0.001)
+                _orig_score = best_signal.score
+                best_signal.score = min(1.0, best_signal.score * (1.0 + _drought_relief))
+                if _drought_relief >= 0.05:
+                    self.logger.info(
+                        "🏜️ anti-drought 점수 보정",
+                        extra={"extra_data": {"symbol": sym, "drought_minutes": round(_drought_min), "relief_pct": round(_drought_relief * 100, 1), "score_before": _orig_score, "score_after": best_signal.score}},
+                    )
+
         # ─── 레짐별 전략 성과 체크 ─────────────────────────────────────────────
         # (레짐 + 전략) 조합의 최근 30일 성과를 조회해 부진하면 점수 감산 또는 차단
         _regime_val = regime.regime.value if hasattr(regime, "regime") else str(regime or "")
@@ -543,10 +559,10 @@ class TradingApplication(CommandProvider):
             days=30,
             min_trades=1,
         )
-        _SOFT_PENALTY_THRESHOLD = 0.45   # 승률 45% 미만 + 5건 이상 → 점수 30% 감산
-        _HARD_BLOCK_THRESHOLD   = 0.25   # 승률 25% 미만 + 8건 이상 → 진입 차단
-        _SOFT_MIN_TRADES = 5
-        _HARD_MIN_TRADES = 8
+        _SOFT_PENALTY_THRESHOLD = 0.35   # 승률 35% 미만 + 10건 이상 → 점수 20% 감산
+        _HARD_BLOCK_THRESHOLD   = 0.20   # 승률 20% 미만 + 15건 이상 → 진입 차단
+        _SOFT_MIN_TRADES = 10
+        _HARD_MIN_TRADES = 15
         if _rs_stats["sufficient"] and _rs_stats["total"] >= _HARD_MIN_TRADES and _rs_stats["win_rate"] < _HARD_BLOCK_THRESHOLD:
             self.logger.info(
                 "🚫 레짐-전략 성과 부진 → 진입 차단",
@@ -562,7 +578,7 @@ class TradingApplication(CommandProvider):
             return
         if _rs_stats["sufficient"] and _rs_stats["total"] >= _SOFT_MIN_TRADES and _rs_stats["win_rate"] < _SOFT_PENALTY_THRESHOLD:
             original_score = best_signal.score
-            best_signal.score = round(best_signal.score * 0.70, 4)
+            best_signal.score = round(best_signal.score * 0.80, 4)
             self.logger.info(
                 "⚠️ 레짐-전략 성과 부진 → 점수 30% 감산",
                 extra={"extra_data": {
@@ -661,11 +677,8 @@ class TradingApplication(CommandProvider):
             "rr_to_best_target": ev.rr_to_best_target,
         }
         if not ev.approved:
-            self.logger.info("EV 필터 거절", extra={"extra_data": {"symbol": sym, "reason": ev.reject_reason, "ev": ev.expected_value, "rr_tp1": ev.rr_to_tp1, "p_win": ev.p_win}})
-            blockers = list(dict.fromkeys(best_signal.blockers + [ev.reject_reason or "ev_filter"]))
-            payload = self._signal_payload(best_signal, SignalStatus.BLOCKED.value, expected_value=ev.expected_value, blockers=blockers)
-            self.trade_journal.log_signal(payload)
-            return
+            # EV 필터: 경고만 남기고 차단하지 않음 (viability에서 이미 RR 검증됨)
+            self.logger.info("⚠️ EV 필터 경고 (차단 안 함)", extra={"extra_data": {"symbol": sym, "reason": ev.reject_reason, "ev": ev.expected_value, "rr_tp1": ev.rr_to_tp1, "p_win": ev.p_win}})
 
         runtime_metrics = self._runtime_metrics()
         # 뉴스 방향과 신호 방향이 일치하면 차단하지 않음
@@ -1986,6 +1999,9 @@ class TradingApplication(CommandProvider):
         chart_notes: list[str] | None = None,
     ) -> None:
         """Apply entry fill bookkeeping and send text/photo alerts."""
+
+        # anti-drought 타이머 갱신
+        self._last_entry_timestamp = datetime.now(UTC)
 
         self.logger.info(
             "진입 완료 처리 시작",
