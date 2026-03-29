@@ -22,6 +22,13 @@ def _fmt_price(price: float) -> str:
         return f"{price:.{decimals}f}"
 
 
+def _calc_margin(payload: dict[str, Any]) -> float:
+    """투입 마진 = 명목금액 / 레버리지."""
+    notional = float(payload.get("entry_notional_usdt", 0) or 0)
+    leverage = float(payload.get("leverage", 1) or 1) or 1.0
+    return notional / leverage
+
+
 _TERM_MAP = {
     "break_retest": "브레이크 앤 리테스트",
     "liquidity_raid": "유동성 리클레임",
@@ -92,8 +99,8 @@ def format_entry_fill_alert(payload: dict[str, Any]) -> str:
         f"- 현재 레짐: {_ko_term(payload.get('market_regime') or payload.get('regime'))}\n"
         f"- 왜 진입했나: {rationale.get('entry_reason_title') or '-'}\n"
         f"{reasons}\n"
-        f"- 진입한 USDT: {float(payload.get('entry_notional_usdt', 0) or 0):,.2f}\n"
-        f"- 남은 USDT: {float(payload.get('remaining_notional_usdt', 0) or 0):,.2f}"
+        f"- 투입 마진: {_calc_margin(payload):,.2f} USDT\n"
+        f"- 남은 잔고: {float(payload.get('account_balance_after', 0) or 0):,.2f} USDT"
     )
 
 

@@ -2028,6 +2028,8 @@ class TradingApplication(CommandProvider):
             str(fill_payload.get("side", "long")),
             fill_price,
         )
+        _margin_used = (fill_price * filled_quantity) / max(float(fill_payload.get("leverage", 1) or 1), 1.0)
+        _balance_after = max(0.0, self.last_balance.get("balance", 0.0) - _margin_used)
         await self.telegram_bot.broadcast_admins(
             format_entry_fill_alert(
                 {
@@ -2035,7 +2037,7 @@ class TradingApplication(CommandProvider):
                     "symbol": contract.symbol,
                     "final_target_price": final_target_price,
                     "entry_notional_usdt": fill_price * filled_quantity,
-                    "remaining_notional_usdt": fill_price * remaining_quantity,
+                    "account_balance_after": _balance_after,
                 }
             )
         )
