@@ -85,7 +85,7 @@
     "target_mode": "structure",
     "use_atr_buffer_for_stop": true,
     "atr_buffer_multiplier": 0.15,
-    "min_stop_distance_pct": 0.005,
+    "min_stop_distance_pct": 0.002,
     "max_stop_distance_pct": 0.04,
     "enable_structural_tp1_tp2_tp3": true,
     "risk_per_trade": 0.015,
