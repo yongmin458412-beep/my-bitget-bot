@@ -37,7 +37,7 @@ class MTFConfig(BaseModel):
     # 4H 추세 판단
     h4_ema_fast: int = 50
     h4_ema_slow: int = 200
-    h4_adx_threshold: float = 25.0
+    h4_adx_threshold: float = 20.0
     # 1H 방향 확인
     h1_ema_period: int = 20
     # 5M 진입 타이밍

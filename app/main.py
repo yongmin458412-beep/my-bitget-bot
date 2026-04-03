@@ -353,22 +353,7 @@ class TradingApplication(CommandProvider):
         # ✅ regime 분류: 실제 1H 데이터 사용
         regime = self.regime_classifier.classify(frames["15m"], frames["1H"])
 
-        # ── 멀티타임프레임 필터 (4H+1H+5M 방향 일치 사전 체크) ──────────────
-        if self.settings.mtf.enabled and "4H" in frames and "1H" in frames:
-            from market.indicators import ema as _ema
-            _h1_ema20 = _ema(frames["1H"]["close"], self.settings.mtf.h1_ema_period)
-            _preliminary_side = Side.LONG if float(_h1_ema20.iloc[-1]) > float(_h1_ema20.iloc[-3]) else Side.SHORT
-            _mtf_verdict = self.mtf_filter.evaluate(
-                df_4h=frames["4H"], df_1h=frames["1H"], df_5m=frames["5m"],
-                side=_preliminary_side,
-            )
-            if not _mtf_verdict.approved:
-                self.logger.debug(
-                    "MTF 필터 미통과",
-                    extra={"extra_data": {"symbol": sym, "side": _preliminary_side.value, "blockers": _mtf_verdict.blockers[:3], "h4": _mtf_verdict.h4_bias, "h1": _mtf_verdict.h1_bias}},
-                )
-                return
-        # ────────────────────────────────────────────────────────────────────
+        # MTF 필터는 전략 신호 확정 후 실제 side로 평가 (→ Line 645 이후로 이동)
 
         ticker = self.latest_tickers.get(contract.symbol) or await self.exchange.rest.get_ticker(contract.product_type, contract.symbol)
         if ticker is None or ticker.bid_price <= 0 or ticker.ask_price <= 0:
@@ -643,6 +628,24 @@ class TradingApplication(CommandProvider):
             )
             return
         self.logger.info("✅ 진입 신호 승인!", extra={"extra_data": {"symbol": sym, "strategy": best_signal.strategy.value, "side": best_signal.side, "score": best_signal.score, "entry": best_signal.entry_price}})
+
+        # ─── 멀티타임프레임 필터 (실제 신호 side로 평가) ────────────────────
+        if self.settings.mtf.enabled and "4H" in frames and "1H" in frames:
+            _mtf_verdict = self.mtf_filter.evaluate(
+                df_4h=frames["4H"], df_1h=frames["1H"], df_5m=frames["5m"],
+                side=best_signal.side,
+            )
+            if not _mtf_verdict.approved:
+                self.logger.info(
+                    "🔍 MTF 필터 미통과",
+                    extra={"extra_data": {"symbol": sym, "side": best_signal.side.value if hasattr(best_signal.side, 'value') else str(best_signal.side), "blockers": _mtf_verdict.blockers[:3], "h4": _mtf_verdict.h4_bias, "h1": _mtf_verdict.h1_bias}},
+                )
+                blockers = list(dict.fromkeys(best_signal.blockers + [f"mtf:{b}" for b in _mtf_verdict.blockers[:2]]))
+                self.trade_journal.log_signal(
+                    self._signal_payload(best_signal, SignalStatus.BLOCKED.value, expected_value=-1.0, blockers=blockers)
+                )
+                return
+        # ────────────────────────────────────────────────────────────────────
 
         # ─── AI 트레이드 필터 (규칙 통과 후 AI 확인) ────────────────────────
         try:
