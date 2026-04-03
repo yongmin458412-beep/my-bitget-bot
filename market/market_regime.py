@@ -40,7 +40,7 @@ class MarketRegimeClassifier:
             RegimeType.TRENDING: [StrategyName.BREAK_RETEST, StrategyName.CHOCH, StrategyName.FAIR_VALUE_GAP],
             RegimeType.RANGING: [StrategyName.LIQUIDITY_RAID, StrategyName.ORDER_BLOCK],
             RegimeType.EXPANSION: [StrategyName.BREAK_RETEST, StrategyName.FAIR_VALUE_GAP, StrategyName.ORDER_BLOCK],
-            RegimeType.EVENT_RISK: [],
+            RegimeType.EVENT_RISK: [StrategyName.BREAK_RETEST, StrategyName.FAIR_VALUE_GAP, StrategyName.CHOCH],
             RegimeType.DEAD_MARKET: [],
             RegimeType.UNKNOWN: [StrategyName.BREAK_RETEST, StrategyName.LIQUIDITY_RAID, StrategyName.FAIR_VALUE_GAP],
         }
@@ -138,7 +138,7 @@ class MarketRegimeClassifier:
             notes.append("절대 변동폭이 너무 작음")
             penalty_flags.append("dead_market")
             regime = RegimeType.DEAD_MARKET
-        elif shock_ratio >= 1.8 and volume_spike_ratio >= 1.8 and atr_percentile > 0.75:
+        elif shock_ratio >= 2.5 and volume_spike_ratio >= 2.5 and atr_percentile > 0.85:
             notes.append("이벤트/뉴스성 급변 가능성")
             penalty_flags.append("event_risk")
             regime = RegimeType.EVENT_RISK

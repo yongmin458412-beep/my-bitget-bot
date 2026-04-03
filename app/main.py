@@ -386,7 +386,7 @@ class TradingApplication(CommandProvider):
             max_active_groups=self.settings.strategy_router.max_active_strategy_groups,
         )
         if not available_registry:
-            self.logger.debug("전략 필터링 후 0개", extra={"extra_data": {"symbol": sym, "regime": str(regime.regime), "allowed": [str(s) for s in allowed_strategies]}})
+            self.logger.info("전략 필터링 후 0개", extra={"extra_data": {"symbol": sym, "regime": str(regime.regime), "allowed": [str(s) for s in allowed_strategies]}})
             return
         candidates = get_candidate_signals(available_registry, context, allowed_strategies)
         blocked_candidates: list[StrategySignal] = []
