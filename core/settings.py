@@ -26,6 +26,32 @@ class TimeframeConfig(BaseModel):
     entry: str = "3m"
     confirm: str = "5m"
     structure: str = "15m"
+    higher: str = "1H"     # 멀티타임프레임: 방향 확인
+    macro: str = "4H"      # 멀티타임프레임: 추세 판단
+
+
+class MTFConfig(BaseModel):
+    """멀티타임프레임 필터 설정 (Alexander Elder 3중 스크린)."""
+
+    enabled: bool = True
+    # 4H 추세 판단
+    h4_ema_fast: int = 50
+    h4_ema_slow: int = 200
+    h4_adx_threshold: float = 25.0
+    # 1H 방향 확인
+    h1_ema_period: int = 20
+    # 5M 진입 타이밍
+    m5_rsi_period: int = 14
+    m5_rsi_overbought: float = 70.0
+    m5_rsi_oversold: float = 30.0
+    m5_bb_period: int = 20
+    m5_bb_std: float = 2.0
+    # 거래량 필터
+    volume_multiplier: float = 1.5
+    volume_lookback: int = 20
+    # 변동성 킬스위치
+    volatility_atr_kill_multiplier: float = 3.0
+    volatility_atr_lookback: int = 50
 
 
 class StrategyConfig(BaseModel):
@@ -105,22 +131,30 @@ class RiskConfig(BaseModel):
     max_stop_distance_pct: float = 0.02
     enable_structural_tp1_tp2_tp3: bool = True
     # 포지션 사이징 모드: "risk_based" (손절거리 기반) | "equity_share" (자산 균등 배분)
-    sizing_mode: str = "equity_share"
+    sizing_mode: str = "equity_share"  # equity_share | risk_based | atr_proportional | kelly
+    kelly_fraction: float = 0.25       # Kelly 분율 (0.25 = quarter Kelly)
+    atr_stop_multiplier: float = 1.5   # ATR × 이 값 = 손절 거리
     # equity_share 모드: 총 자산을 몇 개 포지션으로 나눌지 (증거금 기준)
     equity_share_count: int = 10
     risk_per_trade: float = 0.005
     min_risk_per_trade: float = 0.0025
     max_risk_per_trade: float = 0.01
-    max_concurrent_positions: int = 10
+    max_concurrent_positions: int = 3      # 최대 동시 포지션 (10→3)
     # 포트폴리오 히트 한도: 전체 증거금 / 총자산 (equity_share 모드에서도 안전망)
     max_portfolio_heat_pct: float = 1.0
     max_daily_loss_r: float = 3.0
-    max_consecutive_losses: int = 4
+    max_daily_loss_pct: float = 2.0        # 일일 최대 손실 % → 당일 중단
+    max_consecutive_losses: int = 3         # 연속 손실 → 쿨다운 (4→3)
     cooldown_minutes_after_loss: int = 30
+    # 서킷 브레이커 토글
+    daily_loss_limit_enabled: bool = True
+    consecutive_loss_cooldown_enabled: bool = True
+    drawdown_limit_enabled: bool = True
+    kill_switch_enabled: bool = True
     # 같은 손절 이유 연속 발동 시 쿨다운
     stop_reason_cooldown_threshold: int = 5       # N회 연속 같은 이유 손절 시 쿨다운
     stop_reason_cooldown_minutes: int = 30        # 쿨다운 지속 시간(분)
-    max_daily_orders: int = 40
+    max_daily_orders: int = 10             # 일일 최대 거래 (40→10)
     max_position_hold_minutes: int = 30
     stale_eviction_minutes: int = 30  # 새 진입 시 이 시간 초과 포지션 먼저 정리
     max_account_drawdown_pct: float = 8.0
@@ -293,6 +327,7 @@ class EnvSecrets(BaseSettings):
     bitget_demo_api_passphrase: str = ""
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    anthropic_api_key: str = ""           # AI 듀얼 프로바이더 — 에스컬레이션용
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     live_trading_enabled: bool = False
@@ -323,6 +358,7 @@ class AppSettings(BaseModel):
 
     mode: TradingMode = TradingMode.DEMO
     timeframes: TimeframeConfig = Field(default_factory=TimeframeConfig)
+    mtf: MTFConfig = Field(default_factory=MTFConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     strategy_router: StrategyRouterConfig = Field(default_factory=StrategyRouterConfig)

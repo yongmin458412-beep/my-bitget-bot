@@ -59,8 +59,16 @@ class TradeGuard:
             result.blockers.append("portfolio_heat_limit")
         if symbol_has_position and not self.config.allow_multiple_positions_per_symbol:
             result.blockers.append("symbol_position_exists")
-        # daily_loss_limit, consecutive_loss_limit, drawdown_limit, kill_switch 비활성화
-        # 잔고가 0이 되지 않는 한 매매 지속
+        # ── 서킷 브레이커 (토글 제어) ─────────────────────────────────────
+        if getattr(self.config, "daily_loss_limit_enabled", False) and daily_loss_r <= -self.config.max_daily_loss_r:
+            result.blockers.append("daily_loss_limit")
+        if getattr(self.config, "consecutive_loss_cooldown_enabled", False) and consecutive_losses >= self.config.max_consecutive_losses:
+            result.blockers.append("consecutive_loss_cooldown")
+        if getattr(self.config, "drawdown_limit_enabled", False) and account_drawdown_pct >= self.config.max_account_drawdown_pct:
+            result.blockers.append("account_drawdown_limit")
+        if getattr(self.config, "kill_switch_enabled", False) and unrealized_loss_pct >= self.config.kill_switch_unrealized_loss_pct:
+            result.blockers.append("kill_switch_triggered")
+        # ──────────────────────────────────────────────────────────────────
         if daily_order_count >= self.config.max_daily_orders:
             result.blockers.append("daily_order_limit")
         if news_blocked:

@@ -106,6 +106,14 @@ class TradingApplication(CommandProvider):
             self.orderbooks,
         )
         self.regime_classifier = MarketRegimeClassifier()
+        from market.mtf_filter import MultiTimeframeFilter
+        self.mtf_filter = MultiTimeframeFilter(self.settings.mtf)
+        from ai.anthropic_client import AnthropicClient
+        from ai.cost_tracker import AICostTracker
+        from ai.trade_filter import AITradeFilter
+        self._anthropic_client = AnthropicClient(self.settings)
+        self._ai_cost_tracker = AICostTracker(self.persistence, daily_limit_usd=2.0, monthly_limit_usd=50.0)
+        self.ai_trade_filter = AITradeFilter(self.ai_client, self._anthropic_client, self._ai_cost_tracker, self.settings)
         self.level_detector = SupportResistanceDetector()
         self.break_retest = BreakRetestStrategy(
             retest_tolerance_atr=self.settings.strategy.retest_tolerance_atr,
@@ -323,21 +331,44 @@ class TradingApplication(CommandProvider):
         entry_tf = self.settings.timeframes.entry      # 3m
         confirm_tf = self.settings.timeframes.confirm  # 5m
         structure_tf = self.settings.timeframes.structure  # 15m
-        # ✅ 1H 제거 — 1m~15m 봉만 사용 (단기 구조 기반)
+        higher_tf = self.settings.timeframes.higher    # 1H
+        macro_tf = self.settings.timeframes.macro      # 4H
+        # ✅ 멀티타임프레임: 1H + 4H 추가
+        tf_list = [entry_tf, confirm_tf, structure_tf, higher_tf, macro_tf]
         frames_raw = await self.klines.get_multi_timeframe(
             contract.product_type,
             contract.symbol,
-            [entry_tf, confirm_tf, structure_tf],
+            tf_list,
             limit=250,
         )
         frames = {
             "3m": frames_raw[entry_tf],
             "5m": frames_raw[confirm_tf],
             "15m": frames_raw[structure_tf],
+            "1H": frames_raw[higher_tf],
+            "4H": frames_raw[macro_tf],
         }
         levels = self.level_detector.build_levels(frames["3m"], frames["15m"])
-        # ✅ regime 분류도 15m 기반으로 (1H 대신 15m 반복 사용)
-        regime = self.regime_classifier.classify(frames["15m"], frames["15m"])
+        # ✅ regime 분류: 실제 1H 데이터 사용
+        regime = self.regime_classifier.classify(frames["15m"], frames["1H"])
+
+        # ── 멀티타임프레임 필터 (4H+1H+5M 방향 일치 사전 체크) ──────────────
+        if self.settings.mtf.enabled and "4H" in frames and "1H" in frames:
+            from market.indicators import ema as _ema
+            _h1_ema20 = _ema(frames["1H"]["close"], self.settings.mtf.h1_ema_period)
+            _preliminary_side = Side.LONG if float(_h1_ema20.iloc[-1]) > float(_h1_ema20.iloc[-3]) else Side.SHORT
+            _mtf_verdict = self.mtf_filter.evaluate(
+                df_4h=frames["4H"], df_1h=frames["1H"], df_5m=frames["5m"],
+                side=_preliminary_side,
+            )
+            if not _mtf_verdict.approved:
+                self.logger.debug(
+                    "MTF 필터 미통과",
+                    extra={"extra_data": {"symbol": sym, "side": _preliminary_side.value, "blockers": _mtf_verdict.blockers[:3], "h4": _mtf_verdict.h4_bias, "h1": _mtf_verdict.h1_bias}},
+                )
+                return
+        # ────────────────────────────────────────────────────────────────────
+
         ticker = self.latest_tickers.get(contract.symbol) or await self.exchange.rest.get_ticker(contract.product_type, contract.symbol)
         if ticker is None or ticker.bid_price <= 0 or ticker.ask_price <= 0:
             return
@@ -611,6 +642,33 @@ class TradingApplication(CommandProvider):
             )
             return
         self.logger.info("✅ 진입 신호 승인!", extra={"extra_data": {"symbol": sym, "strategy": best_signal.strategy.value, "side": best_signal.side, "score": best_signal.score, "entry": best_signal.entry_price}})
+
+        # ─── AI 트레이드 필터 (규칙 통과 후 AI 확인) ────────────────────────
+        try:
+            _ai_verdict = await self.ai_trade_filter.evaluate(
+                signal=best_signal,
+                context=context,
+                regime=regime,
+                position_size_usd=best_signal.entry_price * float(best_signal.score * 100),
+                account_equity=self.last_balance.get("balance", 0.0),
+            )
+            if not _ai_verdict.approved:
+                self.logger.info(
+                    "🤖 AI 필터 거절",
+                    extra={"extra_data": {
+                        "symbol": sym, "provider": _ai_verdict.provider_used,
+                        "confidence": _ai_verdict.confidence, "reason": _ai_verdict.reason,
+                        "cost": _ai_verdict.cost_usd, "latency_ms": round(_ai_verdict.latency_ms),
+                    }},
+                )
+                blockers = list(dict.fromkeys(best_signal.blockers + [f"ai_filter:{_ai_verdict.reason}"]))
+                self.trade_journal.log_signal(
+                    self._signal_payload(best_signal, SignalStatus.BLOCKED.value, expected_value=-1.0, blockers=blockers)
+                )
+                return
+        except Exception:
+            self.logger.warning("AI 필터 예외 — 규칙만으로 진행")
+        # ────────────────────────────────────────────────────────────────────
 
         # ─── S/R 기반 진입가 최적화 ─────────────────────────────────────────
         # 롱 → 현재가 아래 가장 가까운 지지 레벨 / 숏 → 현재가 위 가장 가까운 저항 레벨

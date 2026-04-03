@@ -1,4 +1,11 @@
-"""Position sizing based on stop distance and risk budget."""
+"""Position sizing based on stop distance and risk budget.
+
+Sizing modes:
+  - equity_share: 자산 균등 배분 (총자산 / N)
+  - risk_based: 손절 거리 기반 (자본의 X% 리스크)
+  - atr_proportional: ATR × 배수 = 손절 거리, 리스크 기반 사이징
+  - kelly: Kelly Criterion 기반 (fractional Kelly)
+"""
 
 from __future__ import annotations
 
@@ -97,4 +104,65 @@ class PositionSizer:
             leverage=leverage,
             valid=valid,
             reason=reason,
+        )
+
+    def size_from_atr(
+        self,
+        *,
+        account_equity: float,
+        risk_fraction: float,
+        entry_price: float,
+        atr_value: float,
+        atr_multiplier: float,
+        leverage: float,
+        contract: ContractConfig,
+    ) -> PositionSizeResult:
+        """ATR 비례 사이징: 손절 = ATR × multiplier."""
+        stop_distance = atr_value * atr_multiplier
+        if stop_distance <= 0:
+            return PositionSizeResult(0.0, 0.0, 0.0, leverage, False, "atr_stop<=0")
+        stop_price = entry_price - stop_distance  # 방향 무관, 거리만 사용
+        return self.size_from_risk(
+            account_equity=account_equity,
+            risk_fraction=risk_fraction,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            leverage=leverage,
+            contract=contract,
+        )
+
+    def size_from_kelly(
+        self,
+        *,
+        account_equity: float,
+        win_rate: float,
+        avg_win_r: float,
+        avg_loss_r: float,
+        kelly_fraction: float,
+        entry_price: float,
+        stop_price: float,
+        leverage: float,
+        contract: ContractConfig,
+    ) -> PositionSizeResult:
+        """Kelly Criterion 기반 사이징 (fractional Kelly)."""
+        if avg_loss_r <= 0 or win_rate <= 0:
+            return self.size_from_risk(
+                account_equity=account_equity,
+                risk_fraction=0.005,
+                entry_price=entry_price,
+                stop_price=stop_price,
+                leverage=leverage,
+                contract=contract,
+            )
+        b = avg_win_r / avg_loss_r
+        kelly_f = (win_rate * b - (1.0 - win_rate)) / b
+        kelly_f = max(0.0, kelly_f * kelly_fraction)
+        risk_fraction = min(kelly_f, 0.02)  # 최대 2% 캡
+        return self.size_from_risk(
+            account_equity=account_equity,
+            risk_fraction=risk_fraction,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            leverage=leverage,
+            contract=contract,
         )

@@ -142,3 +142,65 @@ def swing_points(df: pd.DataFrame, window: int = 3) -> dict[str, list[tuple[pd.T
         if center_low <= df["low"].iloc[idx - window : idx + window + 1].min():
             lows.append((df.index[idx], float(center_low)))
     return {"highs": highs, "lows": lows}
+
+
+# ── 멀티타임프레임 필터용 지표 ──────────────────────────────────────────────
+
+
+def ema(series: pd.Series, period: int) -> pd.Series:
+    """지수이동평균 (Exponential Moving Average)."""
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """RSI (Relative Strength Index)."""
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def macd(
+    close: pd.Series,
+    fast: int = 12,
+    slow: int = 26,
+    signal_period: int = 9,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """MACD 라인, 시그널 라인, 히스토그램 반환."""
+    fast_ema = ema(close, fast)
+    slow_ema = ema(close, slow)
+    macd_line = fast_ema - slow_ema
+    signal_line = ema(macd_line, signal_period)
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def bollinger_bands(
+    close: pd.Series,
+    period: int = 20,
+    std_dev: float = 2.0,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """볼린저밴드 상단, 중간, 하단 반환."""
+    mid = close.rolling(period).mean()
+    std = close.rolling(period).std()
+    upper = mid + std_dev * std
+    lower = mid - std_dev * std
+    return upper, mid, lower
+
+
+def stochastic_rsi(
+    close: pd.Series,
+    rsi_period: int = 14,
+    stoch_period: int = 14,
+    k_smooth: int = 3,
+    d_smooth: int = 3,
+) -> tuple[pd.Series, pd.Series]:
+    """Stochastic RSI — %K, %D 반환."""
+    rsi_val = rsi(close, rsi_period)
+    rsi_min = rsi_val.rolling(stoch_period).min()
+    rsi_max = rsi_val.rolling(stoch_period).max()
+    stoch = (rsi_val - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan) * 100.0
+    k = stoch.rolling(k_smooth).mean()
+    d = k.rolling(d_smooth).mean()
+    return k, d

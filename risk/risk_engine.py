@@ -108,7 +108,8 @@ class RiskEngine:
             hard_stop_pct=self.settings.risk.hard_stop_loss_pct,
             structural_stop_already_buffered=True,
         )
-        if self.settings.risk.sizing_mode == "equity_share":
+        _sm = self.settings.risk.sizing_mode
+        if _sm == "equity_share":
             sizing = self.position_sizer.size_from_equity_share(
                 account_equity=account_equity,
                 equity_share_count=self.settings.risk.equity_share_count,
@@ -116,7 +117,30 @@ class RiskEngine:
                 leverage=leverage,
                 contract=contract,
             )
-        else:
+        elif _sm == "atr_proportional":
+            sizing = self.position_sizer.size_from_atr(
+                account_equity=account_equity,
+                risk_fraction=self.settings.risk.risk_per_trade,
+                entry_price=signal.entry_price,
+                atr_value=atr_value,
+                atr_multiplier=self.settings.risk.atr_stop_multiplier,
+                leverage=leverage,
+                contract=contract,
+            )
+        elif _sm == "kelly":
+            _hist = runtime_metrics or {}
+            sizing = self.position_sizer.size_from_kelly(
+                account_equity=account_equity,
+                win_rate=float(_hist.get("win_rate", 0.4)),
+                avg_win_r=float(_hist.get("avg_win_r", 1.5)),
+                avg_loss_r=float(_hist.get("avg_loss_r", 1.0)),
+                kelly_fraction=self.settings.risk.kelly_fraction,
+                entry_price=signal.entry_price,
+                stop_price=stop_price,
+                leverage=leverage,
+                contract=contract,
+            )
+        else:  # risk_based (기본)
             sizing = self.position_sizer.size_from_risk(
                 account_equity=account_equity,
                 risk_fraction=self.settings.risk.risk_per_trade,
