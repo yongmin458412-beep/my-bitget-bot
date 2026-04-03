@@ -108,12 +108,6 @@ class TradingApplication(CommandProvider):
         self.regime_classifier = MarketRegimeClassifier()
         from market.mtf_filter import MultiTimeframeFilter
         self.mtf_filter = MultiTimeframeFilter(self.settings.mtf)
-        from ai.anthropic_client import AnthropicClient
-        from ai.cost_tracker import AICostTracker
-        from ai.trade_filter import AITradeFilter
-        self._anthropic_client = AnthropicClient(self.settings)
-        self._ai_cost_tracker = AICostTracker(self.persistence, daily_limit_usd=2.0, monthly_limit_usd=50.0)
-        self.ai_trade_filter = AITradeFilter(self.ai_client, self._anthropic_client, self._ai_cost_tracker, self.settings)
         self.level_detector = SupportResistanceDetector()
         self.break_retest = BreakRetestStrategy(
             retest_tolerance_atr=self.settings.strategy.retest_tolerance_atr,
@@ -163,6 +157,13 @@ class TradingApplication(CommandProvider):
         self.fill_handler = FillHandler(self.persistence, self.state_store, self.trade_journal)
         self.telegram_router = TelegramCommandRouter(self)
         self.telegram_bot = TelegramBotService(self.settings, self.telegram_router)
+        # AI 듀얼 프로바이더 (OpenAI + Anthropic)
+        from ai.anthropic_client import AnthropicClient
+        from ai.cost_tracker import AICostTracker
+        from ai.trade_filter import AITradeFilter
+        self._anthropic_client = AnthropicClient(self.settings)
+        self._ai_cost_tracker = AICostTracker(self.persistence, daily_limit_usd=2.0, monthly_limit_usd=50.0)
+        self.ai_trade_filter = AITradeFilter(self.ai_client, self._anthropic_client, self._ai_cost_tracker, self.settings)
 
     async def start(self) -> None:
         """Start background tasks."""
