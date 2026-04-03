@@ -415,6 +415,29 @@ class TradingApplication(CommandProvider):
         approved_candidates: list[StrategySignal] = []
         for candidate in candidates:
             risk_distance = max(abs(candidate.entry_price - candidate.stop_price), 1e-9)
+            # 👑 SL 기반 TP 계산을 viability 체크 전에 적용 (항상 올바른 RR 보장)
+            if candidate.stop_price is not None and candidate.stop_price > 0:
+                from strategy.rr_filter import compute_quadrant_targets
+                _quadrants = compute_quadrant_targets(
+                    entry_price=candidate.entry_price,
+                    stop_price=candidate.stop_price,
+                    side=candidate.side
+                )
+                if _quadrants:
+                    candidate.tp1_price = _quadrants.get("tp1")
+                    candidate.tp2_price = _quadrants.get("tp2")
+                    candidate.tp3_price = _quadrants.get("tp3")
+                    candidate.tp4_price = _quadrants.get("tp4")
+                    candidate.target_plan = [
+                        {"price": _quadrants["tp1"], "reason": "tp1_50pct_of_remaining", "priority": 1},
+                        {"price": _quadrants["tp2"], "reason": "tp2_50pct_of_remaining", "priority": 2},
+                        {"price": _quadrants["tp3"], "reason": "tp3_50pct_of_remaining", "priority": 3},
+                        {"price": _quadrants["tp4"], "reason": "tp4_full_close", "priority": 4},
+                    ]
+                    candidate.rr_to_tp1 = 0.5
+                    candidate.rr_to_tp2 = 1.0
+                    candidate.rr_to_best_target = 2.0
+                    candidate.expected_r = 2.0
             candidate.fees_r = (candidate.entry_price * (self.settings.ev.estimated_maker_fee_bps * 2 / 10_000)) / risk_distance
             candidate.slippage_r = (
                 candidate.entry_price
@@ -442,49 +465,13 @@ class TradingApplication(CommandProvider):
                 reject_trade_if_targets_are_inside_range_middle=self.settings.strategy.reject_trade_if_targets_are_inside_range_middle,
                 min_stop_distance_pct=self.settings.risk.min_stop_distance_pct,
             )
-            # 👑 SL 기반 TP 계산: SL이 1이면 TP는 2배
-            if candidate.stop_price is not None and candidate.stop_price > 0:
-                from strategy.rr_filter import compute_quadrant_targets
-                quadrants = compute_quadrant_targets(
-                    entry_price=candidate.entry_price,
-                    stop_price=candidate.stop_price,
-                    side=candidate.side
-                )
-                if quadrants:
-                    candidate.tp1_price = quadrants.get("tp1")
-                    candidate.tp2_price = quadrants.get("tp2")
-                    candidate.tp3_price = quadrants.get("tp3")
-                    candidate.tp4_price = quadrants.get("tp4")
-                    # TP1-3: 각 50% | TP4: 전량청산
-                    candidate.target_plan = [
-                        {"price": quadrants["tp1"], "reason": "tp1_50pct_of_remaining", "priority": 1},
-                        {"price": quadrants["tp2"], "reason": "tp2_50pct_of_remaining", "priority": 2},
-                        {"price": quadrants["tp3"], "reason": "tp3_50pct_of_remaining", "priority": 3},
-                        {"price": quadrants["tp4"], "reason": "tp4_full_close", "priority": 4},
-                    ]
-                    # RR 재계산 (1:2 구조)
-                    candidate.rr_to_tp1 = 0.5   # TP1 = 0.5R
-                    candidate.rr_to_tp2 = 1.0   # TP2 = 1.0R
-                    candidate.rr_to_best_target = 2.0  # 최종 TP4 = 2.0R
-                    candidate.expected_r = 2.0
-                else:
-                    candidate.rr_to_tp1 = viability.rr_to_tp1
-                    candidate.rr_to_tp2 = viability.rr_to_tp2
-                    candidate.rr_to_best_target = viability.rr_to_best_target
-                    candidate.expected_r = viability.rr_to_tp2 or viability.rr_to_best_target or candidate.expected_r
-                    if viability.target_plan:
-                        candidate.target_plan = viability.target_plan
-                        candidate.tp1_price = float(viability.target_plan[0]["price"])
-                        if len(viability.target_plan) > 1:
-                            candidate.tp2_price = float(viability.target_plan[1]["price"])
-                        if len(viability.target_plan) > 2:
-                            candidate.tp3_price = float(viability.target_plan[2]["price"])
-            else:
+            # RR 값은 viability 결과로 보완 (quadrant로 이미 설정됐으면 유지)
+            if not (candidate.rr_to_tp1 and candidate.rr_to_tp1 > 0):
                 candidate.rr_to_tp1 = viability.rr_to_tp1
                 candidate.rr_to_tp2 = viability.rr_to_tp2
                 candidate.rr_to_best_target = viability.rr_to_best_target
                 candidate.expected_r = viability.rr_to_tp2 or viability.rr_to_best_target or candidate.expected_r
-                if viability.target_plan:
+                if viability.target_plan and not candidate.target_plan:
                     candidate.target_plan = viability.target_plan
                     candidate.tp1_price = float(viability.target_plan[0]["price"])
                     if len(viability.target_plan) > 1:
