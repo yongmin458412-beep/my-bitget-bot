@@ -54,8 +54,8 @@ def _range_middle(df_15m: pd.DataFrame, price: float, exclusion: float) -> bool:
 class BreakRetestStrategy(BaseStrategy):
     """Vincent-style break and retest with deterministic filters."""
 
-    retest_tolerance_atr: float = 0.4
-    volume_multiple: float = 1.15
+    retest_tolerance_atr: float = 0.7
+    volume_multiple: float = 1.0
     range_middle_exclusion: float = 0.2
     merge_nearby_target_threshold_pct: float = 0.0015
 
@@ -117,7 +117,7 @@ class BreakRetestStrategy(BaseStrategy):
                 continue
 
             chase_distance = abs(last_close - level_value)
-            if chase_distance > atr_value * 0.8:
+            if chase_distance > atr_value * 1.5:
                 continue
 
             fvg_zone = find_fvg_zone(df_3m.tail(5))

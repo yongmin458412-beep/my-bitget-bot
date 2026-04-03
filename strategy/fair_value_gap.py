@@ -35,8 +35,8 @@ class FairValueGapStrategy(BaseStrategy):
     가격이 FVG 중간선(50%) 에 진입하면 반응 진입.
     """
 
-    min_fvg_atr_multiple: float = 0.08   # FVG 크기 최소 조건 (ATR 의 0.08배)
-    max_fvg_age_candles: int = 60        # FVG 최대 유효 캔들 수 (6시간)
+    min_fvg_atr_multiple: float = 0.05   # FVG 크기 최소 조건 (ATR 의 0.05배)
+    max_fvg_age_candles: int = 80        # FVG 최대 유효 캔들 수 (8시간)
     entry_fill_ratio: float = 0.50       # FVG 진입 깊이 (0.50 = 50% 수준)
     merge_nearby_target_threshold_pct: float = 0.0015
     name: StrategyName = StrategyName.FAIR_VALUE_GAP
