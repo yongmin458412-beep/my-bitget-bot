@@ -47,7 +47,7 @@ class MTFConfig(BaseModel):
     m5_bb_period: int = 20
     m5_bb_std: float = 2.0
     # 거래량 필터
-    volume_multiplier: float = 1.5
+    volume_multiplier: float = 1.1
     volume_lookback: int = 20
     # 변동성 킬스위치
     volatility_atr_kill_multiplier: float = 3.0
