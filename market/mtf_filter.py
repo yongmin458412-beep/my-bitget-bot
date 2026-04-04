@@ -163,10 +163,8 @@ class MultiTimeframeFilter:
         # 5M 타이밍
         m5_bias, m5_details = self._check_5m(df_5m, side)
 
-        # 거래량
-        volume_ok = self._check_volume(df_5m)
-        if not volume_ok:
-            blockers.append("volume_below_threshold")
+        # 거래량 (각 전략 내부에도 체크 있으므로 MTF에서는 비활성화)
+        volume_ok = True  # _check_volume 제거 — 전략 자체 volume_recovered() 사용
 
         # 변동성 킬스위치
         volatility_ok = self._check_volatility(df_5m)
