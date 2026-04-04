@@ -174,18 +174,16 @@ class MultiTimeframeFilter:
             blockers.append("extreme_volatility")
 
         # 방향 일치 체크
+        # h4 neutral(횡보) 시에는 차단하지 않음 — 방향이 없으면 1H/5M 기준으로 진입
+        # h4 가 신호와 반대 방향일 때만 차단
         side_str = "bullish" if side == Side.LONG else "bearish"
+        opposite_str = "bearish" if side == Side.LONG else "bullish"
 
-        if h4_bias == "neutral":
-            blockers.append("h4_no_trend")
-        elif h4_bias != side_str:
+        if h4_bias == opposite_str:
             blockers.append(f"h4_against_{side_str}")
 
-        if h1_bias != "neutral" and h1_bias != side_str:
+        if h1_bias == opposite_str:
             blockers.append(f"h1_against_{side_str}")
-
-        if m5_bias == "neutral":
-            blockers.append("m5_no_signal")
 
         # 추세 방향 결정
         if h4_bias == h1_bias and h4_bias != "neutral":
