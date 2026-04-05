@@ -58,6 +58,9 @@ class OpenAIResponsesClient:
         else:
             schema = schema_model.model_json_schema()
             schema["additionalProperties"] = False
+            # OpenAI strict mode requires 'required' to list ALL properties
+            if "properties" in schema and "required" not in schema:
+                schema["required"] = list(schema["properties"].keys())
 
         try:
             async for attempt in AsyncRetrying(

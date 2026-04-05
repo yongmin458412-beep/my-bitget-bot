@@ -50,6 +50,10 @@ class PositionSizer:
             return PositionSizeResult(0.0, risk_amount, 0.0, leverage, False, "stop_distance<=0")
 
         raw_quantity = risk_amount / stop_distance
+        # 레버리지 기반 최대 포지션 크기 제한: margin = notional / leverage <= equity * 0.95
+        max_notional = account_equity * leverage * 0.95
+        max_qty_by_margin = max_notional / entry_price if entry_price > 0 else raw_quantity
+        raw_quantity = min(raw_quantity, max_qty_by_margin)
         quantity = round_to_step(raw_quantity, contract.size_step or 1.0, mode="down")
         if contract.min_order_size and quantity < contract.min_order_size:
             quantity = round_to_step(contract.min_order_size, contract.size_step or 1.0, mode="up")
